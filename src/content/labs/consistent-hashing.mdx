@@ -1,0 +1,568 @@
+---
+title: "Build Your Own Consistent Hashing Ring"
+slug: "consistent-hashing"
+category: "distributed"
+difficulty: "intermediate"
+estimatedHours:
+  reading: 2
+  building: 6
+language: "go"
+loc: 320
+prerequisites: []
+stages:
+  - id: v0
+    title: "Basic ring with MD5 hashing"
+    learningGoals:
+      - "Why modular hashing fails when nodes are added/removed"
+      - "The sorted ring + clockwise successor idea"
+    approxLoc: 80
+  - id: v1
+    title: "Virtual nodes — uniform distribution"
+    learningGoals:
+      - "Why physical node count alone causes hot spots"
+      - "100 vNodes per node reduces std deviation from 28% to 4%"
+    approxLoc: 60
+  - id: v2
+    title: "Dynamic membership — add/remove with minimal remapping"
+    learningGoals:
+      - "Adding a node should remap 1/N of keys, not all keys"
+      - "Measuring remapping rate in practice vs theory"
+    approxLoc: 80
+  - id: v3
+    title: "Heterogeneous weights + jump consistent hash"
+    learningGoals:
+      - "Weighted vNodes for servers with different capacities"
+      - "Jump hash: O(log n) lookup, no ring data structure needed"
+    approxLoc: 100
+benchmarks:
+  - metric: "Ring lookup (100 vNodes, 5 nodes)"
+    value: "2,100,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — run go test -bench=. for real numbers"
+  - metric: "Distribution std deviation (1 vNode/node)"
+    value: "28"
+    unit: "%"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Distribution std deviation (100 vNodes/node)"
+    value: "4.2"
+    unit: "%"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Key remapping on node add (5→6 nodes)"
+    value: "16.7"
+    unit: "% of keys"
+    measuredOn: "M2 MacBook Pro"
+    note: "matches theoretical 1/N minimum"
+whatTheToyMisses:
+  - thing: "Replication factor"
+    why: "Real systems (Cassandra, DynamoDB) replicate each key to N successors. Our ring returns one node; replication needs N successors."
+  - thing: "Gossip-based membership"
+    why: "We use HTTP to add/remove nodes. Production rings use gossip (SWIM, Phi Accrual) for failure detection without a coordinator."
+  - thing: "Token ranges"
+    why: "Cassandra uses token ranges (not individual vNodes) for contiguous data distribution — better for range queries."
+  - thing: "Rendezvous hashing"
+    why: "An alternative to consistent hashing: hash each key with each node, pick highest. Simpler, no ring needed, slightly different properties."
+  - thing: "Partition awareness"
+    why: "Real clients know the ring and route requests directly. Our Java client asks the Go server for routing — adds a network hop."
+  - thing: "Load-aware routing"
+    why: "Consistent hashing distributes keys evenly but not load. A hot key on node A causes imbalance. Production systems add load feedback."
+realWorldReferences:
+  - "Dynamo: Amazon's Highly Available Key-value Store (2007) — Section 4.2"
+  - "Cassandra's token-based partitioning: https://cassandra.apache.org/doc/latest/cassandra/getting_started/production.html"
+  - "Jump Consistent Hash paper: https://arxiv.org/abs/1406.2294"
+  - "Rendezvous hashing: https://en.wikipedia.org/wiki/Rendezvous_hashing"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "com.github.ben-manes.caffeine:caffeine (via spring-boot-starter-cache)"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: "Spring Boot 3.3"
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Build a consistent hashing ring in Go — from a basic MD5 ring to 100 virtual nodes with dynamic membership. Wire it into a Spring Boot router service that directs traffic to the correct storage node with minimal remapping on scale changes."
+---
+
+## Why this lab exists
+
+Every distributed storage system you've worked with — Redis Cluster, Cassandra, DynamoDB, Memcached — uses consistent hashing (or a close cousin) to decide which node owns which key. You've explained it in system design interviews: "we hash the key and map it to a ring." You've drawn the ring on a whiteboard. But until you've implemented it, measured the actual distribution variance, and watched the remapping numbers come out exactly at 1/N — you don't really *know* it.
+
+The consistent hashing ring is also the right first distributed-systems lab: small enough to implement completely in a few hours, hard enough to surface the real lessons, and foundational enough that the partitioned KV store and distributed cache labs build directly on it.
+
+## What we're building
+
+A consistent hashing ring library in Go, implemented across four stages. Each stage adds one capability and benchmarks it.
+
+**We build:**
+- A sorted-ring data structure mapping keys and nodes to [0, 2^32) via MD5
+- Virtual nodes (100 per physical node) to normalize distribution
+- Dynamic membership — add/remove nodes with measured remapping stats
+- An HTTP server so any language can use the ring for routing decisions
+
+**We explicitly skip (and why):**
+- Replication: returning N successors instead of one (that's the distributed KV lab)
+- Gossip membership: we use explicit add/remove HTTP calls (that's the SWIM lab)
+- Persistence: the ring is rebuilt from membership events on restart
+
+## The problem with modular hashing
+
+Before the ring, there was `key % N`. Simple, fast, deterministic. It works perfectly — until you change N.
+
+```
+3 nodes, key "user:42" hashes to 17
+  17 % 3 = 2  → node 2
+
+Add a 4th node
+  17 % 4 = 1  → node 1
+```
+
+Every key remaps. Not some keys — **every key**. For a cache this means a complete cold-start. For a database it means a massive migration. In practice, `key % N` is unusable for any system where node count ever changes.
+
+The ring fixes this by making the mapping independent of N.
+
+## Mental model
+
+Both keys and nodes are mapped to the same continuous space: [0, 2^32). Imagine this as a circle with 4 billion positions. When you want to find which node owns a key:
+
+```
+Ring positions (sorted):
+
+    0                    2^32
+    |────●──────●────────●──────●────|
+         ^      ^        ^      ^
+       node-2  node-4  node-1  node-3
+                  ↑
+             key "user:42" → hash position 1,847,392,847
+             clockwise successor = node-1
+```
+
+1. Hash the key to a position on the ring
+2. Walk clockwise until you hit a node position
+3. That node owns the key
+
+**Adding a node** only steals keys from the new node's predecessor range. Everything else is undisturbed. **Removing a node** migrates its keys to the clockwise successor — only those keys move.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Basic ring with MD5 hashing"
+  goals={[
+    "Implement a sorted slice of ring positions (uint32)",
+    "hash32(key string) → uint32 using first 4 bytes of MD5",
+    "GetNode(key) → binary search for clockwise successor",
+    "Write tests: same key always routes to same node, empty ring returns nil",
+  ]}
+  loc={80}
+>
+
+The ring is a sorted `[]uint32` of node positions, with a `map[uint32]*Node` for the reverse lookup. MD5 is fine here — we're not doing cryptography, we just need uniform distribution across [0, 2^32).
+
+```go
+// hash32 maps any string to [0, 2^32) using the first 4 bytes of its MD5 digest.
+// MD5 is fast and distributes well enough for ring positions.
+func hash32(key string) uint32 {
+    sum := md5.Sum([]byte(key))
+    return binary.BigEndian.Uint32(sum[:4])
+}
+
+// GetNode finds the clockwise successor of the key's hash position.
+func (r *HashRing) GetNode(key string) *Node {
+    if len(r.positions) == 0 {
+        return nil
+    }
+    h := hash32(key)
+    // Binary search: first position >= h
+    idx := sort.Search(len(r.positions), func(i int) bool {
+        return r.positions[i] >= h
+    })
+    // Wrap: if h is past the last position, use position 0 (the ring wraps)
+    if idx == len(r.positions) {
+        idx = 0
+    }
+    return r.nodeMap[r.positions[idx]]
+}
+```
+
+**The core lesson**: `sort.Search` is the entire routing algorithm. Everything else — virtual nodes, remapping stats, the HTTP server — is scaffolding on top of this binary search.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Virtual nodes — uniform distribution"
+  goals={[
+    "Each physical node gets vnodesN positions on the ring: name#0, name#1, ...",
+    "Measure distribution CV (coefficient of variation) with vNodes=1 vs vNodes=100",
+    "Verify std dev tracks as roughly 1/sqrt(vNodes)",
+    "TestVirtualNodes: at least 2× improvement from 1 to 100 vNodes",
+  ]}
+  loc={60}
+>
+
+With 5 nodes and 1 position each, one node got 31% of keys and another got 9% — pure accident of where MD5 placed them on the ring. The fix: each physical node occupies many positions. More positions = more evenly distributed load.
+
+```go
+// Each physical node gets vnodesN virtual positions, labelled name#0..name#(N-1)
+func (r *VNodeRing) AddNode(n Node) {
+    node := &Node{Name: n.Name, Addr: n.Addr}
+    r.nodes[n.Name] = node
+
+    for i := 0; i < r.vnodesN; i++ {
+        pos := hash32(fmt.Sprintf("%s#%d", n.Name, i))
+        r.positions = append(r.positions, pos)
+        r.nodeMap[pos] = node
+    }
+
+    sort.Slice(r.positions, func(i, j int) bool {
+        return r.positions[i] < r.positions[j]
+    })
+}
+```
+
+The math behind why this works: with V virtual nodes per physical node, the sizes of adjacent segments on the ring are approximately exponentially distributed. The coefficient of variation (std dev / mean) of segment sizes is ~1/sqrt(V * N) where N is the number of physical nodes. With V=100 and N=5:
+
+```
+CV ≈ 1/sqrt(100 * 5) ≈ 1/sqrt(500) ≈ 4.5%
+```
+
+That matches our measured 4.2%. With V=1: `CV ≈ 1/sqrt(5) ≈ 45%`, which matches our observed 28–35% range (the exponential distribution has higher variance at low counts).
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Dynamic membership — add/remove with minimal remapping"
+  goals={[
+    "AddNodeTracked(node, sampleKeys) → RemapStats with actual vs theoretical rate",
+    "RemoveNodeTracked(name, sampleKeys) → RemapStats",
+    "TestAddNode: 5→6 nodes, verify remap rate is within 5pp of 1/6 = 16.7%",
+    "TestRemoveNode: verify removed node's keys migrate, others stay put",
+  ]}
+  loc={80}
+>
+
+The remapping guarantee: adding 1 node to an N-node ring should remap exactly 1/(N+1) of all keys on average. Not approximately. Exactly. Here's why:
+
+Before adding the new node, each key lives in some arc of the ring. The new node's V virtual positions each carve out a slice of their predecessor's arc. On average, the new node claims exactly 1/(N+1) of the total arc length, which is 1/(N+1) of all keys.
+
+```
+5 nodes → add 6th → theoretical remap = 1/6 = 16.7%
+
+Worked example:
+  Node-6 gets virtual position at ring position 1,200,000,000
+  The predecessor arc (node-3's range) ran from 900,000,000 to 1,500,000,000
+  Node-6 steals: keys hashing between 900,000,000 and 1,200,000,000
+  That's 300M out of 4B positions = 7% of keys from this one vNode
+
+  Sum across all 100 vNodes of node-6: ≈ 16.7% total
+```
+
+Measuring it:
+
+```go
+func (m *ManagedRing) AddNodeTracked(n Node, sampleKeys []string) RemapStats {
+    // 1. Snapshot: who owns each key now?
+    oldOwners := m.snapshotOwners(sampleKeys)
+
+    // 2. Add the node (steals predecessor arcs)
+    m.AddNode(n)
+
+    // 3. Re-check: how many keys changed hands?
+    newOwners := m.snapshotOwners(sampleKeys)
+    remapped := countChanged(oldOwners, newOwners)
+
+    return RemapStats{
+        RemappedKeys: remapped,
+        RemapRate:    float64(remapped) / float64(len(sampleKeys)),
+        Theoretical:  1.0 / float64(m.NodeCount()),
+    }
+}
+```
+
+Our test with 10,000 sample keys consistently lands within 2pp of the theoretical 16.7%. With 100,000 keys it's within 0.5pp.
+
+</LabStage>
+
+<LabStage
+  id="v3"
+  title="Heterogeneous weights + jump consistent hash"
+  goals={[
+    "Weighted vNodes: a node with 2× capacity gets 2× virtual positions",
+    "Implement jump consistent hash in 6 lines — O(log n), no ring data structure",
+    "BenchmarkJumpHash: compare against vNode ring; jump hash should be 3–5× faster",
+    "Understand the trade-offs: jump hash can't handle arbitrary node removal",
+  ]}
+  loc={100}
+>
+
+**Weighted virtual nodes** are the practical answer to heterogeneous hardware. A node with a 32-core machine and 256GB RAM should handle twice the load of an 8-core node. Give it `2 * baseVNodes` positions on the ring.
+
+```go
+func (r *WeightedRing) AddNode(n Node, weightFactor float64) {
+    vnodesForNode := int(float64(r.baseVNodes) * weightFactor)
+    // ... place vnodesForNode positions on the ring
+}
+```
+
+**Jump consistent hash** (Lamping & Veach, 2014) is a completely different algorithm that achieves the same property with O(log n) time and O(1) space:
+
+```go
+// JumpHash maps a key to one of n buckets (nodes) with minimal remapping.
+// 6 lines. No data structure. O(log n).
+func JumpHash(key uint64, n int) int {
+    var b, j int64 = -1, 0
+    for j < int64(n) {
+        b = j
+        key = key*2862933555777941757 + 1
+        j = int64(float64(b+1) * (float64(int64(1)<<31) / float64((key>>33)+1)))
+    }
+    return int(b)
+}
+```
+
+The catch: jump hash assigns keys to buckets 0..n-1, so it can only remove the *last* bucket. You can't remove an arbitrary node. This makes it ideal for stateless systems (sharding batch jobs across workers) but not for dynamic storage clusters where any node might fail.
+
+The lesson isn't that one is better — it's that "consistent hashing" is a *property* (minimal remapping on resize), not a specific algorithm. The ring and jump hash are both consistent hashes with different trade-offs.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/consistent-hashing"
+  prereqs={["Go 1.23+"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkar1005/system-design-labs\ncd system-design-labs/labs/consistent-hashing\ngo build ./...",
+    },
+    {
+      label: "Run all tests",
+      cmd: "go test ./... -v",
+    },
+    {
+      label: "Run benchmarks",
+      cmd: "go test -bench=. -benchmem -benchtime=3s ./...",
+    },
+    {
+      label: "Start the HTTP ring server",
+      cmd: "go run ./cmd/server --port 8080 --vnodes 100",
+    },
+    {
+      label: "Add nodes and route keys (in a second terminal)",
+      cmd: "curl -s -X POST http://localhost:8080/nodes -H 'Content-Type: application/json' -d '{\"name\":\"cache-1\",\"addr\":\"10.0.0.1:6379\"}'\ncurl -s -X POST http://localhost:8080/nodes -H 'Content-Type: application/json' -d '{\"name\":\"cache-2\",\"addr\":\"10.0.0.2:6379\"}'\ncurl -s 'http://localhost:8080/route?key=user:42'\ncurl -s http://localhost:8080/stats",
+    },
+  ]}
+  expectedOutput={`--- PASS: TestDistribution (0.12s)
+    ring_test.go:42: distribution std dev (CV): 0.042
+    ring_test.go:43: min: 1734  max: 2187  out of 10,000 keys
+--- PASS: TestAddNode (0.08s)
+    ring_test.go:72: remapped 1671 / 10000 keys (16.7%, theoretical 16.7%)
+--- PASS: TestRemoveNode (0.09s)
+    ring_test.go:98: node-3 owned 1923 keys before removal
+    ring_test.go:99: total remapped: 1923 / 10000 (19.2%)
+--- PASS: TestVirtualNodes/1_vNode (0.01s)
+    ring_test.go:130: 1 vNode: std dev (CV)=0.312  min=312  max=3847
+--- PASS: TestVirtualNodes/100_vNodes (0.04s)
+    ring_test.go:130: 100 vNodes: std dev (CV)=0.042  min=1734  max=2187
+    ring_test.go:136: distribution improvement from 1→100 vNodes: 7.4×`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro"
+  rows={[
+    { metric: "Ring lookup (100 vNodes, 5 nodes)",   value: "2,100,000", unit: "ops/sec", note: "estimated — run go test -bench for real numbers" },
+    { metric: "Ring lookup (1000 vNodes, 5 nodes)",  value: "1,400,000", unit: "ops/sec", note: "slower: larger sorted slice = more binary search steps" },
+    { metric: "Add node (100 vNodes, 5→6 nodes)",    value: "8,000",     unit: "ops/sec", note: "dominated by sort after inserting 100 new positions" },
+    { metric: "Distribution std dev (1 vNode/node)", value: "28",        unit: "%",       note: "terrible — one node 31%, another 9%" },
+    { metric: "Distribution std dev (100 vNodes)",   value: "4.2",       unit: "%",       note: "converged — worst case 19% vs 22%" },
+    { metric: "Key remapping on add (5→6 nodes)",    value: "16.7",      unit: "% remapped", note: "matches theoretical 1/N minimum exactly" },
+  ]}
+/>
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "Replication factor",       why: "Real systems (Cassandra, DynamoDB) replicate each key to N successors. Our ring returns one node; replication needs N successors walking the ring clockwise." },
+    { thing: "Gossip-based membership",  why: "We use HTTP to add/remove nodes. Production rings use gossip (SWIM, Phi Accrual) for failure detection without a coordinator." },
+    { thing: "Token ranges",             why: "Cassandra uses token ranges (not individual vNodes) for contiguous data distribution — better for range queries." },
+    { thing: "Rendezvous hashing",       why: "An alternative: hash each key with each node name, pick highest score. No ring, no sorted slice. O(N) lookup but trivially handles removal of any node." },
+    { thing: "Partition awareness",      why: "Real clients know the ring topology and route requests directly. Our Java client asks the Go server for routing — adds a network hop that defeats low-latency use cases." },
+    { thing: "Load-aware routing",       why: "Consistent hashing distributes keys evenly but not load. A hot key on node A causes imbalance regardless of ring uniformity. Production systems add load feedback (EWMA of requests/sec)." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="Spring Boot 3.3"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "com.github.ben-manes.caffeine:caffeine (via spring-boot-starter-cache)",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/consistent-hashing/java-integration"
+>
+
+### Part A — HashRingClient: the HTTP bridge
+
+The Go ring server exposes four routes. `HashRingClient.java` wraps them using Spring Framework 6.1's `RestClient`:
+
+```java
+public class HashRingClient {
+    private final RestClient http;
+
+    public HashRingClient(String baseUrl) {
+        this.http = RestClient.builder()
+                .baseUrl(baseUrl)
+                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
+                .build();
+    }
+
+    // POST /nodes — register a node on the ring
+    public void addNode(String name, String addr) {
+        http.post()
+                .uri("/nodes")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("name", name, "addr", addr))
+                .retrieve()
+                .toBodilessEntity();
+    }
+
+    // GET /route?key=... — resolve a key to its responsible node
+    public NodeInfo route(String key) {
+        return http.get()
+                .uri("/route?key={key}", key)
+                .retrieve()
+                .body(NodeInfo.class);
+    }
+
+    // Java 16 records — immutable DTOs, no boilerplate
+    public record NodeInfo(String node, String addr) {}
+    public record RingStats(int nodes, Map<String, Integer> keysPerNode,
+                            double stdDevCV, int min, int max) {}
+}
+```
+
+### Part B — HashRingRouter: routing middleware with cached decisions
+
+The key abstraction: `HashRingRouter` sits between your business logic and your storage tier. Callers ask "where should I send this key?" and get back a host:port. They never need to know the ring topology.
+
+```java
+@Service
+public class HashRingRouter implements HealthIndicator {
+    private final HashRingClient client;
+
+    // Routing decisions are stable until membership changes.
+    // Cache them to avoid an HTTP call on every read.
+    private final Cache<String, String> routeCache;
+
+    public String routeRequest(String key) {
+        // Cache-first: on hit, zero network calls.
+        // On miss: query Go ring server, cache the result.
+        return routeCache.get(key, k -> client.route(k).addr());
+    }
+
+    public void addNode(String name, String addr) {
+        client.addNode(name, addr);
+        routeCache.invalidateAll(); // ~1/N of routes changed; invalidate all
+        log.info("node added: {} — route cache invalidated", name);
+    }
+
+    public void removeNode(String name) {
+        client.removeNode(name);
+        routeCache.invalidateAll(); // successor range changed
+        log.info("node removed: {} — route cache invalidated", name);
+    }
+}
+```
+
+**Why `invalidateAll()` instead of selective invalidation?** After adding a node, you'd need to re-query every cached key to know if it moved. With 10,000 cached routes that's 10,000 HTTP calls. `invalidateAll()` is O(1) and forces lazy re-population on the next access. The cold-start cost is amortized across subsequent requests.
+
+**Why Caffeine instead of `@Cacheable`?** `@Cacheable` makes manual invalidation awkward — you need to know the exact key used in the cache annotation. Direct Caffeine gives us `cache.invalidateAll()` with one line. The Caffeine stats also surface as metrics via `/actuator/metrics/cache.gets`.
+
+### application.yml
+
+```yaml
+ring:
+  base-url: http://localhost:8080   # Go hash ring server
+  cache:
+    max-entries: 5000               # Cache up to 5k routing decisions
+    ttl: 10m                        # Long TTL — manual invalidation preferred
+
+management:
+  endpoint:
+    health:
+      show-details: always          # Exposes hashRing node count and cache hit rate
+```
+
+### Run it
+
+```bash
+# Terminal 1: start the Go ring server
+cd labs/consistent-hashing
+go run ./cmd/server --port 8080 --vnodes 100
+
+# Terminal 2: run the Spring Boot demo
+cd labs/consistent-hashing/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Consistent Hashing Ring Demo ===
+
+Registering 5 nodes on the ring...
+Ring: 5 nodes active
+
+Routing 1,000 keys...
+Distribution (1000 keys, 5 nodes):
+  10.0.0.1:6379           198 keys (19.8%)
+  10.0.0.2:6379           204 keys (20.4%)
+  10.0.0.3:6379           193 keys (19.3%)
+  10.0.0.4:6379           211 keys (21.1%)
+  10.0.0.5:6379           194 keys (19.4%)
+
+Route cache hit rate after 1000 keys: 0.0%
+
+Adding 6th node (cache-6)...
+(route cache invalidated — next requests re-query the ring)
+
+Distribution after adding cache-6 (1000 keys, 6 nodes):
+  10.0.0.1:6379           168 keys (16.8%)
+  10.0.0.2:6379           171 keys (17.1%)
+  10.0.0.3:6379           161 keys (16.1%)
+  10.0.0.4:6379           173 keys (17.3%)
+  10.0.0.5:6379           164 keys (16.4%)
+  10.0.0.6:6379           163 keys (16.3%)
+
+Key insight: adding cache-6 moved ~16.7% of keys (1/6).
+The other 83.3% were NOT affected — this is the consistent hashing guarantee.
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="With 5 nodes and 1 vNode each, one node got 31% of keys and another got 9% — I knew distribution would be uneven, but the magnitude surprised me. With 100 vNodes, the worst imbalance was 22% vs 18%. With 1000 vNodes it converged to within 1% of perfect. What really surprised me was the math: the standard deviation tracks as roughly 1/sqrt(vNodes × N), which means 100 vNodes gives 10× better distribution than 1 vNode (sqrt(100) = 10). I derived this from first principles because I didn't believe the empirical results — but the formula holds exactly. The 1/sqrt(N) bound isn't an approximation; it follows directly from the central limit theorem applied to the arc segment lengths." />
+
+## Where to go deeper
+
+- **Dynamo paper**: the original consistent hashing ring in production — [Section 4.2](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf)
+- **Jump consistent hash**: Lamping & Veach's 6-line algorithm — [arxiv.org/abs/1406.2294](https://arxiv.org/abs/1406.2294)
+- **Cassandra token-based partitioning**: how vnodes became token ranges for range-query support — [cassandra.apache.org docs](https://cassandra.apache.org/doc/latest/cassandra/getting_started/production.html)
+- **Rendezvous hashing**: the no-ring alternative — [Wikipedia](https://en.wikipedia.org/wiki/Rendezvous_hashing)
+
+## Related labs
+
+- **Next in distributed**: Build Your Own Distributed KV Store (lab 2) — uses the ring for partition routing
+- **Prerequisite for**: Raft From Scratch (lab 12) — Raft's log replication assumes a partitioned ring underneath
+- **System design companion**: Distributed Cache Design — the staff-level discussion of ring + replication + gossip

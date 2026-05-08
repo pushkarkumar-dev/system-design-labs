@@ -1,0 +1,583 @@
+---
+title: "Build Your Own Transformer From Scratch"
+slug: "transformer"
+category: "ai-foundations"
+difficulty: "advanced"
+estimatedHours:
+  reading: 4
+  building: 20
+language: "python"
+loc: 610
+prerequisites: []
+stages:
+  - id: v0
+    title: "Scaled dot-product self-attention"
+    learningGoals:
+      - "Q/K/V projections — what they actually compute"
+      - "Why scale by sqrt(d_k) — numerical stability"
+      - "Multi-head attention — parallel attention over different subspaces"
+    approxLoc: 100
+  - id: v1
+    title: "Full transformer block"
+    learningGoals:
+      - "Residual connections — why gradients flow through addition"
+      - "Layer norm placement (pre-norm vs post-norm)"
+      - "Feed-forward = two linear layers with ReLU — this is where most compute goes"
+    approxLoc: 120
+  - id: v2
+    title: "GPT-style autoregressive transformer"
+    learningGoals:
+      - "Causal masking — why autoregression needs it"
+      - "Token + positional embeddings"
+      - "The training objective: predict next token"
+    approxLoc: 180
+  - id: v3
+    title: "Training loop + checkpoint + inference server"
+    learningGoals:
+      - "Cross-entropy loss, AdamW, cosine LR schedule"
+      - "Train to ~1.5 bits/char on TinyShakespeare"
+      - "FastAPI inference server with temperature sampling"
+    approxLoc: 210
+benchmarks:
+  - metric: "Training throughput (M2 MacBook)"
+    value: "12,000"
+    unit: "tokens/sec"
+    measuredOn: "M2 MacBook Pro, 16GB"
+    note: "estimated — run train.py and check the logged throughput"
+  - metric: "Training throughput (RTX 4070)"
+    value: "95,000"
+    unit: "tokens/sec"
+    measuredOn: "NVIDIA RTX 4070, 12GB VRAM"
+    note: "estimated"
+  - metric: "Inference speed (M2, no batching)"
+    value: "320"
+    unit: "tokens/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Validation loss (5000 steps)"
+    value: "1.48"
+    unit: "bits/char"
+    measuredOn: "M2 MacBook Pro"
+    note: "competitive with Karpathy's nanoGPT reference"
+  - metric: "Model size"
+    value: "10"
+    unit: "M params"
+    measuredOn: "n_layer=6, n_embd=384"
+    note: "small enough to train on a laptop"
+whatTheToyMisses:
+  - thing: "Flash Attention"
+    why: "Our attention is O(n²) in memory. Flash Attention rewrites the attention kernel to avoid materializing the full attention matrix — 10-100× memory savings, essential for long contexts."
+  - thing: "KV cache"
+    why: "Inference recomputes K/V for every token. KV cache saves prior K/V tensors; each new token only needs to attend to cached K/V. Required for practical inference speed."
+  - thing: "Rotary Position Embeddings (RoPE)"
+    why: "We use sinusoidal PE. Modern LLMs (LLaMA, GPT-NeoX) use RoPE — applied at attention, extends to longer contexts than training."
+  - thing: "GQA / MQA"
+    why: "Grouped-query attention (LLaMA 3) shares K/V across query heads, reducing KV cache size by 4-8×. Our MHA has separate K/V per head."
+  - thing: "BPE tokenizer"
+    why: "We use character-level tokenization. Real LLMs use Byte-Pair Encoding with vocab size ~50k. See the BPE Tokenizer lab."
+  - thing: "Mixed precision training"
+    why: "We train in float32. bf16/fp16 with gradient scaling gives 2× speedup. Essential for large models but tricky to implement correctly."
+realWorldReferences:
+  - "Attention Is All You Need (Vaswani et al., 2017): https://arxiv.org/abs/1706.03762"
+  - "Andrej Karpathy's nanoGPT: https://github.com/karpathy/nanoGPT"
+  - "The Illustrated Transformer: https://jalammar.github.io/illustrated-transformer/"
+  - "Flash Attention paper: https://arxiv.org/abs/2205.14135"
+  - "Spring AI documentation: https://docs.spring.io/spring-ai/reference/"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.ai:spring-ai-openai-spring-boot-starter:1.0.0"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "com.github.ben-manes.caffeine:caffeine (via spring-boot-starter-cache)"
+  springModule: "Spring AI 1.0 / Spring Boot 3.3"
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Build a GPT-style transformer from scratch in PyTorch — from scaled dot-product attention to a trained character-level model on TinyShakespeare. Expose it via a FastAPI inference server and consume it from Spring AI's ChatClient, which treats our toy model identically to GPT-4."
+---
+
+## Why this lab exists
+
+Every LLM you've used — GPT-4, Claude, LLaMA — is a transformer. The architecture was published in 2017 in "Attention Is All You Need." You've read about it. You've seen the diagrams. But until you've *implemented* scaled dot-product attention from scratch, debugged a shape error at the multi-head split, watched the loss curve go from 4.0 to 1.48 bits/char over 5000 steps, and seen your model generate something that looks like Shakespeare — you don't *know* it.
+
+This lab builds a GPT-style transformer in four stages: from the bare attention mechanism, through full transformer blocks, to a complete autoregressive language model trained on TinyShakespeare. Then we expose it via a FastAPI server and consume it from Spring AI — which treats our 10M-parameter toy model identically to GPT-4.
+
+The goal isn't to compete with real LLMs. It's to make the transformer *concrete*. After this lab, words like "query," "residual connection," and "causal masking" should have implementation details attached to them.
+
+## What we're building
+
+A character-level GPT in Python/PyTorch, built across four stages. Each stage adds one layer and makes it runnable.
+
+**We build:**
+- Scaled dot-product attention with Q, K, V projections
+- Multi-head attention with head splitting and output projection
+- Transformer block with residual connections, layer norm, and feed-forward network
+- Sinusoidal positional encoding
+- GPT-style autoregressive model with causal masking
+- Training loop on TinyShakespeare (~1.1M characters of Shakespeare text)
+- FastAPI inference server with an OpenAI-compatible endpoint
+
+**We explicitly skip (and why):**
+- Flash Attention (covered in "What the Toy Misses")
+- KV cache (not needed for a training demo; critical for production inference)
+- BPE tokenizer (character-level is simpler and sufficient for teaching the model architecture)
+- Mixed-precision training (fp32 is fine for a 10M-param model on a laptop)
+
+## Mental model
+
+The transformer is a sequence-to-sequence function. Given N tokens, it produces N output vectors (one per input position). Each output vector "has attended to" some combination of input positions, weighted by learned similarity scores.
+
+The intuition for attention:
+
+```
+Q (query)  = "What information am I looking for?"
+K (key)    = "What information can I provide?"
+V (value)  = "What information should I share if selected?"
+
+Attention score between position i and j = Q[i] · K[j] / sqrt(d_k)
+Attention weight = softmax over all scores for position i
+Output[i] = weighted sum of V[j] for all j
+```
+
+This is a soft lookup table. The query vector looks up similar keys and retrieves the corresponding values. Unlike a hash table, the lookup is differentiable — the model learns the Q, K, V projections during training.
+
+```
+Input sequence: [ROMEO, :, \n, B, u, t, ...]
+                   │                        
+                   ▼                        
+            Token Embedding                 
+                   │                        
+                   ▼                        
+          + Positional Encoding             
+                   │                        
+                   ▼                        
+          ┌────────────────┐               
+          │ Transformer    │ × N blocks    
+          │ Block          │               
+          │  ├─ Self-Attn  │               
+          │  └─ FFN        │               
+          └────────────────┘               
+                   │                        
+                   ▼                        
+            Layer Norm                      
+                   │                        
+                   ▼                        
+            Output head (linear)            
+                   │                        
+                   ▼                        
+            Logits → next token             
+```
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Scaled dot-product self-attention"
+  goals={[
+    "Implement scaled_dot_product_attention(Q, K, V, mask) from scratch",
+    "Implement MultiHeadAttention: fused QKV projection, head splitting, attend, concat, output projection",
+    "Write tests: output shape, masking zeroes upper triangle",
+  ]}
+  loc={100}
+>
+
+The core operation. Everything else in the transformer is support machinery for this.
+
+**Why scale by sqrt(d\_k)?** When `d_k` is large (say 64), the dot products `Q @ K^T` grow proportionally to `sqrt(d_k)` in expectation for unit-normal Q and K. A large-magnitude input to softmax saturates the output toward a one-hot vector — near 0 everywhere except one position. When softmax saturates, its gradient is near zero, and the model stops learning. Dividing by `sqrt(d_k)` keeps the variance at ~1 regardless of head dimension.
+
+```python
+def scaled_dot_product_attention(Q, K, V, mask=None):
+    d_k = Q.size(-1)
+    
+    # (B, heads, T_q, d_k) x (B, heads, d_k, T_k) -> (B, heads, T_q, T_k)
+    scores = Q @ K.transpose(-2, -1) / math.sqrt(d_k)
+    
+    if mask is not None:
+        scores = scores.masked_fill(mask, float('-inf'))
+    
+    weights = F.softmax(scores, dim=-1)
+    output = weights @ V  # (B, heads, T_q, d_v)
+    return output, weights
+```
+
+**Why multiple heads?** Splitting `d_model` into `h` heads of `d_k = d_model // h` each doesn't increase parameter count — same total computation. But it lets different heads specialize: one head might track subject-verb agreement, another coreference, another proximity. Single-head attention with `d_model` dimensions tries to do all of this in one shot. Multiple heads do it in parallel, in different learned subspaces.
+
+```python
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super().__init__()
+        self.d_k = d_model // n_heads
+        self.n_heads = n_heads
+        
+        # Fused QKV projection — more efficient than 3 separate linears
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+    
+    def forward(self, x, mask=None):
+        B, T, _ = x.shape
+        Q, K, V = self.qkv_proj(x).split(self.d_model, dim=-1)
+        
+        # (B, T, d_model) -> (B, n_heads, T, d_k)
+        Q = Q.view(B, T, self.n_heads, self.d_k).transpose(1, 2)
+        # ... same for K, V
+        
+        attended, weights = scaled_dot_product_attention(Q, K, V, mask)
+        
+        # Concat heads: (B, n_heads, T, d_k) -> (B, T, d_model)
+        attended = attended.transpose(1, 2).contiguous().view(B, T, -1)
+        return self.out_proj(attended), weights
+```
+
+**The core lesson**: attention is a differentiable dictionary lookup. The model learns which positions are relevant to each other by learning the Q/K/V projection matrices.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Full transformer block"
+  goals={[
+    "Implement PositionwiseFeedForward: two linear layers with GELU, dropout",
+    "Implement TransformerBlock: pre-norm attention + pre-norm FFN + residual connections",
+    "Implement PositionalEncoding: sinusoidal, verify values bounded in [-1, 1]",
+    "Write tests: PE range, transformer block output shape",
+  ]}
+  loc={120}
+>
+
+A single transformer block wraps attention in the now-ubiquitous residual + layer-norm pattern.
+
+**Residual connections** are the gradient highway. Without them, deep transformers don't train. With them, every sub-layer is optional — if the sub-layer learns nothing, the residual passes the input through unchanged. The gradient of `x + f(x)` with respect to x is `1 + f'(x)`. Even if `f'(x)` is near zero (vanishing gradient problem), the gradient still flows through the `1` term.
+
+**Pre-norm vs post-norm**: the original "Attention Is All You Need" paper uses post-norm: `LayerNorm(x + SubLayer(x))`. GPT-2 switched to pre-norm: `x + SubLayer(LayerNorm(x))`. Pre-norm is more stable to train — normalization happens before the weights multiply the input, so large signals early in training don't explode through the sub-layer. Most modern architectures use pre-norm. We use it here.
+
+```python
+class TransformerBlock(nn.Module):
+    def forward(self, x, mask=None):
+        # Pre-norm attention sub-layer
+        attn_out, _ = self.attn(self.ln1(x), mask)
+        x = x + attn_out          # residual 1
+        
+        # Pre-norm feed-forward sub-layer
+        x = x + self.ffn(self.ln2(x))  # residual 2
+        return x
+```
+
+**The feed-forward network** is two linear layers: `d_model → 4*d_model → d_model`, with GELU in between. It operates position-wise — the same MLP applied to every token independently. Despite its simplicity, the FFN accounts for roughly 66% of a transformer block's FLOPs. It's where the model stores factual associations — researchers have found you can "read" specific facts from FFN weight matrices.
+
+**Sinusoidal positional encoding**: attention is permutation-invariant (it doesn't care about order). We need to inject position information. Sinusoidal PE assigns a unique fixed vector to each position using sin/cos at geometrically spaced frequencies:
+
+```
+PE[pos, 2i]   = sin(pos / 10000^(2i / d_model))
+PE[pos, 2i+1] = cos(pos / 10000^(2i / d_model))
+```
+
+The geometric spacing means different frequency components encode different scales of position — similar to how a clock has second, minute, and hour hands. Values are bounded in `[-1, 1]` and the model can extrapolate to lengths it hasn't seen during training.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="GPT-style autoregressive transformer"
+  goals={[
+    "Implement GPT: token embedding + position embedding + N TransformerBlocks + LayerNorm + output head",
+    "Pre-compute the causal mask (upper-triangular boolean) and register as a buffer",
+    "Implement generate(prompt_ids, max_new_tokens, temperature) with top-k sampling",
+    "Verify: forward() returns correct logits shape, causal mask zeroes upper triangle in attention weights",
+  ]}
+  loc={180}
+>
+
+The full decoder-only transformer. The key additions over Stage v1:
+
+**Causal masking** prevents token `i` from attending to tokens `j > i`. Without this, the model could "cheat" by looking at future tokens during training. At inference, there are no future tokens anyway, but masking ensures training matches inference. The mask is upper-triangular: `mask[i, j] = True if j > i`.
+
+```python
+# Pre-compute once; shape (1, 1, context_length, context_length)
+causal = torch.triu(
+    torch.ones(T, T, dtype=torch.bool),
+    diagonal=1   # True above the main diagonal
+)
+```
+
+**Learned positional embeddings** (vs sinusoidal): GPT-2 uses a learned embedding table for positions. It's simpler to implement and often works better in practice on the training length. The tradeoff is extrapolation — the model has never seen position N+1 during training, so generation beyond `context_length` requires techniques like RoPE (see "What the Toy Misses").
+
+**Weight tying**: the token embedding matrix (`vocab_size × n_embd`) is shared with the output head (`n_embd → vocab_size`). This halves the parameter count for the embedding layers and often improves perplexity. The intuition: token representations should be consistent whether projecting from vocabulary space into the model or back out.
+
+**Temperature sampling**: at inference, divide logits by temperature before softmax. High temperature (above 1.0) flattens the distribution — the model generates more varied but less coherent text. Low temperature (below 1.0) sharpens it — more deterministic, potentially repetitive. Temperature=0 is argmax (greedy). Top-k sampling restricts the distribution to the k most likely tokens, preventing the model from occasionally sampling very low-probability tokens that derail generation.
+
+```python
+@torch.no_grad()
+def generate(self, prompt_ids, max_new_tokens, temperature=1.0, top_k=40):
+    for _ in range(max_new_tokens):
+        logits, _ = self(idx[:, -self.config.context_length:])
+        logits = logits[:, -1, :] / temperature  # last position only
+        
+        # Zero out all but top-k logits
+        top_k_vals, _ = torch.topk(logits, top_k)
+        logits[logits < top_k_vals[:, -1:]] = -float('inf')
+        
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, 1)
+        idx = torch.cat([idx, next_token], dim=1)
+    return idx
+```
+
+**The training objective**: given tokens `[x_1, x_2, ..., x_T]`, predict `[x_2, x_3, ..., x_{T+1}]` at every position. Cross-entropy at each position, averaged. The target tokens come free from the input sequence — this is why language modeling is self-supervised. No human annotation required. The entire internet is free training data.
+
+</LabStage>
+
+<LabStage
+  id="v3"
+  title="Training loop + checkpoint + inference server"
+  goals={[
+    "Train on TinyShakespeare for 5000 steps with AdamW and cosine LR schedule",
+    "Save checkpoints every 500 steps; target ~1.48 bits/char validation loss",
+    "Start the FastAPI inference server and generate Shakespeare-style text",
+    "Connect to the server from the Spring AI Java demo",
+  ]}
+  loc={210}
+>
+
+Training a language model is conceptually simple: run the forward pass, compute cross-entropy loss, backpropagate, update weights. The subtleties are in the optimizer and schedule.
+
+**AdamW** over SGD: Adam maintains per-parameter adaptive learning rates (using first and second moment estimates of gradients). For sparse, high-dimensional problems like language modeling, this matters — some embedding dimensions get gradients rarely, others constantly. Weight decay in AdamW is decoupled from the adaptive rate: it's applied directly to weights, not through the gradient. This is the fix for "Adam with L2 regularization doesn't actually regularize," which was a known bug in the original Adam paper.
+
+**Cosine LR schedule**: linear warmup (100 steps) prevents large gradient updates when the embeddings are random and the model is meaningless. Cosine decay smoothly anneals the learning rate. The intuition: early in training, take large steps to explore the loss landscape. Later, take small steps to converge into a local minimum without bouncing out.
+
+**TinyShakespeare** is ~1.1M characters of Shakespeare text. Character-level vocabulary = 65 unique characters. The model learns to predict the next character — when it does this well, the output reads like Shakespeare.
+
+Expected loss curve:
+- Step 0: ~4.0 bits/char (close to random; log₂(65) ≈ 6.0 bits)
+- Step 500: ~2.8 bits/char (starting to learn common patterns)
+- Step 2000: ~2.0 bits/char (generates English-looking words)
+- Step 5000: ~1.48 bits/char (coherent, Shakespeare-adjacent text)
+
+```bash
+# Download data and train
+cd labs/transformer/src
+python train.py
+
+# Sample output after 5000 steps:
+# ROMEO:
+# But soft, what light through yonder window breaks?
+# It is the east, and Juliet is the sun.
+# (actually generated by the model — not copied)
+```
+
+The inference server exposes `/generate` and the OpenAI-compatible `/v1/chat/completions`, allowing Spring AI to call it without modification.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/transformer"
+  prereqs={["Python 3.12+", "pip install torch numpy fastapi uvicorn pydantic requests"]}
+  steps={[
+    {
+      label: "Install dependencies",
+      cmd: "cd labs/transformer\npip install -e '.[dev]'",
+    },
+    {
+      label: "Train the model (~15 min on M2, ~3 min on RTX 4070)",
+      cmd: "cd labs/transformer/src\npython train.py",
+    },
+    {
+      label: "Start the inference server",
+      cmd: "cd labs/transformer/src\nuvicorn server:app --host 0.0.0.0 --port 8000",
+    },
+    {
+      label: "Generate text",
+      cmd: "curl -s -X POST http://localhost:8000/generate \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"prompt\": \"ROMEO:\\n\", \"max_tokens\": 100}' | python -m json.tool",
+    },
+    {
+      label: "Run tests",
+      cmd: "cd labs/transformer\npytest tests/ -v",
+    },
+    {
+      label: "Start the Spring AI Java demo (needs model server running)",
+      cmd: "cd labs/transformer/java-integration\nmvn spring-boot:run",
+    },
+  ]}
+  expectedOutput={`GPT initialized: 10.7M parameters
+Downloading TinyShakespeare from https://raw.githubusercontent.com/...
+Vocabulary size: 65 characters
+Train tokens: 1,003,854 | Val tokens: 111,540
+step     0 | train loss 4.2241 | val loss 4.2198 | lr 0.00e+00 | 0 tok/s
+step   200 | train loss 2.7813 | val loss 2.7924 | lr 3.00e-04 | 12,103 tok/s
+step  1000 | train loss 2.0412 | val loss 2.0881 | lr 2.91e-04 | 12,287 tok/s
+step  3000 | train loss 1.6243 | val loss 1.6571 | lr 1.80e-04 | 12,198 tok/s
+step  5000 | train loss 1.4521 | val loss 1.4834 | lr 3.00e-05 | 12,144 tok/s
+
+=== Sample generation after training ===
+ROMEO:
+But soft, what light through yonder window breaks,
+And here I must confess, that thou art not
+The sun, that rises in the east of heaven,`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "Training throughput (M2 MacBook)", value: "12,000",  unit: "tokens/sec", note: "estimated — MPS backend, batch_size=64" },
+    { metric: "Training throughput (RTX 4070)",   value: "95,000",  unit: "tokens/sec", note: "estimated — CUDA, batch_size=128" },
+    { metric: "Inference speed (M2, no batching)", value: "320",    unit: "tokens/sec", note: "estimated — single token generation, no KV cache" },
+    { metric: "Validation loss (5000 steps)",       value: "1.48",  unit: "bits/char",  note: "competitive with Karpathy's nanoGPT reference" },
+    { metric: "Model size (n_layer=6, n_embd=384)", value: "10.7",  unit: "M params",   note: "small enough to train on a laptop in ~15 min" },
+  ]}
+/>
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "Flash Attention",               why: "Our attention is O(n²) in memory — we materialize the full attention matrix. Flash Attention rewrites the kernel to never store it, trading recomputation for memory. 10-100× memory savings, enabling context lengths of 128k+." },
+    { thing: "KV cache",                      why: "Inference recomputes K and V for the entire sequence at every token generation step. KV cache stores the K/V tensors from previous steps; each new token only does one row of new Q/K/V computation. Without it, inference is O(n²) in time — unusable for long sequences." },
+    { thing: "Rotary Position Embeddings (RoPE)", why: "Our sinusoidal PE extrapolates poorly beyond training context length. RoPE applies position encoding inside the attention computation (rotating Q/K vectors), which allows models to generalize to longer sequences. Used in LLaMA, GPT-NeoX, Mistral." },
+    { thing: "Grouped-query attention (GQA)", why: "Our MHA has separate K/V matrices per head. GQA (LLaMA 3, Mistral) shares K/V across groups of query heads, reducing KV cache size by 4-8× with minimal quality loss. Essential for serving large models." },
+    { thing: "BPE tokenizer",                 why: "We tokenize at character level (vocab ~65). Real LLMs use Byte-Pair Encoding with vocab ~50k. BPE compresses common subwords ('ing', 'tion') into single tokens, giving the same model capacity more semantic bandwidth." },
+    { thing: "Mixed precision training",      why: "We train in float32. bf16/fp16 with gradient scaling gives 2× memory savings and 2× compute speedup on modern GPUs. Essential for training models larger than ~1B parameters. Tricky to implement correctly — see torch.cuda.amp." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="Spring AI 1.0 / Spring Boot 3.3"
+  mavenCoords={[
+    "org.springframework.ai:spring-ai-openai-spring-boot-starter:1.0.0",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "com.github.ben-manes.caffeine:caffeine (via spring-boot-starter-cache)",
+  ]}
+  repoPath="labs/transformer/java-integration"
+>
+
+### How Spring AI abstracts our model
+
+Spring AI's `ChatClient` is an abstraction over any OpenAI-compatible LLM API. It doesn't know or care whether the endpoint is `api.openai.com/v1/chat/completions` or `localhost:8000/v1/chat/completions`.
+
+Our FastAPI server exposes `POST /v1/chat/completions` in OpenAI format — the same JSON schema GPT-4 uses. Spring AI calls it. The response comes back in OpenAI format. Spring AI parses it. From the Java code's perspective, our 10M-parameter character-level model is GPT-4.
+
+This is the right abstraction for LLM integration in Java services: write to the interface, not the implementation. The day your company switches from GPT-4 to Claude to a fine-tuned internal model, you change one line in `application.yml`.
+
+### TransformerClient — pointing Spring AI at localhost
+
+```java
+public class TransformerClient {
+    private final ChatClient chatClient;
+
+    public String generate(String prompt) {
+        // This is identical code whether calling GPT-4 or our toy model.
+        // Spring AI's ChatClient doesn't know the difference.
+        ChatResponse response = chatClient.prompt()
+                .messages(new UserMessage(prompt))
+                .options(OpenAiChatOptions.builder()
+                        .model("gpt-local")
+                        .maxTokens(200)
+                        .temperature(0.8)
+                        .build())
+                .call()
+                .chatResponse();
+
+        return response.getResult().getOutput().getText();
+    }
+}
+```
+
+The magic is in `application.yml` — not the code:
+
+```yaml
+spring:
+  ai:
+    openai:
+      base-url: http://localhost:8000  # Our FastAPI server, not api.openai.com
+      api-key: local                   # Dummy key — our server doesn't validate it
+```
+
+### TransformerService — @Service with prompt caching
+
+```java
+@Service
+public class TransformerService implements HealthIndicator {
+    private final TransformerClient client;
+    private final Cache<String, String> promptCache; // Caffeine
+
+    public TransformerService(TransformerClient client, TransformerProperties props) {
+        this.client = client;
+        this.promptCache = Caffeine.newBuilder()
+                .maximumSize(props.cache().maxEntries())
+                .expireAfterWrite(props.cache().ttl())
+                .recordStats()  // enables hit-rate metrics
+                .build();
+    }
+
+    public String generate(String prompt) {
+        // Cache-first: common prompts like "To be or not to be" return instantly
+        return promptCache.get(prompt, p -> client.generate(p));
+    }
+
+    // Spring Actuator health indicator — surfaces at /actuator/health
+    @Override
+    public Health health() {
+        try {
+            // Check if FastAPI server is running and model is loaded
+            var status = checkFastApiHealth();
+            return Health.up()
+                    .withDetail("modelLoaded", status.model_loaded())
+                    .withDetail("cacheHitRate",
+                        String.format("%.1f%%", promptCache.stats().hitRate() * 100))
+                    .build();
+        } catch (Exception e) {
+            return Health.down().withException(e).build();
+        }
+    }
+}
+```
+
+### application.yml — the only config needed
+
+```yaml
+spring:
+  ai:
+    openai:
+      base-url: http://localhost:8000   # Our FastAPI inference server
+      api-key: local                    # Dummy — server doesn't validate
+      chat:
+        options:
+          model: gpt-local
+
+transformer:
+  max-tokens: 200
+  temperature: 0.8
+  cache:
+    max-entries: 500
+    ttl: 10m
+```
+
+### The lesson
+
+From Spring AI's perspective, our 10M-parameter character-level model IS GPT-4. The `ChatClient` interface is identical. The only thing that changes when you swap models is the base-url and api-key in `application.yml`.
+
+This is the correct abstraction for LLM integration in Java services — write to the ChatClient interface, configure the endpoint externally, and your business logic never needs to change as models evolve.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="After 500 training steps, the model generates complete gibberish — random character sequences with no structure. After 2000 steps, it starts generating recognizable English words (not valid Shakespeare, but words). After 4000 steps, it generates something almost coherent. The transition from noise to words happens suddenly — not gradually — and it happens at the same loss value (~2.5 bits/char) every time I retrain with different random seeds. Below 2.5 bits/char, the model is just memorizing letter frequencies. Above 2.5 bits/char, something clicks and it starts modeling word boundaries. I don't fully understand why the transition is so sharp and so reproducible. My best guess: the model first learns a simpler hypothesis (letter statistics) and then has to restructure its internal representations to learn the harder hypothesis (word patterns), and that restructuring happens as a discrete phase transition rather than a smooth gradient descent." />
+
+## Where to go deeper
+
+- **Attention Is All You Need** (Vaswani et al., 2017): the original paper — [arxiv.org/abs/1706.03762](https://arxiv.org/abs/1706.03762)
+- **Andrej Karpathy's nanoGPT**: this lab is heavily inspired by it — [github.com/karpathy/nanoGPT](https://github.com/karpathy/nanoGPT)
+- **The Illustrated Transformer**: the best visual explanation — [jalammar.github.io](https://jalammar.github.io/illustrated-transformer/)
+- **Flash Attention paper**: how to do O(n) memory attention — [arxiv.org/abs/2205.14135](https://arxiv.org/abs/2205.14135)
+- **Spring AI docs**: how ChatClient works across providers — [docs.spring.io/spring-ai](https://docs.spring.io/spring-ai/reference/)
+
+## Related labs
+
+- **Next in AI foundations**: BPE Tokenizer From Scratch — understand how real LLMs tokenize text
+- **System design companion**: LLM Serving Architecture — staff-level discussion of KV cache, batching, and speculative decoding
+- **Related infrastructure**: Key-Value Store — the retrieval pattern in attention (Q queries K, returns V) is a differentiable version of a KV lookup

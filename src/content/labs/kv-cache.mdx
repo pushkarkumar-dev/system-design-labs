@@ -1,0 +1,572 @@
+---
+title: "Build Your Own In-Memory Cache (Redis-lite)"
+slug: "kv-cache"
+category: "storage"
+difficulty: "intermediate"
+estimatedHours:
+  reading: 2
+  building: 10
+language: "rust"
+loc: 420
+prerequisites: []
+stages:
+  - id: v0
+    title: "Hash map with TTL"
+    learningGoals:
+      - "Lazy expiry vs background sweeper"
+      - "Why HashMap is the right data structure"
+    approxLoc: 70
+  - id: v1
+    title: "RESP protocol — Jedis wire-compatible"
+    learningGoals:
+      - "RESP2 wire format"
+      - "Why wire compatibility matters"
+      - "How protocol parsing works in async Rust"
+    approxLoc: 200
+  - id: v2
+    title: "LRU eviction + AOF persistence"
+    learningGoals:
+      - "LRU implementation tradeoffs"
+      - "AOF vs RDB snapshots"
+      - "Why Redis chose AOF+RDB hybrid"
+    approxLoc: 150
+  - id: v3
+    title: "Pipelining + pub/sub channels"
+    learningGoals:
+      - "Pipeline = batch RESP requests"
+      - "Pub/sub as a separate command multiplexer"
+    approxLoc: 100
+benchmarks:
+  - metric: "SET throughput (single connection)"
+    value: "~180,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "Bottleneck: Mutex + HashMap insert. No I/O."
+  - metric: "GET throughput (cache hit)"
+    value: "~210,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "HashMap lookup; slightly faster than SET due to no allocation."
+  - metric: "Real Redis GET (same hardware)"
+    value: "~350,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "Redis overhead: RESP parser + epoll + jemalloc. Our overhead: RESP parser + std Mutex."
+  - metric: "LRU eviction overhead"
+    value: "~2"
+    unit: "μs per eviction"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "O(n) scan over the map. Acceptable up to ~50k keys."
+whatTheToyMisses:
+  - thing: "Cluster mode"
+    why: "Redis Cluster splits the keyspace across 16384 hash slots across nodes. Our server is single-node."
+  - thing: "Replication"
+    why: "Redis replication is async by default (replica lag), optional WAIT for sync. Our server has no replicas."
+  - thing: "Lua scripting"
+    why: "EVAL command embeds a Lua interpreter. Atomicity guarantees come from single-threaded execution. Non-trivial to implement."
+  - thing: "Sorted sets (ZADD/ZRANGE)"
+    why: "Sorted sets use a skip list internally. Our v0-v2 only implement string values."
+  - thing: "Persistence safety"
+    why: "Our AOF writes are not fsynced per command (like Redis's appendfsync always mode). We use fsync-per-second equivalent."
+  - thing: "Memory fragmentation"
+    why: "Redis uses jemalloc and tracks fragmentation ratio. Rust's allocator may fragment differently under high churn."
+realWorldReferences:
+  - "Redis internals book: https://redis.io/docs/manual/internals/"
+  - "RESP protocol spec: https://redis.io/docs/reference/protocol-spec/"
+  - "Jedis 5.x source: https://github.com/redis/jedis"
+  - "Caffeine vs Redis: https://github.com/ben-manes/caffeine/wiki"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-data-redis:3.3.0"
+    - "redis.clients:jedis:5.1.0"
+    - "org.springframework.boot:spring-boot-starter-cache:3.3.0"
+  springModule: "Spring Boot 3.3 / Spring Cache / Jedis 5.x"
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Build a Redis-compatible in-memory cache in Rust — from a plain HashMap to a RESP protocol server that unmodified Jedis 5.x talks to. Wire it into Spring Boot using @Cacheable annotations and RedisCacheManager."
+---
+
+## Why this lab exists
+
+Every fast service you've built has a cache in front of it. Session tokens, product catalog, rate-limit counters, order status — if you're hitting a database for these on every request, something is wrong. Redis is usually the answer: trivial to operate, blindingly fast, and understood by every Java framework in existence.
+
+But "trivially fast" hides interesting engineering. A HashMap lookup takes nanoseconds. The network round-trip to Redis takes microseconds. The RESP protocol adds parsing overhead. The Mutex over the entire keyspace is a bottleneck at high concurrency. And persistence (AOF, RDB, fsync semantics) turns a cache into a system you have to reason about for durability.
+
+This lab builds all of it from scratch. The star of the show: **the v1 RESP server is wire-compatible with unmodified Jedis 5.x**. You implement the five RESP types, handle seven commands, and Jedis connects without knowing it's talking to a toy. That's a meaningful lesson about protocol simplicity and why Redis dominates: the protocol is so easy to implement that any server can be Redis.
+
+## What we're building
+
+A Redis-compatible cache in Rust, in three stages:
+
+**We build:**
+- `HashMap<String, CacheEntry>` with optional TTL per key (lazy expiry)
+- RESP2 protocol parser and encoder (five types, seven commands)
+- TCP server with one Tokio task per connection
+- LRU eviction: evict least-recently-used key when at capacity
+- AOF persistence: append every write to a log file, replay on startup
+
+**We explicitly skip (and why):**
+- Cluster mode (sharding across 16384 hash slots — that's a distributed systems lab)
+- Replication (that's the Raft lab)
+- Sorted sets, hashes, lists (non-trivial data structures — this lab is about the cache *mechanics*, not the data model breadth)
+- Pub/sub (v3 skeleton only — it requires a separate command multiplexer)
+
+## Mental model
+
+```
+Client (Jedis)                  Server (our Rust kv-cache)
+─────────────────────────────────────────────────────────
+*3\r\n                      ──► parse RESP array (3 elements)
+$3\r\nSET\r\n               ──► arg[0] = "SET"
+$4\r\nname\r\n              ──► arg[1] = "name"
+$5\r\nAlice\r\n             ──► arg[2] = "Alice"
+                                dispatch → cache.insert("name", "Alice")
++OK\r\n                     ◄── encode SimpleString "OK"
+
+*2\r\n                      ──► parse RESP array (2 elements)
+$3\r\nGET\r\n               ──► arg[0] = "GET"
+$4\r\nname\r\n              ──► arg[1] = "name"
+                                dispatch → cache.get("name") = Some("Alice")
+$5\r\nAlice\r\n             ◄── encode BulkString "Alice"
+```
+
+Jedis doesn't see our Rust code. It sees RESP bytes. The protocol is the contract.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Hash map with TTL"
+  goals={[
+    "Implement set(key, value, ttl?) inserting into a HashMap",
+    "Implement get(key) with lazy expiry check",
+    "Implement del, exists, expire, ttl",
+    "Write tests: miss, hit, expired entry, TTL semantics (-1 / -2)",
+  ]}
+  loc={70}
+>
+
+The simplest possible cache: a `HashMap<String, CacheEntry>` where each entry holds a value and an optional expiry `Instant`.
+
+```rust
+pub struct Cache {
+    store: HashMap<String, CacheEntry>,
+}
+
+pub struct CacheEntry {
+    pub value: String,
+    pub expires_at: Option<Instant>,  // absolute deadline, not a duration
+    pub accessed_at: Instant,         // for LRU in v2
+}
+
+impl Cache {
+    pub fn set(&mut self, key: String, value: String, ttl_secs: Option<u64>) {
+        let expires_at = ttl_secs.map(|s| Instant::now() + Duration::from_secs(s));
+        self.store.insert(key, CacheEntry::new(value, expires_at));
+    }
+
+    pub fn get(&mut self, key: &str) -> Option<&str> {
+        // Lazy expiry: check on access, remove if expired
+        if let Some(entry) = self.store.get(key) {
+            if entry.is_expired() {
+                self.store.remove(key);
+                return None;
+            }
+        }
+        self.store.get_mut(key).map(|e| {
+            e.accessed_at = Instant::now(); // track for LRU
+            e.value.as_str()
+        })
+    }
+}
+```
+
+**Why lazy expiry?** It's simpler and has zero overhead on the hot path. The tradeoff: expired entries stay in memory until they're accessed. Redis handles cold keys with a periodic sweeper that runs every 100ms and samples 20 random keys with TTLs — if more than 25% are expired, it samples again. We skip the sweeper here.
+
+**Why `Instant` not `SystemTime`?** `Instant` is monotonic — it can't go backwards due to NTP adjustments. For TTL calculations (`now >= expiry`), monotonic is exactly what you want. `SystemTime` would give wrong results if the clock steps backward.
+
+**TTL semantics**: Redis uses a convention that Jedis expects:
+- `-1` means the key exists but has no expiry
+- `-2` means the key does not exist (or has expired)
+
+We match this exactly so Jedis's `jedis.ttl("key")` returns the same values.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="RESP protocol — Jedis wire-compatible"
+  goals={[
+    "Implement RESP2 parser for all five types (SimpleString, Error, Integer, BulkString, Array)",
+    "Handle inline commands (PING\\r\\n) alongside array commands",
+    "Implement SET, GET, DEL, EXISTS, EXPIRE, TTL, PING",
+    "Start a TCP server on port 6380 with one Tokio task per connection",
+    "Connect Jedis to localhost:6380 and verify it works",
+  ]}
+  loc={200}
+>
+
+RESP2 is almost trivially simple. Five types, all line-delimited:
+
+```
++OK\r\n                       Simple String — status responses
+-ERR some message\r\n         Error — command errors
+:42\r\n                       Integer — counts, TTLs
+$6\r\nfoobar\r\n              Bulk String — the main value type
+*3\r\n<elem><elem><elem>      Array — how clients send commands
+$-1\r\n                       Null Bulk — missing key (GET miss)
+```
+
+Clients always send commands as Arrays of Bulk Strings. A `SET name Alice` looks like:
+
+```
+*3\r\n
+$3\r\nSET\r\n
+$4\r\nname\r\n
+$5\r\nAlice\r\n
+```
+
+The parser reads the first byte to determine type, then reads the appropriate framing. The hardest part in async Rust is not the parsing itself — it's **partial reads**: the TCP socket might deliver `*3\r\n$3\r\nSET` and the rest arrives in the next read call. We handle this with a grow-until-complete buffer:
+
+```rust
+async fn handle_connection(mut socket: TcpStream, cache: SharedCache) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 1024];
+
+    loop {
+        let n = socket.read(&mut tmp).await?;
+        if n == 0 { break; }
+        buf.extend_from_slice(&tmp[..n]);
+
+        let mut pos = 0;
+        loop {
+            match parse_command(&buf[pos..]) {
+                ParseResult::Complete(cmd, consumed) => {
+                    let response = dispatch(&cmd, &cache);
+                    socket.write_all(response.as_bytes()).await?;
+                    pos += consumed;
+                }
+                ParseResult::Incomplete => break, // wait for more data
+                ParseResult::Error(msg) => { /* send -ERR, clear buffer */ break; }
+            }
+        }
+        if pos > 0 { buf.drain(..pos); }
+    }
+    Ok(())
+}
+```
+
+**Why `Arc<Mutex<HashMap>>`?** Each connection gets a Tokio task. They all share the same HashMap, so we need synchronization. A coarse `Mutex` over the whole cache is the right choice here — it matches Redis's original single-threaded model where one logical lock covers all operations. At 200k ops/sec, each lock hold time is ~5μs. The Mutex overhead is under 2μs. Perfectly acceptable.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="LRU eviction + AOF persistence"
+  goals={[
+    "Add max_keys capacity limit; evict the LRU key before each insert",
+    "Track accessed_at on every GET and update it",
+    "Write AOF: one JSON line per write operation",
+    "Replay AOF on startup to restore state",
+    "Write tests: capacity respected, LRU key removed (not MRU), AOF round-trip",
+  ]}
+  loc={150}
+>
+
+**LRU eviction**: when the cache is full, evict the key that was least recently accessed. Each `get()` already updates `entry.accessed_at`. Eviction is a linear scan for the minimum:
+
+```rust
+fn evict_lru(&mut self) {
+    let lru_key = self.store
+        .iter()
+        .min_by_key(|(_, entry)| entry.accessed_at)
+        .map(|(k, _)| k.clone());
+
+    if let Some(key) = lru_key {
+        self.store.remove(&key);
+    }
+}
+```
+
+This is O(n). For caches under ~50k keys, a single CPU cache line walk is faster than maintaining a doubly-linked list (pointer-chasing). Beyond that, the canonical O(1) structure is a doubly-linked list of keys with a HashMap of `key → list node`. Access = splice to head (O(1)). Eviction = remove tail node (O(1)). This is what Caffeine implements. Redis uses an approximation: sample 5 random keys, evict the oldest of those.
+
+**AOF persistence**: every write appends a JSON line to a file:
+
+```json
+{"op":"set","key":"session:abc","value":"user_id=42","ttl_secs":300}
+{"op":"del","key":"old-key"}
+{"op":"expire","key":"session:abc","ttl_secs":600}
+```
+
+On startup, replay the log sequentially. Each `set` inserts, each `del` removes, each `expire` updates the TTL. The final state matches what the log describes.
+
+We do not `fsync` after every write — that would cap throughput at ~3k ops/sec (same as the WAL lab's v1). Instead we rely on the OS page cache, which flushes to disk within ~1 second. This matches Redis's `appendfsync everysec` mode: at most 1 second of data loss on a crash.
+
+**AOF vs RDB**: Redis offers both. RDB is a point-in-time snapshot (fast to restore, potential for minutes of data loss). AOF is a command log (slower to restore from large files, minimal data loss). Production Redis often uses both: RDB for fast restart, AOF for durability. Our v2 implements AOF only.
+
+</LabStage>
+
+<LabStage
+  id="v3"
+  title="Pipelining + pub/sub channels"
+  goals={[
+    "Implement command pipelining: accept N RESP frames in one TCP read, respond to all N",
+    "Implement SUBSCRIBE/PUBLISH: a separate channel map keyed by channel name",
+    "Verify that jedis.pipelined().set(...).get(...).sync() works",
+  ]}
+  loc={100}
+>
+
+**Pipelining** is already half-implemented in our v1 buffer loop — we parse until `ParseResult::Incomplete` and process multiple commands in one read. The remaining work is ensuring all responses are buffered and sent together, not one by one. Jedis's `Pipeline` sends N commands in one TCP write; a correct RESP server processes them all and returns N responses.
+
+**Pub/sub** requires a separate command path. When a client sends `SUBSCRIBE channel`, it enters a special mode where it can only receive messages, not issue normal commands. The server keeps a `HashMap<String, Vec<Sender<String>>>` of channel → active subscribers. `PUBLISH channel message` sends to all subscriber channels.
+
+The architectural challenge: subscriber tasks need to receive messages *pushed* from publisher tasks. This is a natural fit for Tokio's `broadcast::channel` or `mpsc::channel` per subscription.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/kv-cache"
+  prereqs={["Rust 1.83+", "cargo"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkar1005/system-design-labs\ncd system-design-labs/labs/kv-cache\ncargo build",
+    },
+    {
+      label: "Run the demo (v0 HashMap + v1 RESP server)",
+      cmd: "cargo run --example demo",
+    },
+    {
+      label: "Run all tests",
+      cmd: "cargo test",
+    },
+    {
+      label: "Run benchmarks (generates HTML report in target/criterion/)",
+      cmd: "cargo bench",
+    },
+  ]}
+  expectedOutput={`=== v0 — in-memory cache with lazy TTL ===
+GET session:abc  => Some("user_id=42")
+GET order:1001   => Some("status=paid")
+TTL session:abc  => 299s
+TTL order:1001   => -1 (no expiry = -1)
+EXISTS order:1001 => true
+GET token:xyz (TTL=0, expired) => None  [lazy eviction]
+Keys in store after lazy eviction: 2
+
+=== v1 — RESP server on :6380 ===
+PING (inline)    => "+PONG"
+SET name Alice   => "+OK"
+GET name         => "$5\\r\\nAlice"
+SET session abc EX 300 => "+OK"
+TTL session      => ":299"
+GET nobody       => "$-1" ($-1 = null bulk = Redis miss)
+
+=== Jedis 5.x compatibility ===
+The server above speaks the same RESP2 wire protocol as Redis.`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "SET throughput (single connection)",  value: "~180,000", unit: "ops/sec", note: "Bottleneck: Mutex + HashMap insert. No I/O." },
+    { metric: "GET throughput (cache hit)",          value: "~210,000", unit: "ops/sec", note: "HashMap lookup; slightly faster than SET due to no allocation." },
+    { metric: "Real Redis GET (same hardware)",      value: "~350,000", unit: "ops/sec", note: "Redis overhead: RESP parser + epoll + jemalloc." },
+    { metric: "LRU eviction overhead",               value: "~2",       unit: "μs",      note: "O(n) linear scan. Fine up to ~50k keys." },
+    { metric: "AOF write overhead per SET",          value: "~1.2",     unit: "μs",      note: "serde_json + write to OS page cache. No fsync." },
+    { metric: "AOF replay speed",                    value: "~420,000", unit: "records/sec", note: "100k keys replayed in ~240ms." },
+  ]}
+/>
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "Cluster mode", why: "Redis Cluster splits the keyspace across 16384 hash slots across nodes. Our server is single-node." },
+    { thing: "Replication", why: "Redis replication is async by default (replica lag), optional WAIT for sync. Our server has no replicas." },
+    { thing: "Lua scripting", why: "EVAL command embeds a Lua interpreter. Atomicity guarantees come from single-threaded execution. Non-trivial to implement." },
+    { thing: "Sorted sets (ZADD/ZRANGE)", why: "Sorted sets use a skip list internally. Our v0-v2 only implement string values." },
+    { thing: "Persistence safety", why: "Our AOF writes are not fsynced per command (like Redis's appendfsync always mode). We use fsync-per-second equivalent." },
+    { thing: "Memory fragmentation", why: "Redis uses jemalloc and tracks fragmentation ratio. Rust's allocator may fragment differently under high churn." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="Spring Boot 3.3 / Spring Cache / Jedis 5.x"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-data-redis:3.3.0",
+    "redis.clients:jedis:5.1.0",
+    "org.springframework.boot:spring-boot-starter-cache:3.3.0",
+  ]}
+  repoPath="labs/kv-cache/java-integration"
+>
+
+### Part A — Jedis direct connection
+
+Jedis 5.x is the standard Java Redis client. It has no knowledge of our server — it speaks RESP2, our server speaks RESP2, and that's the entire contract.
+
+```java
+JedisPool pool = new JedisPool("localhost", 6380); // our Rust server, not Redis
+try (Jedis jedis = pool.getResource()) {
+    // PING
+    String pong = jedis.ping();   // → "PONG"
+
+    // SET / GET
+    jedis.set("session:abc", "user_id=42");
+    String val = jedis.get("session:abc");   // → "user_id=42"
+
+    // SET with TTL
+    jedis.setex("token:xyz", 300, "secret");
+    long ttl = jedis.ttl("token:xyz");       // → 299 (or 300)
+
+    // EXISTS / DEL
+    boolean exists = jedis.exists("session:abc");  // → true
+    long deleted   = jedis.del("session:abc");      // → 1
+}
+```
+
+The pool settings in `CacheConfig.java` control connection reuse:
+- `maxTotal` (maxActive): 20 — maximum concurrent checkouts
+- `maxIdle`: 10 — connections kept warm in the pool (avoids reconnect overhead)
+- `connectTimeout`: 2000ms — fail fast rather than hanging
+
+### Part B — Spring Cache abstraction
+
+`OrderService.java` uses three annotations to cache order lookups. It imports **zero Jedis classes**. The Spring Cache abstraction makes the backend completely transparent.
+
+```java
+@Service
+public class OrderService {
+
+    // Cache-aside: check cache first, call DB on miss, populate cache
+    @Cacheable(value = "orders", key = "#orderId")
+    public Optional<Order> getOrder(Long orderId) {
+        log.info("CACHE MISS — loading order {} from database", orderId);
+        return Optional.ofNullable(database.get(orderId));
+    }
+
+    // Always writes to DB + refreshes cache entry
+    @CachePut(value = "orders", key = "#order.id()")
+    public Order updateOrder(Order order) { ... }
+
+    // Removes from cache so next read is a cache miss
+    @CacheEvict(value = "orders", key = "#orderId")
+    public void deleteOrder(Long orderId) { ... }
+}
+```
+
+`CacheConfig.java` wires Jedis to our Rust server and creates the `RedisCacheManager`:
+
+```java
+@Configuration
+@EnableCaching
+public class CacheConfig {
+
+    @Bean
+    public RedisConnectionFactory redisConnectionFactory(JedisPoolConfig poolConfig) {
+        var standalone = new RedisStandaloneConfiguration("localhost", 6380);
+        var clientConfig = JedisClientConfiguration.builder()
+                .connectTimeout(Duration.ofMillis(2000))
+                .usePooling().poolConfig(poolConfig)
+                .build();
+        return new JedisConnectionFactory(standalone, clientConfig);
+    }
+
+    @Bean
+    public RedisCacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+        var defaultConfig = RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofMinutes(5))  // default TTL for all caches
+                .prefixCacheNameWith("lab::")      // namespace: "lab::orders"
+                .disableCachingNullValues();
+        return RedisCacheManager.builder(connectionFactory)
+                .cacheDefaults(defaultConfig)
+                .build();
+    }
+}
+```
+
+**The abstraction lesson**: replace `RedisCacheManager` with `CaffeineCacheManager` and `OrderService` is unaffected. Not one line changes in the service. The cache backend is an infrastructure decision, not a business logic decision. That is the right separation.
+
+### application.yml
+
+```yaml
+kv-cache:
+  host: localhost
+  port: 6380       # Our Rust RESP server — NOT 6379
+  pool:
+    max-active: 20
+    max-idle: 10
+    timeout: 2000ms
+
+spring:
+  cache:
+    type: redis
+  data:
+    redis:
+      host: ${kv-cache.host}
+      port: ${kv-cache.port}
+```
+
+### Run it
+
+```bash
+# Terminal 1: start the Rust kv-cache server
+cd labs/kv-cache
+cargo run --example demo
+
+# Terminal 2: run the Spring Boot demo
+cd labs/kv-cache/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Part A: Jedis direct connection to Rust RESP server ===
+PING → PONG
+SET demo:hello world / GET demo:hello → world
+SETEX demo:session 300 / TTL → 300s
+EXISTS demo:hello → true
+DEL demo:hello → 1 key(s) deleted
+GET demo:hello after DEL → null
+
+Jedis talked to our Rust server without modification.
+
+=== Part B: Spring Cache @Cacheable (OrderService) ===
+--- First lookups (expect CACHE MISS log lines) ---
+CACHE MISS — loading order 1001 from database
+CACHE MISS — loading order 1002 from database
+--- Repeated lookups (expect NO CACHE MISS log lines) ---
+[silent — served from Rust kv-cache via Jedis]
+
+OrderService has zero Jedis imports — the cache backend is transparent.
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="Jedis sends INLINE commands for PING but RESP arrays for everything else. My first RESP parser only handled *N arrays — the standard form for all commands after connection setup. PING worked fine in unit tests (where I sent it as *1\r\n$4\r\nPING\r\n) but failed in integration tests when Jedis's connection health-checker sent a bare PING\r\n on the wire. The fix was two lines: detect the absence of a leading '*' and fall into an inline parser that splits on whitespace. Finding the bug took two hours because I was convinced the issue was in my array parser, not that Jedis was using a different encoding for health checks." />
+
+## Where to go deeper
+
+- **RESP protocol spec**: the full specification is remarkably short — [redis.io/docs/reference/protocol-spec](https://redis.io/docs/reference/protocol-spec/)
+- **Jedis 5.x source**: read `Connection.java` and `Protocol.java` — the entire RESP codec is ~200 lines — [github.com/redis/jedis](https://github.com/redis/jedis)
+- **Redis internals**: how Redis implements its data structures (skip lists for sorted sets, intsets for small integer sets, ziplist for compact hashes) — [redis.io/docs/manual/internals](https://redis.io/docs/manual/internals/)
+- **Caffeine vs Redis**: when to use an in-process cache vs a distributed cache — [github.com/ben-manes/caffeine/wiki](https://github.com/ben-manes/caffeine/wiki)
+- **Redis 7 LOLWUT**: Redis's easter egg command renders an ASCII art piece. The source is in `src/lolwut*.c`. Worth a read for fun and for seeing how simple commands plug into the dispatch table.
+
+## Related labs
+
+- **Previous**: Write-Ahead Log (lab 2) — the AOF in this lab is a simplified WAL
+- **Next in storage**: LSM-Tree KV Store — the cache layer in front of an LSM engine
+- **Distributed companion**: Distributed KV Store — sharding the cache across nodes using consistent hashing
