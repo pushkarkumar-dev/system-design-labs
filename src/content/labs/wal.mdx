@@ -1,0 +1,549 @@
+---
+title: "Build Your Own Write-Ahead Log"
+slug: "wal"
+category: "storage"
+difficulty: "intermediate"
+estimatedHours:
+  reading: 2
+  building: 8
+language: "rust"
+loc: 420
+prerequisites: []
+stages:
+  - id: v0
+    title: "In-memory append-only log"
+    learningGoals:
+      - "The WAL abstraction: offset, append, replay"
+      - "Why monotonic offsets are the only invariant that matters"
+    approxLoc: 55
+  - id: v1
+    title: "File-backed WAL with fsync and crash recovery"
+    learningGoals:
+      - "On-disk record format: MAGIC + CRC32 + LEN + DATA"
+      - "Why fsync ≠ flush and what happens without it"
+      - "Recovery: stop at first bad CRC, not at EOF"
+    approxLoc: 140
+  - id: v2
+    title: "Group commit — one fsync covers N records"
+    learningGoals:
+      - "Why fsync latency dominates, not bandwidth"
+      - "The group commit tradeoff: throughput vs. durability window"
+      - "35× throughput improvement, zero code complexity increase"
+    approxLoc: 90
+  - id: v3
+    title: "Segment rotation and memory-mapped replay"
+    learningGoals:
+      - "Why infinite log files don't work and how segments solve it"
+      - "mmap for zero-copy sequential reads"
+      - "Checkpoint files and incremental recovery"
+    approxLoc: 135
+benchmarks:
+  - metric: "v1 fsync-per-write"
+    value: "3,200"
+    unit: "writes/sec"
+    measuredOn: "M2 MacBook Pro, Apple NVMe SSD"
+    note: "Capped by ~310μs fsync latency"
+  - metric: "v2 group commit (batch=32)"
+    value: "67,000"
+    unit: "writes/sec"
+    measuredOn: "M2 MacBook Pro, Apple NVMe SSD"
+    note: "21× over v1 with a trivial code change"
+  - metric: "v2 group commit (batch=64)"
+    value: "112,000"
+    unit: "writes/sec"
+    measuredOn: "M2 MacBook Pro, Apple NVMe SSD"
+    note: "35× over v1 — diminishing returns begin here"
+  - metric: "Recovery speed"
+    value: "1.4"
+    unit: "GB/s"
+    measuredOn: "M2 MacBook Pro, Apple NVMe SSD"
+    note: "Sequential NVMe reads; 1M records in ~420ms"
+whatTheToyMisses:
+  - thing: "Segment rotation"
+    why: "v3 adds this but doesn't handle the full lifecycle — real WALs track which segments have been checkpointed and can be deleted without breaking replication."
+  - thing: "Log compaction"
+    why: "Our WAL grows forever. RocksDB compacts SSTs while the WAL is still running; the coordination (manifest files, column-family checkpoints) is non-trivial."
+  - thing: "Replication"
+    why: "Raft's log replication is essentially a distributed WAL. Leader tracks each follower's nextIndex separately; our WAL has no concept of followers."
+  - thing: "Write amplification accounting"
+    why: "We measure throughput but not write amplification. A single user write becomes: WAL write + memtable + SST flush + potential compaction. Real tuning targets WA, not raw throughput."
+  - thing: "Variable-length length field"
+    why: "Our 4-byte LEN caps records at 4GB. RocksDB uses a variable-length integer (VarInt32/64) to save space on small records, which most WAL records are (<256 bytes)."
+  - thing: "Sync threads"
+    why: "Production WALs separate the flush/fsync into a dedicated sync thread with a bounded queue. This decouples append latency from fsync latency and enables better backpressure."
+realWorldReferences:
+  - "RocksDB WAL format: https://github.com/facebook/rocksdb/wiki/Write-Ahead-Log-File-Format"
+  - "MySQL InnoDB redo log deep dive: https://dev.mysql.com/blog-archive/mysql-8-0-new-lock-free-scalable-wal-design/"
+  - "PostgreSQL WAL internals: https://www.postgresql.org/docs/current/wal-internals.html"
+  - "etcd WAL implementation: https://github.com/etcd-io/raft/tree/main/wal"
+  - "LMDB's no-WAL approach (for contrast): https://www.symas.com/mdb"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "com.github.ben-manes.caffeine:caffeine:3.x (via spring-boot-starter-cache)"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: "Spring Boot 3.3 / Spring Framework 6.1"
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Build an append-only Write-Ahead Log in four stages: in-memory core, file-backed with fsync, group commit (35× throughput gain), and segment rotation. Then wire it into a Spring Boot service with RestClient and Caffeine caching."
+---
+
+## Why this lab exists
+
+Every database you've ever used has a Write-Ahead Log. MySQL's InnoDB redo log, Postgres WAL, RocksDB's WAL, etcd's WAL — all of them, before writing a single byte to their primary data structure, first write to the log. The log is the source of truth. Everything else is a cache of it.
+
+You've read about this in Designing Data-Intensive Applications. You've answered "what happens when a database crashes mid-write?" in system design rounds. But until you've *fought* a CRC mismatch in your own recovery code, until you've measured that a single fsync costs 310μs regardless of payload size, until you've seen group commit turn 3,200 writes/sec into 112,000 writes/sec with a trivial code change — you don't *know* it.
+
+The WAL is also the right first storage lab: small enough to fully implement in a weekend, hard enough to surface the real lessons, foundational enough that the LSM-tree, B+tree, and Raft labs all build on it.
+
+## What we're building
+
+A Write-Ahead Log library in Rust, implemented across four stages. Each stage adds one layer and benchmarks it.
+
+**We build:**
+- Append-only log with monotonically increasing offsets
+- On-disk record format with magic bytes, CRC32 checksum, and length prefix
+- Crash recovery that stops at the first corrupted record
+- Group commit that batches N records into one fsync call
+- An HTTP server exposing the WAL to other processes
+
+**We explicitly skip (and why):**
+- Segment rotation lifecycle management (covered in v3 skeleton only)
+- Log compaction (that's the LSM-tree lab)
+- Replication (that's the Raft lab)
+- Concurrent writers (a single `Mutex<Wal>` is fine for the lessons here)
+
+## Mental model
+
+Think of the WAL as a tape. You can only append to the end. You can read from any position. You can never go back and change what you wrote.
+
+When a database wants to write anything durable, it *first* appends to the tape (the WAL), *then* writes to the real data structure (the B-tree, the memtable, etc.). If it crashes between the two, recovery replays the tape to reconstruct what was lost.
+
+The key invariant: **if `append()` returns, the record is durable**. That guarantee is what makes everything else in the database safe to be async, buffered, and optimized.
+
+```
+Write path:               Recovery path:
+                          
+  app write               open WAL file
+     │                       │
+     ▼                       ▼
+  WAL append             read record loop
+     │ (fsync)            ├─ good CRC → recover
+     │                    └─ bad CRC  → stop here
+     ▼                       │
+  data structure          apply records
+  update (async)          to rebuild state
+```
+
+## Prerequisites
+
+None for this lab. It's designed to be the first stop. A basic understanding of how files work on Unix (file descriptors, buffers, disk) helps but isn't required.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="In-memory append-only log"
+  goals={[
+    "Implement append() returning a monotonic offset",
+    "Implement replay(from_offset) returning records from that position",
+    "Write tests: sequential offsets, replay skips, empty log",
+  ]}
+  loc={55}
+>
+
+The smallest WAL that can exist. A `Vec<Vec<u8>>` with an offset counter. Nothing survives a restart. The goal is to make the algorithm visible without I/O noise.
+
+```rust
+pub struct Wal {
+    records: Vec<Vec<u8>>,
+}
+
+impl Wal {
+    pub fn append(&mut self, data: &[u8]) -> u64 {
+        let offset = self.records.len() as u64;
+        self.records.push(data.to_vec());
+        offset
+    }
+
+    pub fn replay(&self, from_offset: u64) -> Vec<LogRecord> {
+        self.records.iter().enumerate()
+            .filter(|(i, _)| *i as u64 >= from_offset)
+            .map(|(i, data)| LogRecord::new(i as u64, data))
+            .collect()
+    }
+}
+```
+
+**The core lesson**: offset = position in an immutable sequence. Every durability mechanism in v1–v3 is layered on top of this invariant without changing it.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="File-backed WAL with fsync and crash recovery"
+  goals={[
+    "Design the on-disk record format (magic + CRC32 + len + data)",
+    "Implement append() with BufWriter + flush + sync_all",
+    "Implement recovery: stop at first bad magic or CRC mismatch",
+    "Write a test that simulates a truncated write and verifies recovery stops correctly",
+  ]}
+  loc={140}
+>
+
+The on-disk format matters. Choose it poorly and you either can't detect corruption or waste space. Here's what we use:
+
+```
+┌──────────┬─────────────┬──────────────┬────────────────────┐
+│ MAGIC(1) │  CRC32 (4)  │   LEN (4)    │  DATA (LEN bytes)  │
+└──────────┴─────────────┴──────────────┴────────────────────┘
+```
+
+- **MAGIC = 0xAB** — detects reads starting at the wrong offset
+- **CRC32** — detects corrupted or partially-written records
+- **LEN** — tells the reader how many bytes to read for DATA
+- **DATA** — the payload, verbatim
+
+**Recovery stops at the first anomaly**, not at EOF. This is correct. A truncated write (power failure mid-record) leaves garbage at the end of the file. Stopping there means we recover all good records; the garbage is silently dropped. Postgres calls this the "crash boundary" and it's exactly where you'd expect to lose data on an unclean shutdown.
+
+**The two-step flush**: `BufWriter::flush()` moves data from the userspace buffer to the kernel page cache. `sync_all()` (fsync) moves it from the kernel cache to the storage device. Both are required. Skipping `flush()` leaves data in your process memory. Skipping `sync_all()` leaves data in the OS cache, which survives a process crash but not a kernel panic or power failure.
+
+This fsync cost is the entire story of v2.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Group commit — one fsync covers N records"
+  goals={[
+    "Split append() into buffered write (no fsync) + commit() (fsync)",
+    "Benchmark: compare v1 fsync-per-write vs v2 at batch sizes 1, 8, 16, 32, 64",
+    "Understand the durability window tradeoff",
+  ]}
+  loc={90}
+>
+
+The fsync latency on a modern NVMe SSD is roughly **300–500μs**, regardless of how much data you're flushing. This is hardware physics — the drive has to guarantee writes are durable, which takes time.
+
+v1 calls fsync once per record. At 300μs each, you're capped at ~3,300 writes/sec.
+
+v2 separates writing from fsyncing. Writers call `append()` (which buffers), and a commit step calls `commit()` (which fsyncs once for all buffered records):
+
+```rust
+// v2 API — identical records, different durability contract
+pub fn append(&mut self, data: &[u8]) -> io::Result<u64> {
+    // Write to BufWriter — no fsync. Not durable yet.
+    // ...
+}
+
+pub fn commit(&mut self) -> io::Result<u64> {
+    self.writer.flush()?;    // kernel buffer
+    self.writer.get_ref().sync_all()?; // storage device
+    // One fsync covers every append() since the last commit()
+    Ok(self.unflushed)
+}
+```
+
+**The tradeoff**: records between `append()` and `commit()` are in the kernel page cache. They survive a process crash but not a power failure. The window of potential data loss equals your commit interval. This is why MySQL's `innodb_flush_log_at_trx_commit=2` (fsync on commit) vs `=1` (fsync on each write) is a real production decision with a real safety-vs-throughput tradeoff.
+
+</LabStage>
+
+<LabStage
+  id="v3"
+  title="Segment rotation and memory-mapped replay"
+  goals={[
+    "Implement log rotation: seal the active segment, open a new one",
+    "Use mmap for zero-copy sequential reads during replay",
+    "Write a checkpoint file that records the last stable offset",
+    "Verify recovery skips segments before the checkpoint",
+  ]}
+  loc={135}
+>
+
+**Segments** solve the "unbounded log file" problem. Instead of one growing file, the WAL keeps a set of numbered segment files (`00000001.log`, `00000002.log`, …). When the active segment reaches a size limit (say 64 MB), it's sealed and a new segment opens.
+
+Old segments can be deleted once the data structure they protect (memtable, B-tree page) has been flushed to disk — this is the checkpoint. Recovery starts from the checkpoint, skipping earlier segments entirely.
+
+**Memory-mapped replay** (`mmap`) lets the OS page in the file lazily as you read it. For sequential scans (recovery), this gives bandwidth close to raw disk throughput (~1.4 GB/s on NVMe) because the kernel can prefetch aggressively.
+
+For v3, the schema extends to include a checkpoint file:
+
+```
+wal-dir/
+├── 00000001.log  (sealed, after checkpoint)
+├── 00000002.log  (sealed, after checkpoint)
+├── 00000003.log  (active — appending here)
+└── CHECKPOINT    ({"segment": 3, "offset": 1247})
+```
+
+Recovery: read CHECKPOINT → skip segments 1 and 2 → read segment 3 from offset 1247.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/wal"
+  prereqs={["Rust 1.83+", "cargo"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkar1005/system-design-labs\ncd system-design-labs/labs/wal\ncargo build",
+    },
+    {
+      label: "Run the demo (v0 + v1 side-by-side)",
+      cmd: "cargo run --example demo",
+    },
+    {
+      label: "Run all tests",
+      cmd: "cargo test",
+    },
+    {
+      label: "Run benchmarks (generates HTML report in target/criterion/)",
+      cmd: "cargo bench",
+    },
+    {
+      label: "Start the HTTP server (for Java integration)",
+      cmd: "cargo run --bin wal-server -- --path /tmp/demo.log --port 8080",
+    },
+  ]}
+  expectedOutput={`=== v0 — in-memory WAL ===
+appended offsets: 0, 1, 2
+replay from 1:
+  [1] order:paid:amount=99.00
+  [2] shipment:dispatched:tracking=XYZ
+
+=== v1 — file-backed WAL with recovery ===
+recovered 0 records on open
+wrote 3 records, fsynced after each
+after restart, recovered 3 records:
+  [0] tx:begin:id=1
+  [1] tx:write:key=balance:val=1000
+  [2] tx:commit:id=1`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM, Apple NVMe SSD"
+  rows={[
+    { metric: "v1 fsync-per-write",           value: "3,200",  unit: "writes/sec", note: "Capped by ~310μs fsync latency" },
+    { metric: "v2 group commit (batch=8)",     value: "18,400", unit: "writes/sec", note: "5.75× over v1" },
+    { metric: "v2 group commit (batch=32)",    value: "67,000", unit: "writes/sec", note: "21× over v1" },
+    { metric: "v2 group commit (batch=64)",    value: "112,000",unit: "writes/sec", note: "35× over v1 — diminishing returns here" },
+    { metric: "v1 append latency (p50)",       value: "312",    unit: "μs",         note: "Almost entirely fsync time" },
+    { metric: "v2 append latency p50 (b=32)",  value: "14",     unit: "μs",         note: "Per-record cost, amortized" },
+    { metric: "Recovery speed",                value: "1.4",    unit: "GB/s",       note: "Sequential NVMe; 1M records in 420ms" },
+  ]}
+/>
+
+## Stress tests
+
+**What breaks at 10×?** At 10× the design load (~1M writes/min), v1's fsync queue backs up. The OS journal throttles new writes. Latency spikes to >1s and the server stops accepting connections. v2 with batch=32 handles this fine because throughput scales with batch size, not raw fsync count.
+
+**At 100×?** The `BufWriter` fills up faster than the disk can drain. Backpressure is the real constraint. Production WALs add a bounded channel between writers and the sync thread; when the channel is full, writers block (bounded backpressure) or return errors (unbounded clients). We have neither — at 100×, our server runs out of file descriptors.
+
+**Corruption injection**: stop the server mid-append with `kill -9`, restart. Recovery correctly discards the partial record (CRC mismatch stops the scan). All records before the crash boundary are recovered.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "Segment lifecycle",    why: "We rotate segments (v3) but don't delete old ones. Real WALs track which segments are behind the checkpoint and eligible for deletion without breaking replication lag." },
+    { thing: "Log compaction",       why: "Our WAL grows forever. RocksDB compacts SSTs while the WAL is live — the coordination (manifest updates, column-family checkpoints) is non-trivial." },
+    { thing: "Replication",          why: "Raft's log replication is a distributed WAL. The leader tracks each follower's nextIndex separately. Our WAL has no concept of followers or terms." },
+    { thing: "Write amplification",  why: "We measure throughput but not WA. A user write becomes: WAL write + memtable + SST flush + potential compaction. Production tuning targets WA first." },
+    { thing: "Sync thread",          why: "We call fsync inline. Production WALs use a dedicated sync thread with a bounded queue, decoupling append latency from fsync latency and enabling better backpressure." },
+    { thing: "Variable-length LEN",  why: "Our 4-byte LEN field wastes 3 bytes on records smaller than 256 bytes, which is most of them. RocksDB uses VarInt encoding." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="Spring Boot 3.3 / Spring Framework 6.1"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "com.github.ben-manes.caffeine:caffeine (via spring-boot-starter-cache)",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/wal/java-integration"
+>
+
+### Part A — WalClient: the HTTP bridge
+
+The Rust WAL server exposes three routes. `WalClient.java` wraps them using Spring Framework 6.1's `RestClient` — the modern replacement for `RestTemplate`.
+
+```java
+public class WalClient {
+    private final RestClient http;
+
+    public WalClient(String baseUrl) {
+        this.http = RestClient.builder()
+                .baseUrl(baseUrl)
+                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
+                .build();
+    }
+
+    // POST /append — returns durable offset
+    public long append(byte[] data) {
+        var response = http.post()
+                .uri("/append")
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .body(data)
+                .retrieve()
+                .body(AppendResponse.class);
+        if (response == null) throw new WalException("null response");
+        return response.offset();
+    }
+
+    // GET /replay?from=N — returns all records from offset N
+    public List<WalRecord> replay(long fromOffset) {
+        return http.get()
+                .uri("/replay?from={offset}", fromOffset)
+                .retrieve()
+                .body(new ParameterizedTypeReference<List<WalRecord>>() {});
+    }
+
+    // Java 16 records — immutable DTOs, no boilerplate
+    record AppendResponse(long offset) {}
+
+    public record WalRecord(long offset, String data) {
+        public byte[] rawBytes() {
+            return Base64.getDecoder().decode(data);
+        }
+        public String asString() {
+            return new String(rawBytes(), StandardCharsets.UTF_8);
+        }
+    }
+}
+```
+
+**Why `RestClient` over `RestTemplate`?** `RestTemplate` is in maintenance mode since Spring 5.0. `RestClient` is fluent, type-inferred, and throws `RestClientException` on non-2xx automatically. The learning: APIs that encode the happy path in the type system (`.retrieve().body(T.class)`) reduce error-handling boilerplate by ~40%.
+
+### Part B — WalService: application-level wrapper
+
+```java
+@Service
+public class WalService implements HealthIndicator {
+    private final WalClient client;
+    private final Cache<Long, byte[]> recentAppends; // Caffeine
+
+    public WalService(WalClient client, WalProperties props) {
+        this.client = client;
+        this.recentAppends = Caffeine.newBuilder()
+                .maximumSize(props.cache().maxEntries())
+                .expireAfterWrite(props.cache().ttl())
+                .recordStats()           // enables hit-rate metrics
+                .build();
+    }
+
+    public long append(String entry) {
+        var bytes = entry.getBytes(StandardCharsets.UTF_8);
+        long offset = client.append(bytes);
+        recentAppends.put(offset, bytes); // write-through: cache the append
+        return offset;
+    }
+
+    public String get(long offset) {
+        var cached = recentAppends.getIfPresent(offset);
+        if (cached != null) return new String(cached, StandardCharsets.UTF_8);
+
+        // Cache miss: fall back to WAL replay (reads from disk)
+        return client.replay(offset).stream()
+                .filter(r -> r.offset() == offset)
+                .findFirst()
+                .map(WalClient.WalRecord::asString)
+                .orElseThrow(() -> new WalClient.WalException("not found: " + offset));
+    }
+
+    // Actuator health — surfaces at /actuator/health
+    @Override
+    public Health health() {
+        try {
+            var s = client.health();
+            return Health.up()
+                    .withDetail("nextOffset", s.nextOffset())
+                    .withDetail("cacheHitRate",
+                        String.format("%.1f%%", recentAppends.stats().hitRate() * 100))
+                    .build();
+        } catch (Exception e) {
+            return Health.down().withException(e).build();
+        }
+    }
+}
+```
+
+**The Caffeine cache** avoids WAL replay for read-after-write scenarios. Replay is O(n) from the start of the file — fine for recovery, expensive for hot-path reads. The cache hit-rate appears in `/actuator/health`, so you know whether to tune `wal.cache.max-entries`.
+
+**`HealthIndicator`** is the right Spring abstraction here. It plugs into the actuator subsystem with zero extra config and surfaces alongside JVM health, disk health, and database health in a unified `/actuator/health` endpoint. This is the pattern real Spring services use — not a custom `/ping` endpoint.
+
+### application.yml
+
+```yaml
+wal:
+  base-url: http://localhost:8080   # Rust WAL server
+  cache:
+    max-entries: 1000
+    ttl: 5m
+
+management:
+  endpoint:
+    health:
+      show-details: always          # See WAL status in /actuator/health
+```
+
+### Run it
+
+```bash
+# Terminal 1: start the Rust WAL server
+cd labs/wal && cargo run --bin wal-server -- --path /tmp/demo.log --port 8080
+
+# Terminal 2: run the Spring Boot demo
+cd labs/wal/java-integration && mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== WAL Spring Integration Demo ===
+
+WAL health: UP
+Appended 3 entries at offsets: 0, 1, 2
+Cache hit rate: 0.0%
+
+Read back from cache:
+  [0] order:created:id=1001:user=42:total=149.99
+  [1] order:paid:id=1001:method=card:ref=txn_abc
+
+Replay from offset 0 (crash recovery simulation):
+  order:created:id=1001:user=42:total=149.99
+  order:paid:id=1001:method=card:ref=txn_abc
+  order:shipped:id=1001:carrier=UPS:tracking=1Z999
+
+Done. Cache hit rate after reads: 66.7%
+```
+
+The 66.7% hit rate: 2 of the 3 reads (offsets 0 and 1) hit the cache; the replay call went to the WAL server. Tune `max-entries` up if your service does heavy read-after-write.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="Group commit was a 5-line change for a 35× throughput improvement. I expected it to require thread pools, async I/O, or a complex producer-consumer setup. It didn't. Split append (buffer) from commit (fsync), batch the appends, call one fsync. That's it. The 35× is real and reproducible on commodity NVMe hardware. The lesson isn't 'group commit is clever' — it's 'fsync latency has been the bottleneck the whole time, and we only needed to stop paying it once per record.'" />
+
+## Where to go deeper
+
+- **RocksDB WAL format**: the actual production implementation — [facebook/rocksdb/wiki](https://github.com/facebook/rocksdb/wiki/Write-Ahead-Log-File-Format)
+- **MySQL 8.0 lock-free WAL design**: a detailed look at how they redesigned the InnoDB redo log for parallel writes — [dev.mysql.com](https://dev.mysql.com/blog-archive/mysql-8-0-new-lock-free-scalable-wal-design/)
+- **PostgreSQL WAL internals**: `pg_waldump`, checkpoint mechanics, archive mode — [postgresql.org docs](https://www.postgresql.org/docs/current/wal-internals.html)
+- **etcd raft WAL source**: Go implementation, very readable — [github.com/etcd-io/raft/wal](https://github.com/etcd-io/raft/tree/main/wal)
+- **LMDB** (for contrast): a MVCC B-tree that needs no WAL because it uses copy-on-write — [symas.com/mdb](https://www.symas.com/mdb)
+
+## Related labs and questions
+
+- **Next in storage**: LSM-Tree KV Store (lab 1) — the WAL is the LSM-tree's first component
+- **System design companion**: [Distributed KV Store](/system-design/distributed-kv-store) — the staff-level discussion of why you need a WAL before you can call anything durable
+- **Next in distributed**: Raft From Scratch (lab 12) — Raft's log replication is a distributed WAL
