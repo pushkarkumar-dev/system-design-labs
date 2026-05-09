@@ -15,7 +15,8 @@ fn main() {
 
         println!("replay from 1:");
         for r in w.replay(1) {
-            let text = String::from_utf8_lossy(&r.decode_data());
+            let data = r.decode_data();
+            let text = String::from_utf8_lossy(&data);
             println!("  [{offset}] {text}", offset = r.offset);
         }
         println!("(nothing survives restart — that's v0's job)");
@@ -41,7 +42,8 @@ fn main() {
             let (_, recovered) = v1::Wal::open(path).expect("reopen");
             println!("after restart, recovered {} records:", recovered.len());
             for r in &recovered {
-                let text = String::from_utf8_lossy(&r.decode_data());
+                let data = r.decode_data();
+                let text = String::from_utf8_lossy(&data);
                 println!("  [{offset}] {text}", offset = r.offset);
             }
         }
