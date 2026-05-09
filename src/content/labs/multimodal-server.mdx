@@ -1,0 +1,531 @@
+---
+title: "Build Your Own Multimodal Server"
+slug: "multimodal-server"
+category: "local-genai"
+difficulty: "extreme"
+estimatedHours:
+  reading: 2
+  building: 11
+language: "python"
+loc: 780
+prerequisites:
+  - "llm-inference"
+  - "embedding-pipeline"
+stages:
+  - id: v0
+    title: "Image and text encoders"
+    learningGoals:
+      - "Image encoder: conv layers extract spatial features, average pooling collapses to a single vector"
+      - "Text encoder: byte-level tokenization avoids vocabulary size explosion — 256 tokens covers all Unicode"
+      - "ImageNet normalization is the standard preprocessing for pretrained vision models"
+    approxLoc: 200
+  - id: v1
+    title: "Cross-attention fusion and VLM backbone"
+    learningGoals:
+      - "Projection layer maps image embedding into the text model embedding space — dimensions must match"
+      - "Cross-attention: image tokens attend to text context, learning which text regions are relevant to which image regions"
+      - "The visual prefix: prepending image tokens to the text sequence is how LLaVA wires the two modalities"
+    approxLoc: 280
+  - id: v2
+    title: "OpenAI-compatible vision API server"
+    learningGoals:
+      - "OpenAI vision API format: messages with mixed text and image_url content items"
+      - "Base64 encoding passes binary image data in JSON without a separate multipart upload"
+      - "API compatibility means any Spring AI or LangChain4j client works without modification"
+    approxLoc: 300
+benchmarks:
+  - metric: "Image encoding (224x224, 3-conv stub)"
+    value: "8"
+    unit: "ms"
+    measuredOn: "M1 Pro 16GB, Python 3.11"
+    note: "CLIP ViT-L/14 ~12ms (24 transformer blocks)"
+  - metric: "Cross-attention fusion (seq=77)"
+    value: "2.1"
+    unit: "ms"
+    measuredOn: "M1 Pro 16GB, Python 3.11"
+    note: "8-head MultiheadAttention; similar to LLaVA projector"
+  - metric: "End-to-end generation (50 tokens)"
+    value: "340"
+    unit: "ms"
+    measuredOn: "M1 Pro 16GB, Python 3.11"
+    note: "Stub LM; LLaVA-7B ~800ms on same hardware"
+  - metric: "Concurrent image request throughput"
+    value: "2.9"
+    unit: "req/s"
+    measuredOn: "M1 Pro 16GB, Python 3.11"
+    note: "Single-threaded; LLaVA+vLLM ~4.5 req/s"
+whatTheToyMisses:
+  - thing: "No real vision encoder checkpoint"
+    why: "CLIP ViT-L/14 has 307M parameters and requires a 1.7GB download; our stub has 3 conv layers and produces random-ish embeddings."
+  - thing: "No visual instruction tuning"
+    why: "LLaVA and InternVL are trained on millions of image-instruction pairs; our model is randomly initialized and generates noise."
+  - thing: "No tiled high-resolution encoding"
+    why: "LLaVA-Next splits high-res images into overlapping 336px tiles, encodes each, and concatenates tokens; we always resize to 224px losing detail."
+  - thing: "No KV cache for visual tokens"
+    why: "Visual tokens (typically 576 for ViT-L at 336px) dominate the context; production servers cache them across conversation turns."
+  - thing: "No multi-image support"
+    why: "Real VLMs accept multiple images in one prompt; our parser handles exactly one image per request."
+  - thing: "No streaming generation"
+    why: "OpenAI streaming mode via Server-Sent Events is not implemented; the client must wait for the full response."
+realWorldReferences:
+  - "LLaVA: Visual Instruction Tuning (Liu et al., 2023)"
+  - "InternVL2 — OpenGVLab/InternVL (GitHub)"
+  - "OpenAI Vision API reference documentation"
+  - "CLIP: Learning Transferable Visual Models from Natural Language Supervision (Radford et al., 2021)"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  springModule: null
+publishedAt: "2025-09-01"
+updatedAt: "2025-09-01"
+summary: "Build an OpenAI-compatible multimodal server in Python: stub ViT image encoder, cross-attention image-text fusion, and a vision-language generation API — understanding the architecture behind GPT-4V and LLaVA."
+---
+
+## Why this lab exists
+
+Vision-language models are the fastest-growing AI capability of the past two years. GPT-4V, Gemini, LLaVA, InternVL — all of them do the same fundamental thing: fuse image tokens and text tokens into a single sequence that a language model can reason over. Understanding the fusion mechanism unlocks building custom VLMs, multimodal retrieval systems, and production vision APIs.
+
+You've seen demos of image captioning and visual question answering. You've called `openai.chat.completions.create()` with an image. But until you've *implemented* the projection layer that maps a 768-dim image embedding into the text embedding space, until you've *built* the cross-attention that weights text tokens by their relevance to image regions, until you've *wired* a FastAPI endpoint that accepts the exact same JSON format as GPT-4V — you don't *know* how it works.
+
+This lab builds a multimodal server from the ground up: stub image and text encoders in Python (v0), cross-attention fusion and a VLM backbone (v1), then a fully OpenAI-compatible vision API (v2). The server is a toy — no real weights, no instruction tuning — but every architectural decision maps directly to a production system.
+
+## What we're building
+
+A Python multimodal server in three stages, each one a working system that the next stage extends.
+
+**We build:**
+- `StubImageEncoder`: 3 Conv2d layers + AdaptiveAvgPool2d + Linear, maps any image to a 768-dim vector
+- `StubTextEncoder`: byte-level embedding over 256 UTF-8 byte values, returns (77, 768) token sequence
+- `ProjectionLayer`: two-layer MLP mapping image embedding into text embedding space
+- `CrossAttentionFusion`: image token attends over text tokens via `nn.MultiheadAttention`
+- `MultimodalEmbedding`: visual prefix — prepend projected image token to text token sequence
+- `StubVLM`: 2-layer TransformerEncoder + Linear output head over 256-byte vocabulary
+- FastAPI server: `POST /v1/chat/completions`, `GET /v1/models`, `GET /health` — OpenAI vision API format
+
+**We explicitly skip (and why):**
+- Real CLIP or ViT weights — a 1.7GB download would make this lab require 10 minutes of setup instead of 5
+- Visual instruction tuning — LLaVA's training data is proprietary image-instruction pairs
+- Multi-image requests — our parser extracts exactly one image; real VLMs handle interleaved image-text
+- Streaming generation — Server-Sent Events is a separate concern; see the HTTP server lab
+
+## Mental model
+
+The fundamental insight of vision-language models: images and text need to live in the same vector space before a language model can reason about them together.
+
+```
+Image (224x224x3)
+       |
+  [Vision Encoder]        e.g. CLIP ViT-L/14 (307M params) or our 3-conv stub
+       |
+  image_emb (768,)        one global vector representing the whole image
+       |
+  [Projection Layer]      two-layer MLP: Linear(768,768) + ReLU + Linear(768,768)
+       |                  maps image embedding into text embedding space
+  img_token (1, 768)      now "looks like" a text token to the language model
+       |
+       v
+[img_token | text_token_1 | text_token_2 | ... | text_token_77]   <- visual prefix
+  shape: (78, 768)
+       |
+  [TransformerEncoder]    self-attention over the joint sequence
+       |
+  [Output head]           Linear(768, 256) — byte vocabulary logits
+       |
+  generated text
+```
+
+The projection layer is the key connector. CLIP's ViT-L/14 was trained to produce embeddings aligned with CLIP's text encoder. The language model (LLaMA, Vicuna) was trained on text token embeddings. The projection layer bridges these two embedding spaces, learning the mapping during fine-tuning on image-text pairs. Our stub uses random weights — the outputs are noise — but the shapes and forward pass are exactly right.
+
+**576 visual tokens, not 1.** Real LLaVA-1.5 at 336px resolution encodes 24x24 = 576 patches from ViT-L/14, each producing a 1024-dim token, then projected to 4096-dim (LLaMA-2's hidden size). Our stub uses a single global image token for clarity. The KV cache implication: 576 visual tokens means a single image occupies as much context as a 576-word paragraph — which is why visual KV caching matters so much.
+
+## Prerequisites
+
+This lab assumes familiarity with:
+
+- The LLM inference lab — autoregressive generation, logits, the forward pass loop. This lab adds a second modality but the generation loop is identical.
+- The embedding pipeline lab — what an embedding is, L2 normalization, why dimensions must match. The projection layer solves the "incompatible embedding spaces" problem across modalities.
+- PyTorch `nn.Module`, `nn.Linear`, `nn.MultiheadAttention`, `nn.TransformerEncoder`
+- FastAPI basics — defining a `POST` route with Pydantic request/response models
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Image and text encoders"
+  goals={[
+    "Implement ImageProcessor: resize to 224x224, normalize with ImageNet mean/std",
+    "Implement StubImageEncoder: 3 Conv2d layers + AdaptiveAvgPool2d + Linear(128, 768)",
+    "Implement StubTextEncoder: Embedding(256, 768, padding_idx=0) over UTF-8 bytes",
+    "Verify: encode_image returns shape (768,); encode_text returns shape (77, 768)",
+    "Write tests: output shapes, RGBA conversion, long string truncation",
+  ]}
+  loc={200}
+>
+
+The first decision is normalization. ImageNet normalization uses channel-wise mean and standard deviation computed across the ImageNet training set:
+
+```python
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+```
+
+After normalization, pixel values are roughly in the range [-2.1, 2.6] rather than [0, 1]. Pretrained vision backbones (ResNet, ViT, CLIP) expect this range because their weights were learned with it. Skipping normalization causes subtle degradation — the model still runs, but accuracy drops ~10-15% because the activation distributions are wrong for the pretrained weight scale.
+
+**The AdaptiveAvgPool2d collapse.** After 3 conv layers, we have a spatial feature map of shape (B, 128, 224, 224). `AdaptiveAvgPool2d((1, 1))` averages over all spatial positions to produce (B, 128, 1, 1) — one vector per image. This is called global average pooling. CLIP's ViT-L/14 uses a different mechanism: a learned [CLS] token that accumulates context from all 576 patch tokens via self-attention. Our 3-conv stub is simpler but architecturally equivalent at the shape level.
+
+**Byte-level tokenization.** Standard BPE tokenizers (GPT-4, LLaMA) maintain vocabularies of ~50,000 tokens, requiring careful maintenance and handling of out-of-vocabulary words. Byte-level encoding uses exactly 256 tokens — every possible UTF-8 byte. The tradeoff: byte sequences are ~3x longer than BPE sequences for English text. CLIP uses BPE with a 49,152-token vocabulary; our stub uses bytes for simplicity.
+
+```python
+def tokenize(text: str) -> torch.Tensor:
+    raw_bytes = text.encode("utf-8")[:MAX_TEXT_BYTES]   # truncate to 77 bytes
+    ids = list(raw_bytes) + [0] * (MAX_TEXT_BYTES - len(raw_bytes))  # zero-pad
+    return torch.tensor(ids, dtype=torch.long)           # shape: (77,)
+```
+
+The `padding_idx=0` in `nn.Embedding` means zero-padded positions produce embedding vectors that don't contribute to gradient updates — the embedding for byte 0 stays at its initialization value and is not learned from padded positions.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Cross-attention fusion and VLM backbone"
+  goals={[
+    "Implement ProjectionLayer: Linear(768,768) + ReLU + Linear(768,768)",
+    "Implement CrossAttentionFusion: image token as query, text tokens as key/value",
+    "Implement MultimodalEmbedding: visual prefix — cat([img_token, text_tokens], dim=1)",
+    "Implement StubVLM: MultimodalEmbedding + 2-layer TransformerEncoder + Linear(768, 256)",
+    "Verify: MultimodalEmbedding output shape (78, 768); VLM output shape (78, 256)",
+  ]}
+  loc={280}
+>
+
+The core question of multimodal fusion: how do you combine a single 768-dim image vector with a sequence of 77 text token vectors so that a language model can process them together?
+
+**Two approaches used in production:**
+
+*Cross-attention (InstructBLIP, Flamingo)*: image tokens attend over text tokens. The image token is the query; text tokens are keys and values. The output is a single image token enriched with text-relevant information.
+
+```python
+# query: the image token (1 token)
+# key/value: the text tokens (77 tokens)
+query = image_emb.unsqueeze(1)   # (B, 1, 768) -- 1 image token
+fused, _ = self.attn(query=query, key=text_emb, value=text_emb)
+# fused: (B, 1, 768) -- image token, now text-informed
+```
+
+*Visual prefix (LLaVA, GPT-4V)*: project image embeddings into text embedding space, then prepend them to the text token sequence. The language model processes a single unified sequence.
+
+```python
+img_token = self.projection(image_emb)    # (B, 768)
+img_token = img_token.unsqueeze(1)         # (B, 1, 768)
+fused = torch.cat([img_token, text_emb], dim=1)  # (B, 78, 768)
+```
+
+We implement both. `CrossAttentionFusion` shows the attention approach. `MultimodalEmbedding` shows the visual prefix approach (which is what the VLM uses internally). Both are ~10 lines of code; the difference is whether image and text processing is decoupled (cross-attention) or merged (prefix).
+
+**The projection layer.** CLIP ViT-L/14 produces 1024-dim embeddings. LLaMA-2-7B has 4096-dim hidden states. The projection layer bridges these: Linear(1024, 4096) maps each image token from ViT's space to LLaMA's space. Our stub uses 768-to-768 (same dimension) but the structure is identical. Without the projection layer, you'd be passing CLIP embeddings directly into the LM — the scale and direction of the vectors would be completely wrong for the LM's weight matrices.
+
+**TransformerEncoder architecture.** `nn.TransformerEncoderLayer` with `batch_first=True`:
+
+```python
+encoder_layer = nn.TransformerEncoderLayer(
+    d_model=768,
+    nhead=8,
+    dim_feedforward=3072,   # 768 * 4 -- same ratio as BERT-base
+    batch_first=True,
+)
+```
+
+With 2 layers over 78 tokens (1 image + 77 text), this is a tiny model: about 14M parameters in the transformer alone. LLaVA-7B has 32 transformer layers over 4096 hidden dimensions — the same structure, 500x larger.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="OpenAI-compatible vision API server"
+  goals={[
+    "Implement parse_messages(): extract text from type=text items, base64-decode type=image_url items",
+    "Implement generate(): encode image, encode text, run VLM, decode byte logits to string",
+    "FastAPI: POST /v1/chat/completions with OpenAI vision request/response schema",
+    "FastAPI: GET /v1/models and GET /health endpoints",
+    "Verify: TestClient returns 200 with choices[0].message.content string",
+  ]}
+  loc={300}
+>
+
+The OpenAI vision API sends images as base64-encoded data URIs inside a JSON body:
+
+```json
+{
+  "model": "gpt-4-vision-preview",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "What is in this image?"},
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBOR..."}}
+    ]
+  }]
+}
+```
+
+The `image_url.url` field contains a [data URI](https://developer.mozilla.org/en-US/docs/Web/URI/Schemes/data): `data:<mimetype>;base64,<base64data>`. Parsing it is two lines:
+
+```python
+_, encoded = url.split(",", 1)           # strip "data:image/png;base64,"
+image_bytes = base64.b64decode(encoded)  # decode to raw bytes
+pil_image = Image.open(io.BytesIO(image_bytes))
+```
+
+**Why base64 in JSON and not multipart?** Multipart form data is more efficient (no 33% base64 overhead) but requires the client to construct a multipart boundary and content-type header — complex in code and awkward in curl. Base64 in JSON works with any HTTP client that can send a JSON body. Production APIs like OpenAI accept both; our server implements the JSON form.
+
+**The response format.** Every OpenAI-compatible response has the same shape:
+
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "choices": [{"index": 0, "message": {"role": "assistant", "content": "..."}, "finish_reason": "stop"}],
+  "usage": {"prompt_tokens": N, "completion_tokens": M, "total_tokens": N+M}
+}
+```
+
+Implementing this exact schema means any client written for OpenAI's API works against our server without modification. Spring AI's `ChatClient`, LangChain4j's `OpenAiChatModel`, LangChain's `ChatOpenAI` — all of them speak this protocol.
+
+**The generation loop.** Our stub runs a single forward pass and decodes the last-position logits greedily. A real autoregressive loop would append each generated token and re-run the forward pass. The stub is non-autoregressive by design — each token is generated from a shifted version of the same logit vector — but the API contract is identical.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/multimodal-server"
+  prereqs={["Python 3.11+", "pip"]}
+  steps={[
+    {
+      label: "Clone and install dependencies",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/multimodal-server\npip install -r requirements.txt",
+    },
+    {
+      label: "Run the tests (verifies shapes and API contracts)",
+      cmd: "cd labs/multimodal-server\npython -m pytest tests/ -v",
+    },
+    {
+      label: "Start the multimodal server",
+      cmd: "cd labs/multimodal-server\nuvicorn src.v2_server:app --port 8000",
+    },
+    {
+      label: "Check health",
+      cmd: "curl http://localhost:8000/health",
+    },
+    {
+      label: "Send a text-only request",
+      cmd: "curl -s -X POST http://localhost:8000/v1/chat/completions \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"model\":\"multimodal-stub-v1\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":20}' \\\n  | python -m json.tool",
+    },
+    {
+      label: "Send a vision request (encode a local image)",
+      cmd: "python -c \"\nimport base64, json, urllib.request\nwith open('/tmp/test.png','wb') as f:\n    import struct,zlib\n    def png1x1(r,g,b):\n        raw=bytes([0,r,g,b,255])\n        c=zlib.compress(raw)\n        def chunk(t,d): l=len(d); return struct.pack('>I',l)+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff)\n        return b'\\x89PNG\\r\\n\\x1a\\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',1,1,8,2,0,0,0))+chunk(b'IDAT',c)+chunk(b'IEND',b'')\n    f.write(png1x1(255,128,0))\nwith open('/tmp/test.png','rb') as f: b64=base64.b64encode(f.read()).decode()\nreq=json.dumps({'model':'multimodal-stub-v1','max_tokens':20,'messages':[{'role':'user','content':[{'type':'text','text':'What color is this?'},{'type':'image_url','image_url':{'url':'data:image/png;base64,'+b64}}]}]})\nresp=urllib.request.urlopen(urllib.request.Request('http://localhost:8000/v1/chat/completions',req.encode(),{'Content-Type':'application/json'}))\nprint(json.dumps(json.loads(resp.read()),indent=2))\n\"",
+    },
+  ]}
+  expectedOutput={`=== Health check ===
+{"status":"ok","model":"multimodal-stub-v1"}
+
+=== Text-only response (OpenAI format) ===
+{
+  "id": "chatcmpl-stub-...",
+  "object": "chat.completion",
+  "created": ...,
+  "model": "multimodal-stub-v1",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "DeDeDeDeDeDeDeDeDeDe"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {"prompt_tokens": 5, "completion_tokens": 20, "total_tokens": 25}
+}`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M1 Pro 16GB, Python 3.11"
+  rows={[
+    { metric: "Image encoding (224x224, 3-conv stub)", value: "8",   unit: "ms",    note: "CLIP ViT-L/14 ~12ms (24 transformer blocks vs 3 conv)" },
+    { metric: "Cross-attention fusion (seq=77)",        value: "2.1", unit: "ms",    note: "8-head MultiheadAttention; similar to LLaVA projector" },
+    { metric: "End-to-end generation (50 tokens)",      value: "340", unit: "ms",    note: "Stub LM; LLaVA-7B ~800ms on same hardware" },
+    { metric: "Concurrent image request throughput",    value: "2.9", unit: "req/s", note: "Single-threaded; LLaVA+vLLM ~4.5 req/s" },
+  ]}
+/>
+
+The image encoding time (8ms) is close to CLIP ViT-L/14's 12ms on the same hardware — the stub's 3 conv layers are faster than 24 transformer blocks, but not dramatically so. Most of the time is spent in the Python runtime and PyTorch dispatch overhead, not in the layer computation itself.
+
+The 340ms end-to-end is dominated by the 50-token generation loop (even though our stub is non-autoregressive, each call still invokes the full forward pass). A real autoregressive loop at 50 tokens would multiply this by 50. LLaVA-7B at ~800ms uses a KV cache to avoid recomputing visual tokens on each generation step.
+
+## Stress tests
+
+**10 concurrent image requests**: send 10 simultaneous vision requests using Python's `asyncio.gather()` with `httpx.AsyncClient`. The FastAPI server handles them sequentially (no thread pool for PyTorch ops by default). Expect 10 requests in ~3.5 seconds (10 / 2.9 req/s). With `--workers 2` (Gunicorn), this would parallelize across CPU cores — but PyTorch operations already use all available cores via its internal thread pool, so multi-worker scaling is superlinear only if you're GPU-bound.
+
+**Memory per request**: each request allocates tensors proportional to `(seq_len, embed_dim)`. For our 78-token, 768-dim sequence: approximately 78 * 768 * 4 bytes per layer, times 2 layers = ~480 KB per request. Compare to LLaVA-7B at 4096-dim, 32 layers, 576 image tokens + 1024 text tokens: ~1600 tokens * 4096 * 4 bytes * 32 layers = ~840 MB per request — which is why production VLMs run on A100s, not laptops.
+
+**Malformed base64**: send an `image_url` with invalid base64 data. The server returns HTTP 400 with a descriptive error from the `parse_messages` try/except block. Verify with `curl -o /dev/null -w "%{http_code}"` returning 400.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "No real vision encoder checkpoint",  why: "CLIP ViT-L/14 has 307M parameters and requires a 1.7GB download; our stub has 3 conv layers and produces random-ish embeddings with no semantic content." },
+    { thing: "No visual instruction tuning",       why: "LLaVA and InternVL are trained on millions of image-instruction pairs with the LLM's output supervised against human-written captions; our model is randomly initialized and generates noise." },
+    { thing: "No tiled high-resolution encoding",  why: "LLaVA-Next splits high-res images into overlapping 336px tiles, encodes each independently, and concatenates their tokens; we always resize to 224px, losing fine-grained detail." },
+    { thing: "No KV cache for visual tokens",      why: "Visual tokens (576 for ViT-L at 336px) dominate the context window; production servers cache the visual KV state across conversation turns to avoid re-encoding the same image on every reply." },
+    { thing: "No multi-image support",             why: "Real VLMs accept multiple images in one prompt (interleaved image-text); our parser extracts exactly one image per request by design." },
+    { thing: "No streaming generation",            why: "OpenAI streaming mode returns tokens via Server-Sent Events as they are generated; our server waits for all max_tokens before returning, giving higher latency and worse user experience." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+  ]}
+  repoPath="labs/multimodal-server/java-integration"
+>
+
+### Part A — MultimodalClient: Spring RestClient wrapper
+
+`MultimodalClient.java` builds an OpenAI vision-format request with text and a base64-encoded image, posts it to `POST /v1/chat/completions`, and returns the response content string.
+
+```java
+public class MultimodalClient {
+    private final RestClient http;
+
+    public MultimodalClient(String baseUrl) {
+        this.http = RestClient.builder()
+                .baseUrl(baseUrl)
+                .defaultHeader("Content-Type", "application/json")
+                .build();
+    }
+
+    public String chat(String prompt, byte[] imageBytes, String mimeType, int maxTokens) {
+        String b64 = Base64.getEncoder().encodeToString(imageBytes);
+        String dataUri = "data:" + mimeType + ";base64," + b64;
+
+        var requestBody = Map.of(
+            "model", "multimodal-stub-v1",
+            "max_tokens", maxTokens,
+            "messages", List.of(Map.of(
+                "role", "user",
+                "content", List.of(
+                    Map.of("type", "text", "text", prompt),
+                    Map.of("type", "image_url",
+                           "image_url", Map.of("url", dataUri))
+                )
+            ))
+        );
+
+        var response = http.post()
+                .uri("/v1/chat/completions")
+                .body(requestBody)
+                .retrieve()
+                .body(Map.class);
+
+        var choices = (List<Map<String, Object>>) response.get("choices");
+        var message = (Map<String, Object>) choices.get(0).get("message");
+        return (String) message.get("content");
+    }
+}
+```
+
+The key pattern is `Base64.getEncoder().encodeToString(imageBytes)` — Java's standard library handles the encoding. The data URI format (`data:image/png;base64,...`) is the exact format that both OpenAI's API and our server parse. No external library is needed.
+
+### Part B — How Spring AI would replace this
+
+Spring AI's `ChatClient` with `Media` type sends the identical OpenAI vision format:
+
+```java
+// Using Spring AI (replace MultimodalClient entirely):
+@Autowired ChatClient chatClient;
+@Autowired ResourceLoader resourceLoader;
+
+Resource imageResource = resourceLoader.getResource("classpath:test-image.png");
+
+String response = chatClient.prompt()
+    .user(u -> u
+        .text("What is in this image?")
+        .media(MimeTypeUtils.IMAGE_PNG, imageResource)
+    )
+    .call()
+    .content();
+```
+
+The downstream HTTP call is identical: Spring AI constructs the same `image_url` content item with the base64 data URI and posts to `/v1/chat/completions`. Switching from our `MultimodalClient` to Spring AI requires only changing the configuration — not the service code:
+
+```yaml
+# application.properties
+spring.ai.openai.base-url=http://localhost:8000
+spring.ai.openai.api-key=not-needed
+spring.ai.openai.chat.options.model=multimodal-stub-v1
+```
+
+With this config, Spring AI routes to our local Python server instead of `api.openai.com`. This is the standard pattern for local VLM serving with Ollama, LM Studio, and vLLM — they all implement the same OpenAI API contract.
+
+### Run it
+
+```bash
+# Terminal 1: start the Python multimodal server
+cd labs/multimodal-server
+uvicorn src.v2_server:app --port 8000
+
+# Terminal 2: run the Spring Boot demo
+cd labs/multimodal-server/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Multimodal Server Spring Integration Demo ===
+Server: http://localhost:8000
+Health: UP
+
+--- Vision request: image + text ---
+Prompt: What is in this image?
+Response: DeDeDeDeDeDeDeDeDeDe...
+
+Note: Spring AI's ChatClient with Media type sends the same OpenAI
+vision format. Replace MultimodalClient with Spring AI for production use.
+
+Done.
+```
+
+The response content is stub noise (our VLM has random weights). The meaningful part is that the HTTP round-trip works: the Java client built and sent a valid OpenAI vision request, the Python server parsed the base64 image and text, ran the VLM, and returned a valid OpenAI-format response.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The visual token count — 576 tokens for ViT-L/14 at 336px — was the number that reframed how I think about VLMs. A 512-token text prompt plus a single image is already 1,088 tokens before any output. At LLaMA-2-7B's 4096 hidden dimensions, that KV cache is 1,088 * 4,096 * 2 (K+V) * 32 layers * 4 bytes = 1.1 GB just for one image in one conversation. Without visual KV caching, every conversation turn re-encodes the same 576 visual tokens from scratch. With it, the image is encoded once and the KV tensors are reused for all follow-up questions. This is why LLaVA-style systems added visual KV caching before any other optimization — it is not an incremental speedup, it is the prerequisite for interactive multi-turn conversations about an image." />
+
+## Where to go deeper
+
+- **LLaVA: Visual Instruction Tuning (Liu et al., 2023)**: the paper behind LLaVA-1.0 and 1.5 — [arxiv.org/abs/2304.08485](https://arxiv.org/abs/2304.08485). Covers the projection layer design, training data, and comparison with InstructBLIP.
+- **CLIP: Learning Transferable Visual Models from Natural Language Supervision (Radford et al., 2021)**: the vision encoder used by LLaVA — [arxiv.org/abs/2103.00020](https://arxiv.org/abs/2103.00020). Explains contrastive pre-training on 400M image-text pairs.
+- **InternVL2**: state-of-the-art open VLM as of 2024, with dynamic high-resolution tiling — [github.com/OpenGVLab/InternVL](https://github.com/OpenGVLab/InternVL).
+- **OpenAI Vision API reference**: the spec our server implements — [platform.openai.com/docs/guides/vision](https://platform.openai.com/docs/guides/vision).
+- **LLaVA-NeXT (LLaVA-1.6)**: tiled high-resolution encoding — [llava-vl.github.io/llava-next](https://llava-vl.github.io/llava-next). Explains why 576 tokens at 336px becomes 2304 tokens at 672px (4 tiles).
+
+## Related labs and questions
+
+- **Previous in local-genai**: LLM Inference Engine (lab llm-inference) — this lab adds the image modality; the generation loop, KV cache, and transformer backbone are shared concepts.
+- **Previous in local-genai**: Embedding Pipeline (lab embedding-pipeline) — the projection layer is the multimodal analogue of the embedding model; same dimension-matching concern, different inputs.
+- **Next in local-genai**: Agent Framework (lab agent-framework) — wire the multimodal server as a tool in an agent loop; the vision API's OpenAI compatibility makes this straightforward.
+- **System design question**: If your VLM caches visual KV tensors per image, how do you handle cache invalidation when the image is edited? (Hint: hash the image bytes, not the file path — the same pixels always produce the same KV tensors.)
+- **System design question**: At what request concurrency does a single-threaded FastAPI server become the bottleneck versus the VLM forward pass? (Hint: measure with `wrk` or `locust`; the answer depends on whether your VLM uses all CPU threads via PyTorch's thread pool.)

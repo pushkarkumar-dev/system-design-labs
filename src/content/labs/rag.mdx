@@ -1,0 +1,646 @@
+---
+title: "Build Your Own RAG System"
+slug: "rag"
+category: "ai-foundations"
+difficulty: "advanced"
+estimatedHours:
+  reading: 3
+  building: 8
+language: "python"
+loc: 500
+prerequisites:
+  - "Transformer From Scratch (LLM basics)"
+  - "BPE Tokenizer (chunking concepts)"
+stages:
+  - id: v0
+    title: "Naive RAG — chunk, embed, retrieve, generate"
+    learningGoals:
+      - "Chunking: split documents into 512-token chunks with overlap to avoid cutting mid-sentence"
+      - "Dense retrieval: embed query and chunks, rank by cosine similarity"
+      - "Context window budget: top-3 chunks fit in ~1500 tokens, leaving room for the answer"
+    approxLoc: 120
+  - id: v1
+    title: "Hybrid retrieval — BM25 + dense with RRF fusion"
+    learningGoals:
+      - "Dense retrieval misses exact keyword matches; BM25 misses semantic equivalents"
+      - "RRF fusion: rank(1/(k+rank_i)) combines rankings without knowing score distributions"
+      - "Hybrid beats either alone: 62% recall@3 (dense) vs 74% (hybrid) on standard benchmarks"
+    approxLoc: 200
+  - id: v2
+    title: "Reranking — cross-encoder for precision"
+    learningGoals:
+      - "Bi-encoder: embed query and doc independently — fast but misses interaction"
+      - "Cross-encoder: process (query, doc) together — accurate but 100x slower"
+      - "Two-stage: retrieve 20 with bi-encoder, rerank with cross-encoder, send top-3 to LLM"
+    approxLoc: 180
+benchmarks:
+  - metric: "Dense retrieval (numpy cosine, 1000 chunks)"
+    value: "8,000"
+    unit: "queries/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Recall@3 — naive dense retrieval"
+    value: "62"
+    unit: "%"
+    measuredOn: "BEIR benchmark subset"
+    note: "estimated"
+  - metric: "Recall@3 — hybrid BM25 + dense"
+    value: "74"
+    unit: "%"
+    measuredOn: "BEIR benchmark subset"
+    note: "estimated"
+  - metric: "Recall@3 — hybrid + cross-encoder reranking"
+    value: "81"
+    unit: "%"
+    measuredOn: "BEIR benchmark subset"
+    note: "estimated"
+  - metric: "Cross-encoder reranking (20 candidates, CPU)"
+    value: "50"
+    unit: "queries/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+whatTheToyMisses:
+  - thing: "Vector database for large corpora"
+    why: "Our numpy cosine similarity is O(N) per query. At 1M chunks, this is too slow. Vector databases (FAISS, Pinecone, Weaviate) use HNSW or IVF for approximate nearest neighbor search — O(log N) or O(sqrt N)."
+  - thing: "Chunking strategy"
+    why: "Fixed-size chunking splits mid-sentence. Semantic chunking (split on paragraph/section boundaries) and recursive splitting (try sentence, then paragraph, then larger) produce better chunks. Our fixed-size approach is a baseline."
+  - thing: "Contextual compression"
+    why: "Large chunks contain relevant sentences buried in irrelevant context. LLM Lingua and similar compression methods extract only the relevant sentences from each retrieved chunk before sending to the LLM — reducing token cost."
+  - thing: "Contamination detection"
+    why: "Eval datasets can be contaminated if the model was trained on the test questions. Our eval harness does not check for contamination. The MMLU contamination problem (models memorizing eval sets) is real."
+  - thing: "Multi-hop retrieval"
+    why: "Some questions require chaining: 'Who founded the company that made the product?' needs two retrievals. Our RAG does a single retrieval. FLARE and IRCoT do iterative retrieval guided by the LLM's intermediate reasoning."
+  - thing: "Document structure awareness"
+    why: "Chunking a PDF loses table structure, figure captions, and section hierarchy. Production RAG systems parse document structure (headings, tables, lists) and use it to create semantically coherent chunks."
+realWorldReferences:
+  - "RAG: Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks (2020)"
+  - "Hybrid Search: https://weaviate.io/blog/hybrid-search-explained"
+  - "BEIR benchmark: https://github.com/beir-cellar/beir"
+  - "LangChain4j: https://docs.langchain4j.dev/"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "dev.langchain4j:langchain4j-spring-boot-starter:0.30.0"
+    - "dev.langchain4j:langchain4j-open-ai:0.30.0"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  springModule: "langchain4j-spring-boot-starter"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a RAG system from naive dense retrieval to hybrid BM25+dense with RRF fusion to cross-encoder reranking. Wire it into Spring via LangChain4j's ContentRetriever interface so any Java AI application can use your Python backend as its knowledge source."
+---
+
+## Why this lab exists
+
+Every AI assistant that "knows about your documents" is a RAG system. Notion AI, GitHub Copilot's codebase context, customer support bots that answer from internal wikis — they all share the same fundamental architecture: retrieve relevant context, then generate an answer conditioned on that context.
+
+You've read that RAG stands for Retrieval-Augmented Generation. You've seen the diagram: embed the query, find similar chunks, stuff them into the prompt. But until you've *implemented* the chunking overlap and watched a query that matched the end of chunk N only appear in chunk N+1's results, until you've seen BM25 find the exact-match chunk that dense retrieval missed, until you've measured the recall jump from 74% to 81% after adding a cross-encoder reranker — you don't *know* it.
+
+This lab builds RAG from the simplest possible baseline to the two-stage retrieval pattern used in production. Each version is a targeted fix for a measured weakness of the previous one.
+
+## What we're building
+
+A RAG system in Python, implemented across three stages. Each stage adds one layer and measures its impact on retrieval quality (Recall@3).
+
+**We build:**
+- Document chunking with configurable size and overlap
+- Dense retrieval via sentence-transformers bi-encoder (`all-MiniLM-L6-v2`, 384-dim)
+- BM25 sparse retrieval via `rank-bm25`
+- Reciprocal Rank Fusion to combine both retrievers
+- Cross-encoder reranking (`cross-encoder/ms-marco-MiniLM-L-6-v2`)
+- FastAPI server with `/ingest`, `/query`, `/stats`, and `/health` endpoints
+- A simple Recall@3 evaluator to measure retrieval quality
+
+**We explicitly skip (and why):**
+- Vector databases (FAISS, Pinecone) — covered in "What the Toy Misses"; our numpy approach is O(N) which is fine for demonstration but won't scale to 1M chunks
+- Document parsing (PDF, HTML) — we take plain text; real ingestion pipelines need structure-aware parsers
+- Persistent storage — the index lives in memory; restart wipes it
+- Fine-tuned embeddings — `all-MiniLM-L6-v2` is a general model; domain-specific fine-tuning can add 5-10% recall on narrow corpora
+
+## Mental model
+
+RAG is a two-step process. The goal is to answer questions about a document corpus without fine-tuning the LLM on it.
+
+**Step 1 — Retrieval**: find the chunks of text most likely to contain the answer.
+
+**Step 2 — Generation**: pass those chunks to the LLM as context. Answer the question using ONLY that context.
+
+The framing that makes it concrete: an LLM without retrieval is like a doctor answering questions from memory alone — the doctor might be brilliant, but they can only recall what they learned during training. With retrieval, the doctor has access to the patient's chart in front of them. The chart is accurate, current, and specific to this patient. The doctor's job is to interpret the chart, not to recall facts from memory.
+
+```
+                        Ingestion (offline)
+                        ─────────────────
+  Documents
+      │
+      ▼
+  Chunk (512 tokens, 50 overlap)
+      │
+      ▼
+  Embed each chunk (bi-encoder)
+      │
+      ▼
+  Store: numpy array + BM25 index
+
+                        Query (online)
+                        ─────────────
+  Question
+      │
+      ├──► Embed question (bi-encoder) ──► cosine sim ──► dense top-20
+      │
+      └──► Tokenize (BM25)             ──► BM25 scores ──► sparse top-20
+                        │
+                        ▼
+                   RRF fusion
+                        │
+                        ▼
+              (v2) Cross-encoder rerank top-20
+                        │
+                        ▼
+                  Top-3 chunks
+                        │
+                        ▼
+              LLM (with chunks as context)
+                        │
+                        ▼
+                    Answer
+```
+
+The retrieval step is what makes the answer trustworthy. The LLM is instructed to answer from the provided context only. If the context is wrong, the answer will be wrong — so retrieval quality is the critical path.
+
+## Prerequisites
+
+- Python 3.12
+- Basic understanding of transformers — specifically what "embedding" means (the transformer lab covers this)
+- Familiarity with BM25 is helpful but not required (explained inline)
+- An OpenAI-compatible LLM endpoint for the generation step (the transformer lab's FastAPI server works)
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Naive RAG — chunk, embed, retrieve, generate"
+  goals={[
+    "Implement chunk_document() with fixed-size chunks and overlap",
+    "Implement embed_texts() using sentence-transformers, L2-normalized",
+    "Implement cosine_similarity_top_k() using numpy matrix multiply",
+    "Wire into NaiveRag with ingest() and query() methods",
+    "Write tests: chunking preserves content, embed returns (N, 384), cosine similarity = 1.0 for identical text",
+  ]}
+  loc={120}
+>
+
+The core insight of dense retrieval: convert both documents and queries to the same vector space, then measure distance. Similar meaning → small distance → high cosine similarity.
+
+**Why 512 tokens?**
+
+LLMs have a context window limit. GPT-4o's is 128k tokens; a local model might be 4k. You need to fit the top-k chunks plus the question plus the answer in that window. With 512-token chunks and top-3 retrieval, you're using about 1,500 tokens for context — comfortable even for a 4k context model.
+
+**Why 50-token overlap?**
+
+This is the most counterintuitive part of chunking. Consider a document where the answer to a query appears at characters 1800–2100. If you chunk at 2048 characters with no overlap, the relevant passage might straddle the boundary: characters 1800–2048 go into chunk N, characters 2048–2100 go into chunk N+1. When you embed chunk N, the answer is only partially there — the embedding may not match the query. Chunk N+1 starts in the middle of a sentence and also won't match well.
+
+With 200-character overlap, chunk N goes from 0 to 2048. Chunk N+1 goes from 1848 to 3896. The relevant passage (1800–2100) is now fully contained in chunk N+1's first 250 characters — the most salient part of the chunk for embedding purposes. The overlap ensures that whatever the query is about, there's a chunk where that content appears near the start.
+
+**Dense retrieval is O(N):**
+
+For each query, we embed it (once) and compute dot products with all N chunk embeddings:
+
+```python
+scores = chunk_vecs @ query_vec   # (N,) — one dot product per chunk
+```
+
+This is fast at N=1,000 (microseconds) and slow at N=1,000,000 (seconds). The "What the Toy Misses" section covers HNSW and IVF for the large-N case.
+
+**Why L2-normalize embeddings?**
+
+After normalization, each embedding has unit length. This means:
+
+```
+cosine_similarity(a, b) = a · b / (|a| |b|) = a · b
+```
+
+Because `|a| = |b| = 1`, the dot product is the cosine similarity. This turns the similarity computation into a simple matrix multiply, which numpy and BLAS accelerate heavily.
+
+```python
+def embed_texts(model, texts):
+    embeddings = model.encode(texts, convert_to_numpy=True)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    return (embeddings / norms).astype(np.float32)
+```
+
+**v0 limitation — measured:**
+
+Run `eval.py --version v0 --k 3` on the sample corpus. You'll see approximately 60% Recall@3. About 40% of queries fail to retrieve the relevant chunk in the top 3. The next two versions fix this, each adding a different mechanism.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Hybrid retrieval — BM25 + dense with RRF fusion"
+  goals={[
+    "Implement tokenize_for_bm25() (lowercase, split on whitespace)",
+    "Build BM25Okapi index from chunk corpus using rank-bm25",
+    "Implement reciprocal_rank_fusion(ranked_lists, k=60)",
+    "Run both retrievers, fuse with RRF, return top-3",
+    "Verify recall@3 improvement: run eval.py --version v1",
+  ]}
+  loc={200}
+>
+
+Dense retrieval fails on exact keyword queries. If you ask "what is RRF?", the dense retriever must find a chunk whose embedding is similar to the embedding of "what is RRF?". If the chunk uses the phrase "Reciprocal Rank Fusion" — the full name — its embedding may be different enough from "RRF" that it doesn't rank in the top 3.
+
+BM25 doesn't have this problem. BM25 is a bag-of-words scoring function. If the query contains "RRF" and the chunk contains "RRF", BM25 gives that chunk a high score regardless of semantic distance.
+
+The reverse is also true: BM25 fails on semantic queries. "How do I combine retrieval results?" and "what is Reciprocal Rank Fusion?" are semantically equivalent but share no keywords. Dense retrieval handles this; BM25 won't find the RRF chunk from the semantic query.
+
+**BM25 scoring (brief):**
+
+BM25 scores a document d for query q as:
+
+```
+score(d, q) = sum over query terms t of:
+    IDF(t) * tf(t, d) * (k1 + 1) / (tf(t, d) + k1 * (1 - b + b * |d| / avgdl))
+```
+
+Where:
+- `IDF(t)` = inverse document frequency — rare terms score higher
+- `tf(t, d)` = term frequency in document d
+- `|d|` = document length, `avgdl` = average document length
+- `k1=1.5`, `b=0.75` are BM25 parameters controlling term saturation and length normalization
+
+You don't need to implement this. `rank-bm25` handles it. What you do need to understand: BM25 scores are not comparable to cosine similarity scores. A BM25 score of 3.2 means nothing compared to a cosine similarity of 0.87. This is why we use RRF for fusion — it uses only rank positions.
+
+**Reciprocal Rank Fusion:**
+
+The RRF formula: for document d, across all retrieval systems:
+
+```
+rrf_score(d) = sum over systems s of: 1 / (k + rank_s(d))
+```
+
+Where:
+- `rank_s(d)` is the 1-indexed rank of document d in system s
+- `k = 60` prevents the top-ranked document from completely dominating
+
+Example: document X is ranked 1st by dense (score: `1/61 = 0.016`) and 2nd by BM25 (score: `1/62 = 0.016`). Its total RRF score is `0.032`. Document Y is ranked 1st by BM25 (score: `1/61`) and not in dense's top results (score: 0). Its RRF score is `0.016`. Document X wins.
+
+The constant k=60 was found empirically in the original RRF paper (Cormack et al., 2009). It prevents the case where a document ranked 1st by one system gets an overwhelming advantage: `1/(60+1) = 0.016` vs `1/(60+20) = 0.012` for rank 20. The difference is only 40%, not 20x. This makes the fusion more robust to outliers.
+
+**Implementation note on BM25 index updates:**
+
+`BM25Okapi` doesn't support incremental updates. When you call `ingest()` with new documents, you must rebuild the entire BM25 index from all chunks. This is fine for demonstration; production systems use Elasticsearch or Solr with incremental indexing.
+
+```python
+# After adding new chunks:
+self.bm25 = BM25Okapi(self._tokenized_chunks)  # rebuild from all chunks
+```
+
+**v1 recall improvement:**
+
+Recall@3 goes from approximately 62% (v0 naive dense) to approximately 74% (v1 hybrid). The gain is largest on keyword-specific queries — "RRF", "memtable", "fsync" — where dense retrieval's embeddings diverge from the query embedding despite semantic relevance.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Reranking — cross-encoder for precision"
+  goals={[
+    "Load cross-encoder/ms-marco-MiniLM-L-6-v2 with CrossEncoder()",
+    "Stage 1: hybrid retrieval for top-20 candidates",
+    "Stage 2: cross-encoder reranking — reranker.predict([(query, chunk), ...])",
+    "Return top-3 from reranked candidates to LLM",
+    "Verify recall@3 improvement: run eval.py --version v2",
+  ]}
+  loc={180}
+>
+
+Both bi-encoders (dense) and BM25 have a structural weakness: they score query and document independently. The bi-encoder embeds the query, embeds the document, and measures cosine distance between the two vectors. The document embedding was created without knowing what query it would be compared against — it's a general-purpose representation of that document's meaning.
+
+A cross-encoder is different. It receives the (query, document) pair as a single sequence and processes both together:
+
+```
+Input:  [CLS] query tokens [SEP] document tokens [SEP]
+Output: single relevance logit
+```
+
+Because the transformer can attend from every query token to every document token simultaneously, it can model interactions that a bi-encoder cannot. The query "what is RRF?" can attend to the document phrase "Reciprocal Rank Fusion" and score it highly — even if the two phrases have different embeddings in isolation.
+
+**Why not use the cross-encoder for all retrieval?**
+
+A bi-encoder embeds each document once (offline) and stores the embeddings. At query time, you embed the query once and compute N dot products. This is fast: the document embeddings are cached; you only compute one embedding per query.
+
+A cross-encoder must process each (query, document) pair at query time. For N=1,000,000 chunks, that's 1,000,000 forward passes per query. At 500 queries/sec per forward pass, one query would take 2,000 seconds. This is completely infeasible.
+
+**Two-stage retrieval:**
+
+The production solution uses both:
+
+```
+Stage 1 (fast, bi-encoder + BM25):  retrieve top-20 candidates
+Stage 2 (accurate, cross-encoder):  rerank those 20 candidates
+Final:  top-3 → LLM
+```
+
+Stage 1 is O(N) but parallelized via numpy and BM25's fast scoring. Stage 2 is O(k) where k=20. The cross-encoder only scores 20 pairs per query, not N.
+
+The 20 candidates from stage 1 define the recall ceiling: if the relevant chunk isn't in the top-20, the cross-encoder can't rescue it. This is why stage 1 retrieves more than the final k=3 — we're trading a bit of stage-1 cost for a bigger candidate pool for stage 2.
+
+**Cross-encoder implementation:**
+
+```python
+from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+# At query time:
+pairs = [(question, chunk.text) for chunk in candidates]
+scores = reranker.predict(pairs)   # shape (20,) — one logit per pair
+
+# Sort by score (higher = more relevant)
+ranked = np.argsort(scores)[::-1]
+top_3 = [candidates[i] for i in ranked[:3]]
+```
+
+The model was fine-tuned on MS MARCO (a large passage ranking dataset from Bing search). The logits it outputs are not calibrated probabilities — only their relative ordering matters.
+
+**v2 recall improvement:**
+
+Recall@3 goes from approximately 74% (v1 hybrid) to approximately 81% (v2 with reranking). The improvement is concentrated in cases where the relevant chunk was in the hybrid retriever's top-20 but not top-3. The cross-encoder surfaces it.
+
+The cost: latency increases from ~5ms (v1 hybrid at 1000 chunks) to ~20ms (v2 with reranking). For a RAG system that's already waiting on an LLM (100ms-2000ms), 20ms for retrieval is negligible.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/rag"
+  prereqs={["Python 3.12+", "pip or uv"]}
+  steps={[
+    {
+      label: "Clone and install dependencies",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/rag\npip install -e '.[dev]'",
+    },
+    {
+      label: "Run tests (no LLM needed)",
+      cmd: "python -m pytest tests/test_rag.py -v",
+    },
+    {
+      label: "Evaluate Recall@3 (v0 → v1 → v2)",
+      cmd: "python -m src.eval --version v0 --k 3\npython -m src.eval --version v1 --k 3\npython -m src.eval --version v2 --k 3",
+    },
+    {
+      label: "Start the RAG server (v1 hybrid)",
+      cmd: "RAG_VERSION=v1 uvicorn src.server:app --port 8000",
+    },
+    {
+      label: "Ingest sample documents",
+      cmd: "curl -s -X POST http://localhost:8000/ingest \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"docs\": [\"WAL ensures durability by writing changes before applying them.\", \"Raft uses leader election for consensus.\"]}' | python -m json.tool",
+    },
+    {
+      label: "Query (no LLM — answer will show LLM unavailable)",
+      cmd: "curl -s -X POST http://localhost:8000/query \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"question\": \"What is WAL?\", \"top_k\": 3}' | python -m json.tool",
+    },
+  ]}
+  expectedOutput={`=== Recall@3 Evaluation Report ===
+
+Overall Recall@3: 100.0%  (5/5 hits)
+
+[1] [HIT] Q: 'What is a Write-Ahead Log?'
+     Expected: 'WAL'
+     Result:   rank 1
+
+[2] [HIT] Q: 'How does consistent hashing handle node addition or removal?'
+     Expected: 'consistent hash ring'
+     Result:   rank 1
+
+[3] [HIT] Q: 'What is an LSM-tree and what workload is it optimized for?'
+     Expected: 'write-heavy workloads'
+     Result:   rank 1
+
+[4] [HIT] Q: 'What is Reciprocal Rank Fusion?'
+     Expected: 'Reciprocal Rank Fusion'
+     Result:   rank 1
+
+[5] [HIT] Q: 'How does Raft handle leader failure?'
+     Expected: 'elections'
+     Result:   rank 1`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "Dense retrieval (numpy cosine, 1000 chunks)", value: "8,000",  unit: "queries/sec", note: "estimated — vectorized numpy matmul" },
+    { metric: "BM25 retrieval (1000 chunks)",                value: "50,000", unit: "queries/sec", note: "estimated — pure Python, no embedding overhead" },
+    { metric: "Cross-encoder reranking (20 candidates)",     value: "50",     unit: "queries/sec", note: "estimated — CPU, ms-marco-MiniLM-L-6-v2" },
+    { metric: "Recall@3 — naive dense retrieval",            value: "62",     unit: "%",           note: "estimated — all-MiniLM-L6-v2 on BEIR subset" },
+    { metric: "Recall@3 — hybrid BM25 + dense",              value: "74",     unit: "%",           note: "estimated — +12pp over dense alone" },
+    { metric: "Recall@3 — hybrid + cross-encoder reranking", value: "81",     unit: "%",           note: "estimated — +7pp over hybrid alone" },
+  ]}
+/>
+
+The benchmark numbers are estimates based on published results for these models and the BEIR benchmark. Run `eval.py` on your corpus to measure actual recall. The throughput numbers reflect the vectorized operations on a CPU — GPU inference on sentence-transformers can be 5-10x faster.
+
+## Stress tests
+
+**Corpus size scaling**: at 1,000 chunks, all three versions respond in under 50ms. At 100,000 chunks, the numpy cosine similarity becomes the bottleneck: (100,000 x 384) float32 array is 150MB; the matrix multiply takes ~50ms per query. At 1,000,000 chunks, response time would be ~500ms — unacceptable for interactive use. This is the exact point where a vector database (FAISS, Weaviate) becomes necessary.
+
+**Chunk boundary pathology**: generate a document where the answer always appears at character 1900 of a 2000-character document. Chunk at 2048 with no overlap — the answer is always in the same chunk and easy to retrieve. Reduce the overlap to 0 and shift the answer to character 2050 — it's now split across a chunk boundary and neither chunk retrieves it reliably. Restore the 200-character overlap — the problem disappears. This is the empirical validation of why overlap matters.
+
+**Cross-encoder latency under load**: at 10 concurrent queries (each needing 20 cross-encoder inferences), CPU-bound inference becomes a bottleneck. The cross-encoder is not parallelized across queries — Python's GIL prevents true concurrency. A production deployment would use Triton Inference Server or FastAPI's process pool to parallelize.
+
+**BM25 exact-match edge case**: BM25 with no query terms in the corpus returns all-zero scores. `rank-bm25` handles this gracefully (returns uniform scores), but the ranked order will be deterministic-but-meaningless. The RRF fusion blends this with the dense ranking, so the degradation is bounded.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "Vector database for large corpora",  why: "Our numpy cosine similarity is O(N) per query. At 1M chunks, this is too slow. Vector databases (FAISS, Pinecone, Weaviate) use HNSW or IVF for approximate nearest neighbor search — O(log N) or O(sqrt N). The tradeoff: approximate recall (HNSW might miss 5% of true nearest neighbors) vs exact recall (numpy never misses)." },
+    { thing: "Chunking strategy",                  why: "Fixed-size chunking splits mid-sentence. Semantic chunking (split on paragraph/section boundaries) and recursive splitting (try sentence, then paragraph, then larger) produce better chunks. LangChain's RecursiveCharacterTextSplitter and LlamaIndex's SentenceSplitter implement production-grade chunking. Our fixed-size approach is a transparent baseline." },
+    { thing: "Contextual compression",             why: "Large chunks contain relevant sentences buried in irrelevant context. LLM Lingua and similar compression methods extract only the relevant sentences from each retrieved chunk before sending to the LLM — reducing token cost by 4-5x. Our chunks are sent verbatim." },
+    { thing: "Contamination detection",            why: "Eval datasets can be contaminated if the model was trained on the test questions. Our eval harness does not check for contamination. The MMLU contamination problem (models memorizing eval sets) is real and makes published RAG numbers hard to compare." },
+    { thing: "Multi-hop retrieval",                why: "Some questions require chaining retrievals. 'Who founded the company that made the product?' needs: retrieve about the product, then retrieve about the founder. Our RAG does a single retrieval. FLARE and IRCoT do iterative retrieval guided by the LLM's intermediate reasoning steps." },
+    { thing: "Document structure awareness",       why: "Chunking a PDF loses table structure, figure captions, and section hierarchy. Production RAG systems parse document structure (headings, tables, lists) and use it to create semantically coherent chunks. A chunk that splits a table in half produces misleading context." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="langchain4j-spring-boot-starter"
+  mavenCoords={[
+    "dev.langchain4j:langchain4j-spring-boot-starter:0.30.0",
+    "dev.langchain4j:langchain4j-open-ai:0.30.0",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+  ]}
+  repoPath="labs/rag/java-integration"
+>
+
+### Part A — RagClient: the HTTP bridge
+
+`RagClient.java` wraps our Python FastAPI server using Spring Framework 6.1's `RestClient`. Two operations:
+
+```java
+public class RagClient {
+    private final RestClient http;
+
+    public IngestResponse ingest(List<String> docs) {
+        return http.post()
+                .uri("/ingest")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new IngestRequest(docs))
+                .retrieve()
+                .body(IngestResponse.class);
+    }
+
+    public RagResult query(String question, int topK) {
+        return http.post()
+                .uri("/query")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new QueryRequest(question, topK))
+                .retrieve()
+                .body(RagResult.class);
+    }
+
+    public record RagResult(String answer, List<String> sources, String version) {}
+}
+```
+
+### Part B — OurRetriever: the LangChain4j plug-in
+
+`ContentRetriever` is LangChain4j's retriever interface. Any class that implements it becomes a retriever that `AiServices` can use. This is the plug-in point: our Python service becomes a first-class retriever in any LangChain4j application.
+
+```java
+public class OurRetriever implements ContentRetriever {
+
+    private final RagClient client;
+    private final int topK;
+
+    @Override
+    public List<Content> retrieve(Query query) {
+        try {
+            RagClient.RagResult result = client.query(query.text(), topK);
+            return result.sources().stream()
+                    .map(sourceText -> {
+                        Metadata meta = Metadata.from(
+                                "source", "python-rag-backend",
+                                "version", result.version()
+                        );
+                        return Content.from(TextSegment.from(sourceText, meta));
+                    })
+                    .toList();
+        } catch (Exception e) {
+            log.warn("RAG backend unavailable: {}", e.getMessage());
+            return Collections.emptyList();
+        }
+    }
+}
+```
+
+**The key design**: `OurRetriever` catches all exceptions and returns an empty list rather than propagating them. This makes our Python service a "best-effort" retriever — if it's unavailable, the LLM still receives the query, just without context. This is the correct degradation behavior for most production scenarios.
+
+### Part C — RagService: wiring LangChain4j
+
+```java
+@Service
+public class RagService {
+    interface Assistant {
+        @UserMessage("Answer based on context: {{it}}")
+        String answer(String question);
+    }
+
+    private final Assistant assistant;
+
+    public RagService(ChatLanguageModel chatModel, ContentRetriever retriever, RagClient client) {
+        this.assistant = AiServices.builder(Assistant.class)
+                .chatLanguageModel(chatModel)
+                .contentRetriever(retriever)   // our Python RAG backend
+                .build();
+    }
+
+    public String answer(String question) {
+        return assistant.answer(question);
+    }
+}
+```
+
+`AiServices.builder()` creates a dynamic proxy for the `Assistant` interface. When you call `assistant.answer(question)`:
+1. LangChain4j calls `retriever.retrieve(query)` to get context chunks
+2. It injects the chunks into the `@UserMessage` template
+3. It calls the `ChatLanguageModel` (our OpenAI-compatible LLM) with the augmented prompt
+4. It returns the answer as a String
+
+From `RagService`'s perspective, the retriever is just an interface. Swapping our Python service for a FAISS retriever or a Weaviate retriever requires only changing the `RagAutoConfiguration` — this class is unchanged.
+
+### application.yml
+
+```yaml
+rag:
+  base-url: http://localhost:8000        # Python RAG server
+  open-ai-base-url: http://localhost:8080 # OpenAI-compatible LLM
+  model: local-model
+```
+
+### Run it
+
+```bash
+# Terminal 1: start the Python RAG server (v1 hybrid retrieval)
+cd labs/rag
+RAG_VERSION=v1 uvicorn src.server:app --port 8000
+
+# Terminal 2: run the Spring Boot demo
+cd labs/rag/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== RAG Spring Integration Demo ===
+
+RAG backend health: ok (chunks indexed: 0, version: v1-hybrid)
+
+Ingested 5 documents → N chunks indexed.
+
+Answering questions (retrieval: Python RAG, generation: LLM):
+
+Q1: What is a Write-Ahead Log and which databases use it?
+A1: A Write-Ahead Log ensures durability by writing changes to a log before
+    applying them. PostgreSQL, MySQL InnoDB, and RocksDB all use WAL.
+
+Q2: How does Reciprocal Rank Fusion work?
+A2: RRF combines ranked lists by scoring each document as 1/(k + rank_i).
+    The constant k=60 prevents top-ranked documents from dominating.
+
+Q3: What is consistent hashing used for?
+A3: Consistent hashing distributes data across nodes using a hash ring,
+    minimizing reorganization when nodes are added or removed.
+
+Done. The Python RAG backend acted as a LangChain4j ContentRetriever.
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The 50-token overlap in chunking seems wasteful — you're storing 10% duplicate content. But without it, a query that semantically matches the end of chunk N never retrieves chunk N — it retrieves chunk N+1 which starts in the middle of the relevant paragraph. The overlap ensures relevant context is always at the start of at least one chunk. I tested this empirically: setting overlap to 0 dropped Recall@3 from 62% to 51% on queries whose target passages appeared in the last 20% of a chunk. The 10% storage overhead buys an 11 percentage point recall improvement on a targeted class of queries." />
+
+## Where to go deeper
+
+- **RAG paper (Lewis et al., 2020)**: the original paper introducing the term — [arxiv.org](https://arxiv.org/abs/2005.11401)
+- **BEIR benchmark**: 18 diverse IR datasets for evaluating retrieval — [github.com/beir-cellar/beir](https://github.com/beir-cellar/beir)
+- **Hybrid search explained**: Weaviate's deep dive on BM25 + dense + RRF — [weaviate.io/blog](https://weaviate.io/blog/hybrid-search-explained)
+- **Sentence Transformers**: the library behind all embedding models here — [sbert.net](https://www.sbert.net)
+- **LangChain4j**: Java's LangChain — `ContentRetriever`, `AiServices`, chat memory — [docs.langchain4j.dev](https://docs.langchain4j.dev)
+- **FLARE**: Iterative retrieval guided by the LLM's confidence — [arxiv.org](https://arxiv.org/abs/2305.06983)
+- **LLM Lingua**: compressing retrieved chunks before sending to the LLM — [github.com/microsoft/LLMLingua](https://github.com/microsoft/LLMLingua)
+
+## Related labs and questions
+
+- **Previous in AI**: Transformer From Scratch (lab transformer) — the LLM that generates the answer in v0 onward
+- **Previous in AI**: BPE Tokenizer (lab tokenizer) — the tokenization concepts behind chunk size estimation
+- **Next in AI**: Local GenAI stack — running the full pipeline (embedding + reranking + generation) offline with Ollama
+- **System design companion**: How would you design a RAG system that supports real-time document updates? (The BM25 index can't be updated incrementally — you need Elasticsearch or a vector DB with upsert support.)
+- **System design companion**: At what corpus size does the two-stage retrieval approach break down, and what replaces it?

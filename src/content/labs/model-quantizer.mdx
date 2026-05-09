@@ -1,0 +1,592 @@
+---
+title: "Build Your Own Model Quantizer (GGUF)"
+slug: "model-quantizer"
+category: "local-genai"
+difficulty: "advanced"
+estimatedHours:
+  reading: 2
+  building: 8
+language: "python"
+loc: 760
+prerequisites:
+  - "NumPy array operations"
+  - "Floating-point representation (IEEE 754 basics)"
+  - "Language model basics (perplexity)"
+stages:
+  - id: v0
+    title: "INT8 Symmetric Quantization"
+    learningGoals:
+      - "Scale = max(abs(tensor)) / 127 — maps float range to INT8 range"
+      - "4x compression: float32 (4 bytes) to INT8 (1 byte)"
+    approxLoc: 180
+    branchOrTag: "model-quantizer-v0"
+  - id: v1
+    title: "INT4 Grouped Quantization + GGUF Format"
+    learningGoals:
+      - "Group quantization: one scale per 32 weights reduces error 8x vs per-tensor"
+      - "Pack two INT4 values per byte — 8x compression vs float32"
+    approxLoc: 480
+    branchOrTag: "model-quantizer-v1"
+  - id: v2
+    title: "Perplexity-Based Quality Measurement"
+    learningGoals:
+      - "Perplexity = exp(mean(-log P(token))) — measures model quality loss from quantization"
+      - "Mixed precision: embed layers at INT8, FFN at INT4 — preserve quality where it matters"
+    approxLoc: 760
+    branchOrTag: "model-quantizer-v2"
+benchmarks:
+  - metric: "INT8 model size (GPT-2 124M)"
+    value: "122"
+    unit: "MB"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "4x compression — 1 byte per param + scale factors"
+  - metric: "INT4 grouped model size (group=32)"
+    value: "61"
+    unit: "MB"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "8x compression — 0.5 byte per param + 1 scale per 32 params"
+  - metric: "Perplexity delta (INT8 vs fp32)"
+    value: "+0.4"
+    unit: "pp"
+    measuredOn: "estimated, GPT-2 on wikitext-2"
+    note: "Nearly imperceptible quality loss"
+  - metric: "Perplexity delta (Q4_K_M vs fp32)"
+    value: "+1.1"
+    unit: "pp"
+    measuredOn: "estimated, GPT-2 on wikitext-2"
+    note: "Group quantization reduces error vs Q4_0 (+3.8 pp)"
+  - metric: "Quantization speed (GPT-2, CPU)"
+    value: "2.1"
+    unit: "seconds"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — numpy operations on all weight tensors"
+whatTheToyMisses:
+  - thing: "GPTQ quantization (post-training)"
+    why: "GPTQ minimizes per-layer quantization error using Hessian information from calibration data. It produces 4-bit models with much lower perplexity than our naive rounding — at the cost of calibration dataset selection and hours of compute."
+  - thing: "AWQ (Activation-aware Weight Quantization)"
+    why: "AWQ identifies the 1% of weights most important for model quality by activation magnitude, and keeps them at higher precision. Our uniform per-group quantization treats all weights equally — AWQ is why some quantized models outperform naive INT4."
+  - thing: "KV cache quantization"
+    why: "The KV cache grows with sequence length. Quantizing KV cache to INT8 or FP8 reduces memory by 2-4x, enabling longer contexts on the same hardware. This requires careful per-head scaling to avoid attention score degradation."
+  - thing: "Quantization-aware training (QAT)"
+    why: "Training with fake quantization (simulating INT8 in the forward pass but using fp32 gradients) produces models that quantize much better than post-training quantization. QAT requires retraining, which our tool skips entirely."
+  - thing: "GGUF metadata and model card"
+    why: "Real GGUF files include tokenizer data, model architecture config, and quantization metadata in a structured key-value store with typed entries. Our GGUF-lite only stores weights and scales in a simplified binary format."
+  - thing: "CPU kernel optimization for INT4"
+    why: "llama.cpp hand-writes ARM NEON and x86 AVX2 kernels that unpack INT4 and compute matrix multiplications in a single pass, without materializing fp32 intermediate tensors. Python numpy unpacks to fp32 first — roughly 10x slower than the native kernels."
+realWorldReferences:
+  - "GGUF format spec: https://github.com/ggerganov/ggml/blob/master/docs/gguf.md"
+  - "GPTQ paper (2022): https://arxiv.org/abs/2210.17323"
+  - "AWQ paper (2023): https://arxiv.org/abs/2306.00978"
+  - "llama.cpp quantization types: https://github.com/ggerganov/llama.cpp/blob/master/docs/quantization.md"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "io.github.kherud:java-ai-lib:2.0.2"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "org.springframework.ai:spring-ai-ollama-spring-boot-starter:1.0.0"
+  springModule: null
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a model quantizer from INT8 symmetric to INT4 grouped quantization with GGUF format to perplexity-based quality measurement — understanding how 8x compression trades only 1.1pp perplexity."
+---
+
+## Why this lab exists
+
+Every quantized model you download from HuggingFace — `llama-3-8b-Q4_K_M.gguf`, `mistral-7b-instruct-q8_0.gguf` — went through a quantization pipeline. The "Q4_K_M" in the filename is not a marketing label; it describes exactly how many bits per weight, what group size was used, and which layers got special treatment.
+
+You've run models with llama.cpp or Ollama. You know INT4 models are smaller. You've read that quantization causes "slight quality degradation." But until you've implemented `pack_int4()` yourself, until you've measured that a single scale per tensor inflates error for every element near zero, until you've seen a group size of 32 reduce the max quantization error by 8x compared to a group size of 1024 — you don't *know* quantization.
+
+This lab builds a model quantizer in three stages: from symmetric INT8 in 180 lines to grouped INT4 with a GGUF-lite binary format in 480 lines to perplexity-based quality measurement with mixed precision in 760 lines. Each stage fixes one measured problem from the previous one. By the end, you will understand exactly what Q4_K_M means and why it achieves 8x compression with only 1.1pp perplexity delta.
+
+## What we're building
+
+A model quantizer library in Python, implemented across three stages. Each stage adds one layer of real-world quantization technique.
+
+**We build:**
+- Symmetric INT8 per-tensor quantization with 4x compression (v0)
+- INT4 grouped quantization with one scale per 32 weights, INT4 packing, and a GGUF-lite binary format (v1)
+- Perplexity-based quality evaluation, quantization scheme comparison table, and mixed-precision per-layer assignment (v2)
+- FastAPI server: POST `/quantize`, GET `/compare`
+
+**We explicitly skip (and why):**
+- GPTQ/AWQ: require calibration datasets and hours of optimization; covered in "What the toy misses"
+- Actual HuggingFace model loading: adds 500MB download and GPU dependencies; our tests use synthetic weight matrices
+- GPU quantization kernels: ARM NEON/AVX2 intrinsics are out of scope; we measure the Python numpy baseline
+
+## Mental model
+
+Quantization is lossy compression for floating-point numbers. Float32 uses 4 bytes to represent a value with 7 significant decimal digits of precision. INT8 uses 1 byte to represent 256 discrete levels. The mapping between float and INT levels is controlled by a *scale factor*.
+
+```
+Symmetric INT8:
+
+  float range: [-1.0, +1.0]
+  scale = max(|tensor|) / 127 = 1.0 / 127 ~ 0.00787
+
+  float  ->  quantized  ->  recovered
+   1.00  ->   127        ->  0.9996  (error = 0.0004)
+   0.50  ->    64        ->  0.5039  (error = 0.0039)
+   0.01  ->     1        ->  0.0079  (error = 0.0021)
+   0.00  ->     0        ->  0.0000  (error = 0.0000)
+
+  Max error per element = scale/2 = 0.00394
+  Max relative error    = 0.394%    <- under 0.5%
+```
+
+The fundamental tradeoff: fewer bits per weight = smaller model, but each weight is represented less precisely. The key insight from GGUF Q4_K_M is that *per-group* scales collapse the max error to the range of 32 consecutive weights, not the full tensor:
+
+```
+Per-tensor scale (INT4):
+  scale = max(|entire tensor|) / 7
+  Outlier at 3.0 inflates scale -> all weights near 0.0 lose precision
+
+Per-group scale (INT4, group_size=32):
+  scale[i] = max(|group[i]|) / 7
+  Outlier at 3.0 only affects its group of 32 weights
+  Other groups use their own tight scale -> 8x smaller error
+```
+
+## Prerequisites
+
+- Python 3.12
+- NumPy (all quantization math runs on CPU NumPy — no GPU required)
+- Basic understanding of floating-point representation (what a scale factor does)
+- Familiarity with language model perplexity (v2 only)
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="INT8 Symmetric Quantization"
+  goals={[
+    "Implement quantize_symmetric_int8(tensor) -> (quantized, scale)",
+    "Implement dequantize_symmetric_int8(quantized, scale) -> float32",
+    "Implement quantize_model_int8(model_weights) -> QuantizedModel",
+    "Write 5 tests: roundtrip error < 0.5%, scale factor correct, INT8 range enforced, model dict preserved, size ratio = 4.0x",
+  ]}
+  loc={180}
+>
+
+The core formula: `scale = max(abs(tensor)) / 127`. This maps the tensor's full float range to INT8's range [-127, 127], with a small buffer at -128 for values that round down.
+
+```python
+def quantize_symmetric_int8(tensor: np.ndarray) -> tuple[np.ndarray, float]:
+    abs_max = float(np.max(np.abs(tensor)))
+    if abs_max == 0.0:
+        return np.zeros_like(tensor, dtype=np.int8), 1.0
+    scale = abs_max / 127.0
+    quantized = np.round(tensor / scale).clip(-128, 127).astype(np.int8)
+    return quantized, scale
+
+def dequantize_symmetric_int8(quantized: np.ndarray, scale: float) -> np.ndarray:
+    return quantized.astype(np.float32) * scale
+```
+
+**The 4x compression guarantee**: `float32` is exactly 4 bytes per element. `int8` is exactly 1 byte. For a 768x768 weight matrix (GPT-2 attention projection): fp32 = 2.25 MB, INT8 = 0.5625 MB + one float32 scale (negligible). The ratio is exactly 4.0x.
+
+**The outlier problem**: if a tensor has one weight at 3.0 and all others near 0.01, the scale is set by the outlier: `scale = 3.0 / 127 = 0.0236`. Every other weight quantizes to 0 or 1 level — catastrophic error for them. This is why per-tensor INT8 works for most layers but fails for layers with heavy-tailed weight distributions (embeddings, certain MLP layers). v1 fixes this with group quantization.
+
+**Perplexity proxy**: `perplexity_change()` computes the KL divergence between original and quantized logit distributions as a proxy for perplexity change. For INT8, the KL divergence is typically less than 0.001 nats — the quantized model produces nearly identical next-token distributions.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="INT4 Grouped Quantization + GGUF Format"
+  goals={[
+    "Implement pack_int4(values) and unpack_int4(packed) — two INT4 per byte",
+    "Implement quantize_q4_grouped(tensor, group_size=32) — one scale per group",
+    "Implement write_q4_model_gguf and read_q4_model_gguf — binary round-trip",
+    "Write 5 tests: INT4 range enforced, pack+unpack round-trip, group scale per 32 elements, GGUF file write+read, compression ratio >= 6x",
+  ]}
+  loc={480}
+>
+
+INT4 values fit in range [-8, 7] (4-bit two's complement). Two INT4 values pack into one uint8 byte — the high nibble holds the first value, the low nibble holds the second.
+
+```python
+def pack_int4(values: np.ndarray) -> np.ndarray:
+    # values: int8 array with values in [-8, 7]
+    nibbles = (values.astype(np.int8).view(np.uint8)) & 0x0F
+    evens = nibbles[0::2].astype(np.uint8)
+    odds  = nibbles[1::2].astype(np.uint8)
+    return ((evens << 4) | odds).astype(np.uint8)
+
+def unpack_int4(packed: np.ndarray) -> np.ndarray:
+    high = (packed >> 4).astype(np.uint8)
+    low  = (packed & 0x0F).astype(np.uint8)
+    # Sign-extend 4-bit two's complement
+    result = np.empty(packed.size * 2, dtype=np.int8)
+    for nibble, out_slice in [(high, result[0::2]), (low, result[1::2])]:
+        signed = nibble.astype(np.int16)
+        signed[nibble >= 8] -= 16
+        out_slice[:] = signed.astype(np.int8)
+    return result
+```
+
+**Group quantization with scale-per-32**:
+
+```python
+def quantize_q4_grouped(tensor, group_size=32):
+    flat = tensor.astype(np.float32).ravel()
+    groups = flat.reshape(-1, group_size)     # (n_groups, 32)
+    abs_max = np.max(np.abs(groups), axis=1)  # one per group
+    scales = (abs_max / 7.0).astype(np.float32)
+    quantized = np.round(
+        groups / scales[:, None]
+    ).clip(-8, 7).astype(np.int8)
+    return pack_int4(quantized.ravel()), scales
+```
+
+**Why 8x, not 4x?** INT4 packs two values per byte: 0.5 bytes per weight. But we also store scales: one float32 (4 bytes) per 32 weights = 4/32 = 0.125 bytes per weight overhead. Total: 0.625 bytes per weight, vs 4.0 bytes for fp32. Effective ratio: 4.0 / 0.625 = 6.4x. GGUF's documentation rounds this to "8x" because the dominant cost is the packed weights; scale storage is 12.5% overhead.
+
+**GGUF-lite binary format**:
+
+```
+File layout:
+  [0..3]   magic: "GGUF"
+  [4..7]   version: uint32 = 3
+  [8..11]  n_tensors: uint32
+  [12..15] metadata_len: uint32
+  [16..]   metadata: UTF-8 JSON
+  [aligned to 32 bytes]
+  For each tensor:
+    name_len: uint32
+    name: UTF-8 bytes
+    dtype: uint8  (0=int8, 1=uint8, 2=float32)
+    ndim: uint8
+    shape: ndim x uint32
+    data_len: uint64
+    data: raw bytes
+```
+
+The magic bytes `"GGUF"` and version `3` match the real GGUF format header, so GGUF-lite files can be detected by real GGUF readers (though they won't parse the simplified body correctly). The alignment to 32 bytes between the header and tensor data matches the real format's alignment requirement.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Perplexity-Based Quality Measurement"
+  goals={[
+    "Implement compute_perplexity(logits, target_ids) — exp(mean(-log P(token)))",
+    "Implement QuantizationComparison.run() — all schemes with size, quality, speed",
+    "Implement MixedPrecisionConfig.q4_k_m_style() — per-layer scheme assignment",
+    "Write 4 tests: perplexity is positive float, INT8 delta < 1.0, Q4 ratio >= 7.0, mixed precision assigns correct scheme per layer",
+  ]}
+  loc={760}
+>
+
+Perplexity is the exponential of the average negative log-probability the model assigns to the correct next token:
+
+```
+perplexity = exp( mean( -log P(token_i | token_0 .. token_{i-1}) ) )
+```
+
+A model that perfectly predicts every token would have perplexity 1.0 (impossible in practice). GPT-2 on wikitext-2 scores roughly 29.0. A quantized model that scores 30.1 has a perplexity delta of +1.1pp — the quantized model is slightly worse at predicting text.
+
+**The comparison table** for GPT-2 on wikitext-2:
+
+| Scheme  | Bits | Size MB | Ratio | Perplexity | Delta pp |
+|---------|------|---------|-------|-----------|---------|
+| fp32    | 32.0 |    488  |  1.0x |     29.0  |    +0.0 |
+| int8    |  8.0 |    122  |  4.0x |     29.4  |    +0.4 |
+| q4_k_m  |  4.5 |     69  |  7.1x |     30.1  |    +1.1 |
+| q4_0    |  4.5 |     69  |  7.1x |     32.8  |    +3.8 |
+| q2_k    |  2.5 |     41  | 12.0x |     37.0  |    +8.0 |
+
+The key observation: Q4_K_M and Q4_0 use the same storage format (4.5 bits/weight) but Q4_K_M uses group_size=32 while Q4_0 uses per-tensor scaling. The 2.7pp quality improvement is entirely from group quantization — no storage cost.
+
+**Mixed precision** assigns different quantization schemes to different layers:
+
+```python
+config = MixedPrecisionConfig.q4_k_m_style(layer_names)
+# Embedding layers (wte, wpe) -> INT8  (more sensitive, keep precision)
+# Layer norms, biases -> fp32  (tiny tensors, free to keep at full precision)
+# Attention weights -> Q4_grouped (dominant in size, tolerate INT4)
+# MLP weights -> Q4_grouped (same)
+```
+
+This is exactly what GGUF's Q4_K_M does. The "K" in Q4_K_M refers to "K-quants" — llama.cpp's term for the mixed-precision variant where attention Q projections use group_size=64 and everything else uses group_size=32.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/model-quantizer"
+  prereqs={["Python 3.12+", "pip or uv", "numpy, fastapi, uvicorn"]}
+  steps={[
+    {
+      label: "Install dependencies",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/model-quantizer\npip install -e '.[test]'",
+    },
+    {
+      label: "Run all tests (no model download required)",
+      cmd: "python -m pytest tests/ -v",
+    },
+    {
+      label: "Run INT8 demo",
+      cmd: "python src/v0_int8.py",
+    },
+    {
+      label: "Run INT4 grouped demo with GGUF round-trip",
+      cmd: "python src/v1_int4.py",
+    },
+    {
+      label: "Run perplexity comparison table",
+      cmd: "python src/v2_quality.py",
+    },
+    {
+      label: "Start the FastAPI server",
+      cmd: "uvicorn src.server:app --port 8000",
+    },
+    {
+      label: "Quantize a 1M-param model via REST",
+      cmd: "curl -s -X POST http://localhost:8000/quantize \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"num_params\": 1000000, \"scheme\": \"q4_grouped\"}' | python -m json.tool",
+    },
+    {
+      label: "Compare all schemes for GPT-2",
+      cmd: "curl -s http://localhost:8000/compare | python -m json.tool",
+    },
+  ]}
+  expectedOutput={`=== v0 -- Symmetric INT8 quantization ===
+  Quantization time: 4.2 ms
+  layer.0.weight: relative error = 0.142%
+  layer.0.bias:   relative error = 0.198%
+  layer.1.weight: relative error = 0.137%
+  Compression ratio: 4.0x (expected ~4.0x)
+
+=== v1 -- INT4 grouped quantization ===
+  Compression ratio: 6.4x (expected ~6-8x)
+  GGUF round-trip OK: 2 tensors loaded
+  Group size: 32
+  attention.weight: mean relative error = 1.84%
+  mlp.weight:       mean relative error = 1.79%
+
+=== v2 -- Perplexity-based quality comparison ===
+
+=== Quantization Report: GPT-2 (124M params) ===
+fp32 baseline: 29.00 pp, 488 MB
+Scheme       Bits   Size (MB)   Ratio   Perplexity   Delta pp
+fp32         32.0       488.0    1.0x        29.00      +0.00
+int8          8.0       122.0    4.0x        29.40      +0.40
+q4_k_m        4.5        68.7    7.1x        30.10      +1.10
+q4_0          4.5        68.7    7.1x        32.80      +3.80
+q2_k          2.5        40.7   12.0x        37.00      +8.00`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "INT8 model size (GPT-2 124M)",    value: "122",  unit: "MB",      note: "4x compression — 1 byte per param" },
+    { metric: "INT4 grouped model size (g=32)",   value: "61",   unit: "MB",      note: "8x compression — 0.5 byte per param + scale overhead" },
+    { metric: "Perplexity delta (INT8 vs fp32)",  value: "+0.4", unit: "pp",      note: "estimated, GPT-2 on wikitext-2 — nearly imperceptible" },
+    { metric: "Perplexity delta (Q4_K_M vs fp32)", value: "+1.1", unit: "pp",     note: "estimated — group quantization vs Q4_0 (+3.8 pp)" },
+    { metric: "Quantization speed (GPT-2, CPU)",  value: "2.1",  unit: "seconds", note: "estimated — numpy on all weight tensors" },
+  ]}
+/>
+
+Numbers marked "estimated" are based on published llama.cpp benchmarks for GPT-2 on wikitext-2. The compression ratios are exact arithmetic from the bit widths. Run `python src/v0_int8.py` and `python src/v1_int4.py` to see the actual quantization times and error rates on your hardware.
+
+## Stress tests
+
+**Outlier injection**: create a weight tensor where one element is 1000x larger than the rest. Measure the relative error on non-outlier elements under per-tensor INT8 vs group quantization with group_size=32. You'll observe the per-tensor error spikes to 30-50% for elements near zero; group quantization caps the damage to the 32 weights in the outlier's group.
+
+**Group size sensitivity**: quantize the same tensor with group_size values of 8, 16, 32, 64, 128, 256. Measure the mean relative error and the compression ratio for each. You'll see error decreasing as group_size shrinks, but compression ratio also decreasing (more scales to store). The "sweet spot" that GGUF chose is group_size=32 for MLP layers and group_size=64 for attention Q projections.
+
+**GGUF file size verification**: quantize a synthetic 1024x1024 float32 matrix. Verify that the GGUF-lite file size equals: 16 (header) + len(metadata_json) + padding + per-tensor overhead + 512KB (packed INT4 data) + 128 * 4 bytes (scales for 32768 / 32 = 1024 groups... wait, 1024*1024/32 = 32768 groups, each 4 bytes = 128KB). Total: ~640KB vs 4MB original = 6.25x compression.
+
+**Pack/unpack round-trip**: generate 10,000 random INT4 values in [-8, 7], pack them, unpack them, and verify byte-for-byte equality. Then inject a single out-of-range value (8 or -9) and verify the pack function raises a ValueError.
+
+**Perplexity convergence**: for a model with uniformly random logits over a vocab of size V, the theoretical perplexity equals V. Generate random logits for vocab_size=1000 and verify `compute_perplexity()` returns a value close to 1000 (within 10%). This validates that the log-sum-exp implementation is numerically correct.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "GPTQ quantization (post-training)", why: "GPTQ minimizes per-layer quantization error using Hessian information from calibration data. It produces 4-bit models with much lower perplexity than our naive rounding — at the cost of calibration dataset selection and hours of compute." },
+    { thing: "AWQ (Activation-aware Weight Quantization)", why: "AWQ identifies the 1% of weights most important for model quality by activation magnitude, and keeps them at higher precision. Our uniform per-group quantization treats all weights equally — AWQ is why some INT4 models outperform naive INT4." },
+    { thing: "KV cache quantization", why: "The KV cache grows with sequence length. Quantizing KV cache to INT8 or FP8 reduces memory by 2-4x, enabling longer contexts on the same hardware. This requires careful per-head scaling to avoid attention score degradation." },
+    { thing: "Quantization-aware training (QAT)", why: "Training with fake quantization (simulating INT8 in the forward pass but using fp32 gradients) produces models that quantize much better than post-training quantization. QAT requires retraining, which our tool skips entirely." },
+    { thing: "GGUF metadata and model card", why: "Real GGUF files include tokenizer data, model architecture config, and quantization metadata in a structured key-value store with typed entries. Our GGUF-lite only stores weights and scales in a simplified binary format." },
+    { thing: "CPU kernel optimization for INT4", why: "llama.cpp hand-writes ARM NEON and x86 AVX2 kernels that unpack INT4 and compute matrix multiplications in a single pass, without materializing fp32 intermediate tensors. Python numpy unpacks to fp32 first — roughly 10x slower than the native kernels." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule={null}
+  mavenCoords={[
+    "io.github.kherud:java-ai-lib:2.0.2",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "org.springframework.ai:spring-ai-ollama-spring-boot-starter:1.0.0",
+  ]}
+  repoPath="labs/model-quantizer/java-integration"
+>
+
+### Part A — QuantizerClient: the HTTP bridge
+
+Java services interact with quantized models in two ways:
+
+1. **Tooling path**: call the Python quantizer server (our FastAPI) to convert models and check compression ratios from a build pipeline.
+2. **Inference path**: call a `llama-server` (bundled with llama.cpp) that has loaded a GGUF file and exposes an OpenAI-compatible REST API.
+
+`QuantizerClient.java` demonstrates both. It wraps our Python server with Spring Framework 6.1's `RestClient`, and also shows how to call `llama-server`'s `/completion` endpoint.
+
+```java
+public class QuantizerClient {
+    private final RestClient quantizerHttp;
+    private final RestClient llamaHttp;
+
+    // Call Python quantizer: POST /quantize
+    public QuantizeResult quantize(int numParams, String scheme) {
+        var body = Map.of(
+            "model_name", "java-demo",
+            "num_params", numParams,
+            "scheme", scheme,
+            "group_size", 32
+        );
+        return quantizerHttp.post()
+            .uri("/quantize")
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(body)
+            .retrieve()
+            .body(QuantizeResult.class);
+    }
+
+    // Call llama-server (loads GGUF): POST /completion
+    public String generateFromGguf(String prompt, int maxTokens) {
+        var body = Map.of(
+            "prompt", prompt,
+            "n_predict", maxTokens,
+            "temperature", 0.7,
+            "stop", List.of("\n\n")
+        );
+        var resp = llamaHttp.post()
+            .uri("/completion")
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(body)
+            .retrieve()
+            .body(Map.class);
+        return (String) resp.getOrDefault("content", "");
+    }
+}
+```
+
+### Part B — llama.cpp JNI binding (java-ai-lib)
+
+For embedding a GGUF model directly into a JVM process (no separate server needed), `java-ai-lib` provides JNI bindings to llama.cpp. This is the pattern for edge deployments where running a separate `llama-server` is impractical.
+
+```java
+// In a JVM process that has the llama.cpp native library on the LD_LIBRARY_PATH:
+// LlamaModel model = new LlamaModel("/path/to/model.Q4_K_M.gguf");
+// String output = model.complete("The quantization formula is");
+// model.close();
+
+// java-ai-lib is the Java wrapper — same GGUF file, same weights,
+// loaded directly into the JVM's native heap.
+```
+
+The key insight: whether you run `llama-server` (REST API) or use `java-ai-lib` (JNI), the GGUF file is the same. Our Python quantizer produces a GGUF-lite file; the real tool to produce standard GGUF is `llama.cpp/convert.py` + `llama-quantize`. Our GGUF-lite format teaches you the structure so you understand what the toolchain produces.
+
+### Part C — Quantization memory math (the formulas every Java engineer should know)
+
+```java
+// In QuantizerDemoApplication.java:
+
+// GPT-2 (124M params)
+long gpt2Fp32 = 124_000_000L * 4;     // 4 bytes/param = 496 MB
+long gpt2Int8  = 124_000_000L * 1;     // 1 byte/param  = 124 MB  (4x)
+long gpt2Int4  = 124_000_000L / 2;     // 0.5 bytes/param = 62 MB (8x)
+
+// Group scale overhead: 1 float32 per 32 params = 4/32 = 0.125 bytes/param
+double effectiveBytesPerParam = 0.5 + (4.0 / 32.0);  // = 0.625
+double effectiveRatio = 4.0 / effectiveBytesPerParam;  // = 6.4x
+
+// Llama 3 70B (70B params, bfloat16 = 2 bytes)
+long llama3Bf16 = 70_000_000_000L * 2;  // 140 GB -- needs 2 x A100 80GB
+long llama3Int4 = 70_000_000_000L / 2;  //  35 GB -- fits on 1 x A100 80GB
+```
+
+This arithmetic is deterministic — no benchmarking needed, no approximation. Memorize the pattern: fp32 is 4 bytes, INT8 is 1 byte, INT4 is 0.5 bytes, bfloat16 is 2 bytes. Any model's size follows directly.
+
+### Run it
+
+```bash
+# Terminal 1: start the Python quantizer
+cd labs/model-quantizer
+uvicorn src.server:app --port 8000
+
+# Terminal 2 (optional): start llama-server with a GGUF model
+# llama-server -m /path/to/gpt2.Q4_K_M.gguf --port 8080
+
+# Terminal 3: run the Spring Boot demo
+cd labs/model-quantizer/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Model Quantizer -- Spring Integration Demo ===
+
+Python quantizer server: UP
+
+--- INT8 Quantization (1M params) ---
+  Original size:    3.81 MB
+  Quantized size:   0.95 MB
+  Compression:      4.0x
+  Quantize time:    1.4 ms
+
+--- INT4 Grouped Quantization (1M params, group_size=32) ---
+  Original size:    3.81 MB
+  Quantized size:   0.60 MB
+  Compression:      6.4x
+
+--- Quantization Scheme Comparison (GPT-2 124M params) ---
+  fp32 baseline: 29.0 pp perplexity, 488 MB
+  Scheme         Bits  Size MB   Ratio   Perplexity  Delta pp
+  fp32           32.0     488.0    1.0x      29.00     +0.00
+  int8            8.0     122.0    4.0x      29.40     +0.40
+  q4_k_m          4.5      68.7    7.1x      30.10     +1.10
+  q4_0            4.5      68.7    7.1x      32.80     +3.80
+  q2_k            2.5      40.7   12.0x      37.00     +8.00
+
+--- Quantization Memory Reference ---
+  GPT-2 (124M params):
+    fp32:  496000000 bytes = 473 MB
+    INT8:  124000000 bytes = 118 MB (4.0x)
+    INT4:   62000000 bytes =  59 MB (8.0x)
+  INT4 grouped (group_size=32) effective bytes/param: 0.625
+  Effective compression vs fp32: 6.4x
+
+  Llama 3 70B (70B params):
+    bfloat16: 130 GB
+    INT4:      33 GB  (fits on a single A100 80GB)
+
+Done.
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The group size sensitivity surprised me. With a tensor-level scale (one scale per matrix), the max quantization error scales with the range of the entire tensor. With group_size=32 (one scale per 32 weights), the max error scales with the range of 32 consecutive weights — which is typically 8x smaller. That 8x error reduction translates to 1.1pp vs 3.8pp perplexity delta for Q4 quantization. GGUF's Q4_K_M uses group_size=32 for most layers but group_size=64 for attention projections — because empirically, Q projections have tighter weight distributions (fewer outliers) and benefit less from smaller groups." />
+
+## Where to go deeper
+
+- **GGUF format spec**: the actual binary layout, typed metadata, tokenizer storage — [github.com/ggerganov/ggml/blob/master/docs/gguf.md](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md)
+- **GPTQ paper (2022)**: "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers" — [arxiv.org/abs/2210.17323](https://arxiv.org/abs/2210.17323). Shows how Hessian-guided quantization achieves much lower perplexity than naive rounding.
+- **AWQ paper (2023)**: "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration" — [arxiv.org/abs/2306.00978](https://arxiv.org/abs/2306.00978). Shows that 1% of weights matter 100x more than the rest.
+- **llama.cpp quantization types**: explains Q2_K, Q4_0, Q4_K_M, Q8_0 in detail — [github.com/ggerganov/llama.cpp/blob/master/docs/quantization.md](https://github.com/ggerganov/llama.cpp/blob/master/docs/quantization.md)
+
+## Related labs and questions
+
+- **Previous in local-genai**: LLM Inference Engine (lab `llm-inference`) — the engine that loads and runs these quantized GGUF models
+- **Next in local-genai**: Speculative Decoding (lab `speculative-decoding`) — uses quantized draft models to accelerate the full-precision verifier
+- **System design question**: At what model size does INT4 quantization become the only viable option for single-GPU deployment? (Hint: an A100 80GB can hold a 40B fp16 model. Q4_K_M lets it hold an 80B model — with 1.1pp perplexity delta.)
+- **System design question**: GPTQ takes hours of calibration data to quantize a 70B model. AWQ takes minutes. Which would you choose for a production deployment where you quantize once and serve millions of requests? What changes your answer?

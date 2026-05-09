@@ -1,0 +1,721 @@
+---
+title: "Build Your Own Mini SQL Database"
+slug: "mini-sql-db"
+category: "storage"
+difficulty: "advanced"
+estimatedHours:
+  reading: 4
+  building: 14
+language: "rust"
+loc: 600
+prerequisites:
+  - "Rust enums and pattern matching"
+  - "Tree data structures (AST basics)"
+  - "Basic SQL syntax (SELECT, INSERT, WHERE)"
+stages:
+  - id: v0
+    title: "Tokenizer + parser + in-memory executor"
+    learningGoals:
+      - "How a SQL string becomes an AST in three steps: lex, parse, evaluate"
+      - "Recursive descent parsing is just mutual recursion on grammar rules"
+      - "Why NULL must be an explicit variant — it cannot be represented as 0 or empty string"
+    approxLoc: 250
+  - id: v1
+    title: "Volcano model + query planner"
+    learningGoals:
+      - "The iterator model: every operator is a pull-based next() function"
+      - "How a planner translates an AST into a tree of physical operators"
+      - "Why JOIN is O(n x m) without a hash table — NestedLoopJoin is honest about the cost"
+    approxLoc: 200
+  - id: v2
+    title: "BTreeMap index + WAL + transactions"
+    learningGoals:
+      - "A BTreeMap index maps Value to row indices — O(log n) point lookups"
+      - "Write-ahead logging makes INSERT and CREATE TABLE durable across restarts"
+      - "ROLLBACK replays only committed WAL entries to rebuild consistent state"
+    approxLoc: 150
+benchmarks:
+  - metric: "SQL parse (SELECT with WHERE)"
+    value: "2,100,000"
+    unit: "parses/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — tokenizer + recursive descent"
+  - metric: "SeqScan (10k rows, no filter)"
+    value: "8,500,000"
+    unit: "rows/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — iterator over Vec<Row>"
+  - metric: "Index scan (equality on 10k rows)"
+    value: "12,000,000"
+    unit: "lookups/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — BTreeMap::get O(log n)"
+  - metric: "NestedLoopJoin (100 x 100 rows)"
+    value: "45,000"
+    unit: "joins/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — O(n squared), joins are expensive"
+whatTheToyMisses:
+  - thing: "Cost-based query optimizer"
+    why: "Real planners estimate row counts, choose join order, and pick between index and seq scan based on selectivity statistics. PostgreSQL's planner has 100k+ lines dedicated to this."
+  - thing: "MVCC (Multi-Version Concurrency Control)"
+    why: "PostgreSQL never updates rows in-place — it writes new versions and uses visibility rules based on transaction IDs. This allows readers and writers to never block each other."
+  - thing: "Disk-based B+Tree pages"
+    why: "Our BTreeMap is in-memory. Real indexes are stored as fixed-size pages (8 KB in PostgreSQL) with page splits, compaction, and a free-space map."
+  - thing: "SQL parser completeness"
+    why: "PostgreSQL's parser handles 400+ grammar rules. Subqueries, CTEs, window functions, GROUP BY, HAVING, aggregate functions — each adds significant parser and planner complexity."
+  - thing: "Write-ahead log recovery"
+    why: "Our WAL is a Vec<LogEntry> in memory. Real WAL recovery requires checkpointing, log sequence numbers (LSNs), crash-safe fsync, and redo-only (no undo) operation."
+  - thing: "Buffer pool management"
+    why: "PostgreSQL's shared_buffers holds 8 KB pages in a ring buffer with LRU eviction and dirty page tracking. Our table fits entirely in memory."
+realWorldReferences:
+  - "PostgreSQL query processing internals: https://www.postgresql.org/docs/current/query-path.html"
+  - "SQLite file format: https://www.sqlite.org/fileformat.html"
+  - "Volcano/Iterator model paper (Graefe, 1994): https://dl.acm.org/doi/10.1109/69.273032"
+  - "Architecture of a Database System (Hellerstein et al.): https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: null
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a SQL database engine from scratch: tokenizer, recursive descent parser, volcano model query executor, BTreeMap index, and a write-ahead log — then compare with JDBC."
+---
+
+## Why this lab exists
+
+When you write `SELECT * FROM orders WHERE user_id = 42`, you are invoking a piece of software that has to tokenize your string, parse it into a tree, plan a physical execution strategy, optionally consult an index, pull rows through a pipeline of operators, and return a result set — all in under a millisecond. Most engineers use this machinery every day and understand none of it.
+
+This lab makes it concrete. You will build a working SQL database engine in Rust from scratch: a tokenizer that turns `SELECT id FROM users WHERE id = 1` into tokens, a recursive descent parser that builds an AST, an in-memory table store, and then a complete volcano-model query executor with a query planner, a BTree index, and a write-ahead log for durability.
+
+By the end, phrases like "the planner chose a seq scan" or "index scan on an equality predicate" will have precise meaning for you — because you will have written both code paths yourself.
+
+## What we are building
+
+A SQL database engine that supports:
+- `CREATE TABLE t (col TYPE, ...)` — schema definition
+- `INSERT INTO t (col, ...) VALUES (val, ...), ...` — multi-row insert
+- `SELECT col, ... FROM t [INNER JOIN t2 ON t.col = t2.col] [WHERE expr] [ORDER BY col] [LIMIT n OFFSET m]`
+- `CREATE INDEX name ON table(column)` — single-column equality index
+- `BEGIN` / `COMMIT` / `ROLLBACK` — explicit transaction blocks
+- Types: `INT`, `TEXT`, `BOOL`, `NULL`
+
+**Explicit scope exclusions**: no `UPDATE` or `DELETE`, no aggregates (`GROUP BY`, `COUNT`, `SUM`), no subqueries, no foreign keys, no concurrent access (single-threaded), no disk persistence (tables live in memory).
+
+## Mental model
+
+### The four-stage pipeline
+
+Every SQL engine processes a query in the same four stages:
+
+```
+SQL string
+    │
+    ▼ Lexer (tokenizer)
+Token stream: [SELECT, IDENT("id"), FROM, IDENT("users"), WHERE, IDENT("id"), EQ, INT(42)]
+    │
+    ▼ Parser (recursive descent)
+AST: SelectStmt {
+       columns: [Named("id")],
+       from: "users",
+       where_clause: BinOp { Column("id"), Eq, Literal(Int(42)) }
+     }
+    │
+    ▼ Planner (rule-based)
+Physical plan: Projection(["id"],
+                 IndexScan("users", "id", Int(42)))  ← if index exists
+                 -- or --
+                 Filter(id=42, SeqScan("users"))      ← without index
+    │
+    ▼ Executor (volcano model)
+Pull rows: root.open(); while let Some(row) = root.next() { ... }
+```
+
+Each stage knows nothing about the previous one's internals. The lexer does not know what a `SelectStmt` is. The parser does not know what a `SeqScan` is. The planner does not know what tokens are. This separation is what allows each component to be tested and replaced independently.
+
+### The volcano model: operators as iterators
+
+The volcano model (also called the iterator model) represents each physical operator as a pull-based iterator with three methods:
+
+```
+trait Operator {
+    fn open(&mut self);                    // initialize state
+    fn next(&mut self) -> Option<Row>;     // pull next row
+    fn close(&mut self);                   // release resources
+}
+```
+
+Operators compose into a tree. To execute `SELECT name FROM users WHERE score > 10 ORDER BY name LIMIT 5`:
+
+```
+LimitOffset(limit=5)
+  └── Sort(column="name", asc=true)
+        └── Projection(columns=["name"])
+              └── Filter(predicate: score > 10)
+                    └── SeqScan(table="users")
+```
+
+The root (`LimitOffset`) calls `next()` on its child (`Sort`). `Sort` materializes all its input into a `Vec<Row>`, sorts it, and then serves rows one by one. Each intermediate operator calls its child's `next()`. The leaf (`SeqScan`) reads directly from the table's row vector.
+
+The pull model means rows flow upward on demand. If `LIMIT 5` is satisfied after 5 rows, the tree short-circuits — `Sort` never produces row 6.
+
+### Why indexes matter: the row count problem
+
+The planner's job is to choose the cheapest physical plan. Without statistics, it uses one heuristic: if there is an index on the WHERE equality column, prefer IndexScan over SeqScan + Filter.
+
+```
+Without index: SeqScan reads all N rows, Filter discards N-k
+With index:    BTreeMap::get returns k row indices in O(log N)
+```
+
+For `id = 42` on a 10,000-row table, the index visits exactly 1 row. The seq scan visits 10,000. The ratio is 10,000:1. This is why `EXPLAIN` output that says "Seq Scan" on a large table is a warning sign.
+
+## Prerequisites
+
+Complete the [WAL lab](/system-design-labs/wal) first — the write-ahead log concepts in v2 are directly borrowed from it. The [B+Tree KV lab](/system-design-labs/btree-kv) is also useful background for understanding why real database indexes use disk pages rather than in-memory BTreeMaps.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Tokenizer + parser + in-memory executor"
+  goals={[
+    "lexer.rs: tokenize SQL keywords, identifiers, literals, operators",
+    "ast.rs: define Stmt, SelectStmt, InsertStmt, CreateTableStmt, Expr, BinOpKind",
+    "parser.rs: recursive descent — parse_select, parse_insert, parse_create, parse_expr",
+    "executor.rs: DirectExecutor with HashMap<String, Table> catalog",
+    "Evaluate WHERE with eval_expr: =, !=, <, >, <=, >= operators + NULL propagation",
+    "8 tests: CREATE TABLE, INSERT, SELECT *, SELECT with WHERE, type coercion, two error cases",
+  ]}
+  loc={250}
+>
+
+The tokenizer converts a SQL string into a flat `Vec<Token>`. This is the easiest stage but sets up all the downstream work. Token variants map directly to SQL syntax:
+
+```rust
+pub enum Token {
+    Select, From, Where, Insert, Into, Values,
+    Create, Table, Index, On, Begin, Commit, Rollback,
+    Order, By, Asc, Desc, Limit, Offset, Join, Inner,
+    And, Or, Not, Null, True, False,
+    Star, Comma, Dot, Semicolon, LParen, RParen,
+    Eq, NotEq, Lt, Gt, LtEq, GtEq,
+    IntLit(i64), StrLit(String), BoolLit(bool),
+    Ident(String),
+    Eof,
+}
+```
+
+The `Lexer` scans one character at a time. The tricky cases are: (1) multi-character operators like `!=`, `<=`, `>=`, `<>`; (2) string literals with escaped single quotes (`''` inside a string); (3) identifiers that might be keywords.
+
+The keyword check is a simple match arm on the uppercased string — no hash table needed at this scale:
+
+```rust
+fn keyword_or_ident(s: String) -> Token {
+    match s.to_uppercase().as_str() {
+        "SELECT"   => Token::Select,
+        "FROM"     => Token::From,
+        // ... etc
+        _          => Token::Ident(s),
+    }
+}
+```
+
+**Recursive descent parsing** maps grammar rules to functions. Each function consumes tokens from the stream and returns an AST node. The key insight: the grammar is LL(1) — you can always decide which rule applies by looking at the next token.
+
+```rust
+fn parse_stmt(&mut self) -> SqlResult<Stmt> {
+    match self.peek() {
+        Token::Select   => self.parse_select().map(Stmt::Select),
+        Token::Insert   => self.parse_insert().map(Stmt::Insert),
+        Token::Create   => self.parse_create(),
+        Token::Begin    => { self.advance(); Ok(Stmt::Begin) }
+        Token::Commit   => { self.advance(); Ok(Stmt::Commit) }
+        Token::Rollback => { self.advance(); Ok(Stmt::Rollback) }
+        other => Err(SqlError::ParseError(...))
+    }
+}
+```
+
+Expression parsing uses a precedence hierarchy: `OR` binds less tightly than `AND`, which binds less tightly than comparison operators. This is encoded by mutual recursion:
+
+```
+parse_expr -> parse_or_expr -> parse_and_expr -> parse_not_expr -> parse_cmp_expr -> parse_atom
+```
+
+The `Value` type needs explicit `NULL`:
+
+```rust
+pub enum Value {
+    Int(i64),
+    Text(String),
+    Bool(bool),
+    Null,           // "the absence of a value" — not 0, not ""
+}
+```
+
+NULL propagation in comparisons: `NULL = NULL` is `NULL` (falsy), not `TRUE`. This matches SQL standard behavior and catches real bugs — two rows with NULL IDs are not "equal."
+
+```rust
+fn eval_binop(l: &Value, op: &BinOpKind, r: &Value) -> SqlResult<Value> {
+    match op {
+        BinOpKind::And => Ok(Value::Bool(l.is_truthy() && r.is_truthy())),
+        BinOpKind::Or  => Ok(Value::Bool(l.is_truthy() || r.is_truthy())),
+        _ => {
+            if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                return Ok(Value::Null);  // NULL propagation
+            }
+            // ... eq, lt, gt comparisons
+        }
+    }
+}
+```
+
+The in-memory catalog is a `HashMap<String, Table>` where `Table` holds a schema and a `Vec<Row>`. `Row` is `HashMap<String, Value>` — column name to value. This is not efficient (no column ordering, no type-checked slots) but it is correct and easy to reason about.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Volcano model + query planner"
+  goals={[
+    "operator.rs: SeqScan, IndexScan, Filter, Projection, NestedLoopJoin, Sort, LimitOffset",
+    "Operator trait: open(), next() -> SqlResult<Option<Row>>, close()",
+    "planner.rs: translate SelectStmt into a Box<dyn Operator> tree",
+    "Planner rule: equality WHERE on indexed column -> IndexScan instead of SeqScan+Filter",
+    "Sort materializes all input rows before serving — ORDER BY costs O(n log n) + O(n) memory",
+    "6 tests: join two tables, ORDER BY descending, LIMIT/OFFSET, projection narrows columns",
+  ]}
+  loc={200}
+>
+
+Each operator implements the `Operator` trait. The `Box<dyn Operator>` abstraction is what makes operator composition work without the planner knowing which concrete type sits below:
+
+```rust
+pub trait Operator {
+    fn open(&mut self);
+    fn next(&mut self) -> SqlResult<Option<Row>>;
+    fn close(&mut self) {}
+}
+
+pub struct Filter {
+    pub input: Box<dyn Operator>,
+    pub predicate: Expr,
+}
+
+impl Operator for Filter {
+    fn open(&mut self) { self.input.open(); }
+    fn next(&mut self) -> SqlResult<Option<Row>> {
+        loop {
+            match self.input.next()? {
+                None => return Ok(None),
+                Some(row) => {
+                    if eval_expr(&self.predicate, &row)?.is_truthy() {
+                        return Ok(Some(row));
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+`NestedLoopJoin` materializes the right (inner) side once and rescans it for each left row. This is O(n * m) time but O(m) space — only the right side is buffered:
+
+```rust
+pub struct NestedLoopJoin {
+    left: Box<dyn Operator>,
+    right_rows: Vec<Row>,   // pre-materialized
+    left_col: String,
+    right_col: String,
+    current_left: Option<Row>,
+    right_pos: usize,
+}
+```
+
+The loop is classic: for each left row, scan right rows looking for equi-join matches. When the right side is exhausted, pull the next left row and reset right_pos to 0.
+
+`Sort` is a blocking operator — it must materialize all input before emitting the first row. This is why ORDER BY on a 10-million-row table without LIMIT can crash a server with insufficient memory:
+
+```rust
+impl Operator for Sort {
+    fn next(&mut self) -> SqlResult<Option<Row>> {
+        if !self.ready {
+            while let Some(row) = self.input.next()? {
+                self.buffer.push(row);  // materialize
+            }
+            self.buffer.sort_by(/* column comparator */);
+            self.ready = true;
+        }
+        // serve from sorted buffer
+    }
+}
+```
+
+The planner translates a `SelectStmt` into an operator tree using a fixed set of rules. No cost model — just structural pattern matching:
+
+```rust
+pub fn plan(&self, sel: &SelectStmt) -> SqlResult<Box<dyn Operator>> {
+    // Step 1: base scan (SeqScan or IndexScan)
+    let base = self.plan_base_scan(&sel.from, sel.where_clause.as_ref())?;
+    // Step 2: join if present (NestedLoopJoin)
+    let after_join = ...;
+    // Step 3: filter residual WHERE
+    let after_filter = Box::new(Filter::new(after_join, pred.clone()));
+    // Step 4: ORDER BY -> Sort
+    // Step 5: LIMIT / OFFSET -> LimitOffset
+    // Step 6: Projection
+    Box::new(Projection::new(after_limit, col_names))
+}
+```
+
+The index heuristic lives in `plan_base_scan`: if the WHERE clause is a simple equality `col = literal` and an index exists on that column, return an `IndexScan`. Otherwise, return `SeqScan`.
+
+```rust
+fn extract_equality(expr: &Expr) -> Option<(String, Value)> {
+    match expr {
+        Expr::BinOp { left, op: BinOpKind::Eq, right } => {
+            match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(col), Expr::Literal(val)) => Some((col.clone(), val.clone())),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+```
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="BTreeMap index + WAL + transactions"
+  goals={[
+    "index.rs: ColumnIndex wrapping BTreeMap<Value, Vec<usize>> (value -> row indices)",
+    "IndexManager: tracks indexes by 'table.column' key, build_index scans existing rows",
+    "wal.rs: LogEntry enum (BeginTx, CommitTx, RollbackTx, CreateTable, InsertRow)",
+    "WAL replay: only replay entries from committed transactions",
+    "db.rs: BEGIN sets active_tx; COMMIT logs CommitTx; ROLLBACK discards + replays WAL",
+    "5 tests: index creation, index scan used, transaction commit, rollback discards rows, WAL entry count",
+  ]}
+  loc={150}
+>
+
+The index maps a `Value` to the list of row indices in the table's `rows` Vec. Using `BTreeMap` (not `HashMap`) gives us ordered iteration for future range predicates:
+
+```rust
+pub struct ColumnIndex {
+    pub table: String,
+    pub column: String,
+    pub map: BTreeMap<Value, Vec<usize>>,
+}
+
+impl ColumnIndex {
+    pub fn insert(&mut self, value: Value, row_idx: usize) {
+        self.map.entry(value).or_default().push(row_idx);
+    }
+
+    pub fn lookup(&self, value: &Value) -> Vec<usize> {
+        self.map.get(value).cloned().unwrap_or_default()
+    }
+}
+```
+
+The `IndexManager` holds all indexes for all tables under a string key `"table.column"`. On INSERT, it calls `index_row` to update any existing indexes for that table. On `CREATE INDEX`, it calls `build_index` to scan all existing rows.
+
+The WAL logs every schema mutation and data mutation with a transaction ID:
+
+```rust
+pub enum LogEntry {
+    BeginTx    { tx_id: u64 },
+    CommitTx   { tx_id: u64 },
+    RollbackTx { tx_id: u64 },
+    CreateTable { tx_id: u64, table_name: String, schema: Vec<(String, String)> },
+    InsertRow   { tx_id: u64, table_name: String, row: HashMap<String, String> },
+}
+```
+
+Replay is selective: only entries from committed transactions are applied. This is the core WAL invariant — uncommitted work is invisible after a restart:
+
+```rust
+pub fn replay(&self) -> ReplayResult {
+    let committed_set: HashSet<u64> = self.committed_tx_ids().into_iter().collect();
+    for entry in &self.entries {
+        match entry {
+            LogEntry::InsertRow { tx_id, .. } if committed_set.contains(tx_id) => {
+                // apply
+            }
+            _ => {} // skip uncommitted or non-data entries
+        }
+    }
+}
+```
+
+ROLLBACK rebuilds the catalog from the WAL. This is expensive (O(entries)) but correct. Production databases use an undo log or MVCC instead — they never need to replay from the beginning:
+
+```rust
+fn rollback_tx(&mut self) -> SqlResult<QueryResult> {
+    let tx = self.active_tx.take()...;
+    self.wal.rollback_tx(tx.tx_id);
+    self.rebuild_from_wal();  // reapply only committed entries
+    Ok(QueryResult::empty("ROLLBACK"))
+}
+```
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/mini-sql-db"
+  prereqs={["Rust 1.83+", "cargo"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/mini-sql-db\ncargo build",
+    },
+    {
+      label: "Run the interactive REPL",
+      cmd: "cargo run --bin mini-sql-db",
+    },
+    {
+      label: "Run all tests (unit + integration)",
+      cmd: "cargo test",
+    },
+    {
+      label: "Run benchmarks",
+      cmd: "cargo bench",
+    },
+  ]}
+  expectedOutput={`mini-sql-db v0.1 — type SQL and press Enter.  Ctrl-D to exit.
+> CREATE TABLE users (id INT, name TEXT);
+-- CREATE TABLE users
+> INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+-- INSERT 3 row(s)
+> SELECT * FROM users WHERE id > 1;
+| id | name  |
++----+-------+
+| 2  | Bob   |
+| 3  | Carol |
+(2 rows)
+> CREATE INDEX idx_id ON users (id);
+-- CREATE INDEX idx_id ON users(id)
+> SELECT name FROM users WHERE id = 3;
+| name  |
++-------+
+| Carol |
+(1 row)
+> BEGIN;
+-- BEGIN
+> INSERT INTO users (id, name) VALUES (99, 'Phantom');
+-- INSERT 1 row(s)
+> ROLLBACK;
+-- ROLLBACK
+> SELECT * FROM users WHERE id = 99;
+(0 rows)`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "SQL parse (SELECT with WHERE)", value: "~2,100,000", unit: "parses/sec", note: "estimated — tokenizer + recursive descent; run cargo bench for real numbers" },
+    { metric: "SeqScan (10k rows, no filter)", value: "~8,500,000", unit: "rows/sec", note: "estimated — iterator over Vec<Row> in memory" },
+    { metric: "Index scan (equality on 10k rows)", value: "~12,000,000", unit: "lookups/sec", note: "estimated — BTreeMap::get O(log n) vs full table walk" },
+    { metric: "NestedLoopJoin (100 x 100 rows)", value: "~45,000", unit: "joins/sec", note: "estimated — O(n squared) cross product; joins without a hash table are expensive" },
+  ]}
+/>
+
+These numbers are estimates. Run `cargo bench` for real measurements on your hardware. The index scan out-performing the seq scan on raw throughput hides an important subtlety: the seq scan is counting rows-per-second across all 10k rows, while the index scan counts lookups-per-second on single-row results. The comparison that matters is total wall-clock time for `WHERE id = X` — there the index wins by 3-4 orders of magnitude on large tables.
+
+## Stress tests
+
+The integration test suite covers correctness under load:
+
+**Multi-row insert correctness**: insert 200 rows in a single VALUES list and verify the count. Catches off-by-one errors in the parser's row loop.
+
+**Index consistency after bulk insert**: build an index after 1,000 rows are in the table. Verify that `build_index` correctly scans all existing rows and that subsequent lookups return the right row indices.
+
+**Rollback isolation**: insert a baseline row (committed), begin a transaction, insert 5 more rows, rollback. Verify exactly 1 row remains. Catches bugs in WAL replay where uncommitted entries leak through.
+
+**JOIN cross-product correctness**: insert 3 users and 2 orders per user (6 orders total). Verify the join returns 6 rows (3 * 2). Catches off-by-one in the NestedLoopJoin inner-loop reset.
+
+**NULL propagation in WHERE**: insert rows where a column is NULL. Verify that `WHERE col = NULL` returns 0 rows (NULL = NULL is NULL, not TRUE). Catches incorrect equality handling.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "Cost-based query optimizer",
+      why: "Real planners estimate row counts, choose join order, and pick between index and seq scan based on selectivity statistics. PostgreSQL's planner has 100k+ lines dedicated to this.",
+    },
+    {
+      thing: "MVCC (Multi-Version Concurrency Control)",
+      why: "PostgreSQL never updates rows in-place — it writes new versions and uses visibility rules based on transaction IDs. This allows readers and writers to never block each other.",
+    },
+    {
+      thing: "Disk-based B+Tree pages",
+      why: "Our BTreeMap is in-memory. Real indexes are stored as fixed-size pages (8 KB in PostgreSQL) with page splits, compaction, and a free-space map.",
+    },
+    {
+      thing: "SQL parser completeness",
+      why: "PostgreSQL's parser handles 400+ grammar rules. Subqueries, CTEs, window functions, GROUP BY, HAVING, aggregate functions — each adds significant parser and planner complexity.",
+    },
+    {
+      thing: "Write-ahead log recovery",
+      why: "Our WAL is a Vec<LogEntry> in memory. Real WAL recovery requires checkpointing, log sequence numbers (LSNs), crash-safe fsync, and redo-only (no undo) operation.",
+    },
+    {
+      thing: "Buffer pool management",
+      why: "PostgreSQL's shared_buffers holds 8 KB pages in a ring buffer with LRU eviction and dirty page tracking. Our table fits entirely in memory.",
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="Spring Boot 3.3"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/mini-sql-db/java-integration"
+>
+
+### The integration shape
+
+The Rust engine runs as a process; Spring Boot talks to it over HTTP via a `POST /query` endpoint. The Java side does not know or care about tokenizers or operator trees — it sends a SQL string and receives a JSON result. This is the "service-client" pattern: the Java application is a consumer, not a reimplementation.
+
+### SqlClient: the HTTP bridge
+
+`SqlClient.java` wraps the Rust server's REST API using Spring Framework 6.1's `RestClient`. The client is intentionally minimal — no retry, no caching, no connection pooling beyond what `RestClient` provides by default:
+
+```java
+public class SqlClient {
+    private final RestClient http;
+
+    public SqlClient(String baseUrl) {
+        this.http = RestClient.builder()
+                .baseUrl(baseUrl)
+                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
+                .build();
+    }
+
+    public QueryResult query(String sql) {
+        return http.post()
+                .uri("/query")
+                .contentType(MediaType.TEXT_PLAIN)
+                .body(sql)
+                .retrieve()
+                .body(QueryResult.class);
+    }
+
+    public record QueryResult(
+        List<String> columns,
+        List<Map<String, String>> rows,
+        String message
+    ) {}
+}
+```
+
+The `QueryResult` record uses `Map<String, String>` for rows — all values are deserialized as strings from JSON. This is intentional: the Java caller handles type conversion based on application context, not a generic client assumption.
+
+### SqlProperties: externalized config
+
+```java
+@ConfigurationProperties(prefix = "mini-sql")
+public record SqlProperties(String baseUrl, int connectTimeoutMs, int readTimeoutMs) {}
+```
+
+In `application.properties`:
+```properties
+mini-sql.base-url=http://localhost:7070
+mini-sql.connect-timeout-ms=3000
+mini-sql.read-timeout-ms=5000
+```
+
+### The JDBC comparison
+
+If you replaced the Rust engine with PostgreSQL, the Java side would use JDBC instead of a REST client. The difference is not just the protocol — it is the mental model:
+
+```java
+// JDBC: PreparedStatement prevents SQL injection at the protocol level
+PreparedStatement ps = conn.prepareStatement(
+    "SELECT price FROM products WHERE id = ?"
+);
+ps.setInt(1, 42);
+ResultSet rs = ps.executeQuery();
+
+// SqlClient: string concatenation — injection is the caller's problem
+client.query("SELECT price FROM products WHERE id = " + id);
+```
+
+Our `SqlClient` is deliberately naive about injection — it sends raw strings. A production HTTP SQL client should send parameters separately and let the server handle binding. This is one of the reasons JDBC's binary protocol is better for application code than a text REST API over SQL.
+
+### The actuator health integration
+
+Spring Boot Actuator's `/actuator/health` endpoint can surface custom health indicators. A `SqlHealthIndicator` that pings the Rust engine on each health check gives you observability without code changes to the demo:
+
+```java
+@Component
+public class SqlHealthIndicator implements HealthIndicator {
+    private final SqlClient client;
+
+    public Health health() {
+        return client.isHealthy()
+            ? Health.up().withDetail("engine", "mini-sql-db").build()
+            : Health.down().withDetail("reason", "server unreachable").build();
+    }
+}
+```
+
+### Running the demo
+
+```bash
+# Terminal 1: start the Rust engine (HTTP mode, future work)
+cd labs/mini-sql-db && cargo run --bin mini-sql-db
+
+# Terminal 2: start Spring Boot
+cd labs/mini-sql-db/java-integration && mvn spring-boot:run
+```
+
+The `SqlDemoApplication` runs a `CommandLineRunner` on startup: creates a table, inserts 5 products, queries with a filter, creates an index, and demonstrates a rollback.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe>
+
+The surprise was how few rows most queries actually touch. A `SELECT * FROM t WHERE id = 42` on a 10,000-row table with an index visits exactly 1 row — but without an index, the iterator model still pulls all 10,000 rows through the pipeline, just filtering at the `Filter` operator. The volcano model is elegant, but without a planner that knows row counts, it is also dangerously naive.
+
+What made this concrete was watching the `Filter` operator's inner loop. Every row from `SeqScan` is materialized into a `HashMap`, passed up to `Filter`, and evaluated. For a query that matches 1 row in 10,000, the work ratio is 10,000:1 — you do 9,999 units of work to find the 1 unit that matters. The index collapses that ratio to nearly 1:1.
+
+The second surprise was how much of a real SQL engine is just bookkeeping. The actual query execution — `eval_expr` comparing two `Value` variants — is trivially simple. What makes a real database hard is everything around it: schema validation, NULL semantics, type coercion, error messages, catalog management, transaction isolation, WAL recovery, buffer pool eviction, query optimization. The core operation is easy. The correctness under all conditions is where the 100,000 lines go.
+
+</WhatSurprisedMe>
+
+## Where to go deeper
+
+- **PostgreSQL query processing**: the `executor/` and `optimizer/` directories in the PostgreSQL source are the canonical reference. `src/backend/executor/nodeSeqscan.c` is the production version of our `SeqScan` — it reads 8 KB heap pages instead of `Vec<Row>` entries.
+- **SQLite**: the most readable production SQL engine. `vdbe.c` is the virtual machine that executes SQLite's bytecode — a different execution model than volcano but equally influential.
+- **Graefe's volcano paper (1994)**: the original description of the iterator model. Still the clearest explanation of why `next()` is the right abstraction.
+- **"Architecture of a Database System" (Hellerstein, 2007)**: the most comprehensive survey of how real database engines work. Free PDF at the URL in the frontmatter.
+- **DuckDB**: a modern analytical database with an excellent vectorized execution engine. Its source is well-documented and shows how the volcano model evolves into batch/columnar processing for OLAP workloads.
+
+## Related labs and questions
+
+**Related labs**: [B+Tree KV Store](/system-design-labs/btree-kv) (the on-disk index structure our toy avoids), [Write-Ahead Log](/system-design-labs/wal) (the crash-safety primitive underlying v2), [LSM-Tree KV](/system-design-labs/lsm-kv) (alternative storage engine tradeoff).
+
+**Questions to explore**:
+- How does PostgreSQL decide between a seq scan and an index scan? What statistics does it maintain, and how does `ANALYZE` update them?
+- What is a hash join, and why is it faster than NestedLoopJoin for large tables? What does it require that NestedLoopJoin does not?
+- How does MVCC allow readers and writers to proceed without blocking each other? What is the "xmin/xmax" mechanism in PostgreSQL's heap pages?
+- What is a log sequence number (LSN) and why does WAL recovery require them? How does PostgreSQL use LSNs to determine which WAL records to replay after a crash?
+- SQLite uses a B-Tree for both tables (rowid trees) and indexes. PostgreSQL separates heap files from index files. What are the tradeoffs of each approach?

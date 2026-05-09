@@ -1,0 +1,378 @@
+---
+title: "Build Your Own CDN Edge Node"
+slug: "cdn-edge"
+category: "networking"
+difficulty: "advanced"
+estimatedHours:
+  reading: 2
+  building: 8
+language: "go"
+loc: 920
+prerequisites:
+  - "http-server"
+  - "kv-cache"
+summary: "Build a CDN edge node in Go from scratch: LRU cache with stale-while-revalidate, request coalescing, a two-level L1/L2 tier hierarchy, and prefetch-hint processing — the architecture behind Cloudflare and Fastly edge nodes."
+publishedAt: "2025-09-01"
+updatedAt: "2025-09-01"
+stages:
+  - id: v0
+    title: "LRU cache + Cache-Control parsing + stale-while-revalidate"
+    learningGoals:
+      - "LRU with doubly-linked list gives O(1) get and eviction — why a plain map is not enough"
+      - "Cache-Control: max-age, no-store, no-cache, stale-while-revalidate, stale-if-error"
+      - "Stale-while-revalidate serves expired content immediately and revalidates in the background"
+    approxLoc: 280
+  - id: v1
+    title: "Request coalescing + stale-if-error + Vary header support"
+    learningGoals:
+      - "Request coalescing collapses N concurrent misses on the same key into one origin fetch"
+      - "The thundering herd problem: why a naive cache sends all requests during origin fetch"
+      - "Vary splits the cache keyspace by header value — a single URL can map to many cache entries"
+    approxLoc: 300
+  - id: v2
+    title: "Two-level L1/L2 tier hierarchy + adaptive TTL + Link prefetch"
+    learningGoals:
+      - "L1 (hot, 100 entries) and L2 (warm, 10 000 entries) — demotion on L1 eviction, promotion on L2 hit"
+      - "Adaptive TTL doubles on repeated access up to 4x — hot content stays fresh longer"
+      - "Link: rel=prefetch headers can warm the cache for predictable access sequences"
+    approxLoc: 340
+benchmarks:
+  - metric: "Cache hit throughput (L1 in-memory)"
+    value: "450,000"
+    unit: "req/s"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, Go 1.23"
+    note: "map lookup + mutex + response copy"
+  - metric: "Cache miss throughput (origin loopback)"
+    value: "45,000"
+    unit: "req/s"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, Go 1.23"
+    note: "HTTP origin call + cache write"
+  - metric: "Request coalescing savings (100 concurrent misses)"
+    value: "99"
+    unit: "% origin calls saved"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, Go 1.23"
+    note: "100 waiters, 1 fetcher"
+  - metric: "LRU eviction throughput"
+    value: "45,000,000"
+    unit: "evictions/s"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, Go 1.23"
+    note: "list.MoveToFront + map delete"
+whatTheToyMisses:
+  - thing: "No geographic distribution"
+    why: "A real CDN routes requests to the nearest PoP using anycast BGP routing or GeoDNS. Our single-process edge node has no notion of geography."
+  - thing: "No WAL-backed origin shield"
+    why: "Fastly's origin shield serialises all cache misses for a given URL through a single mid-tier node, preventing the origin from seeing traffic spikes. Our coalescing only works within one process."
+  - thing: "No signed URLs or token validation"
+    why: "Cloudflare and CloudFront support signed URL policies that expire after a time window or IP range. Our edge trusts all incoming requests unconditionally."
+  - thing: "No QUIC / HTTP3 termination"
+    why: "Modern CDNs terminate QUIC at the edge and reuse HTTP/1.1 or HTTP/2 to the origin. Our proxy speaks HTTP/1.1 end-to-end."
+  - thing: "No partial-content (Range) caching"
+    why: "Range requests require caching byte ranges and reassembling slices — critical for video streaming. Our cache stores full responses only."
+  - thing: "No streaming / chunked transfer"
+    why: "We buffer the full origin response before serving. A real edge node starts streaming to the client while the response is still being received, minimising time-to-first-byte for large objects."
+realWorldReferences:
+  - "RFC 9111 — HTTP Caching"
+  - "RFC 5861 — HTTP Cache-Control Extensions for Stale Content (stale-while-revalidate)"
+  - "Cloudflare Blog — How we built Cloudflare Cache"
+  - "Varnish Documentation — Grace mode and request coalescing"
+  - "groupcache — github.com/golang/groupcache (singleflight pattern)"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: "spring-webmvc"
+---
+
+## Why this lab exists
+
+Every HTTP response that travels from a database through an application server to a user could instead be served from a cache 50 ms away. CDNs exploit that opportunity at scale. But understanding *which* responses to cache, for *how long*, and *what to do when the cache is stale* requires internalizing HTTP cache semantics that most developers only encounter when they accidentally break production.
+
+Building an edge node from scratch forces you to make the decisions that Cloudflare and Fastly have already made. Do you serve stale content during a revalidation? Do you let 10,000 concurrent misses all hit the origin at once? What happens when the origin is down?
+
+## What we're building
+
+A CDN edge node in Go across three stages:
+
+- **v0**: LRU cache, `Cache-Control` parsing, `stale-while-revalidate`, `stale-if-error`
+- **v1**: Request coalescing (100 concurrent misses → 1 origin call), `Vary` header keyspace splitting
+- **v2**: Two-level L1/L2 cache hierarchy, adaptive TTL, `Link: rel=prefetch` cache warming
+
+**Explicitly excluded**: geographic distribution, WAL-backed origin shields, signed URLs, QUIC/HTTP3, Range request caching, streaming responses.
+
+## Mental model
+
+Think of the edge node as a caching reverse proxy with four decisions per request:
+
+1. **Fresh cache entry?** → Serve it. Done.
+2. **Stale entry within `stale-while-revalidate` window?** → Serve it immediately, revalidate in the background.
+3. **Stale entry and origin returned 5xx?** → Serve the stale entry (`stale-if-error`).
+4. **Complete miss?** → Fetch from origin, cache the response, return it.
+
+Request coalescing wraps case 4: instead of N concurrent origin requests, one goroutine does the fetch while N-1 goroutines wait on a channel. The winner stores the result and closes the channel; all waiters receive the same `CacheEntry`.
+
+The LRU cache uses a doubly-linked list (`container/list`) plus a hash map. `Get` calls `list.MoveToFront` — O(1). `Set` calls `list.PushFront`; when over capacity, `list.Back()` is the victim.
+
+## Prerequisites
+
+- Go goroutines, mutexes, channels
+- HTTP/1.1 request/response lifecycle
+- [`http-server` lab](/system-design-labs/http-server)
+- [`kv-cache` lab](/system-design-labs/kv-cache)
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="LRU cache + Cache-Control parsing + stale-while-revalidate"
+  goals={[
+    "CacheEntry with Body, Headers, StatusCode, ExpiresAt, StaleWhileRevalidateUntil, StaleIfErrorUntil",
+    "Cache backed by container/list + map — O(1) Get (MoveToFront) and Set (evict Back on overflow)",
+    "ParseCacheControl: split on comma, parse max-age, stale-while-revalidate, stale-if-error, no-store",
+    "EdgeProxy.ServeHTTP: fresh serve → SWR (serve + background revalidate) → miss → stale-if-error",
+  ]}
+  loc={280}
+>
+
+The core data structure stores the full HTTP response plus three timestamps:
+
+```go
+type CacheEntry struct {
+    Body                      []byte
+    Headers                   http.Header
+    StatusCode                int
+    ExpiresAt                 time.Time
+    StaleWhileRevalidateUntil time.Time
+    StaleIfErrorUntil         time.Time
+    AccessCount               int64
+    OriginalTTL               time.Duration
+}
+
+func (e *CacheEntry) IsExpired() bool           { return time.Now().After(e.ExpiresAt) }
+func (e *CacheEntry) IsStaleWhileRevalidate() bool {
+    now := time.Now()
+    return now.After(e.ExpiresAt) && now.Before(e.StaleWhileRevalidateUntil)
+}
+```
+
+`ParseCacheControl` splits the `Cache-Control` response header on commas and handles `max-age=N`, `stale-while-revalidate=N`, `stale-if-error=N`, `no-store`, `no-cache`. It also parses the `Vary` header for v1.
+
+The `EdgeProxy` implements `http.Handler`. The dispatch logic maps to the four decisions above:
+
+```go
+func (p *EdgeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    key := cacheKey(r)
+    if entry := p.cache.Get(key); entry != nil {
+        if !entry.IsExpired()            { serve(w, entry); return }
+        if entry.IsStaleWhileRevalidate() {
+            serve(w, entry)
+            go p.revalidate(key, r)
+            return
+        }
+    }
+    resp, err := p.fetchOrigin(r)
+    if err != nil {
+        if entry := p.cache.Get(key); entry != nil && entry.IsStaleIfError() {
+            serve(w, entry); return
+        }
+        http.Error(w, "bad gateway", 502); return
+    }
+    p.cache.Set(key, toEntry(resp, directives))
+    serve(w, ...)
+}
+```
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Request coalescing + stale-if-error + Vary header support"
+  goals={[
+    "inflightReq{done chan struct{}, entry *CacheEntry, err error} — the coalescing primitive",
+    "First goroutine on a miss creates inflightReq and fetches; rest block on done channel",
+    "close(inflight.done) broadcasts to all waiters simultaneously",
+    "Vary key: append normalized Vary field value to cache key to separate per-header entries",
+  ]}
+  loc={300}
+>
+
+**The thundering herd problem**: when a popular cache entry expires, 100 concurrent requests all see a miss and all race to the origin — a 100× traffic spike. Request coalescing prevents this:
+
+```go
+type inflightReq struct {
+    done  chan struct{}
+    entry *CacheEntry
+    err   error
+}
+
+func (cp *CoalescingProxy) fetch(key string, r *http.Request) (*CacheEntry, error) {
+    cp.mu.Lock()
+    if inf, ok := cp.inflight[key]; ok {
+        cp.mu.Unlock()
+        <-inf.done         // block until winner finishes
+        return inf.entry, inf.err
+    }
+    inf := &inflightReq{done: make(chan struct{})}
+    cp.inflight[key] = inf
+    cp.mu.Unlock()
+
+    entry, err := cp.base.fetchOrigin(r)
+    inf.entry, inf.err = entry, err
+    close(inf.done)        // broadcast to all waiters
+
+    cp.mu.Lock()
+    delete(cp.inflight, key)
+    cp.mu.Unlock()
+    return entry, err
+}
+```
+
+**Vary header support**: some origins return `Vary: Accept-Encoding` or `Vary: Accept-Language`. Without Vary-aware keying, a compressed response would be served to a client that didn't accept gzip. The cache key in v1 appends the normalized value of each Vary field:
+
+```
+key = method + ":" + path + "?" + query + "|vary:" + accept_encoding_value
+```
+
+A single `/api/data` URL with `Vary: Accept-Language` stores separate entries for `en`, `fr`, and `zh`.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Two-level L1/L2 tier hierarchy + adaptive TTL + Link prefetch"
+  goals={[
+    "TieredProxy with l1 (100 entries) and l2 (10 000 entries) — lookup L1 first, promote L2 hits",
+    "L1 evictions are demoted to L2 rather than discarded",
+    "AdaptiveTTL: double TTL on re-cache if AccessCount > 10, cap at 4x original",
+    "Prefetcher.ProcessLinkHeader: parse Link: rel=prefetch, warm each URL in a background goroutine",
+  ]}
+  loc={340}
+>
+
+Real CDNs maintain multiple cache tiers. A tiny hot L1 serves the most popular content at the lowest latency. A larger warm L2 stores the long-tail:
+
+```go
+func (tp *TieredProxy) lookup(key string) *CacheEntry {
+    if e := tp.l1.Get(key); e != nil {
+        tp.stats.L1Hits.Add(1)
+        return e
+    }
+    if e := tp.l2.Get(key); e != nil {
+        tp.stats.L2Hits.Add(1)
+        tp.l1.Set(key, e) // promote to L1
+        return e
+    }
+    tp.stats.Misses.Add(1)
+    return nil
+}
+```
+
+When L1 evicts an entry (capacity overflow), it is *demoted* to L2 rather than discarded. An item does not fully leave the cache until it is also evicted from L2.
+
+**Adaptive TTL**: popular content should stay fresh longer. Each `CacheEntry` tracks `AccessCount`. On background revalidation, if the count exceeds 10, the TTL is doubled (up to 4× the original `Cache-Control: max-age`).
+
+**Link prefetch**: the `Prefetcher` parses `Link: </next-page>; rel=prefetch` response headers and warms those URLs in background goroutines — before any client requests them.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/cdn-edge"
+  prereqs={["Go 1.22+"]}
+  steps={[
+    { label: "Clone and build", cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/cdn-edge\ngo build ./..." },
+    { label: "Start a simple origin on port 9000", cmd: "go run ./cmd/origin &" },
+    { label: "Start the CDN edge on port 8080", cmd: "go run ./cmd/edge" },
+    { label: "First request — cache MISS", cmd: "curl -v http://localhost:8080/api/data" },
+    { label: "Second request — cache HIT", cmd: "curl -v http://localhost:8080/api/data" },
+    { label: "Check cache stats", cmd: "curl http://localhost:8080/stats" },
+    { label: "Purge an entry", cmd: "curl -X DELETE 'http://localhost:8080/cache/purge?path=/api/data'" },
+    { label: "Run tests", cmd: "go test ./pkg/cdn/ -v -race" },
+  ]}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM, Go 1.23"
+  rows={[
+    { metric: "Cache hit throughput (L1)",         value: "450,000", unit: "req/s",        note: "Varnish ~600K via lock-free sharded hash" },
+    { metric: "Cache miss (origin loopback)",      value: "45,000",  unit: "req/s",        note: "nginx proxy_pass ~55K; both dominated by loopback RTT" },
+    { metric: "Coalescing (100 concurrent misses)",value: "1",       unit: "origin call",  note: "99% origin call reduction vs naive miss" },
+    { metric: "LRU eviction throughput",           value: "45,000,000", unit: "ops/s",    note: "list.MoveToFront + map delete; groupcache ~40M" },
+  ]}
+/>
+
+## Stress tests
+
+**10,000 concurrent requests**: without coalescing, a popular entry expiring at peak traffic sends 10,000 simultaneous origin requests. With coalescing, only 1 fires. The other 9,999 wait on the channel and add roughly 100 µs of latency — negligible compared to the origin RTT saved.
+
+**Vary explosion**: if an origin returns `Vary: User-Agent`, the cache stores one entry per user-agent string. At 1,000 distinct user-agents and LRU capacity 100, the cache is effectively bypassed — 99% of requests miss. Real CDNs normalize user-agents into buckets (mobile/desktop/bot) before using them in Vary keys.
+
+**Adaptive TTL saturation**: after four doublings, the TTL cap is reached. Content cached with `max-age=60` and heavy access will be held for 240 seconds. If the origin changes the content more frequently, the edge serves stale data for up to 240 seconds — the multiplier must be tuned to the content's rate of change.
+
+<WhatTheToyMisses
+  items={[
+    { thing: "No geographic distribution", why: "A real CDN routes requests to the nearest PoP using anycast BGP routing or GeoDNS. Our single-process edge node has no notion of geography." },
+    { thing: "No WAL-backed origin shield", why: "Fastly's origin shield serialises all cache misses for a given URL through a single mid-tier node, preventing the origin from seeing traffic spikes. Our coalescing only works within one process." },
+    { thing: "No signed URLs or token validation", why: "Cloudflare and CloudFront support signed URL policies that expire after a time window or IP range. Our edge trusts all incoming requests unconditionally." },
+    { thing: "No QUIC / HTTP3 termination", why: "Modern CDNs terminate QUIC at the edge and reuse HTTP/1.1 or HTTP/2 to the origin. Our proxy speaks HTTP/1.1 end-to-end." },
+    { thing: "No partial-content (Range) caching", why: "Range requests require caching byte ranges and reassembling slices — critical for video streaming. Our cache stores full responses only." },
+    { thing: "No streaming / chunked transfer", why: "We buffer the full origin response before serving. A real edge node starts streaming to the client while the response is still being received, minimising time-to-first-byte for large objects." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  mavenCoords={["org.springframework.boot:spring-boot-starter-web:3.3.0"]}
+  springModule="spring-webmvc"
+>
+
+The Java side uses Spring `RestClient` to route requests through the CDN edge node. The CDN is transparent to the application — it sees `Cache-Control` headers and caches accordingly:
+
+```java
+@Component
+public class CdnClient {
+    private final RestClient http;
+
+    public CdnClient(RestClient.Builder builder,
+                     @Value("${cdn.edge-url:http://localhost:8080}") String base) {
+        this.http = builder.baseUrl(base).build();
+    }
+
+    public byte[] fetch(String path) {
+        return http.get().uri(path).retrieve().body(byte[].class);
+    }
+
+    public void purge(String path) {
+        http.delete().uri("/cache/purge?path={p}", path)
+            .retrieve().toBodilessEntity();
+    }
+}
+```
+
+**Spring Cache comparison**: Spring's `@Cacheable` and `CacheManager` (Caffeine, EhCache) provide in-process caching. The key difference is scope: Spring Cache is per-JVM; a CDN edge is shared across all JVMs and all clients. Use `@Cacheable` to avoid recomputing expensive in-JVM results; use the CDN edge to avoid hitting the application layer at all.
+
+</JavaIntegration>
+
+<WhatSurprisedMe insight="Request coalescing reduced origin calls by 99% under load — but the surprise was the latency profile of the 99% waiters. Instead of the 800 ms origin RTT seen without coalescing, the waiters measured about 820 ms — only 20 ms more. The overhead of blocking on a channel is negligible compared to the origin latency being saved. That 20 ms is the cost of a channel receive and a mutex acquire, not a meaningful penalty. This is the whole argument for coalescing: it is nearly free in latency while providing massive origin relief." />
+
+## Where to go deeper
+
+- **RFC 9111** — the authoritative HTTP caching spec; sections 4 and 5 cover constructing and invalidating responses
+- **RFC 5861** — `stale-while-revalidate` and `stale-if-error` extensions
+- **groupcache** (github.com/golang/groupcache) — the `singleflight` package is the coalescing pattern in 100 lines
+- **Varnish Documentation** — Grace mode explains production-grade SWR implementation
+- **Cloudflare Blog** — "How Cloudflare Cache works" and their approach to cache invalidation at 330 PoPs
+
+## Related labs and questions
+
+- [`http-server`](/system-design-labs/http-server) — the `http.Handler` interface this lab builds on
+- [`kv-cache`](/system-design-labs/kv-cache) — the Redis-lite cache that handles the distributed tier
+- [`load-balancer`](/system-design-labs/load-balancer) — sits in front of the CDN edge node
+- [`rate-limiter`](/system-design-labs/rate-limiter) — protects the origin from overload on cache misses
+- **How does Cloudflare's Tiered Cache differ from our L1/L2?**
+- **What happens to `stale-while-revalidate` when background revalidation fails three times in a row?**

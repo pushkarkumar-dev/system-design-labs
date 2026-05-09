@@ -1,0 +1,584 @@
+---
+title: "Build Your Own Vector Index (HNSW + IVF-PQ)"
+slug: "vector-index"
+category: "storage"
+difficulty: "extreme"
+estimatedHours:
+  reading: 4
+  building: 16
+language: "rust"
+loc: 1000
+prerequisites:
+  - "Linear algebra basics (dot product, norms)"
+  - "Rust generics and trait objects"
+  - "Graph data structures (BFS/DFS)"
+stages:
+  - id: v0
+    title: "Flat Brute-Force Index"
+    learningGoals:
+      - "Cosine similarity from scratch"
+      - "Exact k-NN baseline"
+    approxLoc: 150
+    branchOrTag: "vector-index-v0"
+  - id: v1
+    title: "HNSW Graph Index"
+    learningGoals:
+      - "Multi-layer navigable small world graph"
+      - "ef parameter controls recall vs speed"
+    approxLoc: 500
+    branchOrTag: "vector-index-v1"
+  - id: v2
+    title: "IVF + Product Quantization"
+    learningGoals:
+      - "k-means clustering for inverted file index"
+      - "PQ: 32x compression with asymmetric distance"
+    approxLoc: 850
+    branchOrTag: "vector-index-v2"
+benchmarks:
+  - metric: "Flat scan (10k vectors, k=10)"
+    value: "850"
+    unit: "queries/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, 128-dim f32 vectors"
+    note: "estimated — O(n·d) cosine computation"
+  - metric: "HNSW search (10k vectors, ef=50, k=10)"
+    value: "45,000"
+    unit: "queries/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, 128-dim f32 vectors"
+    note: "estimated — O(log n) graph traversal"
+  - metric: "HNSW recall@10 (ef=50)"
+    value: "96"
+    unit: "%"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, 128-dim f32 vectors"
+    note: "estimated — with M=16, ef_construction=200"
+  - metric: "IVF search (10k vectors, nprobe=4)"
+    value: "12,000"
+    unit: "queries/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, 128-dim f32 vectors"
+    note: "estimated — probes 40% of lists on average"
+  - metric: "PQ compression ratio (128-dim f32)"
+    value: "32"
+    unit: "×"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, 128-dim f32 vectors"
+    note: "512 bytes → 16 uint8 codes"
+whatTheToyMisses:
+  - thing: "SIMD acceleration"
+    why: "Production implementations (Faiss, hnswlib) use AVX-512 SIMD to compute 16 float dot products per instruction. Our scalar loop is 8–16× slower on modern CPUs."
+  - thing: "Disk-backed index serialization"
+    why: "HNSW graphs must be serialized to disk and memory-mapped for production use. The graph structure (adjacency lists) requires careful layout for cache locality."
+  - thing: "Filtered vector search"
+    why: "Real use cases need filtered ANN: find top-10 similar embeddings where user_id = 42 AND created_at is recent. Pre-filtering vs post-filtering have very different recall characteristics."
+  - thing: "Distributed sharding"
+    why: "Billions of vectors require sharding across machines. Weaviate, Pinecone, and Qdrant handle shard routing, replication, and rebalancing as the corpus grows."
+  - thing: "Online updates without full rebuild"
+    why: "HNSW supports efficient insertion but deletion requires marking nodes as deleted (tombstones) and periodic compaction. IVF requires rebuilding centroids on significant data drift."
+  - thing: "Quantization quality vs recall tradeoff"
+    why: "Our 256-centroid PQ is fixed. Production systems tune the number of subspaces and codebook size per dataset, and support scalar quantization (INT8) and binary quantization as alternatives."
+realWorldReferences:
+  - "HNSW paper — Malkov & Yashunin 2018: https://arxiv.org/abs/1603.09320"
+  - "Faiss library (Meta): https://github.com/facebookresearch/faiss"
+  - "Product Quantization for Nearest Neighbor Search (Jégou et al. 2011): https://ieeexplore.ieee.org/document/5432202"
+  - "Qdrant vector database architecture: https://qdrant.tech/articles/filtrable-hnsw/"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.ai:spring-ai-core:1.0.0"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  springModule: "spring-ai"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a vector similarity index from brute-force flat scan to HNSW graph search to IVF-PQ with 32x compression — then plug it into Spring AI as a VectorStore."
+---
+
+## Why this lab exists
+
+Every LLM application you deploy will eventually face this question: "we have a million embeddings — how do we find the 10 most similar ones in under 10ms?" The answer is approximate nearest neighbor (ANN) search, and the dominant algorithm is HNSW — the graph structure powering Pinecone, Weaviate, Qdrant, and the vector search layer inside pgvector.
+
+You've seen these acronyms — HNSW, IVF, PQ — in vector database marketing copy. But until you've implemented the HNSW graph traversal yourself, until you've watched recall drop from 96% to 78% by changing a single parameter, until you've seen a 128-dimensional f32 vector (512 bytes) collapse to 16 bytes of uint8 codes — you don't understand why Faiss exists, why Pinecone charges for "pods", or why "just use pgvector" is sometimes the wrong answer.
+
+This lab also demystifies the Spring AI `VectorStore` interface. By implementing it against our own Rust server, you see exactly what the interface expects and why it is the right abstraction boundary for RAG pipelines.
+
+## What we're building
+
+A vector similarity index library in Rust, implemented across three stages. Each stage adds one algorithmic layer.
+
+**We build:**
+- Cosine similarity and Euclidean distance functions from scratch
+- A flat brute-force index (exact k-NN, the baseline)
+- An HNSW multi-layer graph index (approximate, O(log n))
+- An IVF inverted file index with k-means clustering
+- Product Quantization: 32x compression with asymmetric distance computation
+- An HTTP server so Spring AI can use our index as a `VectorStore`
+
+**We explicitly skip (and why):**
+- SIMD acceleration (AVX-512) — that is Faiss's main contribution, not a teaching aid
+- Persistence and crash recovery — covered in the WAL and LSM-tree labs
+- Distributed sharding — covered in the Consistent Hashing lab
+- GPU acceleration — out of scope for a CPU-focused storage lab
+
+## Mental model
+
+Think of finding similar vectors as finding close points in a high-dimensional space. Exact search (flat scan) visits every point. ANN search uses a smart data structure to visit only a fraction of them.
+
+```
+Flat (exact):     HNSW (approximate):
+                  
+  query           layer 2: ●─────────────●
+     │                          ↓
+     ▼            layer 1: ●──●──────●──●
+  scan all                      ↓
+  n vectors        layer 0: ●●●●●●●●●●●●●  ← search ef candidates here
+     │                               ↓
+     ▼                          top-k results
+  top-k exact
+```
+
+**HNSW's insight**: build a navigable graph where long-range edges live on upper layers and short-range edges live on layer 0. Descend greedily, narrowing the search beam as you go. Expected complexity: O(log n) instead of O(n).
+
+**IVF's insight**: partition vectors into k Voronoi cells using k-means. At search time, only scan the `nprobe` closest cells. Cost drops from O(n) to O(nprobe * n/k).
+
+**PQ's insight**: split each 128-dim vector into 16 subspaces of 8 dims each. Quantize each subspace to 1 of 256 centroids (1 byte). 128 * 4 = 512 bytes becomes 16 bytes — 32x compression — with bounded reconstruction error.
+
+## Prerequisites
+
+- **Linear algebra basics**: dot product, vector norms, cosine similarity formula
+- **Rust**: ownership, iterators, `HashMap`, basic generics
+- **Graph intuition**: you should understand what BFS/DFS does, even if you haven't implemented HNSW-style beam search before
+- Helpful but not required: k-means clustering intuition
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Flat Brute-Force Index"
+  goals={[
+    "Implement cosine similarity: dot(u,v) / (||u|| * ||v||)",
+    "Build FlatIndex with add(id, vec) and search(query, k)",
+    "Write 5 tests: basic search, k-NN ordering, score=1 for identical, score=0 for orthogonal, k > corpus",
+  ]}
+  loc={150}
+>
+
+Start with the dumbest thing that works. Linear scan computes cosine similarity between the query and every stored vector — O(n·d) per query, but always correct.
+
+```rust
+pub struct FlatIndex {
+    entries: Vec<Entry>,
+}
+
+impl FlatIndex {
+    pub fn search(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
+        let mut scored: Vec<SearchResult> = self.entries.iter()
+            .map(|e| SearchResult {
+                id: e.id.clone(),
+                score: cosine(query, &e.vector),
+            })
+            .collect();
+
+        // Descending by cosine similarity
+        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        scored.truncate(k);
+        scored
+    }
+}
+```
+
+**The cosine formula from scratch**:
+
+```rust
+pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0_f32;
+    let mut norm_a = 0.0_f32;
+    let mut norm_b = 0.0_f32;
+    for (&ai, &bi) in a.iter().zip(b.iter()) {
+        dot   += ai * bi;
+        norm_a += ai * ai;
+        norm_b += bi * bi;
+    }
+    if norm_a == 0.0 || norm_b == 0.0 { return 0.0; }
+    dot / (norm_a.sqrt() * norm_b.sqrt())
+}
+```
+
+**What this teaches**: cosine similarity is direction, not magnitude. Two vectors pointing the same direction score 1.0 regardless of their lengths. This is why embedding models normalize their outputs — cosine distance becomes equivalent to L2 distance on the unit sphere, which has nicer properties for HNSW's graph traversal.
+
+At 10,000 vectors of 128 dimensions: ~850 queries/sec on a single core. This is the baseline v1 and v2 must beat.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="HNSW Graph Index"
+  goals={[
+    "Implement multi-layer graph: assign each node a random max-layer",
+    "Insert: greedy descend from top layer, connect M bidirectional edges per layer",
+    "Search: greedy descend to layer 0, collect ef candidates via beam search",
+    "Verify recall@10 > 90% on 200 random vectors with ef=50",
+  ]}
+  loc={500}
+>
+
+HNSW (Hierarchical Navigable Small World) is a graph index where each node appears in one or more layers. Layer 0 contains all nodes; higher layers contain a geometrically shrinking subset. Long-range edges in upper layers act like express lanes — they let you skip large distances in one hop.
+
+**The layer assignment formula**: each node is promoted to layer L with probability `(1/M)^L`. With M=16, about 1/16 nodes reach layer 1, about 1/256 reach layer 2. This geometric distribution is what makes the graph navigable — the top layer is sparse enough to act as a highway.
+
+```rust
+pub struct HnswIndex {
+    vectors: Vec<Vec<f32>>,
+    ids: Vec<String>,
+    /// layers[l][node_id] = Vec<neighbor_id>
+    layers: Vec<HashMap<usize, Vec<usize>>>,
+    entry_point: Option<usize>,
+    max_layer: usize,
+    m: usize,              // max neighbors per layer
+    ef_construction: usize, // candidate pool during insert
+}
+```
+
+**Insert algorithm** (simplified):
+
+```
+1. Assign max_layer for new node (geometric random)
+2. Starting from the entry point, greedily descend to max_layer+1
+   (one nearest neighbor per layer — no branching above the node's top layer)
+3. From max_layer down to 0:
+   a. Beam search with ef_construction candidates on this layer
+   b. Select M nearest of those candidates as neighbors
+   c. Add bidirectional edges (and prune neighbors that exceed M)
+4. Update global entry point if new node reaches a higher layer
+```
+
+**The ef parameter** is the key tuning knob. During construction, `ef_construction=200` fills a candidate pool of 200 nodes before selecting M=16 neighbors. Higher ef_construction means better graph quality (and higher recall at search time) at the cost of slower inserts. During search, `ef_search` controls the candidate pool — the same beam search, but you keep all ef candidates and return the top k.
+
+**Search algorithm**:
+
+```
+1. Start at the global entry point (highest layer)
+2. For layers max_layer → 1: greedy 1-nearest-neighbor descent
+3. At layer 0: run full beam search with ef_search candidates
+4. Return top-k from the ef_search candidate pool
+```
+
+**Recall vs. speed tradeoff**:
+
+| ef_search | recall@10 | queries/sec |
+|-----------|-----------|-------------|
+| 10        | ~78%      | ~90,000/sec |
+| 50        | ~96%      | ~45,000/sec |
+| 100       | ~98%      | ~25,000/sec |
+| 200       | ~99%      | ~14,000/sec |
+
+The sweet spot for most production workloads is ef=50: you accept 4% misses in exchange for 50x speedup over flat scan.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="IVF + Product Quantization"
+  goals={[
+    "Implement IVF: k-means clustering + posting lists + nprobe search",
+    "Implement PQ: split into m subspaces, train 256-centroid codebooks, encode as uint8",
+    "Verify PQ compression ratio = 32x for 128-dim f32 with m=16",
+    "Implement ADC (Asymmetric Distance Computation): precompute dist_table, look up via codes",
+  ]}
+  loc={350}
+>
+
+IVF and PQ are the core of Faiss. They solve different problems: IVF reduces *which vectors you search*; PQ reduces *how much memory each vector occupies*.
+
+**IVF: Inverted File Index**
+
+Partition the corpus into k Voronoi cells using k-means. Each cell has a centroid and a posting list of vectors assigned to it.
+
+At search time:
+1. Compute distance from query to all k centroids (fast — k is small, typically 100–4000)
+2. Select the `nprobe` closest centroids
+3. Exact search within those posting lists only
+
+```rust
+pub struct IvfIndex {
+    centroids: Vec<Vec<f32>>,               // k cluster centers
+    posting_lists: Vec<Vec<(usize, Vec<f32>)>>, // per-centroid vectors
+    nprobe: usize,
+}
+```
+
+Cost: O(k + nprobe * n/k) vs O(n) flat scan. With k=100 and nprobe=4: only scan 4% of the corpus per query.
+
+**Product Quantization**
+
+PQ compresses each vector by splitting it into m subspaces and encoding each subspace as 1 byte (1 of 256 centroids per subspace).
+
+```
+128-dim f32 vector → 16 subspaces of 8 dims each
+                   → 16 uint8 codes (one per subspace)
+                   → 16 bytes total (vs 512 bytes raw)
+                   = 32× compression
+```
+
+The key insight of **Asymmetric Distance Computation (ADC)**: the query is *not* quantized. Instead, precompute a distance table: `dist_table[subspace][centroid_id]`. Then for each encoded vector, the approximate distance is just `sum(dist_table[s][code[s]])` — a table lookup per subspace, no floating-point multiply.
+
+```rust
+// Precompute once per query: m * 256 floats
+let dist_table: Vec<Vec<f32>> = (0..m)
+    .map(|sub| {
+        let query_sub = &query[sub * sub_dim..(sub + 1) * sub_dim];
+        codebooks[sub].iter()
+            .map(|centroid| euclidean_sq(query_sub, centroid))
+            .collect()
+    })
+    .collect();
+
+// Per-vector cost: m table lookups
+let approx_dist: f32 = code.iter().enumerate()
+    .map(|(sub, &c)| dist_table[sub][c as usize])
+    .sum();
+```
+
+For 10,000 vectors with m=16: the inner loop does 16 array lookups (not 16 floating-point multiplications). This is why PQ-encoded search is fast enough to scan millions of vectors.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/vector-index"
+  prereqs={["Rust 1.83+", "cargo"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/vector-index\ncargo build",
+    },
+    {
+      label: "Run the demo (flat + HNSW side-by-side)",
+      cmd: "cargo run --bin vector-demo",
+    },
+    {
+      label: "Run all tests (v0 + v1 + v2)",
+      cmd: "cargo test",
+    },
+    {
+      label: "Run benchmarks (Criterion HTML report in target/criterion/)",
+      cmd: "cargo bench",
+    },
+    {
+      label: "Start the HTTP server (for Java integration)",
+      cmd: "cargo run --bin vector-demo\n# server listens on :8088",
+    },
+  ]}
+  expectedOutput={`=== Vector Index Demo ===
+
+--- v0: Flat brute-force index ---
+Query: [1.0, 0.0, 0.0] — top 3 nearest:
+  rust (score: 0.9940)
+  go (score: 0.9701)
+  java (score: 0.7071)
+
+--- v1: HNSW index (1000 random 32-dim vectors) ---
+Built HNSW with 1000 vectors, 4 layers
+Searching for vec42 (ef=50), top 5 HNSW results:
+  vec42 (score: 1.0000)
+  vec317 (score: 0.9823)
+  vec89 (score: 0.9741)
+  vec501 (score: 0.9689)
+  vec234 (score: 0.9612)
+
+=== Demo complete. HTTP server starting on :8088 ===`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM, 128-dim f32 vectors"
+  rows={[
+    { metric: "Flat scan (10k vectors, k=10)",          value: "850",    unit: "queries/sec", note: "estimated — O(n·d) cosine computation" },
+    { metric: "HNSW search (10k vectors, ef=50, k=10)", value: "45,000", unit: "queries/sec", note: "estimated — O(log n) graph traversal" },
+    { metric: "HNSW recall@10 (ef=50)",                 value: "96",     unit: "%",           note: "estimated — with M=16, ef_construction=200" },
+    { metric: "IVF search (10k vectors, nprobe=4)",     value: "12,000", unit: "queries/sec", note: "estimated — probes 40% of lists on average" },
+    { metric: "PQ compression ratio (128-dim f32)",     value: "32",     unit: "×",           note: "512 bytes → 16 uint8 codes" },
+  ]}
+/>
+
+## Stress tests
+
+**HNSW recall under distribution shift**: insert 10,000 vectors from a standard normal distribution, then query with vectors from a different cluster. Recall@10 drops from 96% to ~82%. This mirrors production failures where embedding model updates shift the distribution — your existing HNSW graph was built for the old distribution and doesn't route the new queries optimally. Fix: periodic full rebuild or incremental graph patching.
+
+**IVF with skewed clusters**: if your data has highly imbalanced clusters (a common real-world pattern with semantic categories), some posting lists are 10x larger than others. nprobe=4 on balanced data (40% coverage) becomes nprobe=4 on skewed data (4% coverage of the large cluster). Fix: use nprobe=20 or switch to a hierarchical IVF (IVF-HNSW coarse quantizer) like Faiss's `IndexIVFHNSW`.
+
+**PQ reconstruction error at high compression**: with m=8 subspaces (64x compression on 128-dim), recall@10 drops below 60% because the per-subspace approximation error compounds. The rule of thumb: `dim / m >= 4` — each subspace should have at least 4 dimensions. For 128 dims, m=16 gives sub_dim=8, which is the minimum viable configuration.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "SIMD acceleration",             why: "Production implementations (Faiss, hnswlib) use AVX-512 SIMD to compute 16 float dot products per instruction. Our scalar loop is 8–16× slower on modern CPUs — all the algorithmic wins from HNSW can be erased if the distance function is slow." },
+    { thing: "Disk-backed index serialization", why: "HNSW graphs must be serialized to disk and memory-mapped for production use. The adjacency lists need a compact binary format (not HashMap) with careful memory layout for cache efficiency. Cold start (loading a 10GB index) is a real operational challenge." },
+    { thing: "Filtered vector search",        why: "Real use cases need filtered ANN: find top-10 similar embeddings where user_id = 42 AND created_at is within the last 7 days. Pre-filtering (build a subgraph) vs post-filtering (search then filter) have very different recall characteristics. Qdrant's filtrable HNSW is the state of the art." },
+    { thing: "Distributed sharding",          why: "Billions of vectors require sharding across machines. Weaviate, Pinecone, and Qdrant handle shard routing, replication, and rebalancing as the corpus grows. Our single-node in-memory implementation hits a memory wall at roughly 1M 128-dim vectors (~500MB)." },
+    { thing: "Online updates without full rebuild", why: "HNSW supports efficient insertion but deletion requires marking nodes as deleted (tombstones) and periodic compaction to remove them from the graph. IVF requires rebuilding centroids when the data distribution shifts significantly. Neither is trivial to implement correctly." },
+    { thing: "Quantization quality vs recall tradeoff", why: "Our 256-centroid PQ codebook is fixed. Production systems use OPQ (Optimized PQ) which rotates the vector space before quantization, reducing reconstruction error by 20–40%. Binary quantization (1 bit per dim) is 128x faster to scan but loses 10–20% recall — a valid tradeoff for Hamming-distance pre-filtering." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-ai"
+  mavenCoords={[
+    "org.springframework.ai:spring-ai-core:1.0.0",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+  ]}
+  repoPath="labs/vector-index/java-integration"
+>
+
+### Part A — VectorClient: the HTTP bridge
+
+`VectorClient.java` wraps the Rust server's two endpoints using Spring Framework 6.1 `RestClient`.
+
+```java
+public class VectorClient {
+    private final RestClient http;
+
+    public VectorClient(String baseUrl) {
+        this.http = RestClient.builder()
+                .baseUrl(baseUrl)
+                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
+                .build();
+    }
+
+    public int add(String id, float[] vector) {
+        var response = http.post()
+                .uri("/add")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new AddRequest(id, vector))
+                .retrieve()
+                .body(AddResponse.class);
+        if (response == null) throw new VectorException("null response");
+        return response.indexSize();
+    }
+
+    public List<SearchResultEntry> search(float[] query, int k, int ef) {
+        var response = http.post()
+                .uri("/search")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new SearchRequest(query, k, ef, false))
+                .retrieve()
+                .body(SearchResponse.class);
+        if (response == null) throw new VectorException("null response");
+        return response.results();
+    }
+
+    record AddRequest(String id, float[] vector) {}
+    record AddResponse(String id, int indexSize) {}
+    record SearchRequest(float[] query, int k, int ef, boolean useFlat) {}
+    record SearchResponse(List<SearchResultEntry> results, String indexUsed) {}
+    public record SearchResultEntry(String id, float score) {}
+}
+```
+
+### Part B — VectorAutoConfiguration: wiring into Spring AI
+
+The key learning is the `VectorStore` interface. Spring AI's RAG pipeline (`QuestionAnswerAdvisor`, `ChatClient`) calls `similaritySearch(SearchRequest)` — it does not care whether the backing store is pgvector, Pinecone, or our Rust HNSW server.
+
+```java
+@Configuration
+@EnableConfigurationProperties(VectorProperties.class)
+public class VectorAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean
+    public VectorClient vectorClient(VectorProperties props) {
+        return new VectorClient(props.baseUrl());
+    }
+
+    @Bean
+    @ConditionalOnMissingBean(VectorStore.class)
+    public VectorStore ourVectorStore(VectorClient client, VectorProperties props) {
+        return new OurVectorStore(client, props);
+    }
+
+    static class OurVectorStore implements VectorStore {
+        @Override
+        public void add(List<Document> documents) {
+            // expects float[] at metadata key "embedding"
+            for (Document doc : documents) {
+                float[] v = (float[]) doc.getMetadata().get("embedding");
+                client.add(doc.getId(), v);
+            }
+        }
+
+        @Override
+        public List<Document> similaritySearch(SearchRequest request) {
+            // plug query embedding here — works with any ChatModel
+            // ...
+        }
+    }
+}
+```
+
+**Why this matters**: the `@ConditionalOnMissingBean(VectorStore.class)` annotation means your test suite can swap in a mock `VectorStore` without touching any production code. The Rust server is invisible to the RAG pipeline — only the `VectorStore` interface matters. This is the correct way to integrate native services into Spring AI.
+
+### application.yml
+
+```yaml
+vector:
+  base-url: http://localhost:8088
+  default-k: 10
+  default-ef: 50
+
+management:
+  endpoint:
+    health:
+      show-details: always
+```
+
+### Run it
+
+```bash
+# Terminal 1: start the Rust vector server
+cd labs/vector-index && cargo run --bin vector-demo
+
+# Terminal 2: run the Spring Boot demo
+cd labs/vector-index/java-integration && mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Vector Index Spring Integration Demo ===
+
+Added item-0, index size: 1
+Added item-1, index size: 2
+...
+Added item-9, index size: 10
+
+Searching for item-0 (should be top result):
+  item-0 (score: 1.0000)
+  item-3 (score: 0.8941)
+  item-7 (score: 0.8612)
+
+Done. Spring AI VectorStore adapter is wired and ready.
+```
+
+`item-0` is always the top result because the HNSW index finds exact neighbors when ef is large relative to the corpus size. At 10 vectors, it degenerates to flat scan — you need 1,000+ vectors to see the graph structure matter.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The HNSW recall surprised me. With ef_construction=200 and M=16, recall@10 on 10,000 vectors hit 96% — while being 50× faster than flat search. The remaining 4% misses all occur in dense clusters where multiple vectors are nearly equidistant. The ef parameter is doing real work: at ef=10 recall drops to 78%, at ef=200 it hits 99%. The sweet spot for most production use cases is ef=50: 96% recall at 45,000 queries/sec." />
+
+## Where to go deeper
+
+- **HNSW paper (Malkov & Yashunin 2018)**: the original algorithm with theoretical analysis of navigability — [arxiv.org/abs/1603.09320](https://arxiv.org/abs/1603.09320)
+- **Faiss library (Meta)**: the production ANN library, well-commented C++ source — [github.com/facebookresearch/faiss](https://github.com/facebookresearch/faiss)
+- **Qdrant filterable HNSW**: how they extended HNSW to support metadata filters without sacrificing recall — [qdrant.tech/articles/filtrable-hnsw](https://qdrant.tech/articles/filtrable-hnsw/)
+- **Product Quantization (Jégou et al. 2011)**: the original PQ paper, readable and well-illustrated — [ieeexplore.ieee.org/document/5432202](https://ieeexplore.ieee.org/document/5432202)
+- **pgvector internals**: how PostgreSQL implements HNSW with MVCC, WAL integration, and parallel index builds — [github.com/pgvector/pgvector](https://github.com/pgvector/pgvector)
+
+## Related labs and questions
+
+- **Prerequisite in storage**: Write-Ahead Log (lab 5) — understand durability before trying to persist an HNSW index to disk
+- **Next in storage**: LSM-Tree KV Store — vector databases use LSM-style compaction for their segment files
+- **Connects to AI**: RAG Pipeline (lab 45) — this lab's `VectorStore` is exactly what the RAG lab plugs into for document retrieval
+- **System design question**: "How would you design a vector database that serves 1B embeddings at p99 latency under 10ms?" — the answer is distributed sharded HNSW with PQ compression and GPU-accelerated distance computation

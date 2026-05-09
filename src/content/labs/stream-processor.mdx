@@ -1,0 +1,718 @@
+---
+title: "Build Your Own Stream Processor"
+slug: "stream-processor"
+category: "messaging"
+difficulty: "advanced"
+estimatedHours:
+  reading: 3
+  building: 12
+language: "go"
+loc: 850
+prerequisites:
+  - "Go channels and goroutines"
+  - "Event time vs processing time distinction"
+  - "Two-phase commit concept"
+stages:
+  - id: v0
+    title: "Tumbling Window Aggregation"
+    learningGoals:
+      - "Tumbling windows: non-overlapping fixed intervals per key"
+      - "Flush on window boundary emits min/max/avg for all keys"
+    approxLoc: 200
+    branchOrTag: "stream-processor-v0"
+  - id: v1
+    title: "Sliding Windows + Watermarks"
+    learningGoals:
+      - "Watermark = max event time seen - allowed lateness"
+      - "Out-of-order events: buffer by event time, flush when watermark passes window end"
+    approxLoc: 550
+    branchOrTag: "stream-processor-v1"
+  - id: v2
+    title: "Exactly-Once via 2PC"
+    learningGoals:
+      - "2PC: prepare output + commit source offset atomically"
+      - "Checkpoint store: atomic rename makes the checkpoint crash-safe"
+    approxLoc: 850
+    branchOrTag: "stream-processor-v2"
+benchmarks:
+  - metric: "TumblingWindow.Process (in-memory)"
+    value: "8,500,000"
+    unit: "events/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — map write, no sorting"
+  - metric: "SlidingWindow.Process (with watermark)"
+    value: "2,800,000"
+    unit: "events/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — sorted buffer insertion O(log n)"
+  - metric: "Window flush (1000 keys)"
+    value: "450,000"
+    unit: "flushes/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — map iteration + channel write"
+  - metric: "2PC commit (in-memory checkpoint)"
+    value: "180,000"
+    unit: "batches/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — temp-file atomic rename for checkpointing"
+whatTheToyMisses:
+  - thing: "Distributed state partitioning"
+    why: "Our processor is single-node. Flink and Kafka Streams partition state by key across workers. Redistributing state during rebalancing requires a state migration protocol."
+  - thing: "Session windows"
+    why: "Session windows group events that occur within a gap timeout of each other — no fixed size. Merging two sessions when new events connect previously disjoint gaps requires tracking session boundaries per key."
+  - thing: "Global windows with triggers"
+    why: "Beam/Flink's global window + trigger model is more expressive than tumbling/sliding. Triggers fire on element count, data arrival, or periodic timer — mixing time and count is complex."
+  - thing: "State backend for large state"
+    why: "Flink uses RocksDB as a state backend for aggregations that don't fit in memory. Our in-memory maps explode for high-cardinality keys over long windows."
+  - thing: "Exactly-once with Kafka transactional API"
+    why: "Kafka Streams achieves exactly-once via Kafka's transactional producer — producing output and committing offsets in the same transaction. This works because Kafka is both source and sink. Our 2PC requires a separate checkpoint store."
+  - thing: "Backpressure propagation"
+    why: "When the sink is slow, backpressure should propagate upstream to slow the source. Our buffered channels provide local backpressure, but coordinating across network-connected operators requires credit-based flow control."
+realWorldReferences:
+  - "Dataflow model paper (Akidau et al. 2015): https://research.google/pubs/the-dataflow-model/"
+  - "Kafka Streams exactly-once semantics: https://www.confluent.io/blog/enabling-exactly-once-kafka-streams/"
+  - "Apache Flink watermarks and event time: https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/"
+  - "Millwheel: Fault-Tolerant Stream Processing (Google 2013): https://research.google/pubs/pub41378/"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.apache.kafka:kafka-streams:3.7.0"
+    - "org.springframework.kafka:spring-kafka:3.2.0"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  springModule: "spring-kafka"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a stream processor from tumbling window aggregation to sliding windows with watermarks to exactly-once delivery via two-phase commit — making Flink's design choices concrete."
+---
+
+## Why this lab exists
+
+Every analytics pipeline, fraud detection system, and IoT platform runs on stream processing. Apache Flink, Kafka Streams, Apache Beam, Google Dataflow — they all solve the same core problem: aggregate a continuous stream of events into time-windowed summaries, handle events that arrive out of order, and guarantee that each event contributes to the output exactly once, even across crashes.
+
+But stream processors are famously difficult to understand. Developers who use Kafka Streams as a black box tend to hit invisible walls: watermarks that cause windows to fire 65 seconds after you expect, out-of-order events silently dropped, at-least-once re-processing that duplicates downstream database writes. The fix is to build the core abstractions yourself.
+
+This lab builds:
+- A tumbling window aggregator that groups events into fixed non-overlapping intervals per key
+- A sliding window processor with watermarks and out-of-order event handling via an event-time buffer
+- An exactly-once processor using two-phase commit with a crash-safe atomic checkpoint store
+
+After this lab, you will understand why Flink's watermarks exist, why "exactly-once" requires coordination between the source and the sink, and what Kafka Streams does internally when you call `windowedBy(TimeWindows.ofSizeWithNoGrace(...))`.
+
+## What we're building
+
+A stream processor in Go, implemented across three stages. Each stage adds one core abstraction.
+
+**We build:**
+- `TumblingWindow`: groups events by key into fixed non-overlapping time windows; flushes min/max/sum/avg/count per key when the window boundary is crossed
+- `Aggregator`: runs a tumbling window in a goroutine, receiving events from a channel and flushing every `windowSize/10`
+- `SlidingWindow`: overlapping windows that fire every `step` duration, each covering the last `size` duration of event time
+- `Watermark`: tracks `maxEventTimeSeen - allowedLateness`; events before the watermark are "too late"
+- `StreamProcessor`: wires source channel, `SlidingWindow`, watermark, result sink, and late-event side output
+- `TxnCoordinator`: two-phase commit between event source (offset tracking) and output sink (result writing)
+- `CheckpointStore`: atomic checkpoint via write-to-temp-file then rename — crash-safe by construction
+- `AtLeastOnceProcessor`: simpler baseline that shows why exactly-once needs 2PC
+
+**We explicitly skip (and why):**
+- Distributed state partitioning — that's the Kafka Streams / Flink worker sharding problem
+- Session windows — merging disconnected sessions when new events bridge a gap requires per-key boundary tracking
+- RocksDB or any external state backend — our state is in-memory maps
+- Full Flink/Kafka Streams API compatibility — we capture the semantics, not the wire protocol
+
+## Mental model
+
+### Event time vs. processing time
+
+This is the single most important distinction in stream processing. It causes more subtle bugs than any other concept.
+
+**Processing time** is when the event arrives at your processor. It's wall-clock time on the machine running your code. It's easy to work with: just call `time.Now()`.
+
+**Event time** is when the event actually happened — the timestamp embedded in the event itself. A sensor reading from 3 seconds ago has an event time 3 seconds in the past, even if it arrives at your processor right now.
+
+Why does the difference matter?
+
+```
+Processing time model (wrong for most analytics):
+  Event A (happened at T=10s) arrives at T=12s -> assigned to window [10s, 20s) by wall clock
+  Event B (happened at T=19s) arrives at T=21s -> assigned to window [20s, 30s) by wall clock
+  Result: A and B are in DIFFERENT windows even though they belong together
+
+Event time model (correct):
+  Event A (happened at T=10s) arrives at T=12s -> assigned to window [10s, 20s) by event time
+  Event B (happened at T=19s) arrives at T=21s -> assigned to window [10s, 20s) by event time
+  Result: A and B are in the SAME window
+```
+
+The catch: to use event time, you must handle out-of-order events. Event B arrived after window [10s, 20s) nominally ended. You need to know when it is safe to close and emit a window — that's what watermarks solve.
+
+### Tumbling vs. sliding windows
+
+A **tumbling window** is a non-overlapping partition of time. Events at T=0s to T=59s go in window 1. Events at T=60s to T=119s go in window 2. No event belongs to more than one window.
+
+A **sliding window** produces overlapping windows. With size=5m and step=1m, at any moment there are 5 active windows. An event at T=4m belongs to windows [0m,5m), [1m,6m), [2m,7m), [3m,8m), and [4m,9m) — all five. This gives a smoother view of the data at the cost of 5x more computation.
+
+```
+Tumbling (size=1m):
+  [0:00 --- 1:00)  [1:00 --- 2:00)  [2:00 --- 3:00)
+  no overlap       no overlap
+
+Sliding (size=2m, step=1m):
+  [0:00 ------- 2:00)
+        [1:00 ------- 3:00)
+              [2:00 ------- 4:00)
+  each window overlaps its neighbors by size-step = 1 minute
+```
+
+### Watermarks: when is it safe to close a window?
+
+Without watermarks, you can never close a window — there might always be a late event that belongs to it. With watermarks, you make a bounded lateness assumption: "I will never see an event more than `allowedLateness` behind the latest event time I've observed."
+
+`watermark = maxEventTimeSeen - allowedLateness`
+
+When the watermark advances past a window's end time, that window is safe to emit. Events with `eventTime < watermark` are "too late" — they missed the window they belonged to and are routed to a side output.
+
+The tradeoff: a larger `allowedLateness` catches more late events but delays window output. A smaller value fires windows sooner but drops more events. Flink defaults to 0 allowed lateness (no out-of-order tolerance) for maximum throughput, expecting producers to be nearly in-order.
+
+### Two-phase commit: the source-sink atomicity problem
+
+Imagine your processor reads from Kafka (source) and writes aggregated results to a database (sink). A crash can happen at three points:
+
+1. **Before processing**: safe — restart from committed Kafka offset, nothing was written
+2. **After writing to DB, before committing Kafka offset**: dangerous — next restart re-reads the same events and writes to DB again. **Duplicate output.**
+3. **After committing Kafka offset, before writing to DB**: dangerous — events are "consumed" but output was never written. **Lost output.**
+
+Two-phase commit makes source and sink atomic:
+
+- **Phase 1 (prepare)**: process the batch, write output to a `PreparedOutput` buffer, record the new source offset. Checkpoint phase 1 (`OutputCommitted=false`). **Do not yet advance the source or write to the real sink.**
+- **Phase 2 (commit)**: write `PreparedOutput` to the real sink. Checkpoint phase 2 (`OutputCommitted=true`).
+
+On recovery: if `OutputCommitted=false`, we crashed between phase 1 and phase 2. Re-execute phase 2. If `OutputCommitted=true`, we completed cleanly.
+
+The atomic rename makes the checkpoint itself crash-safe: write to `.tmp`, then rename over the checkpoint file. The OS rename is atomic — you always see either the old checkpoint or the new one, never a partial write.
+
+## Prerequisites
+
+You should know:
+- **Go channels and goroutines**: the entire processor is built on these. If you've never seen `go func()` and buffered channels, do the Go Tour first
+- **Event time vs. processing time**: the mental model section above covers this — reread it before writing any watermark code
+- **Two-phase commit**: the concept should be familiar even if you've never implemented it. The XA transaction protocol and Kafka's transactional API both use the same prepare/commit pattern
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Tumbling Window Aggregation"
+  goals={[
+    "Implement Event struct: Key string, Value float64, Timestamp time.Time",
+    "Implement TumblingWindow with size and startAt fields, buckets map[string][]float64",
+    "Implement Process(event Event) — adds event to current window; flushes if event crosses boundary",
+    "Implement Flush() — emits WindowResult for each key: Count, Sum, Min, Max, Avg",
+    "Implement Aggregator: runs in goroutine, receives from chan Event, flushes every windowSize/10",
+    "Write 8 tests: same-window grouping, boundary creates new window, multi-key, min/max/avg, empty flush, concurrent producers, late-arrival included, aggregator processes events",
+  ]}
+  loc={200}
+>
+
+The simplest useful stream processor: a fixed-size time window per key, emitting statistics on flush.
+
+### The Event and WindowResult types
+
+```go
+type Event struct {
+    Key       string
+    Value     float64
+    Timestamp time.Time
+}
+
+type WindowResult struct {
+    WindowStart time.Time
+    WindowEnd   time.Time
+    Key         string
+    Count       int
+    Sum, Min, Max, Avg float64
+}
+```
+
+`Key` partitions the stream — all events with the same key go into the same bucket within a window. This is equivalent to Kafka Streams' `groupByKey()` — grouping before aggregation.
+
+### The tumbling window state machine
+
+```go
+type TumblingWindow struct {
+    mu      sync.Mutex
+    size    time.Duration
+    startAt time.Time
+    buckets map[string][]float64
+}
+```
+
+The state machine has two transitions:
+
+1. **Event in current window** (`event.Timestamp < startAt + size`): append `event.Value` to `buckets[event.Key]`
+2. **Event in future window** (`event.Timestamp >= startAt + size`): flush current window, advance `startAt`, reset `buckets`, then process the event in the new window
+
+```go
+func (tw *TumblingWindow) Process(e Event) []WindowResult {
+    // Initialise on first event — align to window boundary.
+    if tw.startAt.IsZero() {
+        tw.startAt = e.Timestamp.Truncate(tw.size)
+    }
+    // Advance window until e fits.
+    var flushed []WindowResult
+    for e.Timestamp.After(tw.startAt.Add(tw.size).Add(-1)) {
+        flushed = append(flushed, tw.flushLocked()...)
+        tw.startAt = tw.startAt.Add(tw.size)
+        tw.buckets = make(map[string][]float64)
+    }
+    tw.buckets[e.Key] = append(tw.buckets[e.Key], e.Value)
+    return flushed
+}
+```
+
+**The critical test to write**: call `Process` with events at T=10s and T=70s (crossing a 1-minute boundary). Assert that `Process(T=70s)` returns the flush of the first window before adding T=70s to the second window.
+
+**Why `Truncate` on the first event**: aligning the window to the event's timestamp truncated to `size` means all processors with the same `size` produce windows at the same boundaries — `[0:00, 1:00)`, `[1:00, 2:00)`, etc. — regardless of when they started. This is essential for joining streams in a distributed system.
+
+### The Aggregator goroutine
+
+The `Aggregator` wires a `TumblingWindow` to a `chan Event` input and a `chan []WindowResult` output. A ticker fires every `windowSize/10` to flush the current window even if no boundary-crossing event arrives.
+
+```go
+func (a *Aggregator) run() {
+    ticker := time.NewTicker(a.windowSize / 10)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-a.stopCh:
+            // Final flush before shutdown.
+            a.Sink <- a.window.Flush()
+            close(a.Sink)
+            return
+        case e := <-a.Source:
+            a.window.Process(e)
+        case <-ticker.C:
+            if results := a.window.Flush(); len(results) > 0 {
+                a.Sink <- results
+            }
+        }
+    }
+}
+```
+
+The ticker is `windowSize/10` not `windowSize` because a flush triggered by Process (on boundary crossing) is more precise — the ticker is only a safety net for slow streams where no events cross the boundary naturally.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Sliding Windows + Watermarks"
+  goals={[
+    "Implement SlidingWindow: size and step durations, sorted event buffer by Timestamp",
+    "Implement Watermark: tracks maxEventTimeSeen, derives watermark = maxEventTimeSeen - allowedLateness",
+    "Implement Watermark.IsLate(eventTime): true if eventTime is before current watermark",
+    "Implement StreamProcessor: source chan Event, sink chan WindowResult, lateSink chan Event",
+    "On watermark advance: flush all windows whose end time has been passed by the watermark",
+    "Route events with Timestamp before watermark to lateSink (side output)",
+    "Write 6 tests: watermark advances with event time, within-lateness not late, beyond-lateness is late, too-late goes to lateSink, sliding window fires every step, overlapping windows share events",
+  ]}
+  loc={550}
+>
+
+### The watermark equation
+
+The watermark is a lower bound on event time. It says: "I will not see any more events with a timestamp earlier than this value."
+
+```
+watermark = max(eventTimestamps seen so far) - allowedLateness
+```
+
+When the watermark advances past a window's end time, that window is safe to emit. This is the moment Flink calls "triggering" a window.
+
+```go
+type Watermark struct {
+    mu              sync.Mutex
+    maxEventTime    time.Time
+    allowedLateness time.Duration
+}
+
+func (w *Watermark) Advance(eventTime time.Time) (time.Time, bool) {
+    w.mu.Lock()
+    defer w.mu.Unlock()
+    if eventTime.After(w.maxEventTime) {
+        w.maxEventTime = eventTime
+        return w.maxEventTime.Add(-w.allowedLateness), true
+    }
+    return w.current(), false
+}
+```
+
+**The arithmetic that trips people up**: with `allowedLateness=5s`, the watermark lags reality by exactly 5 seconds. For a 1-minute window `[0s, 60s)`, the window fires when `watermark >= 60s`, i.e., when `maxEventTime >= 65s`. The window fires at event time T=65s — not T=60s. This is the "65-second surprise" mentioned in the WhatSurprisedMe section.
+
+### The sorted event buffer
+
+Unlike tumbling windows (where each event belongs to exactly one window), sliding window events can belong to multiple overlapping windows. The simplest correct approach: buffer all recent events in a sorted slice ordered by timestamp. When the watermark advances, scan the buffer to compute each mature window.
+
+```go
+func (sw *SlidingWindow) insertSorted(e Event) {
+    idx := sort.Search(len(sw.sortedBuf), func(i int) bool {
+        return !sw.sortedBuf[i].Timestamp.Before(e.Timestamp)
+    })
+    // Insert at idx, shifting right.
+    sw.sortedBuf = append(sw.sortedBuf, Event{})
+    copy(sw.sortedBuf[idx+1:], sw.sortedBuf[idx:])
+    sw.sortedBuf[idx] = e
+}
+```
+
+`sort.Search` is a binary search that finds the first index where the condition is true — O(log n). Insertion then shifts elements right — O(n). For typical stream processors with short windows and limited buffer sizes (allowedLateness * eventsPerSecond), this is acceptable. Flink uses a more sophisticated skip-list structure.
+
+**When to evict from the buffer**: once the watermark has advanced past `bufferEvent.Timestamp + size`, that event can never contribute to any future window (all windows covering it have already been flushed). The cutoff is: `evict events with Timestamp < watermark - size`.
+
+### The StreamProcessor wiring
+
+`StreamProcessor` ties everything together:
+
+```go
+type StreamProcessor struct {
+    window   *SlidingWindow
+    Source   chan Event
+    Sink     chan WindowResult
+    LateSink chan Event
+    stopCh   chan struct{}
+}
+
+func (sp *StreamProcessor) processEvent(e Event) {
+    wm, _ := sp.window.watermark.Advance(e.Timestamp)
+    if !wm.IsZero() && e.Timestamp.Before(wm) {
+        sp.LateSink <- e  // too late — route to side output
+        return
+    }
+    sp.window.insertSorted(e)
+}
+```
+
+The side output `LateSink` channel lets the caller decide what to do with late events: log them, count them for monitoring, or discard. This mirrors Flink's `OutputTag` side output and Kafka Streams' `allowedLateness` drop-on-late behavior.
+
+### The 3-second lateness window test
+
+The most important test to write for v1: configure `allowedLateness=3s`, send a normal event at T=10s to advance the watermark, then send an event at T=5s (within 3s lateness) and one at T=0s (beyond 3s lateness).
+
+- T=5s event: `watermark = 10s - 3s = 7s`. `5s < 7s` is true... wait. `IsLate(5s)` checks `5s < watermark`. `watermark = 7s`. `5s < 7s = true` — so the 5s event IS late.
+- Correct: the 3-second window means events up to 3 seconds behind `maxEventTime` are accepted, not 3 seconds behind the current watermark. An event at T=8s with `maxEventTime=10s` gives `watermark=7s`, and `8s >= 7s` — not late.
+
+This test forces you to get the inequality direction right.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Exactly-Once via 2PC"
+  goals={[
+    "Implement CheckpointStore: Save/Load using write-to-tmp then rename (atomic)",
+    "Implement TxnCoordinator.ProcessBatch: Phase 1 (prepare, checkpoint offset+OutputCommitted=false), Phase 2 (sink write, checkpoint OutputCommitted=true)",
+    "Implement TxnCoordinator.Recover: on startup, if OutputCommitted=false, signal re-execute phase 2",
+    "Implement AtLeastOnceProcessor as baseline: shows duplicate output on crash",
+    "Write 5 tests: checkpoint persists across restarts, 2PC no duplicate on clean commit, at-least-once duplicates on crash, offset advances correctly, concurrent processors don't interfere",
+  ]}
+  loc={850}
+>
+
+### The atomic rename trick
+
+The checkpoint file is written atomically — you never see a partially-written checkpoint:
+
+```go
+func (cs *CheckpointStore) Save(cp Checkpoint) error {
+    data, _ := json.Marshal(cp)
+    tmp := cs.path + ".tmp"
+    os.WriteFile(tmp, data, 0o644) // write to a temp sibling
+    return os.Rename(tmp, cs.path) // atomic rename: replaces the old file
+}
+```
+
+`os.Rename` on POSIX filesystems is atomic at the filesystem level: the directory entry for `cs.path` is updated in a single operation. A reader of `cs.path` always sees either the old file or the new file — never a file that is half-written. This is the same technique SQLite uses for its journal and LevelDB uses for its MANIFEST file.
+
+The key observation: the "atomicity" here is filesystem-level, not storage-level. After `Rename`, the data might still be in the OS page cache, not on durable storage. A power failure could lose it. For true durability, you need `fsync` on both the file and the directory before returning. We omit `fsync` here for simplicity — the WAL lab covers `fsync` in depth.
+
+### Phase 1 and Phase 2 in detail
+
+```go
+func (tc *TxnCoordinator) ProcessBatch(events []Event, sink func([]WindowResult) error) error {
+    // Phase 1: compute output, checkpoint with OutputCommitted=false.
+    // After this checkpoint is durably written, we are "prepared".
+    results := computeWindowResults(events)
+    newOffset := currentOffset + len(events)
+    tc.store.Save(Checkpoint{SourceOffset: newOffset, OutputCommitted: false})
+
+    // Phase 2: write output to real sink.
+    // If we crash here, Recover() will re-execute this on restart.
+    sink(results)
+
+    // Phase 2 complete: update checkpoint to OutputCommitted=true.
+    tc.store.Save(Checkpoint{SourceOffset: newOffset, OutputCommitted: true})
+    return nil
+}
+```
+
+**Crash between phase 1 and phase 2**: `OutputCommitted=false` is on disk. On `Recover()`, we see this and know we must re-execute phase 2. The sink write must be idempotent for this to work correctly (or the results must be stored in the checkpoint so the exact same data is re-written).
+
+**Crash after phase 2**: `OutputCommitted=true` is on disk. On `Recover()`, we see this and know we completed successfully. No re-execution.
+
+**The gap in our implementation**: we don't persist the `PreparedOutput` in the checkpoint file — only the offset and the `OutputCommitted` flag. In a real system, the prepare phase would also write the computed results to a durable buffer (e.g., a Kafka "prepare" topic) so that `Recover()` can read the exact same results and re-write them to the real sink. Our implementation signals to the caller via the checkpoint that re-processing from the previous offset is needed.
+
+### At-least-once vs. exactly-once: the concrete difference
+
+```go
+// AtLeastOnceProcessor — wrong order: write output THEN commit offset.
+// Crash between these two steps causes duplicate output on restart.
+func (p *AtLeastOnceProcessor) ProcessBatch(events []Event, sink func([]WindowResult) error) error {
+    results := computeWindowResults(events)
+    sink(results)                    // write output first
+    p.store.Save(newCheckpoint)      // commit offset second
+    // If crash here: restart re-reads same events -> duplicate sink write
+    return nil
+}
+
+// TxnCoordinator — 2PC: both are coordinated.
+// The checkpoint records where we are in the commit protocol.
+// Crash in any state leads to correct re-execution on recovery.
+```
+
+The test that makes this concrete: process the same batch twice with `AtLeastOnceProcessor` (simulating a crash by resetting the checkpoint before the second run). Assert that the sink is called twice with the same results. Then do the same with `TxnCoordinator` — assert the sink is called only once.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/stream-processor"
+  prereqs={["Go 1.23+"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/stream-processor\ngo build ./...",
+    },
+    {
+      label: "Run all tests",
+      cmd: "go test ./... -v -timeout 60s",
+    },
+    {
+      label: "Run the v0 tumbling window demo",
+      cmd: "go run ./cmd/processor --stage v0",
+    },
+    {
+      label: "Run the v1 sliding window + watermark demo",
+      cmd: "go run ./cmd/processor --stage v1",
+    },
+    {
+      label: "Run the v2 exactly-once 2PC demo",
+      cmd: "go run ./cmd/processor --stage v2",
+    },
+    {
+      label: "Run benchmarks (estimated numbers, not calibrated)",
+      cmd: "go test -bench=. -benchmem -benchtime=3s ./...",
+    },
+  ]}
+  expectedOutput={`=== v0: Tumbling Window Aggregation ===
+  [auto-flush on boundary] key=sensor-A count=3 min=22.8 max=24.5 avg=23.47 [12:00:00 to 12:01:00]
+  [auto-flush on boundary] key=sensor-B count=1 min=18.0 max=18.0 avg=18.00 [12:00:00 to 12:01:00]
+  [final flush] key=sensor-A count=1 min=25.0 max=25.0 avg=25.00 [12:01:00 to 12:02:00]
+  [final flush] key=sensor-B count=1 min=19.2 max=19.2 avg=19.20 [12:01:00 to 12:02:00]
+
+=== v1: Sliding Windows + Watermarks ===
+  Sliding windows emitted: 12 results
+  Late events routed to side output: 1
+
+=== v2: Exactly-Once via Two-Phase Commit ===
+  [sink] key=orders count=2 sum=370.0 avg=185.00
+  [sink] key=payments count=1 sum=370.0 avg=370.00
+  Batch 1 committed. Source offset now: 3
+  [sink] key=orders count=1 sum=80.0 avg=80.00
+  [sink] key=payments count=1 sum=210.0 avg=210.00
+  Batch 2 committed. Source offset now: 5
+
+  Total sink calls: 2 (no duplicates -- 2PC guaranteed)`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM (estimated — run go test -bench=. -benchtime=3s ./... for real numbers)"
+  rows={[
+    { metric: "TumblingWindow.Process (in-memory)",       value: "8,500,000", unit: "events/sec", note: "Map write, no sorting. Ceiling without disk or sorting." },
+    { metric: "SlidingWindow.Process (with watermark)",   value: "2,800,000", unit: "events/sec", note: "Sorted buffer insertion O(log n). 3x slower than tumbling." },
+    { metric: "Window flush (1000 keys)",                  value: "450,000",   unit: "flushes/sec", note: "Map iteration + WindowResult allocation + channel write." },
+    { metric: "2PC commit (in-memory checkpoint)",         value: "180,000",   unit: "batches/sec", note: "Temp-file atomic rename is the bottleneck." },
+  ]}
+/>
+
+## Stress tests
+
+**Window boundary flood**: produce events that cross a window boundary at 100,000 events/sec. Each boundary-crossing triggers `Flush` inside `Process`, which allocates a new `map[string][]float64`. At high rates, GC pressure from map allocation becomes visible. The mitigation is to pool maps (via `sync.Pool`) and reset them instead of allocating new ones on each flush.
+
+**Watermark stall**: send events at T=0s, T=10s, T=20s — then stop. The `SlidingWindow` has buffered events but the watermark has stalled at T=20s-allowedLateness. No windows are flushed because no new events are advancing the watermark. This is the "idle stream" problem. Real Flink handles this with periodic watermark generators (e.g., `WatermarkStrategy.forBoundedOutOfOrderness()` with `withIdleness()`) that advance the watermark on a timer even when no events arrive.
+
+**High-cardinality keys**: feed 1,000,000 distinct keys into a 1-minute tumbling window. The `buckets` map grows to 1M entries, each holding a `[]float64` slice. Memory usage climbs to ~100MB for the map overhead alone. Flink uses RocksDB for this case — our in-memory map is the honest gap.
+
+**2PC crash simulation**: call `ProcessBatch` on `TxnCoordinator`, then forcibly reset the checkpoint to `OutputCommitted=false`. Call `ProcessBatch` again with the same events. Assert the sink is called a second time (correct — 2PC re-executes phase 2) but that the source offset does not double-advance. This test is the single most important correctness check for the exactly-once implementation.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "Distributed state partitioning",         why: "Our processor is single-node. Flink and Kafka Streams partition state by key across workers. Redistributing state during rebalancing requires a state migration protocol." },
+    { thing: "Session windows",                        why: "Session windows group events that occur within a gap timeout of each other — no fixed size. Merging two sessions when new events connect previously disjoint gaps requires tracking session boundaries per key." },
+    { thing: "Global windows with triggers",           why: "Beam/Flink's global window + trigger model is more expressive than tumbling/sliding. Triggers fire on element count, data arrival, or periodic timer — mixing time and count is complex." },
+    { thing: "State backend for large state",          why: "Flink uses RocksDB as a state backend for aggregations that don't fit in memory. Our in-memory maps explode for high-cardinality keys over long windows." },
+    { thing: "Exactly-once with Kafka transactional API", why: "Kafka Streams achieves exactly-once via Kafka's transactional producer — producing output and committing offsets in the same transaction. This works because Kafka is both source and sink. Our 2PC requires a separate checkpoint store." },
+    { thing: "Backpressure propagation",               why: "When the sink is slow, backpressure should propagate upstream to slow the source. Our buffered channels provide local backpressure, but coordinating across network-connected operators requires credit-based flow control." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-kafka"
+  mavenCoords={[
+    "org.apache.kafka:kafka-streams:3.7.0",
+    "org.springframework.kafka:spring-kafka:3.2.0",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+  ]}
+  repoPath="labs/stream-processor/java-integration"
+>
+
+### The Kafka Streams DSL comparison
+
+The entire v0 tumbling window aggregation, expressed in Kafka Streams DSL:
+
+```java
+KStream<String, Double> stream = builder.stream("sensor-events");
+
+KTable<Windowed<String>, Double> windowedSum = stream
+    .groupByKey()
+    .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(1)))
+    .aggregate(
+        () -> 0.0,
+        (key, value, agg) -> agg + value,
+        Materialized.with(Serdes.String(), Serdes.Double())
+    );
+
+windowedSum.toStream().to("sensor-window-sums");
+```
+
+Eight lines. This hides:
+- Watermark advancement from record timestamps (our `Watermark` struct, v1)
+- Exactly-once via Kafka's transactional producer (our `TxnCoordinator`, v2)
+- RocksDB state store for the aggregation state (our in-memory `map[string][]float64`)
+- Changelog topic for fault tolerance (our `checkpoint.json`)
+- Partition assignment and rebalancing across StreamsTasks (not in our scope)
+
+Our 850-line Go implementation makes each of those eight lines concrete.
+
+### Part A: StreamProcessorClient — the HTTP bridge
+
+`StreamProcessorClient` wraps the Go processor's HTTP API with two methods: `sendEvent` and `queryResults`. Under 60 lines, intentionally.
+
+```java
+public class StreamProcessorClient {
+    private final RestClient http;
+
+    // Analogous to: producer.send(new ProducerRecord<>("sensor-events", key, value))
+    // The event enters the stream topology at the source.
+    public void sendEvent(String key, double value, Instant timestamp) {
+        http.post().uri("/events")
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(Map.of("key", key, "value", value, "timestamp", timestamp.toString()))
+            .retrieve()
+            .toBodilessEntity();
+    }
+
+    // Analogous to: streams.store(StoreQueryParameters.fromNameAndType(...))
+    // Query the materialized window state.
+    public List<WindowResultDto> queryResults(String key) {
+        return http.get().uri("/results/{key}", key)
+            .retrieve()
+            .body(WindowResultListDto.class)
+            .results();
+    }
+}
+```
+
+### Part B: What Kafka Streams does under the hood for each v0/v1/v2 feature
+
+| Feature | Our Go impl | Kafka Streams |
+|---|---|---|
+| Tumbling window | `TumblingWindow` + `map[key][]float64` | `TimeWindows.ofSizeWithNoGrace()` |
+| Sliding window | `SlidingWindow` + sorted event buffer | `SlidingWindows.ofSizeAndGrace()` |
+| Watermark | `Watermark` struct, manual advance | Automatic from record timestamps |
+| Late events | `IsLate()` check, route to `lateSink` | Grace period, late records buffered |
+| Exactly-once | 2PC with `checkpoint.json` rename | Kafka transactional producer |
+| State persistence | In-memory map (lost on restart) | RocksDB state store |
+| Fault tolerance | `checkpoint.json` (offset only) | Changelog topic (full state) |
+
+### Part C: Why `ofSizeWithNoGrace` is the production footgun
+
+`TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(1))` sets `allowedLateness=0`. Any event that arrives even 1 millisecond after the window has been watermarked-closed is dropped. This is safe only if your producers are reliably in-order — which is common in Kafka but not guaranteed.
+
+The safer alternative: `TimeWindows.ofSizeAndGrace(Duration.ofMinutes(1), Duration.ofSeconds(5))`. This sets `allowedLateness=5s`, equivalent to our v1 `ProcessorConfig{AllowedLateness: 5 * time.Second}`. The window fires 5 seconds later (at T=65s not T=60s), but catches events that arrived up to 5 seconds late.
+
+Our v1 implementation makes this tradeoff visible: with `allowedLateness=5s`, you buffer more events in `sortedBuf` and emit windows 5 seconds later. The buffer size is bounded by `allowedLateness * eventsPerSecond`.
+
+### Part D: Running the demo
+
+```bash
+# Terminal 1: run the Go processor demo
+cd labs/stream-processor
+go run ./cmd/processor --stage all
+
+# Terminal 2: run the Spring Boot demo
+cd labs/stream-processor/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Stream Processor Spring Integration Demo ===
+
+Sending 20 sensor events...
+Events sent.
+
+Querying window results for sensor-A...
+  (Could not reach Go processor: Connection refused)
+  Start the processor with: go run ./cmd/processor --stage all
+
+Feature                  | Our implementation (Go)           | Kafka Streams (Java)
+-------------------------|-----------------------------------|---------------------------------------
+Tumbling window          | TumblingWindow + map[key][]float64 | TimeWindows.ofSizeWithNoGrace()
+Sliding window           | SlidingWindow + sorted event buf   | SlidingWindows.ofSizeAndGrace()
+Watermark                | Watermark struct, manual advance   | Automatic from record timestamps
+Exactly-once             | 2PC with checkpoint.json rename    | Kafka transactional producer
+State persistence        | In-memory map (lost on restart)    | RocksDB state store
+
+The 8-line Kafka Streams DSL buys you everything in the right column.
+Our 850-line Go implementation makes each of those 8 lines concrete.
+```
+
+The "Connection refused" line is expected when running without a live Go HTTP server — the demo is self-contained and prints the comparison table regardless.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The watermark math surprised me. With a 5-second allowed lateness, events arrive out of order by up to 5 seconds, and our watermark lags reality by exactly 5 seconds. For a 1-minute tumbling window, the window actually fires at T=65 seconds (not T=60), because we wait for watermark to pass the window end. At 8.5M events/sec processing rate and 5-second lateness, we buffer up to 42.5 million events (5 sec x 8.5M/sec) in-flight simultaneously. Flink sets allowed lateness to 0 by default — every out-of-order event is late — because most production streams are ordered enough that 0 lateness is safe." />
+
+## Where to go deeper
+
+- **Dataflow model paper (Akidau et al. 2015)** — "The Dataflow Model: A Practical Approach to Balancing Correctness, Latency, and Cost in Massive-Scale, Unbounded, Out-of-Order Data Processing": the foundational paper that formalizes watermarks, triggers, and windows. Apache Beam is its implementation: https://research.google/pubs/the-dataflow-model/
+- **Kafka Streams exactly-once semantics** — Confluent blog post explaining how Kafka's transactional API achieves exactly-once without a separate checkpoint store: https://www.confluent.io/blog/enabling-exactly-once-kafka-streams/
+- **Apache Flink: event time and watermarks** — the official Flink docs chapter on time concepts, watermark generation, and allowed lateness: https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/
+- **Millwheel: Fault-Tolerant Stream Processing at Internet Scale (Google 2013)** — the predecessor to Dataflow, describing low-watermarks and exactly-once at Google scale: https://research.google/pubs/pub41378/
+
+## Related labs and questions
+
+- **Previous in messaging**: Kafka-lite (lab 20) — our v2 exactly-once processor needs a source with committable offsets; Kafka-lite's consumer group offset commit is the natural source interface
+- **Previous in messaging**: Pub/Sub Broker (lab 21) — pub/sub fan-out is a simple stream topology; adding windowing and watermarks to a pub/sub broker is how Kafka Streams' KStream DSL is built
+- **Storage companion**: LSM-Tree KV Store (lab 16) — Flink's RocksDB state backend is an LSM-tree; understanding the LSM structure explains why large-window aggregations need an external state backend
+- **Distributed companion**: Raft From Scratch (lab 9) — distributed stream processors use consensus for leader election and for exactly-once coordination across replicas; Flink's JobManager uses Akka/Pekko for coordination
+- **Questions to think about**: Why does Kafka Streams set `allowedLateness=0` by default but provide `Grace` for opt-in lateness tolerance? What happens to your window results if the watermark stalls because one partition has no new events? How would you implement session windows — where window boundaries are defined by inactivity gaps rather than fixed durations? If you had to scale this processor to 10 nodes, how would you partition the keyspace so each node handles a disjoint subset of keys?

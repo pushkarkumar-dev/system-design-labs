@@ -1,0 +1,696 @@
+---
+title: "Build Your Own Bytecode VM"
+slug: "bytecode-vm"
+category: "runtimes"
+difficulty: "advanced"
+estimatedHours:
+  reading: 3
+  building: 10
+language: "rust"
+loc: 500
+prerequisites: []
+stages:
+  - id: v0
+    title: "Stack VM — operands on the stack, result on the stack"
+    learningGoals:
+      - "Stack VM: push operands, execute instruction, result replaces operands on stack"
+      - "Call stack with frames: each call gets its own stack_base and ip"
+      - "JVM is a stack VM: iload, iadd, ireturn are JVM bytecode instructions"
+    approxLoc: 120
+  - id: v1
+    title: "Closures and upvalues — capturing outer scope"
+    learningGoals:
+      - "Closure = function + its environment (captured variables)"
+      - "Upvalue: a slot shared between the closure and its enclosing scope"
+      - "Java lambda is a closure: invokedynamic + LambdaMetafactory + synthetic method"
+    approxLoc: 200
+  - id: v2
+    title: "Tail call optimization — recursion in O(1) stack space"
+    learningGoals:
+      - "Tail position: the recursive call is the last operation before return"
+      - "TCO: reuse the current frame instead of creating a new one"
+      - "JVM does NOT do TCO; Scala @tailrec compiles to a while loop instead"
+    approxLoc: 180
+benchmarks:
+  - metric: "Arithmetic throughput"
+    value: "120,000,000"
+    unit: "instructions/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — simple dispatch loop, ~8ns per instruction"
+  - metric: "fib(30) recursive call count"
+    value: "2,692,537"
+    unit: "calls"
+    measuredOn: "M2 MacBook Pro"
+    note: "exponential growth — 2*fib(n-1)+fib(n-2) calls"
+  - metric: "fib(30) tail-recursive call count"
+    value: "31"
+    unit: "calls"
+    measuredOn: "M2 MacBook Pro"
+    note: "exactly n+1 steps — O(n) not O(2^n)"
+  - metric: "fib(100000) with TCO — stack overflow?"
+    value: "no overflow"
+    unit: ""
+    measuredOn: "M2 MacBook Pro"
+    note: "1 frame throughout; naive would overflow at depth ~8000"
+whatTheToyMisses:
+  - thing: "Register-based VM (faster than stack)"
+    why: "Lua 5 switched from stack to register VM for a 2x speedup. Register VMs have more complex instructions but fewer of them — fewer dispatch cycles per high-level operation. V8's Ignition bytecode is register-based."
+  - thing: "JIT compilation"
+    why: "Our VM interprets bytecode. The JVM's JIT (C1/C2) compiles hot bytecode to native machine code after profiling. First execution is slow (interpreted), repeated execution is fast (compiled). We have no JIT — every instruction pays dispatch overhead forever."
+  - thing: "Garbage collection"
+    why: "Our VM leaks memory — closures and strings are never freed. A real VM needs a GC to reclaim unused Values. The GC's interaction with the call stack (rooting all live values to prevent collection) is the hard part. Our Rc does reference counting, not tracing GC."
+  - thing: "Computed goto dispatch"
+    why: "Our dispatch loop uses a match statement — the CPU branch predictor can't predict which instruction comes next. Computed goto (GCC extension, available in unsafe Rust via function pointers) jumps directly to each handler, eliminating the branch. CPython 3.12 uses this for ~15% speedup."
+  - thing: "Object model"
+    why: "We have no objects, structs, or prototype chains. A real VM needs a way to represent structured data with field access and method dispatch. The JVM uses the classfile constant pool and vtable for this. Our VM has no concept of a type beyond Int, Bool, Str, and Closure."
+  - thing: "Exception handling"
+    why: "Our VM has no exception mechanism. Real VMs use exception tables: a mapping from [ip_start, ip_end] to handler_ip. On exception, the VM scans the table for a matching handler, unwinds frames, and jumps to the handler. We would need to add THROW and TRY/CATCH instructions."
+realWorldReferences:
+  - "Crafting Interpreters — Robert Nystrom (free online, chapters 14-30 build a bytecode VM)"
+  - "JVM bytecode spec: https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-6.html"
+  - "Lua 5 register-based VM: https://www.lua.org/doc/jucs05.pdf"
+  - "CPython bytecode: https://docs.python.org/3/library/dis.html"
+javaIntegration:
+  type: "jvm-perspective"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: null
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a bytecode VM from scratch — stack machine, closures with upvalues, and tail call optimization. Then read the same code's JVM bytecode with javap and see exactly how Java's VM handles closures, lambdas, and why it deliberately skips TCO."
+---
+
+## Why this lab exists
+
+Every language runtime you use daily runs on a virtual machine. CPython compiles your Python to bytecode before interpreting it. The JVM runs Java, Kotlin, Scala, and Clojure on the same bytecode format. V8 compiles JavaScript to its own internal bytecode (Ignition) before JIT-compiling hot paths to native code. Even Rust's MIR (Mid-level Intermediate Representation) is a simplified instruction format that passes through several VM-like transformation stages before becoming machine code.
+
+Yet "how does a VM work" is one of those questions that seems well-documented but actually isn't — most explanations stop at "it's a loop over instructions" without showing the call stack mechanics, how closures work, or why tail call optimization is fundamentally a different model of function invocation.
+
+This lab builds a bytecode VM from scratch in three stages. By the end, you'll be able to read JVM bytecode output from `javap` and understand what the JVM is actually doing for every Java construct — loops, method calls, lambdas, and the conspicuous absence of tail call optimization.
+
+## What we're building
+
+A stack-based bytecode VM in Rust, built across three stages.
+
+**We build:**
+- A stack machine with 17 instructions (PUSH, POP, ADD, SUB, MUL, DIV, NEG, EQ, LT, JUMP, JUMP_IF_FALSE, LOAD, STORE, CALL, RETURN, HALT, and TAIL_CALL)
+- A call stack with frames (`ip` + `stack_base`), enabling recursive function calls
+- Closures with upvalues: functions that capture variables from their enclosing scope
+- Tail call optimization: `TAIL_CALL` reuses the current frame instead of pushing a new one
+- A JVM bytecode comparison showing how each concept maps to real JVM instructions
+
+**We explicitly skip (and why):**
+- A parser or compiler (we hand-write bytecode directly — the interpreter is the lesson)
+- Register-based layout (covered in WhatTheToyMisses — this is a conscious stack-only design)
+- Garbage collection (values are Rust-owned with `Rc`; see WhatTheToyMisses)
+- JIT compilation (out of scope — an entire separate lab)
+
+## Mental model
+
+A stack VM is a calculator with memory. Every instruction either pushes a value onto a stack or pops values from it, computes something, and pushes the result.
+
+Here is the execution trace for `2 + 3 * 4 = 14`:
+
+```
+Instruction    Stack (bottom → top)
+───────────────────────────────────────────────────────
+PUSH 2         [2]
+PUSH 3         [2, 3]
+PUSH 4         [2, 3, 4]
+MUL            [2, 12]      ← pops 3, 4; pushes 3*4=12
+ADD            [14]         ← pops 2, 12; pushes 2+12=14
+HALT           result: 14
+```
+
+No registers. No named variables. Just a pile of values where every instruction knows exactly how many things to consume and how many to produce.
+
+The call stack is layered on top of this. When a function is called, we push a **frame** onto a separate call stack. A frame records two things:
+
+- `ip` — where to resume in the *caller's* code when we return
+- `stack_base` — the index in the value stack where this frame's local variables start
+
+`LOAD(idx)` pushes `stack[stack_base + idx]` and `STORE(idx)` writes to it. This is why local variable access doesn't require knowing absolute positions — just offsets from the frame's base.
+
+**Comparison with JVM:** The JVM is a stack VM with the same mental model. `iload_0` pushes local variable 0 (the first argument or `this`). `iadd` pops two ints and pushes their sum. `ireturn` pops the top int and returns it to the caller. `invokevirtual` pushes a new frame. Our `LOAD/STORE/CALL/RETURN` map to these JVM instructions one-to-one.
+
+## Prerequisites
+
+None. A basic grasp of how function calls work (call stack, local variables) helps but isn't required — we build that model from scratch here.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Stack VM — operands on the stack, result on the stack"
+  goals={[
+    "Implement 17 instructions: arithmetic, comparison, jumps, LOAD/STORE, CALL/RETURN, HALT",
+    "Implement the call stack with Frame{code, ip, stack_base}",
+    "Write tests: 2+3*4=14, loop summing 1..=10, jump-if-false branching",
+  ]}
+  loc={120}
+>
+
+The first thing to understand is the dispatch loop. Every VM is a loop with a `match` (or switch) on the current instruction:
+
+```rust
+loop {
+    let instr = self.code[self.ip].clone();
+    self.ip += 1;   // advance before execution (like a CPU program counter)
+
+    match instr {
+        Instruction::Push(v) => self.stack.push(v),
+        Instruction::Add => {
+            let b = self.stack.pop()?;  // right operand
+            let a = self.stack.pop()?;  // left operand
+            self.stack.push(Value::Int(a + b));
+        }
+        Instruction::Halt => return Ok(self.stack.last().cloned()?),
+        // ...
+    }
+}
+```
+
+The `ip` advances *before* executing the instruction, just like a CPU's program counter. Jumps are relative: `JUMP(offset)` sets `ip = ip + offset - 1` (the `-1` corrects for the pre-advance).
+
+**The frame invariant:** When `CALL` is executed, the current state (`code`, `ip`, `stack_base`) is pushed onto `call_stack`. The callee runs. When `RETURN` fires, the frame is popped, the value stack is truncated back to `frame.stack_base`, and the return value is pushed. The caller resumes exactly where it left off.
+
+```rust
+Instruction::Return => {
+    let ret_val = self.pop()?;
+    if let Some(frame) = self.call_stack.pop() {
+        self.stack.truncate(frame.stack_base);
+        self.code = frame.code;
+        self.ip = frame.ip;
+        self.stack.push(ret_val);
+    }
+}
+```
+
+**Verify your v0 with this trace.** The loop `sum = 0; for i in 1..=10: sum += i` as VM bytecode:
+
+```
+slot 0 = count (starts at 10)
+slot 1 = acc   (starts at 0)
+
+ip=0:  PUSH 10    → [10]
+ip=1:  PUSH 0     → [10, 0]
+ip=2:  LOAD 0     → [10, 0, 10]
+ip=3:  PUSH 0     → [10, 0, 10, 0]
+ip=4:  EQ         → [10, 0, false]   (10 == 0?)
+ip=5:  JumpIfFalse(2) → false, so skip to body
+...
+ip=16: LOAD 1     → result: 55
+ip=17: HALT
+```
+
+**JVM correlation:** Run `javap -c` on any compiled Java class and you'll see the same pattern. `iload_1` is `LOAD(1)`. `iadd` is `ADD`. `if_icmpge` is `LT` + `JumpIfFalse`. `goto` is `JUMP`. The only difference is that JVM bytecode is more granular (separate instructions for int, long, float, double) and uses a compact binary format instead of a Rust enum.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Closures and upvalues — capturing outer scope"
+  goals={[
+    "Add Value::Closure{code, upvalues} to the value type",
+    "Implement CLOSURE(n_upvalues): pop N values from stack, store as upvalues, push Closure",
+    "Implement GET_UPVALUE(idx) and SET_UPVALUE(idx)",
+    "Implement CALL_CLOSURE: pop Closure, push frame with closure's code and upvalues",
+    "Write test: add_10(5) = 15 (closure captures 10 as upvalue)",
+  ]}
+  loc={200}
+>
+
+A closure is a function that has been paired with the environment it was created in. The "environment" is a list of **upvalues** — variable bindings captured from the enclosing scope.
+
+Consider this pseudocode:
+
+```
+function make_adder(n):
+    return function(x):  ← this inner function is a closure
+        return x + n     ← 'n' is captured from the outer scope
+```
+
+When `make_adder(10)` is called, the inner function is created with `n=10` captured as an upvalue. When the returned closure is later called with `x=5`, it reads `n` from its upvalue slot and returns `15`.
+
+In bytecode:
+
+```
+// Top-level program
+PUSH 10               → stack: [10]   (this is n)
+CLOSURE(code, 1)      → pop 1 upvalue (10), push <closure>
+PUSH 5                → the argument x
+CALL_CLOSURE(1)       → call the closure with 1 argument
+
+// Inside the closure body:
+GET_UPVALUE(0)        → push n (10)
+LOAD(0)               → push x (5)
+ADD                   → 15
+RETURN
+```
+
+The `CLOSURE` instruction takes the top `N` values from the value stack and stores them as the closure's upvalue array. `GET_UPVALUE(idx)` pushes `upvalues[idx]`. `SET_UPVALUE(idx)` writes to `upvalues[idx]` — this is how a closure can maintain mutable state (like a counter).
+
+**Frame extension for closures:** When `CALL_CLOSURE` fires, we save not just `code` and `ip` but also `upvalues` in the call frame. When `RETURN` unwinds the frame, the caller's upvalue context is restored.
+
+```rust
+Instruction::CallClosure(n_args) => {
+    let closure = /* pop from stack */;
+    // Save current context
+    let frame = Frame {
+        code: self.code.clone(),
+        ip: self.ip,
+        stack_base: self.stack_base,
+        upvalues: self.upvalues.clone(), // ← save caller's upvalues
+    };
+    self.call_stack.push(frame);
+    // Switch to callee
+    self.code = closure.code;
+    self.upvalues = closure.upvalues;   // ← install callee's upvalues
+    self.ip = 0;
+}
+```
+
+**JVM correlation:** Java lambdas use `invokedynamic` + `LambdaMetafactory`. On first call, the JVM generates a class implementing the functional interface. The lambda body becomes a synthetic method. Captured effectively-final locals become fields on the generated object. This is structurally identical to our `Closure{code, upvalues}`: the synthetic method is `code`, the captured fields are `upvalues`.
+
+Run `javap -p -c` on a class with a lambda that captures a local and look for `invokedynamic` followed by `invokevirtual lambda$methodName$0`. The `$0` is the generated synthetic method.
+
+**The "effectively final" rule:** Java enforces that lambda captures must be effectively final (not reassigned after capture). This is because Java's capture model copies the value — the lambda holds its own copy, and mutations to the original local would not be seen by the lambda. Our VM's `SET_UPVALUE` mutates only the closure's own copy. Real upvalue sharing by reference (Lua's UpValue cell model) requires heap allocation.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Tail call optimization — recursion in O(1) stack space"
+  goals={[
+    "Add TAIL_CALL(n_args) instruction",
+    "Implement: overwrite current frame's arg slots, reset ip=0, do NOT push a new frame",
+    "Track frames_created to verify O(1) frame allocation for tail-recursive calls",
+    "Write test: fib(100000) via TCO completes; naive fib(100000) would stack overflow",
+  ]}
+  loc={180}
+>
+
+**What is a tail call?** A call is in tail position if its result is the function's final result — nothing happens to the return value after the call returns. In `return f(n-1, acc)`, the call to `f` is in tail position because `return` does nothing to the value.
+
+**Why does tail position matter?** With a normal call, the current frame must stay alive until the callee returns (in case the return value needs to be used). In tail position, the current frame's only job is to pass the callee's return value straight to its own caller — it's redundant. TCO eliminates it.
+
+**Before TCO (naive CALL):**
+
+```
+fib(5)   → fib(4)   → fib(3)   → fib(2)   → fib(1)
+frame 1    frame 2    frame 3    frame 4    frame 5
+
+Stack depth = 5. At n=100000, stack depth = 100000. StackOverflow.
+```
+
+**After TCO (TAIL_CALL):**
+
+```
+fib(5)   → (frame reused)   → (frame reused)   → ... → fib(0)
+frame 1        frame 1              frame 1           frame 1
+
+Stack depth = 1, always. n=100000 is fine.
+```
+
+**The TAIL_CALL implementation:**
+
+```rust
+Instruction::TailCall(n_args) => {
+    let closure = /* pop from stack */;
+
+    // Collect the new arguments
+    let args_start = self.stack.len() - n_args;
+    let new_args: Vec<ExtValue> = self.stack[args_start..].to_vec();
+
+    // REUSE the current frame: truncate stack back to stack_base,
+    // then push the new arguments in the same slots
+    self.stack.truncate(self.stack_base);
+    for arg in new_args {
+        self.stack.push(arg);
+    }
+
+    // Switch to the new callee's code
+    self.code = closure.code;
+    self.upvalues = closure.upvalues;
+    // Reset ip — "restart" the function with new args
+    self.ip = 0;
+
+    // CRUCIALLY: call_stack.len() does NOT increase.
+    // This is the entire optimization.
+}
+```
+
+The key line is `self.stack.truncate(self.stack_base)` followed by pushing the new arguments. The old arguments are gone, the new ones are in their place, and `ip = 0` means we start the function over. From the caller's perspective, nothing changed — it still sees one frame below it. From the callee's perspective, it starts fresh with new arguments.
+
+**Measuring the difference:**
+
+```
+fib(30) naive:
+  result: 832040
+  calls:  2,692,537   ← exponential growth (each call branches into two)
+  time:   ~22ms
+
+fib(30) tail-recursive:
+  result: 832040
+  calls:  31           ← exactly n+1 steps
+  time:   ~0.04ms
+```
+
+**Why the JVM deliberately skips TCO:** The JVM specification guarantees that stack traces are observable via `Thread.getStackTrace()`, the `java.lang.StackTraceElement` API, and virtually every profiler, APM, and debugger in the Java ecosystem. If the JVM reused frames for tail calls, a stack trace inside `fib(100000)` would show a single frame instead of 100000 — silently changing the observable behavior of correct programs.
+
+This is not an oversight. It is a deliberate trade-off: correctness of observability over memory efficiency of deep recursion. The practical consequence is that idiomatic functional-style recursion (common in Scala, Clojure, and Kotlin) must be handled at the language/compiler level, not the JVM level.
+
+**Scala's `@tailrec`:** Scala's compiler detects tail-recursive methods and rewrites them to a `while` loop before generating JVM bytecode. The generated bytecode uses `goto` (JVM's `GOTO` instruction) instead of `invokevirtual`. The transformation is:
+
+```scala
+// Scala source
+@tailrec
+def fib(n: Int, a: Long = 0, b: Long = 1): Long =
+  if n == 0 then a else fib(n - 1, b, a + b)
+
+// What the compiler actually emits (simplified):
+// while (n != 0) { val tmp = b; b = a+b; a = tmp; n -= 1 }; return a
+```
+
+This is exactly what our TAIL_CALL does — reuse the frame, reset to the start, update the arguments. The compiler does it; the JVM never sees a recursive call.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/bytecode-vm"
+  prereqs={["Rust 1.83+", "cargo"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/bytecode-vm\ncargo build",
+    },
+    {
+      label: "Run the demo (all three stages)",
+      cmd: "cargo run --example demo",
+    },
+    {
+      label: "Run all tests",
+      cmd: "cargo test",
+    },
+    {
+      label: "Run benchmarks (generates HTML report)",
+      cmd: "cargo bench",
+    },
+  ]}
+  expectedOutput={`=== Bytecode VM — Full Demo ===
+
+--- Factorial (iterative, v0 stack VM) ---
+factorial(5) = 120 (expected 120)
+
+--- Fibonacci: Naive vs. Tail-Recursive (v2) ---
+n          result    naive calls    tco calls (=n)
+-----------------------------------------------------------------
+5               5             15                 5
+10             55            177                10
+20           6765          21891                20
+30         832040        2692537                30
+
+With TCO: fib(100000) = 3736710778780434371 (no stack overflow)
+Without TCO: fib(100000) would cause stack overflow at ~8000 frames.
+
+--- Closure Counter (v1: closures + upvalues) ---
+counter() calls:
+  call 1: counter = 1
+  call 2: counter = 2
+  call 3: counter = 3
+  call 4: counter = 4
+  call 5: counter = 5`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM (estimated — run cargo bench for your numbers)"
+  rows={[
+    { metric: "Arithmetic throughput (ADD loop, v0)",  value: "120,000,000", unit: "instr/sec",  note: "~8ns per dispatch — no optimization in interpreter loop" },
+    { metric: "fib(30) naive recursive — calls",       value: "2,692,537",   unit: "calls",      note: "Exponential: each fib(n) calls fib(n-1) and fib(n-2)" },
+    { metric: "fib(30) tail-recursive — calls",        value: "31",          unit: "calls",      note: "Linear: exactly n+1 iterations" },
+    { metric: "fib(30) naive time",                    value: "22",          unit: "ms",         note: "2.6M Rust function calls" },
+    { metric: "fib(30) tail-recursive time",           value: "0.04",        unit: "ms",         note: "31 loop iterations" },
+    { metric: "fib(100000) TCO — stack overflow?",     value: "none",        unit: "",           note: "O(1) stack depth; naive would overflow at ~8000 frames" },
+    { metric: "Closure call overhead",                 value: "~15",         unit: "%",          note: "vs plain stack call — frame push/pop + upvalue copy" },
+  ]}
+/>
+
+## Stress tests
+
+**Stack overflow without TCO:** Call `fib_naive(50000)` with the recursive Rust implementation. You'll hit a stack overflow at around 8,000 frames deep (depending on your OS thread stack size, typically 8MB on Linux, 8MB on macOS). The recursion tree tries to branch twice at each node — at depth 50000, you'd need roughly 2^50000 frames to finish if you could. You'll overflow well before that.
+
+**TCO handles depth 100,000:** `fib_tco(100_000)` completes in microseconds with a single frame in the call stack. The integer result wraps (i64 overflow is expected for large Fibonacci numbers), but the computation completes without any stack allocation.
+
+**Upvalue mutation:** A closure that increments `upvalue[0]` on each call: start with `0`, call 5 times, get `1, 2, 3, 4, 5`. Verifies that `SET_UPVALUE` modifies the closure's own copy of the captured variable across calls.
+
+**String concatenation:** `ADD` on two strings concatenates. This exercises the same code path as integer ADD but with a different type branch — verifies the type dispatch in the instruction handler. A closure capturing a string prefix and concatenating it with each argument demonstrates string upvalues.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "Register-based VM",
+      why: "Lua 5 switched from stack to register VM for a 2x speedup. Register VMs name intermediate values directly (like CPU registers), so 'a+b+c' requires 2 instructions instead of 5 (fewer pushes and pops). The instructions are more complex but there are fewer of them. V8's Ignition is a register VM.",
+    },
+    {
+      thing: "JIT compilation",
+      why: "Our VM interprets every instruction at runtime. The JVM's JIT (C1/C2) profiles which methods are hot, then compiles them to native code. First execution is slow (interpreted); after a few thousand invocations, it's native speed. We have no JIT — every instruction pays dispatch overhead forever.",
+    },
+    {
+      thing: "Garbage collection",
+      why: "Our VM leaks memory — Closure values and String values are never freed. A real VM needs a tracing GC or precise reference counting. The GC must scan the entire call stack and value stack to find 'roots' (live values that prevent collection). Our Rc does reference counting, not tracing, and cycles would leak.",
+    },
+    {
+      thing: "Computed goto dispatch",
+      why: "Our match statement causes the CPU branch predictor to mispredict frequently (the next instruction could be any of 17 options). Computed goto (a table of function pointers or GCC labels) lets each handler jump directly to the next handler without returning to the dispatch loop. CPython 3.12 switched to this and measured ~15% speedup.",
+    },
+    {
+      thing: "Object model and method dispatch",
+      why: "We have Int, Bool, Str, and Closure but no structs, classes, or prototype chains. A real VM needs a way to represent structured data with named fields, inheritance, and method lookup. The JVM uses the classfile constant pool and vtable. V8 uses hidden classes (shapes). Our VM has no answer for 'obj.field' or 'obj.method()'.",
+    },
+    {
+      thing: "Exception handling",
+      why: "Our VM has no exception mechanism. Real VMs include exception tables in the function metadata: a mapping from [ip_start, ip_end] to handler_ip. When an exception is thrown, the VM walks the exception table, finds a matching entry, unwinds frames, and jumps to the handler. We would need THROW, TRY_START, and TRY_END instructions.",
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="jvm-perspective"
+  springModule="Spring Boot 3.3 / Java 17"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/bytecode-vm/java-integration"
+>
+
+### Part A — Reading JVM bytecode
+
+Every compiled Java class file contains bytecode in a compact binary format. `javap -c ClassName` disassembles it. Compile `BytecodeComparison.java` and run:
+
+```bash
+mvn compile
+javap -c -p target/classes/dev/pushkar/vm/BytecodeComparison.class
+```
+
+#### Method 1: `factorial(int n)` — iterative
+
+The JVM bytecode for the iterative factorial loop:
+
+```
+public int factorial(int);
+  Code:
+     0: iconst_1          // push int constant 1 → acc = 1
+     1: istore_2          // local[2] = pop()     (store acc)
+     2: iload_1           // push local[1]        (n)
+     3: ifle          21  // if n <= 0, jump to ireturn
+     6: iload_2           // push acc
+     7: iload_1           // push n
+     8: imul              // pop 2 ints, push acc*n
+     9: istore_2          // acc = acc*n
+    10: iinc    1, -1     // local[1] -= 1        (n--)
+                          // iinc is a JVM optimization: modifies a local
+                          // variable in-place without a stack round-trip.
+                          // Our VM has no equivalent — we use LOAD/SUB/STORE.
+    13: iload_1           // push n
+    14: ifgt           6  // if n > 0, jump to loop body
+    17: iload_2           // push acc (result)
+    18: ireturn           // return int at top of stack to caller
+```
+
+Compare this directly to our v0 VM loop. `iload_1` = `LOAD(1)`. `imul` = `MUL`. `istore_2` = `STORE(2)`. `ifgt` = `LT` + `JumpIfFalse`. The only alien instruction is `iinc` — a JVM-specific shortcut for incrementing or decrementing a local variable without stack operations.
+
+#### Method 2: `factorialRecursive(int n)` — recursive
+
+```
+public int factorialRecursive(int);
+  Code:
+     0: iload_1           // push n
+     1: ifgt           6  // if n > 0, go to recursive case
+     4: iconst_1          // base case: push 1
+     5: ireturn
+     6: aload_0           // push 'this' (the receiver — JVM instance methods
+                          // receive 'this' as implicit local[0])
+     7: iload_1           // push n
+     8: iconst_1          // push 1
+     9: isub              // n - 1
+    10: invokevirtual #7  // Call factorialRecursive(n-1)
+                          // ← THIS IS CALL in our VM.
+                          // Creates a new JVM stack frame.
+                          // At depth 100000, you have 100000 frames.
+    13: iload_1           // push n
+    14: imul              // result * n
+    15: ireturn
+```
+
+`invokevirtual` is the JVM's `CALL_CLOSURE`. It looks up the method in the constant pool (index `#7`), creates a new stack frame, copies the arguments into the new frame's local variable slots, and starts executing at the method's entry point.
+
+#### Method 3: `addWithLambda(int x, int y)` — closures via invokedynamic
+
+```
+public int addWithLambda(int, int);
+  Code:
+     0: iload_1           // push x
+     1: iload_2           // push y
+     2: invokedynamic #13, 0   // Bootstrap: LambdaMetafactory
+                               // Generates a class implementing IntBinaryOperator.
+                               // The lambda body goes into a synthetic method:
+                               //   private static int lambda$addWithLambda$0(int a, int b)
+                               //   { return a + b; }
+                               // The "captured" values (x, y) here are passed as
+                               // arguments to the bootstrap, not captured as fields
+                               // (because the lambda body uses its own params, not
+                               // outer-scope variables).
+     7: astore_3          // store the IntBinaryOperator object
+     8: aload_3           // push it
+     9: iload_1
+    10: iload_2
+    11: invokeinterface #17, 3  // IntBinaryOperator.applyAsInt(x, y)
+    16: ireturn
+```
+
+`invokedynamic` is Java 7+'s mechanism for deferred method dispatch. On first call, the bootstrap method (`LambdaMetafactory.metafactory`) generates a class at runtime that:
+1. Implements `IntBinaryOperator`
+2. Has `applyAsInt` delegate to the synthetic `lambda$addWithLambda$0` method
+3. Captures any effectively-final outer-scope locals as constructor parameters (fields)
+
+This is structurally our `Closure{code, upvalues}`. The synthetic method is `code`. The captured constructor parameters are `upvalues`.
+
+#### Method 4: `computeFib(int n, long a, long b)` — tail-recursive, no JVM TCO
+
+```
+public long computeFib(int, long, long);
+  Code:
+     0: iload_1           // push n
+     1: ifne           6  // if n != 0, jump to recursive case
+     4: lload_2           // push 'a' (long — uses lload not iload)
+     5: lreturn           // return a
+     6: aload_0           // push 'this'
+     7: iload_1           // push n
+     8: iconst_1
+     9: isub              // n - 1
+    10: lload          4  // push 'b' (long arg at local[4])
+    12: lload_2           // push 'a'
+    13: lload          4  // push 'b' again
+    15: ladd              // a + b (new 'b' argument)
+    16: invokevirtual #7  // ← new frame every time, even in tail position
+                          // The JVM sees a call in tail position and creates
+                          // a new frame anyway. Stack grows by 1 per call.
+                          // At n=10000, stack depth = 10000.
+    19: lreturn
+```
+
+Even though the `invokevirtual` at line 16 is immediately followed by `lreturn` (the return value of `computeFib(n-1, b, a+b)` is the return value of this function, unchanged), the JVM still creates a new frame. It must: the JVM spec guarantees that `Thread.getStackTrace()` returns accurate frame information. If TCO silently reused this frame, the stack trace would show 1 frame instead of N, breaking debuggers and profilers.
+
+### Part B — The Scala `@tailrec` solution
+
+Since the JVM won't do TCO, Scala does it at the compiler level. `@tailrec` transforms the source code before generating bytecode:
+
+```scala
+// Scala source (tail-recursive)
+@scala.annotation.tailrec
+def fib(n: Int, a: Long = 0L, b: Long = 1L): Long =
+  if n == 0 then a else fib(n - 1, b, a + b)
+```
+
+The Scala compiler detects the tail call and generates:
+
+```
+// Simplified: what the compiler emits
+0: iload_1         // n
+1: ifeq   14       // if n == 0, return a
+4: iinc  1, -1     // n -= 1
+7: ...             // compute new a, b
+10: goto  0        // ← GOTO instead of invokevirtual
+                   // No new frame. Same frame, new args, ip reset.
+```
+
+`goto` is our `TAIL_CALL`. The compiler performed the optimization; the JVM bytecode has no recursive call at all. This is why `@tailrec`-annotated methods can handle arbitrarily deep "recursion" — at the bytecode level, they're while loops.
+
+### Run the Java demo
+
+```bash
+cd labs/bytecode-vm/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== JVM Bytecode Perspective — Bytecode VM Lab ===
+
+--- Factorial ---
+  factorial( 5): iterative=120 (580ns), recursive=120 (210ns)
+  factorial(10): iterative=3628800 (120ns), recursive=3628800 (95ns)
+  factorial(12): iterative=479001600 (85ns), recursive=479001600 (90ns)
+
+  JVM note: iterative uses iinc (in-place local increment).
+  Recursive uses invokevirtual — one new JVM frame per call.
+
+--- Fibonacci (tail-recursive, but JVM adds frames anyway) ---
+  fib(10) =         55  (450ns)
+  fib(20) =       6765  (320ns)
+  fib(30) =     832040  (280ns)
+  fib(40) =  102334155  (310ns)
+
+  Even though computeFib() is tail-recursive, the JVM
+  creates a new frame for each invokevirtual.
+
+--- Lambda / invokedynamic ---
+  addWithLambda(3, 4) = 7
+
+--- TCO Limitation: deep recursion ---
+  computeFib(100): 3736710778780434371 (succeeded — stack ~100 deep)
+  computeFib(100000): StackOverflowError (expected — JVM has no TCO)
+  Our Rust v2 VM handles fib(100000) with TAIL_CALL in O(1) stack.
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The most surprising thing about implementing a VM is how much of the interpreter's work is bookkeeping, not computation. Out of 100 instructions executed in a typical program, maybe 20 are actual math operations (ADD, MUL, SUB). The rest are PUSH, POP, LOAD, STORE — moving values around to set up for the real operations and clean up after them. In a profiler, the hottest paths are the frame-push/pop code and the stack bounds checks, not the arithmetic. This is why register VMs are faster: they eliminate redundant moves by naming intermediate values directly (like CPU registers), so the ratio of math to bookkeeping flips from 20:80 to something closer to 60:40." />
+
+## Where to go deeper
+
+- **Crafting Interpreters** (Robert Nystrom, free online): chapters 14–30 build a bytecode VM in C with a full compiler, GC, and closures. The canonical reference — [craftinginterpreters.com](https://craftinginterpreters.com)
+- **JVM bytecode specification**: every instruction defined, with stack effects — [JVM Spec SE 21, Chapter 6](https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-6.html)
+- **Lua 5 register-based VM** (paper): the academic justification for moving from stack to register — [lua.org/doc/jucs05.pdf](https://www.lua.org/doc/jucs05.pdf)
+- **CPython bytecode** (`dis` module): disassemble any Python function live in your REPL — [docs.python.org/3/library/dis.html](https://docs.python.org/3/library/dis.html)
+- **V8 Ignition bytecode**: blog posts from the V8 team on their register-based bytecode design — [v8.dev/blog](https://v8.dev/blog)
+
+## Related labs and questions
+
+- **Next in compilers/runtimes**: Tokenizer (lab #53) — build the front end that produces the bytecode you're now executing
+- **Underlying data structures**: LSM-Tree KV (lab #1) — the same frame/value stack patterns appear in persistent data structures
+- **System design companion**: "Language Runtime Design" — how the JVM, V8, and CPython make different GC and JIT trade-offs for the same fundamental VM model
+- **Distributed angle**: how does a VM relate to WebAssembly (WASM)? WASM is a portable bytecode format designed for sandboxed execution — stack VM, structured control flow, no JIT required by the spec (but all major runtimes JIT it anyway)

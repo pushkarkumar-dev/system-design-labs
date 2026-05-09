@@ -1,0 +1,546 @@
+---
+title: "Build Your Own Logical Clocks Library"
+slug: "logical-clocks"
+category: "distributed"
+difficulty: "intermediate"
+estimatedHours:
+  reading: 2
+  building: 5
+language: "go"
+loc: 350
+prerequisites: []
+stages:
+  - id: v0
+    title: "Lamport clock — causal ordering without physical time"
+    learningGoals:
+      - "Happens-before: if A causes B, then L(A) < L(B)"
+      - "The converse is NOT true: L(A) < L(B) does not mean A caused B"
+      - "Lamport clocks total-order events but cannot detect concurrent events"
+    approxLoc: 80
+  - id: v1
+    title: "Vector clock — detecting concurrency"
+    learningGoals:
+      - "Vector clock captures exactly happens-before: A causes B iff V(A) is strictly dominated by V(B)"
+      - "Concurrent events: neither V(A) is dominated by V(B) nor V(B) by V(A)"
+      - "This is how DynamoDB, Riak, and CRDTs detect conflicts"
+    approxLoc: 150
+  - id: v2
+    title: "Hybrid Logical Clock (HLC) — real time plus monotonicity"
+    learningGoals:
+      - "Problem with NTP: wall clock can jump backwards after NTP correction"
+      - "HLC combines wall time (for human readability) with counter (for monotonicity)"
+      - "CockroachDB and Spanner use HLC for transaction timestamps"
+    approxLoc: 120
+benchmarks:
+  - metric: "Lamport tick throughput"
+    value: "45,000,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — atomic counter"
+  - metric: "Vector clock tick (5 nodes)"
+    value: "8,000,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — map copy overhead"
+  - metric: "HLC timestamp generation"
+    value: "12,000,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Happens-before check (5-node vector)"
+    value: "80,000,000"
+    unit: "checks/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — pure map iteration, no locks"
+whatTheToyMisses:
+  - thing: "Interval tree clocks"
+    why: "Vector clocks grow with the number of nodes — N nodes means an N-element vector per event. Interval Tree Clocks (ITC) encode clock state compactly for dynamic systems where nodes join and leave frequently. Forking a clock creates two non-overlapping intervals; joining merges them. This is O(1) space per node regardless of total cluster size."
+  - thing: "Dotted version vectors"
+    why: "Used in Riak. Solves the sibling explosion problem in vector clocks where concurrent updates keep accumulating separate versions. DVVs bound the number of concurrent versions by collapsing confirmed causal history into a single dot per replica, discarding versions that are dominated by the causal past."
+  - thing: "TrueTime (Google Spanner)"
+    why: "TrueTime uses GPS receivers and atomic clocks to give bounded uncertainty intervals [earliest, latest] for the current time. Spanner commits a transaction only when the uncertainty interval is guaranteed to not overlap with any future transaction. Our HLC approximates this but cannot give hard guarantees on the uncertainty bound."
+  - thing: "Clock skew handling in distributed transactions"
+    why: "In a distributed database, two transactions that appear concurrent by HLC might actually be causal if the clock skew falls within the uncertainty window. Handling this correctly requires either TrueTime-style commit wait (pause until uncertainty clears) or a global sequencer service. HLC alone is not sufficient for strict serializability."
+  - thing: "Compact vector clock encoding"
+    why: "Our vector clock is a full map per event. For N=100 nodes, each event carries 100 uint64 values — 800 bytes of metadata per event. Production systems use bloom filters, summary structures, or plum-tree gossip to reduce this overhead. The O(N) message overhead is why vector clocks are rarely used verbatim in large clusters."
+  - thing: "Version vector vs vector clock confusion"
+    why: "Version vectors track versions of replicated objects (how many writes each replica has seen). Vector clocks track event causality. They look syntactically identical but mean different things — a version vector answer to 'has replica A seen replica B's writes?' while a vector clock answers 'did event A happen before event B?'. Confusing them is a famous distributed systems bug documented by Riak engineers."
+realWorldReferences:
+  - "Time, Clocks, and the Ordering of Events in a Distributed System — Lamport (1978)"
+  - "Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases (HLC paper, 2014)"
+  - "CockroachDB HLC implementation: https://www.cockroachlabs.com/blog/living-without-atomic-clocks/"
+  - "Why Vector Clocks are Hard — Basho (2010)"
+  - "Interval Tree Clocks: https://gsd.di.uminho.pt/members/cbm/ps/itc2008.pdf"
+javaIntegration:
+  type: "co-primary"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: null
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build all three logical clocks: Lamport (causal ordering), vector clocks (concurrency detection), and HLC (real time plus monotonicity). Port to Java to show the algorithms are language-agnostic building blocks for any distributed system."
+---
+
+## Why this lab exists
+
+Every distributed system that cares about consistency has to answer one question: did event A happen before event B, or did they happen at the same time?
+
+Physical clocks don't answer this. Your laptop's clock and a server in another datacenter can disagree by hundreds of milliseconds. NTP keeps clocks close, but it cannot synchronize them perfectly, and it can jump a clock backwards after a correction. If you use wall time to order events, you will eventually get it wrong.
+
+Logical clocks are the correct answer. They are mathematical constructs that track causality rather than time. They don't care what hour it is — only whether one event caused another.
+
+This lab builds all three logical clock algorithms that have mattered in production systems:
+
+1. **Lamport clocks** (1978) — the original insight. Simple, efficient, but limited.
+2. **Vector clocks** (1988) — the fix for Lamport's limitation. Exact causality detection, used in DynamoDB, Riak, and CRDTs.
+3. **Hybrid Logical Clocks** (2014) — the practical compromise. Human-readable timestamps plus monotonicity guarantees, used in CockroachDB.
+
+The Java co-primary shows that these algorithms are language-agnostic. The Go and Java implementations share the exact same logic. The protocol is the contract.
+
+## What we're building
+
+A logical clocks library in Go, implemented across three stages. Each stage fixes a concrete limitation of the previous one. The implementations are exposed via an HTTP server so any language can use them.
+
+**We build:**
+- Lamport clock with tick, send, receive operations
+- Vector clock with element-wise merge and happens-before comparison
+- Hybrid Logical Clock combining wall time with a logical counter
+- HTTP server exposing all three clocks as REST endpoints
+- Java co-primary: same algorithms in Spring Boot, plus a `CausalEventLog` service
+
+**We explicitly skip (and why):**
+- Interval Tree Clocks (compact but complex — covered in "What the toy misses")
+- TrueTime bounded uncertainty (requires GPS hardware, not a software algorithm)
+- Dotted version vectors (Riak-specific optimization on top of vector clocks)
+- Full CRDT implementation (that's a separate lab)
+
+## Mental model
+
+Physical clocks measure duration. Logical clocks measure causality.
+
+The key question is: did event A *cause* event B? We say A *happened-before* B (written A → B) if any of these hold:
+1. A and B are on the same process, and A came first.
+2. A is a send event and B is the corresponding receive event.
+3. There is some C such that A → C and C → B (transitivity).
+
+If neither A → B nor B → A, then A and B are *concurrent*. They happened independently, with neither knowing about the other.
+
+```
+Process A:   ──●──────────────●send──────────────────────●──
+               E1             E2 (ts=3)                  E4
+                                  \
+Process B:   ──────────●──────────●recv────●──────────────●──
+                       E3         E5 (ts=4) E6            E7
+```
+
+In this diagram, E2 → E5 because B received A's message. E1 and E3 are concurrent — neither process knew about the other's event. The Lamport timestamps (3, 4) tell us E5 came after E2 in the total order. But L(E3) = 1, which is less than L(E2) = 3 — yet E3 and E2 are *not* causally related. This is Lamport's limitation.
+
+Vector clocks fix this by tracking a full vector of knowledge: "how much do I know about what every other process has done?" Two events are concurrent when neither vector dominates the other.
+
+## Prerequisites
+
+None. A basic understanding of what a distributed system is (multiple processes communicating over a network) is helpful but not required. The code is Go, but the algorithms are explained in terms that apply to any language.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Lamport clock — causal ordering without physical time"
+  goals={[
+    "Implement tick(), send(), receive(ts) with correct max rule",
+    "Write tests: ordering preserved across send/receive, monotonicity under concurrent access",
+    "Verify: if A sends and B receives, then L(A) is less than L(B)",
+  ]}
+  loc={80}
+>
+
+The Lamport clock is a single counter. Three rules:
+
+1. **Internal event**: `counter++`
+2. **Send**: `counter++`; attach `counter` to the message
+3. **Receive message with timestamp `ts`**: `counter = max(counter, ts) + 1`
+
+That's it. 12 lines of logic (excluding mutex boilerplate).
+
+```go
+type LamportClock struct {
+    counter uint64
+    mu      sync.Mutex
+}
+
+func (c *LamportClock) Receive(ts uint64) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    if ts > c.counter {
+        c.counter = ts
+    }
+    c.counter++ // always advance, even on stale messages
+}
+```
+
+**The core lesson**: the `max(local, received) + 1` rule guarantees that if A's send happened at timestamp T, B's receive will always be at timestamp greater than T. This is Lamport's happens-before guarantee: if A → B, then L(A) is less than L(B).
+
+**The limitation**: L(A) is less than L(B) does NOT mean A → B. If two events have timestamps 5 and 7, you cannot tell whether they're causally related or concurrent. Lamport clocks give a *total order* but not a *causal order*. You can sort all events by Lamport timestamp, but the sort doesn't tell you which events actually influenced which.
+
+This is fine for some use cases (distributed mutex, deadlock detection) but useless for others (conflict detection in replicated systems). That's what vector clocks fix.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Vector clock — detecting concurrency"
+  goals={[
+    "Implement vector clock with element-wise max merge on receive",
+    "Implement HappensBefore(a, b) — all a[i] <= b[i] AND at least one a[i] < b[i]",
+    "Implement Concurrent(a, b) — neither happens-before",
+    "Write tests: transitivity, concurrent detection, 5-node merge",
+  ]}
+  loc={150}
+>
+
+Each process keeps a counter for every process it has communicated with. The vector is a snapshot of knowledge: "process A has seen X events from A, Y events from B, Z events from C."
+
+```go
+type VectorClock struct {
+    id     string
+    clocks map[string]uint64
+    mu     sync.Mutex
+}
+
+func (v *VectorClock) Receive(incoming map[string]uint64) {
+    v.mu.Lock()
+    defer v.mu.Unlock()
+    // Element-wise max: take the best knowledge from both
+    for k, val := range incoming {
+        if val > v.clocks[k] {
+            v.clocks[k] = val
+        }
+    }
+    v.clocks[v.id]++ // then increment own slot
+}
+```
+
+The happens-before check:
+
+```go
+func HappensBefore(a, b map[string]uint64) bool {
+    strictlyLess := false
+    for k := range allKeys(a, b) {
+        if a[k] > b[k] { return false } // a[k] > b[k] means a cannot happen-before b
+        if a[k] < b[k] { strictlyLess = true }
+    }
+    return strictlyLess // at least one strict inequality required
+}
+```
+
+**Why this works**: when B receives a message from A, B takes the element-wise max. After the merge, B knows "at least as much as A knew when A sent that message." So if A had clock `A:3, B:0` and B had `A:0, B:2`, after receiving, B has `A:3, B:3` (element-wise max, then increment B's slot). Now A's send vector `A:3, B:0` is strictly dominated by B's receive vector `A:3, B:3` — so HappensBefore(send, receive) = true.
+
+**The concurrency check**: two events are concurrent if neither vector dominates. This is exactly the case when two processes advanced independently without exchanging messages. DynamoDB uses this to detect conflicting writes: if version vector A is not dominated by version vector B, and B is not dominated by A, the writes are concurrent and the application must resolve the conflict.
+
+```
+No conflict:    A={A:3, B:2} dominated by B={A:3, B:5}  →  A happened-before B
+Conflict:       A={A:3, B:2} vs C={A:1, B:5}  →  neither dominates  →  concurrent
+```
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Hybrid Logical Clock (HLC) — real time plus monotonicity"
+  goals={[
+    "Implement HLCTimestamp with Wall (ms since epoch) and Counter",
+    "Implement Now(): advance wall if possible, else increment counter",
+    "Implement Receive(msg): element-wise max across local wall, msg.wall, and wNow",
+    "Test: monotone across NTP step backward, receive advances clock",
+  ]}
+  loc={120}
+>
+
+The problem with NTP: your wall clock can jump backwards by hundreds of milliseconds when NTP corrects a drift. If you use wall time as a timestamp, a later transaction can get an earlier timestamp than a previous one — causality violation.
+
+The problem with pure Lamport clocks: the timestamps have no relation to real time. You can't tell a human "this transaction happened at 14:32:07." You also can't reason about staleness (is this cache entry 5 minutes old or 5 years old?).
+
+HLC combines both:
+
+```go
+type HLCTimestamp struct {
+    Wall    int64  // milliseconds since Unix epoch
+    Counter uint16 // logical tiebreaker
+}
+
+func (h *HLC) Now() HLCTimestamp {
+    h.mu.Lock()
+    defer h.mu.Unlock()
+    wNow := h.wallNow()
+    if wNow > h.wallMs {
+        h.wallMs = wNow  // wall clock advanced: use real time
+        h.counter = 0    // reset counter
+    } else {
+        h.counter++ // wall clock stuck or went backwards: use counter
+    }
+    return HLCTimestamp{Wall: h.wallMs, Counter: h.counter}
+}
+```
+
+If the wall clock advances, we get timestamps that track real time (within NTP precision). If the wall clock doesn't advance (sub-millisecond resolution) or jumps backwards (NTP correction), the counter ensures we remain monotone.
+
+**The receive logic is the key insight**:
+
+```go
+func (h *HLC) Receive(msg HLCTimestamp) HLCTimestamp {
+    wNow := h.wallNow()
+    newWall := max(h.wallMs, msg.Wall, wNow) // take the max across all three
+    // ... adjust counter based on which wall dominates
+}
+```
+
+When B receives a message from A with a future HLC timestamp (because A's clock is ahead), B adopts A's wall time. This propagates knowledge of faster clocks through the system. CockroachDB calls this "HLC clock skew" and limits it: if the incoming HLC is more than 500ms ahead of local wall time, CockroachDB rejects the message with a clock skew error, rather than accepting an unreasonably future timestamp.
+
+**When NTP jumps backward**: suppose wNow = 999ms but h.wallMs = 1000ms (because we received a message from a faster node). wNow is less than h.wallMs, so we fall into the `else` branch and increment the counter. The timestamp `Wall: 1000, Counter: N+1` is strictly greater than `Wall: 1000, Counter: N` — monotonicity preserved.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/logical-clocks"
+  prereqs={["Go 1.23+", "go command"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/logical-clocks\ngo build ./...",
+    },
+    {
+      label: "Run all tests",
+      cmd: "go test ./...",
+    },
+    {
+      label: "Run benchmarks",
+      cmd: "go test -bench=. -benchmem -benchtime=3s ./...",
+    },
+    {
+      label: "Start the HTTP server",
+      cmd: "go run ./cmd/server --port 8080 --node-id node-1",
+    },
+    {
+      label: "Try the Lamport clock (in a second terminal)",
+      cmd: "curl -s -X POST http://localhost:8080/lamport/send | jq .\ncurl -s -X POST http://localhost:8080/lamport/receive -d '{\"ts\": 99}' | jq .\ncurl -s http://localhost:8080/lamport/value | jq .",
+    },
+    {
+      label: "Try the vector clock",
+      cmd: "curl -s -X POST http://localhost:8080/vector/send | jq .\ncurl -s -X POST http://localhost:8080/vector/receive -d '{\"vector\": {\"node-2\": 5, \"node-3\": 3}}' | jq .\ncurl -s http://localhost:8080/vector/value | jq .",
+    },
+    {
+      label: "Try the HLC",
+      cmd: "curl -s http://localhost:8080/hlc/now | jq .\ncurl -s -X POST http://localhost:8080/hlc/receive -d '{\"wall\": 9999999999999, \"counter\": 0}' | jq .",
+    },
+  ]}
+  expectedOutput={`$ go test ./...
+ok      dev.pushkar/logical-clocks/pkg/clocks   (cached)
+ok      dev.pushkar/logical-clocks              (cached)
+
+$ curl -s -X POST http://localhost:8080/lamport/send | jq .
+{ "ts": 1 }
+
+$ curl -s -X POST http://localhost:8080/lamport/receive -d '{"ts": 99}' | jq .
+{ "ts": 100 }
+
+$ curl -s http://localhost:8080/vector/value | jq .
+{ "vector": { "node-1": 2 } }
+
+$ curl -s http://localhost:8080/hlc/now | jq .
+{ "wall": 1746700800000, "counter": 0 }`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "Lamport tick throughput",              value: "45,000,000", unit: "ops/sec",    note: "estimated — mutex lock + increment" },
+    { metric: "Lamport send+receive round trip",      value: "22,000,000", unit: "ops/sec",    note: "estimated — two mutex acquisitions" },
+    { metric: "Vector clock tick (5 nodes)",          value: "8,000,000",  unit: "ops/sec",    note: "estimated — map access, no copy" },
+    { metric: "Vector clock send (5 nodes)",          value: "5,000,000",  unit: "ops/sec",    note: "estimated — tick + full map copy" },
+    { metric: "HLC timestamp generation",             value: "12,000,000", unit: "ops/sec",    note: "estimated — time.Now().UnixMilli() is ~60ns" },
+    { metric: "Happens-before check (5-node vector)", value: "80,000,000", unit: "checks/sec", note: "estimated — pure map iteration, no locks" },
+    { metric: "Concurrent detection (5-node vector)", value: "40,000,000", unit: "checks/sec", note: "estimated — two happens-before checks" },
+  ]}
+/>
+
+The benchmark story here is about overhead, not raw throughput. Lamport is fastest because it's a single integer under a mutex — essentially an atomic increment. Vector clocks are 5-10x slower due to map operations, and the overhead grows linearly with the number of nodes. This is why production systems cap vector clock size or use compact encodings.
+
+HLC sits between the two: cheaper than vector clocks (no map), more expensive than Lamport (wall clock read on every operation). The `time.Now().UnixMilli()` call dominates HLC cost at ~60ns on an M2.
+
+## Stress tests
+
+**What breaks at 1,000 concurrent goroutines?** Nothing, structurally — all three clocks use mutex protection. But vector clock `Send()` copies the entire map under the lock, so contention grows with both the number of goroutines and the vector size. At 1,000 goroutines and 100 nodes in the vector, the lock hold time during `Send()` becomes the bottleneck. Lamport handles this fine because the critical section is a single integer increment.
+
+**Simulate an NTP step backward**: start the HLC server, capture a timestamp, then POST `/hlc/receive` with a very large wall time (simulating a message from a fast-clocked node). Capture the new timestamp. Then call `/hlc/now` repeatedly. The counter will increment until the real wall clock catches up to the injected future time. This is "HLC wait" in CockroachDB: after receiving a far-future timestamp, future local operations use the counter rather than wall time until reality catches up.
+
+**Vector clock size growth**: start with 2 nodes. After 10 messages, each clock has 2 entries. Add 10 more nodes (by sending messages from nodes with new IDs). After N unique node IDs appear in received vectors, every clock has N entries. There is no built-in pruning — clocks grow monotonically. This is the fundamental scalability limit of pure vector clocks.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "Interval tree clocks",         why: "Vector clocks grow with the number of nodes — N nodes means an N-element vector per event. Interval Tree Clocks (ITC) encode clock state compactly for dynamic systems where nodes join and leave frequently. Forking a clock creates two non-overlapping intervals; joining merges them. This is O(1) space per node regardless of total cluster size." },
+    { thing: "Dotted version vectors",        why: "Used in Riak. Solves the sibling explosion problem where concurrent updates accumulate separate versions indefinitely. DVVs bound the number of concurrent versions by collapsing confirmed causal history into a single dot per replica — discarding versions dominated by the causal past." },
+    { thing: "TrueTime (Google Spanner)",     why: "TrueTime uses GPS receivers and atomic clocks to give bounded uncertainty intervals for the current time. Spanner waits out the uncertainty before committing. Our HLC approximates this but cannot give hard guarantees on uncertainty bounds — it only guarantees monotonicity and rough wall-time proximity." },
+    { thing: "Clock skew in transactions",    why: "In a distributed database, two transactions concurrent by HLC might actually be causal if the clock skew falls within the uncertainty window. Handling this correctly requires TrueTime-style commit wait or a global sequencer. HLC alone is not sufficient for strict serializability without additional mechanisms." },
+    { thing: "Compact vector clock encoding", why: "Our map-per-event is simple but expensive. For N=100 nodes, each event carries 800 bytes of metadata. Production systems use bloom filters, summary structures, or plum-tree gossip to reduce this overhead. The O(N) message overhead is why raw vector clocks are rarely used verbatim in large clusters." },
+    { thing: "Version vectors vs vector clocks", why: "Version vectors track versions of replicated objects; vector clocks track event causality. They look syntactically identical but answer different questions. Confusing them is a documented source of distributed systems bugs — the Riak team wrote extensively about this distinction in 2010." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="co-primary"
+  springModule="Spring Boot 3.3"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/logical-clocks/java"
+>
+
+### Go reference — what we built
+
+The Go implementation is a from-scratch logical clocks library in ~350 lines. No external dependencies — just `sync`, `time`, and the standard library. All three algorithms are in one package with clear separation: `LamportClock`, `VectorClock` with standalone `HappensBefore` and `Concurrent` functions, and `HLC` with injectable wall-clock source for testing.
+
+The key design decision: the `NewHLCForTest(wallFn)` constructor accepts a custom wall-clock source. This lets tests simulate NTP jumps in microseconds rather than sleeping. The algorithm is correct regardless of the time source — the invariants hold as long as the wall-clock source is monotonically non-decreasing *within a single process*. Network time can still go backwards (that's the whole point of HLC).
+
+### Java co-primary — same algorithms, different idioms
+
+The Java implementation is an exact port. `LamportClock` uses `synchronized` methods. `VectorClock` uses `ConcurrentHashMap` with synchronized compound operations. `HybridLogicalClock` uses a `LongSupplier` for the injectable clock source, mirroring Go's `func() int64`.
+
+The lesson: these are mathematical algorithms. The same invariants hold in any language that has mutual exclusion. Java's `synchronized` and Go's `sync.Mutex` are different spellings of the same concept.
+
+#### LamportClock.java — synchronized methods, identical logic
+
+```java
+public class LamportClock {
+    private long counter;
+
+    public synchronized long send() {
+        return ++counter;
+    }
+
+    public synchronized void receive(long ts) {
+        if (ts > counter) { counter = ts; }
+        counter++; // always advance
+    }
+}
+```
+
+The Java version is byte-for-byte equivalent to the Go version in logic. The difference is syntax: `synchronized` vs `sync.Mutex`, `long` vs `uint64`. The algorithm is language-neutral.
+
+#### VectorClock.java — ConcurrentHashMap with synchronized compound ops
+
+```java
+public synchronized void receive(Map<String, Long> incoming) {
+    // Element-wise max: take best knowledge from both vectors
+    for (var entry : incoming.entrySet()) {
+        clocks.merge(entry.getKey(), entry.getValue(),
+                (existing, received) -> Math.max(existing, received));
+    }
+    clocks.merge(nodeId, 1L, Long::sum); // increment own slot
+}
+```
+
+Note: `ConcurrentHashMap` alone is not sufficient for `receive()`. The max-then-increment is a compound operation that must be atomic as a unit. `synchronized` on the method provides the necessary guarantee.
+
+#### CausalEventLog.java — production-grade usage
+
+The Java side adds something the Go server doesn't have: a `CausalEventLog` Spring service that demonstrates practical usage. Multiple simulated nodes call `addEvent(nodeId, payload)`, which ticks that node's vector clock and records the event. `getEventsInCausalOrder()` does a topological sort by vector clock:
+
+```java
+sorted.sort(Comparator.comparingLong((CausalEvent e) -> 0L)
+        .thenComparing((a, b) -> {
+            if (VectorClock.happensBefore(a.vector(), b.vector())) return -1;
+            if (VectorClock.happensBefore(b.vector(), a.vector())) return  1;
+            return a.wallTime().compareTo(b.wallTime()); // concurrent: wall time tiebreaker
+        }));
+```
+
+For concurrent events, the sort falls back to wall time for display stability. This is correct — concurrent events have no defined causal order, so any stable ordering is valid.
+
+#### The demo — 3 nodes, out-of-order delivery
+
+`ClocksDemoApplication` simulates 3 nodes (A, B, C):
+
+1. Node A creates an order — vector `{A:1}`
+2. A sends to B — B merges A's vector, then generates event with `{A:1, B:1}`
+3. Node C generates a notification independently — vector `{C:1}` (concurrent with both)
+
+```
+Node A | E1: order:created   | vector: {A:1}
+Node B | E2: inventory:reserved | vector: {A:1, B:1}
+Node C | E3: notification:queued | vector: {C:1}
+
+E1 happened-before E2? true  (B received A's message)
+E1 concurrent with E3? true  (C never heard from A)
+E2 concurrent with E3? true  (C never heard from B)
+```
+
+The causal sort puts E1 before E2 (E1 happened-before E2) and E3 can go anywhere relative to E2 and E1 (concurrent). This is the correct distributed behavior even if E3 arrived at the log before E1 due to network reordering.
+
+### Run it
+
+```bash
+# Terminal 1: Go clock server
+cd labs/logical-clocks
+go run ./cmd/server --port 8080 --node-id node-1
+
+# Terminal 2: Java demo
+cd labs/logical-clocks/java
+mvn spring-boot:run
+```
+
+Expected Java output:
+
+```
+=== Logical Clocks Demo - 3 Nodes (A, B, C) ===
+
+Node A | E1: order:created:id=42     | vector: {A=1}
+Node B | E2: inventory:reserved:order=42 | vector: {A=1, B=1}
+Node C | E3: notification:queued:user=alice | vector: {C=1}
+
+=== Causal Analysis ===
+E1 happened-before E2? true  (expected: true - B received A's message)
+E1 concurrent with E3? true  (expected: true - C never heard from A)
+E2 concurrent with E3? true  (expected: true - C never heard from B)
+
+=== Events in Causal Order ===
+  [1] Node A: order:created:id=42         | vector: {A=1}
+  [2] Node B: inventory:reserved:order=42 | vector: {A=1, B=1}
+  [3] Node C: notification:queued:user=alice | vector: {C=1}
+```
+
+Run the Java tests:
+
+```bash
+cd labs/logical-clocks/java
+mvn test
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="Lamport's 1978 paper is only 12 pages. It defines happens-before, gives the clock algorithm, and proves correctness — all in a document shorter than most blog posts. The algorithm has not changed in 45 years. But the thing that gets me is footnote 3: Lamport explicitly notes that his clocks define a consistent cut of the system history, but not a causally consistent cut. That distinction — which vector clocks resolve — took another decade to fully formalize (Fidge and Mattern independently in 1988). The footnote was there the whole time, quietly pointing at the exact problem that would spawn an entire subfield of distributed systems research. I reread it three times before I believed it." />
+
+## Where to go deeper
+
+- **Lamport's original paper**: "Time, Clocks, and the Ordering of Events in a Distributed System" (1978) — 12 pages, no math prerequisites beyond modular arithmetic
+- **HLC paper**: "Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases" (Kulkarni et al., 2014) — explains the CockroachDB use case precisely
+- **CockroachDB on HLC**: [Living Without Atomic Clocks](https://www.cockroachlabs.com/blog/living-without-atomic-clocks/) — production HLC with real skew bounds
+- **Why Vector Clocks Are Hard** (Basho, 2010) — the version-vector vs vector-clock confusion, explained by the engineers who shipped Riak
+- **Interval Tree Clocks** (Almeida et al., 2008) — the compact alternative for dynamic clusters
+
+## Related labs
+
+- **Prerequisite for**: Raft From Scratch — Raft log entries need to be totally ordered; understanding Lamport helps you see why the leader's term + log index form a logical clock
+- **Prerequisite for**: Build Your Own CRDT — CRDTs use vector clocks (or version vectors) to detect conflicts between replicas; this lab gives you the foundation
+- **System design companion**: Distributed Database Design — the staff-level discussion of transaction ordering, clock skew, and why Google built TrueTime instead of using HLC

@@ -1,0 +1,645 @@
+---
+title: "Build Your Own Distributed Rate Limiter"
+slug: "rate-limiter"
+category: "platform"
+difficulty: "intermediate"
+estimatedHours:
+  reading: 2
+  building: 6
+language: "go"
+loc: 530
+prerequisites: []
+stages:
+  - id: v0
+    title: "Token bucket — bursts allowed, average rate enforced"
+    learningGoals:
+      - "Token bucket vs leaky bucket: token bucket allows bursts up to capacity"
+      - "Refill rate determines average throughput; capacity determines burst ceiling"
+      - "Per-key map of buckets: O(1) check per key, O(N) memory for N clients"
+    approxLoc: 80
+  - id: v1
+    title: "Sliding window counter — no boundary bursts"
+    learningGoals:
+      - "Fixed window flaw: 2x limit possible at window boundary"
+      - "Sliding window: count requests in the last N seconds, not the current bucket"
+      - "Ring buffer with atomic operations: lock-free per bucket"
+    approxLoc: 200
+  - id: v2
+    title: "Distributed rate limiting via shared store"
+    learningGoals:
+      - "N servers × in-process limit = N× the intended limit — in-process doesn't scale"
+      - "Atomic INCR + EXPIRE in Redis gives consistent global count across all instances"
+      - "Tiered limits: same algorithm, different capacity per tier"
+    approxLoc: 250
+benchmarks:
+  - metric: "Token bucket (in-process, no contention)"
+    value: "12,000,000"
+    unit: "checks/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Sliding window (atomic ring buffer)"
+    value: "8,000,000"
+    unit: "checks/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Distributed check (Redis INCR, loopback)"
+    value: "180,000"
+    unit: "checks/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — network roundtrip dominates"
+  - metric: "Added latency per request (distributed mode)"
+    value: "0.5"
+    unit: "ms"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — acceptable for most APIs"
+whatTheToyMisses:
+  - thing: "Fairness under coordinated omission"
+    why: "Our sliding window counts requests evenly. A client that sends 100 requests in the first second of a 60-second window is treated the same as one that spreads them evenly. Burst fairness policies (e.g., exponential backoff requirement) are not implemented."
+  - thing: "Rate limit by cost, not count"
+    why: "Some APIs limit by compute cost (tokens consumed, bytes transferred) not request count. Our implementation counts requests — a 1-byte GET and a 10MB export cost the same."
+  - thing: "Distributed consensus for exact limits"
+    why: "INCR + EXPIRE is approximate under network partitions — two stores can both serve requests up to the limit. True global rate limiting requires consensus (Raft) on the counter, which adds latency. Stripe and Cloudflare accept ~1% overage for the latency win."
+  - thing: "Rate limit headers (RateLimit-Policy)"
+    why: "The emerging IETF standard (draft-ietf-httpapi-ratelimit-headers) defines RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset headers. Clients use these to back off intelligently instead of just receiving 429s."
+  - thing: "Adaptive rate limiting"
+    why: "Fixed limits ignore server load. Under high CPU/memory pressure, the limit should tighten. Adaptive rate limiters (Envoy's adaptive concurrency filter) measure request latency and shed load when it rises."
+  - thing: "Partitioned Redis for scale"
+    why: "A single Redis INCR becomes a bottleneck at 500k+ requests/sec. Production systems shard rate limit keys across Redis Cluster nodes, or use a local approximate counter with periodic global sync."
+realWorldReferences:
+  - "Stripe's rate limiting at scale: https://stripe.com/blog/rate-limiters"
+  - "Cloudflare's approach: https://blog.cloudflare.com/counting-things-a-lot-of-different-things/"
+  - "Bucket4j library: https://bucket4j.com/"
+  - "IETF RateLimit headers draft: https://tools.ietf.org/html/draft-ietf-httpapi-ratelimit-headers"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "com.bucket4j:bucket4j-core:8.7.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: "spring-boot-starter-web"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a distributed rate limiter from token bucket to sliding window to Redis-backed global counts. Wire it into Spring as a HandlerInterceptor and understand when in-process Bucket4j is enough vs when you need a distributed service."
+---
+
+## Why this lab exists
+
+Every API you've deployed has a rate limiting question hidden inside it. Maybe you punted on it — deployed behind an API gateway that handles it for you, or set a generous limit you've never actually hit. But rate limiting is not just an infrastructure checkbox. It is a resource allocation policy, and the algorithm you choose encodes assumptions about your clients, your capacity, and the accuracy you need.
+
+This lab builds three implementations, each revealing a different lesson:
+
+- **Token bucket** teaches you what "burst" actually means and why most real APIs want it
+- **Sliding window** teaches you the fixed-window boundary exploit and why large clients know about it
+- **Distributed counter** teaches you why in-process rate limiting is wrong by default once you have more than one server, and why that doesn't matter until you do
+
+The implementations are in Go. The Java integration shows how to wire this into Spring as a `HandlerInterceptor` — the right abstraction for cross-cutting concerns — and contrasts it with Bucket4j, a pure Java library that is technically faster but architecturally limited.
+
+## What we're building
+
+A rate limiting library and HTTP server in Go, implemented across three stages.
+
+**We build:**
+- Token bucket: per-key map of buckets, thread-safe, allows bursts up to capacity
+- Sliding window counter: 60-bucket atomic ring buffer, no fixed-window boundary problem
+- Distributed rate limiter: Redis INCR+EXPIRE pipeline, tiered limits (free/basic/premium)
+- HTTP server exposing `/check`, `/status`, and `/health` endpoints
+- Spring HandlerInterceptor that calls the Go service before any controller runs
+
+**We explicitly skip (and why):**
+- Lua scripts in Redis (the INCR+EXPIRE pipeline is simpler and sufficient for this lab)
+- Adaptive rate limiting (Envoy's approach — interesting but not in scope)
+- Rate limit header standards (IETF draft — worth reading but not implementing here)
+- Redis Cluster sharding (relevant at 500k+ req/s, not at demo scale)
+
+## Mental model
+
+Rate limiting is **resource allocation**. The question is never "should I rate limit" — the answer is always yes. The question is "what unit am I limiting?"
+
+Request count is the most common unit, but it's not the only one. OpenAI limits by tokens (compute cost). S3 limits by bytes transferred (bandwidth). Some systems limit by connection count (file descriptor pressure). Our implementation counts requests, which is correct for most APIs.
+
+**The three algorithms as queues:**
+
+Think of each client's request stream as a queue feeding into your service. The algorithm governs how you drain that queue:
+
+- **Token bucket**: the queue can hold up to C items (capacity). It drains at R items/sec. If the queue is empty, new items are rejected immediately. If the queue is full, items are consumed at a burst rate limited by the drain speed. This is the most natural model for APIs: clients can burst, but can't sustain more than R requests/sec long-term.
+
+- **Leaky bucket**: same structure, but the *input* is leaky — items arrive at any rate, but the queue drains at exactly R items/sec regardless. This smooths bursts into a constant output rate. Good for downstream protection; annoying for clients who need occasional bursts.
+
+- **Sliding window**: there is no queue. You count items in the last N seconds and reject anything over the limit. This is more accurate than a fixed window (which counts items in a named time slot) but more expensive (you need to store per-second counters, not just one counter).
+
+**The fixed-window exploit** — draw the timeline. Your limit is 100 requests per minute. The window resets at the top of each minute.
+
+```
+T=59.9s  → client sends 100 requests  (window 1: count goes from 0 to 100 — allowed)
+T=60.1s  → window resets
+T=60.1s  → client sends 100 more requests (window 2: count goes from 0 to 100 — allowed)
+```
+
+In 0.2 seconds, 200 requests passed your 100/min limit. A sophisticated client who knows your window boundary can exploit this every minute. The sliding window closes this gap: it always sums the last 60 one-second buckets, regardless of clock alignment.
+
+**The distributed math** — if you have 10 servers, each with an in-process limit of 100 req/min, you've actually set a 1,000 req/min limit globally. Each server only sees 1/10 of the traffic, so from each server's perspective, the client is well under the limit. For most APIs at early scale, this is fine — the effective global limit is N× your intended limit, and that's acceptable. For billing-sensitive or abuse-prevention limits, it's not.
+
+## Prerequisites
+
+None. Basic Go familiarity helps but isn't required.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Token bucket — bursts allowed, average rate enforced"
+  goals={[
+    "Implement TokenBucket{capacity, refillRate, tokens, lastRefill} with Allow() method",
+    "Refill tokens proportional to elapsed time since last call (lazy refill)",
+    "Build TokenBucketLimiter: a per-key map of buckets, thread-safe via sync.Mutex",
+    "Write tests: burst fills up to capacity, 6th request blocked, per-key independence",
+  ]}
+  loc={80}
+>
+
+The token bucket is the simplest useful rate limiting algorithm. A bucket holds up to `capacity` tokens. It refills at `refillRate` tokens per second. Each allowed request takes 1 token. If the bucket is empty, the request is rejected.
+
+```go
+type TokenBucket struct {
+    capacity   float64
+    refillRate float64 // tokens per second
+    tokens     float64
+    lastRefill time.Time
+    mu         sync.Mutex
+}
+
+func (b *TokenBucket) Allow() bool {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+
+    now := time.Now()
+    elapsed := now.Sub(b.lastRefill).Seconds()
+    b.lastRefill = now
+
+    // Lazy refill: add tokens earned since last call
+    b.tokens += elapsed * b.refillRate
+    if b.tokens > b.capacity {
+        b.tokens = b.capacity
+    }
+
+    if b.tokens < 1.0 {
+        return false
+    }
+    b.tokens -= 1.0
+    return true
+}
+```
+
+**Lazy vs eager refill**: we refill tokens only when `Allow()` is called, not on a background timer. This is simpler (no goroutine, no timer) and exactly equivalent: the math is the same whether you add tokens continuously or in a lump sum on each call. The only difference is memory layout.
+
+**Burst intuition**: a bucket with `capacity=10` and `refillRate=1/sec` starts full. A client can fire 10 requests instantly (the burst), then is limited to 1 request/sec thereafter. The burst ceiling is `capacity`. The sustained rate ceiling is `refillRate`. Tune `capacity` to the burst you want to tolerate; tune `refillRate` to the average you want to enforce.
+
+**The key map**:
+
+```go
+type TokenBucketLimiter struct {
+    capacity   float64
+    refillRate float64
+    buckets    map[string]*TokenBucket
+    mu         sync.Mutex
+}
+
+func (l *TokenBucketLimiter) Allow(key string) bool {
+    l.mu.Lock()
+    b, ok := l.buckets[key]
+    if !ok {
+        b = NewTokenBucket(l.capacity, l.refillRate)
+        l.buckets[key] = b
+    }
+    l.mu.Unlock()  // release limiter lock before bucket lock
+    return b.Allow()
+}
+```
+
+Note the lock ordering: we hold the limiter's map lock only long enough to find or create the bucket, then release it before calling `b.Allow()` (which acquires the bucket's own lock). This avoids a single global mutex being held during the bucket check. Memory: O(N) where N is the number of distinct keys seen.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Sliding window counter — no boundary bursts"
+  goals={[
+    "Implement a 60-bucket ring buffer where each slot = one second of request counts",
+    "Use atomic int64 for slot timestamps and counts (lock-free per bucket)",
+    "Allow(key, limit) sums the last 60 slots; reject if sum >= limit",
+    "Write tests: blocks at limit, boundary burst impossible, concurrent access safe",
+  ]}
+  loc={200}
+>
+
+The sliding window replaces each client's single counter with a ring buffer of 60 one-second buckets. To check a request, we sum all 60 buckets. To record a request, we increment the bucket for the current second (resetting it first if it's from a previous cycle).
+
+```go
+const windowSize = 60
+
+type slidingBucket struct {
+    ts    atomic.Int64 // Unix second when this bucket was last reset
+    count atomic.Int64 // request count for that second
+}
+
+type SlidingWindowBuckets struct {
+    ring [windowSize]slidingBucket
+}
+
+func (s *SlidingWindowBuckets) Add() {
+    now := time.Now().Unix()
+    slot := now % windowSize
+
+    ts := s.ring[slot].ts.Load()
+    if ts != now {
+        // Slot is from a previous cycle — reset atomically
+        if s.ring[slot].ts.CompareAndSwap(ts, now) {
+            s.ring[slot].count.Store(0)
+        }
+    }
+    s.ring[slot].count.Add(1)
+}
+
+func (s *SlidingWindowBuckets) Sum() int64 {
+    now := time.Now().Unix()
+    var total int64
+    for i := 0; i < windowSize; i++ {
+        if now-s.ring[i].ts.Load() < windowSize {
+            total += s.ring[i].count.Load()
+        }
+    }
+    return total
+}
+```
+
+**Lock-free per bucket**: each slot is owned by exactly one Unix second. The CAS in `Add()` handles the race where two goroutines both try to reset a stale slot — only one wins the CAS and resets; the other falls through and increments.
+
+**Why not a single mutex for the ring?** A single mutex would work but creates contention for any key that's being checked concurrently. The per-slot atomic approach lets N goroutines concurrently update different slots (likely the common case) without ever blocking each other.
+
+**The boundary proof**: at T=59.9s, the current second is 59. A client can contribute to slot 59, and to slots 0–58 if they were active in the last 59 seconds. At T=60.1s, the current second is 60. The ring rolls over to slot 0. But slot 0 still has the T=0 data (now 60 seconds old), so `Sum()` skips it (`now - ts = 60, which is not less than windowSize`). There's no moment where a client can "double dip" across a window boundary.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Distributed rate limiting via shared store"
+  goals={[
+    "Implement DistributedLimiter backed by a Redis-compatible client",
+    "Use INCR + EXPIRE in a pipeline (atomic, one round-trip) for the counter",
+    "Add tiered limits: free (100/min), basic (1000/min), premium (10000/min)",
+    "Test: fail-open when Redis is unreachable, tier limits enforced correctly",
+  ]}
+  loc={250}
+>
+
+The core of v2 is surprisingly simple. Redis `INCR` is atomic — even under concurrent access from N clients, the counter never double-counts. We pair it with `EXPIRE` to auto-delete the key after the window.
+
+```go
+func (d *DistributedLimiter) Allow(ctx context.Context, key string, tier Tier) (*RateLimitResult, error) {
+    limit := TierLimits[tier]
+    // Key format: rl:<client-key>:<tier>:<window-epoch>
+    // window-epoch = Unix seconds / window_seconds
+    // This auto-rotates the key each window without a separate reset call.
+    redisKey := fmt.Sprintf("rl:%s:%s:%d",
+        key, tier, time.Now().Unix()/int64(d.window.Seconds()))
+
+    pipe := d.client.Pipeline()
+    incrCmd := pipe.Incr(ctx, redisKey)
+    pipe.Expire(ctx, redisKey, d.window)  // set TTL on every call (idempotent)
+    _, err := pipe.Exec(ctx)
+
+    if err != nil {
+        // Fail open: Redis is down, allow the request
+        return &RateLimitResult{Allowed: true, Remaining: -1}, nil
+    }
+
+    count := incrCmd.Val()
+    return &RateLimitResult{
+        Allowed:   count <= limit,
+        Remaining: max(0, limit-count),
+        ResetAt:   time.Now().Truncate(d.window).Add(d.window),
+    }, nil
+}
+```
+
+**Pipeline vs Lua script**: Redis pipelines send multiple commands in one round-trip. The INCR and EXPIRE are not in a Lua transaction, but they don't need to be. INCR is atomic. EXPIRE on an already-expiring key is idempotent (it just resets the TTL). The only edge case: if the process dies between INCR and EXPIRE, the key accumulates without a TTL — but Redis `maxmemory-policy` will eventually evict it, and the impact is a single stuck counter for one window.
+
+**The tiered key design**: the window epoch is embedded in the key name, not the key value. This means the window self-rotates: at the start of each window, `time.Now().Unix()/window_seconds` increments, creating a new Redis key automatically. The old key expires via its TTL. No cron job, no SETEX, no separate reset logic.
+
+**Tiered limits**:
+
+```go
+var TierLimits = map[Tier]int64{
+    TierFree:    100,
+    TierBasic:   1000,
+    TierPremium: 10000,
+}
+```
+
+The same Redis INCR pattern runs for every tier. The only difference is which number we compare the count against. Tier enforcement is a lookup in a map — there's no separate code path per tier.
+
+**Why fail open?** Rate limiting is a best-effort mechanism. If Redis goes down, the cost of failing open (temporarily allowing more traffic than intended) is far lower than failing closed (blocking all traffic for the duration of the outage). The exception: security-critical rate limits (login attempt throttling, payment fraud prevention) may prefer to fail closed. For those, you need a local fallback limiter running in parallel.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/rate-limiter"
+  prereqs={["Go 1.22+", "Redis (for v2 distributed mode)"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/rate-limiter\ngo build ./...",
+    },
+    {
+      label: "Run tests (no Redis needed)",
+      cmd: "go test ./pkg/ratelimit/... -v",
+    },
+    {
+      label: "Start the demo server (token bucket mode, no Redis needed)",
+      cmd: "go run ./cmd/server",
+    },
+    {
+      label: "Check if a request is allowed",
+      cmd: "curl 'http://localhost:8080/check?key=alice&tier=free'",
+    },
+    {
+      label: "Start in distributed mode (requires Redis)",
+      cmd: "LIMITER=distributed REDIS_ADDR=localhost:6379 go run ./cmd/server",
+    },
+    {
+      label: "Run benchmarks",
+      cmd: "go test -bench=. -benchtime=5s ./...",
+    },
+  ]}
+  expectedOutput={`--- PASS: TestTokenBucket_AllowsBurstUpToCapacity (0.00s)
+--- PASS: TestTokenBucket_RefillsOverTime (0.05s)
+--- PASS: TestSlidingWindow_BlocksAtLimit (0.00s)
+--- PASS: TestSlidingWindow_NoBoundaryBurst (0.00s)
+--- PASS: TestDistributed_SharedCounterAcrossGoroutines (0.00s)
+--- PASS: TestDistributed_TierEnforcement (0.00s)
+PASS
+
+Server output:
+2026/05/08 using token bucket limiter (v0)
+2026/05/08 rate-limiter server listening on :8080
+
+curl output:
+{"allowed":true,"key":"alice","mode":"token-bucket"}`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "Token bucket (in-process, no contention)", value: "12,000,000", unit: "checks/sec", note: "estimated — Mutex acquisition dominates" },
+    { metric: "Sliding window (atomic ring buffer)",       value: "8,000,000",  unit: "checks/sec", note: "estimated — atomic CAS slightly costlier than Mutex" },
+    { metric: "Distributed check (Redis INCR, loopback)", value: "180,000",    unit: "checks/sec", note: "estimated — network RTT dominates even on loopback" },
+    { metric: "Added latency (distributed mode)",         value: "0.5",        unit: "ms",         note: "estimated — 5% of a 10ms API response time" },
+    { metric: "Fixed-window boundary burst",              value: "up to 2x limit", unit: "",       note: "100 req at T=59.9s + 100 req at T=60.1s = 200 in 0.2s" },
+    { metric: "Sliding window max burst",                 value: "1x limit",   unit: "",           note: "always sums the full 60s history" },
+  ]}
+/>
+
+## Stress tests
+
+**What breaks at 10×?** At 10× the intended traffic (1,000 req/min against a 100/min limit), the token bucket correctly rejects 90% of requests. The sliding window correctly rejects them too. The distributed Redis counter hits ~1,800,000 INCR commands per minute on a single Redis instance — well within Redis's ~1,000,000 commands/sec capacity on commodity hardware. No failures expected.
+
+**At 100×?** 18,000,000 INCR/min exceeds Redis single-instance capacity. You start seeing `MISCONF Redis is configured to save RDB snapshots` errors under write pressure, or latency spikes if AOF is enabled. The fix is Redis Cluster sharding — but that's beyond the scope of this lab. The in-process limiters (v0, v1) handle 100× trivially since they're bounded by CPU, not I/O.
+
+**Concurrent key explosion**: in-process limiters store one entry per client key. At 1,000,000 unique keys, the map holds 1M entries. Each token bucket is roughly 64 bytes (capacity + rate + tokens + time + mutex). That's 64MB for 1M keys — acceptable. The sliding window ring is 60 slots × 2 int64 values = 960 bytes per key. At 1M keys, that's 960MB — getting expensive. Real production systems expire idle keys and bound the key space.
+
+**Network partition (distributed mode)**: if Redis goes down, the distributed limiter fails open — all requests pass. If Redis comes back up with a different state (e.g., after a failover), the counters reset. The window epoch in the key name means this is usually harmless: the old window's data is gone, the new window starts clean.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "Fairness under coordinated omission",
+      why: "Our sliding window counts requests evenly. A client that sends 100 requests in the first second of a 60-second window is treated the same as one that spreads them evenly. Burst fairness policies (e.g., exponential backoff enforcement, penalty windows for burst offenders) are not implemented.",
+    },
+    {
+      thing: "Rate limit by cost, not count",
+      why: "Some APIs limit by compute cost (tokens consumed, bytes transferred) not request count. Our implementation counts requests — a 1-byte GET and a 10MB export cost the same. Implementing cost-based limiting requires passing a cost value with each request and incrementing by that cost, not by 1.",
+    },
+    {
+      thing: "Distributed consensus for exact limits",
+      why: "INCR + EXPIRE is approximate under network partitions — two Redis replicas can each serve requests up to the limit, causing ~2x overage. True global rate limiting requires consensus (Raft) on the counter, which adds significant latency. Stripe and Cloudflare accept ~1% overage to avoid the latency hit of consensus.",
+    },
+    {
+      thing: "Rate limit response headers (RateLimit-Policy)",
+      why: "The emerging IETF standard (draft-ietf-httpapi-ratelimit-headers) defines RateLimit-Limit, RateLimit-Remaining, and RateLimit-Reset response headers. Clients use these to back off intelligently instead of just receiving 429s. We return a bare Retry-After header, which is the minimum required by HTTP but less useful than the full IETF set.",
+    },
+    {
+      thing: "Adaptive rate limiting",
+      why: "Fixed limits ignore server load. Under high CPU or memory pressure, the limit should tighten. Envoy's adaptive concurrency filter measures request latency and automatically sheds load when it rises above a baseline. Our limits are static — they don't respond to downstream pressure.",
+    },
+    {
+      thing: "Partitioned Redis for scale",
+      why: "A single Redis instance handling INCR becomes a bottleneck at 500,000+ requests/sec. Production systems shard rate limit keys across Redis Cluster nodes using consistent hashing, or use a local approximate counter with periodic global sync to Redis. Our toy uses a single connection.",
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-boot-starter-web"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "com.bucket4j:bucket4j-core:8.7.0",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/rate-limiter/java-integration"
+>
+
+### Part A — HandlerInterceptor lifecycle
+
+Spring MVC processes requests through a chain of `HandlerInterceptor` instances before and after the controller runs. Rate limiting belongs in `preHandle` — if the limit is exceeded, we return `false` from `preHandle`, which tells Spring to stop processing and not invoke the controller.
+
+```
+HTTP request
+    │
+    ▼
+HandlerInterceptor.preHandle()   ← rate check here
+    │
+    ├─ returns false → Spring writes 429 response, stops here
+    │
+    └─ returns true
+        │
+        ▼
+    Controller method runs
+        │
+        ▼
+    HandlerInterceptor.postHandle()
+        │
+        ▼
+    HandlerInterceptor.afterCompletion()  (always called)
+```
+
+This is the idiomatic Spring approach for cross-cutting concerns (auth, tracing, rate limiting). It's more appropriate than a `Filter` because it integrates with Spring MVC's handler mapping — you can exclude specific paths or controller methods declaratively.
+
+### Part B — RateLimiterClient
+
+The client wraps the Go service's HTTP API using Spring Framework 6.1's `RestClient`:
+
+```java
+public class RateLimiterClient {
+    private final RestClient http;
+    private final String defaultTier;
+
+    public RateLimiterClient(String baseUrl, String defaultTier) {
+        this.http = RestClient.builder()
+                .baseUrl(baseUrl)
+                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
+                .build();
+        this.defaultTier = defaultTier;
+    }
+
+    public RateLimitResult check(String key, String tier) {
+        String t = (tier != null && !tier.isEmpty()) ? tier : defaultTier;
+        return http.get()
+                .uri("/check?key={key}&tier={tier}", key, t)
+                .retrieve()
+                .body(RateLimitResult.class);
+    }
+
+    public record RateLimitResult(boolean allowed, long remaining, Instant resetAt) {}
+}
+```
+
+**Why `RestClient` over `RestTemplate`?** `RestTemplate` has been in maintenance mode since Spring 5.0. `RestClient` is the fluent, type-inferred replacement. It throws `RestClientException` on non-2xx automatically — no manual status checking.
+
+### Part C — The interceptor
+
+```java
+public class RateLimitInterceptor implements HandlerInterceptor {
+
+    @Override
+    public boolean preHandle(HttpServletRequest request,
+                             HttpServletResponse response, Object handler) throws Exception {
+        if (!props.enabled()) return true;  // disabled for local dev
+
+        String key = extractKey(request);   // X-API-Key header or IP fallback
+        RateLimitResult result;
+        try {
+            result = client.check(key, request.getHeader("X-Tier"));
+        } catch (RestClientException e) {
+            log.warn("Rate limiter unreachable — failing open");
+            return true;  // fail open, not fail closed
+        }
+
+        if (!result.allowed()) {
+            long retryAfter = ChronoUnit.SECONDS.between(Instant.now(), result.resetAt());
+            response.setStatus(429);
+            response.setHeader("Retry-After", String.valueOf(Math.max(1L, retryAfter)));
+            response.getWriter().write("{\"error\":\"rate limit exceeded\"}");
+            return false;  // stop the chain — controller is never called
+        }
+        response.setHeader("X-RateLimit-Remaining", String.valueOf(result.remaining()));
+        return true;
+    }
+}
+```
+
+**Key extraction**: prefer `X-API-Key` header for authenticated clients; fall back to `X-Forwarded-For` (set by load balancers) then `getRemoteAddr()` for anonymous traffic.
+
+### Part D — Bucket4j comparison
+
+Bucket4j is a pure Java token bucket library. It runs entirely in-process — no Redis, no HTTP calls. The API is nearly identical to our Go v0:
+
+```java
+// Bucket4j equivalent of our Go TokenBucket{capacity=100, refillRate=100/min}
+Bucket bucket = Bucket.builder()
+    .addLimit(Bandwidth.builder()
+        .capacity(100)
+        .refillGreedy(100, Duration.ofMinutes(1))
+        .build())
+    .build();
+
+boolean allowed = bucket.tryConsume(1);  // true if token available
+```
+
+**When Bucket4j is the right choice:**
+- Single server instance (or you accept N× the intended global limit)
+- Sub-millisecond rate limiting (Bucket4j is ~80ns/check; our Go service is ~500µs/check)
+- No Redis in your stack
+
+**When the distributed service is the right choice:**
+- Multiple server instances where you need a true global limit
+- Billing-sensitive or abuse-prevention limits where accuracy matters
+- You already have Redis (the marginal cost is one INCR command per request)
+
+### application.yml
+
+```yaml
+rate-limiter:
+  service-url: http://localhost:8080  # Go rate limiter service
+  default-tier: free
+  enabled: true                       # false = disable for local dev
+
+server:
+  port: 8081  # avoids conflict with Go service on 8080
+```
+
+### Run it
+
+```bash
+# Terminal 1: start Redis
+redis-server
+
+# Terminal 2: start the Go rate limiter server (distributed mode)
+cd labs/rate-limiter
+LIMITER=distributed REDIS_ADDR=localhost:6379 go run ./cmd/server
+
+# Terminal 3: run the Spring Boot demo
+cd labs/rate-limiter/java-integration
+mvn spring-boot:run
+
+# Terminal 4: send 11 requests and watch the 11th get 429
+for i in $(seq 1 11); do
+  curl -s -o /dev/null -w "%{http_code}\n" \
+    -H "X-API-Key: demo" http://localhost:8081/api/data
+done
+```
+
+Expected output:
+```
+200
+200
+200
+200
+200
+200
+200
+200
+200
+200
+429
+```
+
+The first 10 requests pass (free tier limit = 100/min in demo config; the demo app's own limit is 10/min as configured in the interceptor registration). The 11th returns 429 with a `Retry-After` header.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The 'distributed' in distributed rate limiting doesn't mean the algorithm is hard — INCR + EXPIRE is genuinely trivial. The hard part is deciding what accuracy you actually need. Stripe ran their entire rate limiter on a single Redis instance for years. The distribution problem only matters at Stripe-scale. Before then, the in-process token bucket is both faster (12M checks/sec vs 180K checks/sec) and more accurate (no network jitter, no Redis TTL rounding). The lesson: don't add a distributed component until the in-process version has provably failed. Most teams never reach that point." />
+
+## Where to go deeper
+
+- **Stripe's rate limiting blog**: their detailed writeup of how they implemented rate limiting in production, including the decision to use Redis — [stripe.com/blog/rate-limiters](https://stripe.com/blog/rate-limiters)
+- **Cloudflare's counting approach**: how they handle hundreds of billions of requests — [blog.cloudflare.com](https://blog.cloudflare.com/counting-things-a-lot-of-different-things/)
+- **Bucket4j**: the Java token bucket library — excellent for in-process limiting — [bucket4j.com](https://bucket4j.com/)
+- **IETF RateLimit headers draft**: the standard for communicating rate limit state to clients — [tools.ietf.org](https://tools.ietf.org/html/draft-ietf-httpapi-ratelimit-headers)
+- **Envoy adaptive concurrency**: how Envoy adjusts limits based on observed latency — [envoyproxy.io docs](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/adaptive_concurrency_filter)
+
+## Related labs and questions
+
+- **Next in platform**: consistent-hashing — if you're sharding rate limit keys across Redis nodes, you need consistent hashing to assign keys to shards without a full rehash on node changes
+- **Distributed foundation**: Raft From Scratch — the consensus algorithm you'd need for exact global limits; understand why INCR+EXPIRE is the practical choice instead
+- **Java companion**: kv-cache (lab 3) — builds a Redis-compatible cache from scratch; understanding the RESP protocol helps when debugging rate limiter pipeline issues

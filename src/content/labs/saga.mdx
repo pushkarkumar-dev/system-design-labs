@@ -1,0 +1,719 @@
+---
+title: "Build Your Own Saga Orchestrator"
+slug: "saga"
+category: "distributed"
+difficulty: "advanced"
+estimatedHours:
+  reading: 3
+  building: 10
+language: "go"
+loc: 850
+prerequisites:
+  - "Go HTTP client basics"
+  - "Distributed transactions (2PC concept)"
+  - "Error handling patterns in Go"
+stages:
+  - id: v0
+    title: "In-Memory Saga Runner"
+    learningGoals:
+      - "Forward execution + reverse compensation on failure"
+      - "SagaContext threads state through all steps"
+    approxLoc: 200
+    branchOrTag: "saga-v0"
+  - id: v1
+    title: "Persistent Event Log + Idempotency"
+    learningGoals:
+      - "Append-only event log for recovery"
+      - "Skip completed steps on re-execution"
+    approxLoc: 550
+    branchOrTag: "saga-v1"
+  - id: v2
+    title: "Retry Budgets + HTTP Participants"
+    learningGoals:
+      - "RetryableError vs fatal error distinction"
+      - "Saga timeout aborts mid-retry and triggers compensation"
+    approxLoc: 850
+    branchOrTag: "saga-v2"
+benchmarks:
+  - metric: "Saga execution (3 steps, in-memory, no log)"
+    value: "1,800,000"
+    unit: "sagas/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — pure function call dispatch"
+  - metric: "Saga execution (3 steps, with SagaLog)"
+    value: "650,000"
+    unit: "sagas/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — append-only slice write per event"
+  - metric: "Recovery from 6-event log"
+    value: "8,500,000"
+    unit: "recoveries/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — slice scan, no I/O"
+  - metric: "HTTP participant round-trip (loopback)"
+    value: "12,000"
+    unit: "req/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — httptest.Server, loopback"
+whatTheToyMisses:
+  - thing: "Durable saga log storage"
+    why: "Our SagaLog is an in-memory slice. Production sagas persist events to PostgreSQL or a message broker. On process restart, the orchestrator must recover all in-flight sagas by scanning the event store."
+  - thing: "Choreography-based sagas"
+    why: "Our orchestrator centrally drives the saga. Choreography-based sagas have no central orchestrator — each service publishes domain events and reacts to others. This avoids a single point of failure but makes the flow invisible."
+  - thing: "Saga execution timeout and dead-letter"
+    why: "Sagas stuck mid-flight (e.g., payment service down for 2 hours) need a timeout policy and a dead-letter queue. Manual intervention workflows for stuck sagas are a significant operational concern."
+  - thing: "Compensation failure handling"
+    why: "If compensation itself fails, the system is in an inconsistent state. Production sagas alert operators, retry compensations with longer backoffs, and may require manual SQL rollbacks."
+  - thing: "Distributed tracing across participants"
+    why: "A saga spans 3-10 services. Without a correlation ID threaded through all HTTP calls and stored in the event log, debugging a failed saga across service logs is extremely difficult."
+  - thing: "Idempotency keys at participants"
+    why: "We send an idempotency key in HTTP headers, but participants must implement idempotent handlers — checking if the key was already processed and returning the cached result. This requires a separate idempotency store per participant."
+realWorldReferences:
+  - "Saga pattern — Chris Richardson: https://microservices.io/patterns/data/saga.html"
+  - "Microservices Patterns book (Richardson, 2018) — Chapter 4"
+  - "Temporal workflow engine: https://temporal.io/blog/workflow-engine-principles"
+  - "AWS Step Functions saga pattern: https://docs.aws.amazon.com/step-functions/latest/dg/sample-saga-lambda.html"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.statemachine:spring-statemachine-core:4.0.0"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: "spring-statemachine"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a saga orchestrator from forward-then-compensate to persistent event log with recovery to retry budgets — then compare with Spring State Machine's event-driven approach."
+---
+
+## Why this lab exists
+
+Two-phase commit (2PC) seems like the natural answer to cross-service transactions: lock everything, prepare, commit atomically, unlock. It works. Until your payment service is unavailable during the prepare phase. Or your coordinator crashes between prepare and commit. Or your lock timeout is 30 seconds and your order service needs to hold 10,000 locks during a Black Friday peak.
+
+2PC's fundamental problem is that it requires all participants to be available simultaneously. In a system with ten microservices, the probability that all ten are healthy at the exact moment you need to commit is (0.999)^10 = 0.99. For 100 services that is 0.9048. In other words, 2PC's availability is the product of each participant's availability — and microservice architectures multiply failures.
+
+The saga pattern inverts this. Instead of one distributed transaction, a saga is a sequence of local transactions. Each step commits locally and publishes an event or calls the next service. If a step fails, compensating transactions undo the completed steps in reverse. No global lock. No coordinator blocking on all participants. Each participant is independently available.
+
+This lab builds all three layers from scratch in Go: pure in-memory saga runner (v0), persistent event log with recovery (v1), and retry budgets with HTTP participants (v2). After finishing it you will understand exactly why Temporal, AWS Step Functions, and Axon Framework all chose sagas over distributed transactions for long-running business processes.
+
+## What we're building
+
+A saga orchestrator in Go, implemented across three stages. Each stage adds one correctness property.
+
+**We build:**
+- A `Saga` runner that executes steps forward and compensates in reverse on failure
+- A `SagaContext` map that threads shared state (orderId, paymentRef, reservationRef) through all steps
+- A `SagaLog` with append-only event recording and `Recover()` to resume from any position
+- `RetryableError` type to distinguish transient failures (retry) from fatal failures (compensate immediately)
+- `HttpStep` builder that calls participant services with idempotency key headers and exponential backoff
+
+**We explicitly skip (and why):**
+- Choreography-based sagas (no central orchestrator — covered in "What the Toy Misses")
+- Distributed saga coordinators like Temporal or Conductor (they add cluster management complexity)
+- Saga persistence to PostgreSQL (our SagaLog simulates durable storage in memory)
+- Saga isolation (sagas are not isolated — a concurrent saga can read partially-committed state)
+
+## Mental model
+
+A saga is the distributed-systems equivalent of a try/catch/finally block.
+
+```
+// Single-process world
+try {
+    reserveInventory();
+    chargePayment();
+    createShipment();
+} catch (Exception e) {
+    // Rollback is automatic — the database undoes everything
+    throw e;
+}
+
+// Distributed world — each service has its own database
+saga.run([
+    {execute: reserveInventory, compensate: releaseInventory},
+    {execute: chargePayment,    compensate: refundPayment},
+    {execute: createShipment,   compensate: cancelShipment},
+])
+// If createShipment fails:
+//   compensate: refundPayment   (step 2, reversed)
+//   compensate: releaseInventory (step 1, reversed)
+```
+
+The compensation ordering is not arbitrary. Step 3's compensate runs before step 2's because step 3 may have produced artifacts (a shipment record) that step 2's compensation (a refund) might depend on. Reversing the order respects the dependency graph.
+
+**The critical insight about isolation:** database transactions give you ACID — Atomicity, Consistency, Isolation, Durability. Sagas give you ACD but not Isolation. Between the moment InventoryReserve commits and the moment a failure triggers InventoryRelease, another saga can see the reserved inventory. This is the "pivot transaction" problem. Production sagas handle it with semantic locks (reserving inventory in a "pending" state) or compensating reads (re-checking before compensating).
+
+**Forward-then-compensate vs. two-phase:**
+
+```
+Two-phase commit (coordinator blocks):
+  T=0  Coordinator: PREPARE to all participants (global lock held)
+  T=1  All participants: PREPARED
+  T=2  Coordinator: COMMIT to all participants
+  T=3  All participants: COMMITTED
+  T=4  Coordinator releases global lock
+  (If coordinator crashes at T=2, the lock is held forever)
+
+Saga (no global lock):
+  T=0  Step 1: reserve inventory locally, commit
+  T=1  Step 2: charge payment locally, commit
+  T=2  Step 3: create shipment locally — FAILS
+  T=3  Compensate step 2: refund payment locally, commit
+  T=4  Compensate step 1: release inventory locally, commit
+  (Each step commits independently — no global lock)
+```
+
+## Prerequisites
+
+- Basic Go (goroutines, error handling, interfaces)
+- Understanding of what a distributed transaction is and why 2PC requires all participants to be available simultaneously
+- Basic HTTP in Go (`net/http`, request/response)
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="In-Memory Saga Runner"
+  goals={[
+    "Implement Step with Execute and Compensate functions",
+    "Implement Saga.Run: execute forward, on failure reverse-compensate completed steps",
+    "SagaContext (map[string]any) passes state between steps",
+    "Write 8 tests covering: happy path, failure at step 2, failure at step 3, compensation failure logged, context state flow",
+  ]}
+  loc={200}
+>
+
+The simplest saga implementation that proves the core property: execute forward, compensate backward. A `Step` is just two functions. A `Saga` is an ordered slice of steps. `Run` is a for-loop with a compensation loop on failure.
+
+```go
+type Step struct {
+    Name       string
+    Execute    func(ctx SagaContext) error
+    Compensate func(ctx SagaContext) error
+}
+
+type Saga struct {
+    Steps []Step
+}
+
+func (s *Saga) Run(ctx SagaContext) SagaResult {
+    completed := make([]int, 0, len(s.Steps))
+
+    for i, step := range s.Steps {
+        if err := step.Execute(ctx); err != nil {
+            // Compensate in reverse: last completed first.
+            for j := len(completed) - 1; j >= 0; j-- {
+                cs := s.Steps[completed[j]]
+                if cerr := cs.Compensate(ctx); cerr != nil {
+                    // Log but continue — must attempt all compensations.
+                }
+            }
+            return SagaResult{Status: StatusCompensated, FailedStep: step.Name, Error: err}
+        }
+        completed = append(completed, i)
+    }
+    return SagaResult{Status: StatusCompleted}
+}
+```
+
+The key detail: `completed` tracks *indices* of steps that finished successfully, not all steps. When step 3 fails, `completed = [0, 1]`. We iterate backwards: compensate index 1, then compensate index 0. Step 3 itself is not compensated — it failed before completing, so there is nothing to undo.
+
+**The order placement saga** in the demo:
+
+```go
+orderSaga := &Saga{
+    Steps: []Step{
+        {
+            Name: "InventoryReserve",
+            Execute:    func(ctx SagaContext) error {
+                ctx.Set("reservationRef", "res-1001")
+                return inventoryClient.Reserve(ctx.GetString("orderId"), 2)
+            },
+            Compensate: func(ctx SagaContext) error {
+                return inventoryClient.Release(ctx.GetString("reservationRef"))
+            },
+        },
+        {
+            Name: "PaymentCharge",
+            Execute:    func(ctx SagaContext) error {
+                ref, err := paymentClient.Charge(ctx.GetString("orderId"), 49.99)
+                ctx.Set("paymentRef", ref)
+                return err
+            },
+            Compensate: func(ctx SagaContext) error {
+                return paymentClient.Refund(ctx.GetString("paymentRef"))
+            },
+        },
+        {
+            Name: "ShipmentCreate",
+            Execute:    func(ctx SagaContext) error {
+                return shippingClient.Create(ctx.GetString("orderId"))
+            },
+            Compensate: func(ctx SagaContext) error {
+                return shippingClient.Cancel(ctx.GetString("orderId"))
+            },
+        },
+    },
+}
+
+ctx := SagaContext{"orderId": "ord-42"}
+result := orderSaga.Run(ctx)
+```
+
+Notice how `SagaContext` threads the `reservationRef` produced by step 1 into step 1's compensate function. The compensate function does not need to call the inventory service to look up what it reserved — the context carries it forward. This is the pattern that makes compensation code simple.
+
+**Compensation is not rollback.** A database rollback is instantaneous and invisible to other transactions. A saga compensation is a new forward action — a refund, a release, a cancellation — that is visible to the system the moment it commits. This means:
+
+1. Compensation must be idempotent (the orchestrator may call it more than once on recovery).
+2. Compensation may fail (the payment service may be down when we try to refund).
+3. Other sagas can observe the intermediate state between the original commit and the compensation.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Persistent Event Log + Idempotency"
+  goals={[
+    "Implement SagaLog: append-only event log with StepStarted/StepCompleted/StepFailed/Compensation events",
+    "SagaOrchestrator wraps Saga with log writes before and after each step",
+    "Idempotency: if StepCompleted is in the log for a step, skip it",
+    "Recover(sagaID): replay log to reconstruct state and resume from correct position",
+    "Write 6 tests covering: recovery skips completed steps, recovery resumes mid-saga, duplicate execution skipped, compensation event ordering",
+  ]}
+  loc={550}
+>
+
+v0 has a problem: if the orchestrator process crashes mid-saga, it loses all state. On restart, it cannot tell whether InventoryReserve committed or not. Running it again risks double-reserving inventory. v1 solves this with an append-only event log.
+
+The event log is the source of truth. Every mutation to saga state is recorded as an immutable event before and after execution:
+
+```go
+type EventKind string
+
+const (
+    EventStepStarted           EventKind = "StepStarted"
+    EventStepCompleted         EventKind = "StepCompleted"
+    EventStepFailed            EventKind = "StepFailed"
+    EventCompensationStarted   EventKind = "CompensationStarted"
+    EventCompensationCompleted EventKind = "CompensationCompleted"
+    EventCompensationFailed    EventKind = "CompensationFailed"
+)
+
+type SagaEvent struct {
+    SagaID    string
+    StepName  string
+    Kind      EventKind
+    ErrString string
+    At        time.Time
+}
+```
+
+The `SagaOrchestrator` wraps the execution loop with log writes:
+
+```go
+func (o *SagaOrchestrator) Run(sagaID string, s *Saga, ctx SagaContext) SagaResult {
+    // Replay log to determine what already happened.
+    events := o.log.EventsFor(sagaID)
+    state := ReplayLog(events)
+
+    for i, step := range s.Steps {
+        // Idempotency: skip steps that already completed in a prior run.
+        if state.CompletedSteps[step.Name] {
+            completed = append(completed, i)
+            continue
+        }
+
+        o.log.Append(SagaEvent{SagaID: sagaID, StepName: step.Name, Kind: EventStepStarted})
+
+        if err := step.Execute(ctx); err != nil {
+            o.log.Append(SagaEvent{SagaID: sagaID, StepName: step.Name, Kind: EventStepFailed, ErrString: err.Error()})
+            // ... reverse compensation with log writes ...
+            return SagaResult{Status: StatusCompensated, FailedStep: step.Name, Error: err}
+        }
+
+        o.log.Append(SagaEvent{SagaID: sagaID, StepName: step.Name, Kind: EventStepCompleted})
+        completed = append(completed, i)
+    }
+    return SagaResult{Status: StatusCompleted}
+}
+```
+
+`ReplayLog` scans the events for a saga and reconstructs which steps completed:
+
+```go
+func ReplayLog(events []SagaEvent) SagaRecoveryState {
+    state := SagaRecoveryState{
+        CompletedSteps:   make(map[string]bool),
+        CompensatedSteps: make(map[string]bool),
+    }
+    for _, e := range events {
+        switch e.Kind {
+        case EventStepCompleted:
+            state.CompletedSteps[e.StepName] = true
+        case EventStepFailed:
+            state.FailedStep = e.StepName
+        case EventCompensationCompleted:
+            state.CompensatedSteps[e.StepName] = true
+        }
+    }
+    return state
+}
+```
+
+**Recovery scenario:**
+
+```
+Process crashes after writing StepCompleted for InventoryReserve.
+Log contains: [StepStarted/Inventory, StepCompleted/Inventory]
+
+On restart: Recover("ord-42", saga, ctx)
+  ReplayLog → CompletedSteps = {InventoryReserve: true}
+  Loop: InventoryReserve → SKIP (already completed)
+  Loop: PaymentCharge → execute normally
+  Loop: ShipmentCreate → execute normally
+```
+
+The orchestrator picks up exactly where it left off. InventoryReserve never runs twice.
+
+**Event count per saga:** a successful 3-step saga writes 6 events (StepStarted + StepCompleted for each). A failed 3-step saga (failure at step 3) writes 10 events: StepStarted×3, StepCompleted×2, StepFailed×1, CompensationStarted×2, CompensationCompleted×2. Both paths write deterministic counts — which is what makes recovery predictable.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Retry Budgets + HTTP Participants"
+  goals={[
+    "RetryableError: steps return this for transient failures; fatal errors skip retry",
+    "RetryPolicy per step: MaxAttempts, exponential BackoffBase, jitter, MaxBackoff",
+    "Saga-level context timeout: if context is cancelled mid-retry, abort and compensate",
+    "HttpStep builder: calls participant over HTTP, sends Idempotency-Key header, treats 503/429 as retryable and 4xx as fatal",
+    "Write 5 tests: retry succeeds on 3rd attempt, budget exhaustion triggers compensation, non-retryable error skips retry, context cancellation aborts retry, HTTP idempotency key in header",
+  ]}
+  loc={850}
+>
+
+v1 executes each step once. In a microservices system, services are temporarily unavailable all the time: deployment rollouts, GC pauses, network blips. Failing a saga permanently because of a 200ms inventory service blip is too aggressive. v2 adds per-step retry policies with exponential backoff.
+
+The key design decision: distinguish retryable errors from fatal errors.
+
+```go
+// RetryableError signals: try again with backoff.
+type RetryableError struct {
+    Cause error
+    Msg   string
+}
+
+func (e *RetryableError) Error() string {
+    return fmt.Sprintf("retryable: %s: %v", e.Msg, e.Cause)
+}
+
+// Steps return RetryableError for transient failures:
+func callInventoryService(ctx SagaContext) error {
+    resp, err := http.Post(inventoryURL, ...)
+    if err != nil || resp.StatusCode == 503 {
+        return &RetryableError{Msg: "inventory service unavailable"}
+    }
+    if resp.StatusCode == 400 {
+        // Invalid order data — no point retrying, compensate immediately.
+        return fmt.Errorf("invalid order: %s", body)
+    }
+    return nil
+}
+```
+
+The `RetryPolicy` wraps a step's Execute function with a retry loop:
+
+```go
+type RetryPolicy struct {
+    MaxAttempts    int
+    BackoffBase    time.Duration
+    MaxBackoff     time.Duration
+    JitterFraction float64
+}
+
+func (rs RetryingStep) AsStep(sagaCtx context.Context) Step {
+    return Step{
+        Name: rs.Name,
+        Execute: func(ctx SagaContext) error {
+            for attempt := 1; attempt <= rs.Policy.MaxAttempts; attempt++ {
+                // Check saga-level timeout before attempting.
+                select {
+                case <-sagaCtx.Done():
+                    return fmt.Errorf("saga context cancelled: %w", sagaCtx.Err())
+                default:
+                }
+
+                if attempt > 1 {
+                    backoff := rs.Policy.backoffDuration(attempt)
+                    select {
+                    case <-sagaCtx.Done():
+                        return fmt.Errorf("cancelled during backoff: %w", sagaCtx.Err())
+                    case <-time.After(backoff):
+                    }
+                }
+
+                err := rs.Step.Execute(ctx)
+                if err == nil {
+                    return nil
+                }
+                if !IsRetryable(err) {
+                    return err // fatal — trigger compensation immediately
+                }
+                // Retryable — loop to next attempt.
+            }
+            return fmt.Errorf("exhausted %d attempts", rs.Policy.MaxAttempts)
+        },
+        Compensate: rs.Compensate,
+    }
+}
+```
+
+**The timeout abort pattern** is the key v2 addition. When the saga-level context expires (e.g., a 30-second overall timeout), the retry loop detects cancellation on the `sagaCtx.Done()` channel and returns immediately. The orchestrator then triggers compensation. Without this, a saga with MaxAttempts=10 and 5s backoff could take 50 seconds — far beyond what a user-facing order flow can tolerate.
+
+**HttpStep** builds a complete step for calling a participant over HTTP:
+
+```go
+step := HttpStep(HttpStepConfig{
+    Name:   "InventoryReserve",
+    Method: "POST",
+    URL:    "http://inventory-service/reserve",
+    IdempotencyKeyFn: func(ctx SagaContext) string {
+        return ctx.GetString("sagaID") + "/InventoryReserve"
+    },
+    Policy: RetryPolicy{
+        MaxAttempts:    3,
+        BackoffBase:    100 * time.Millisecond,
+        MaxBackoff:     5 * time.Second,
+        JitterFraction: 0.2,
+    },
+    Timeout:          5 * time.Second,
+    CompensateMethod: "DELETE",
+    CompensateURL:    "http://inventory-service/reserve/{reservationRef}",
+})
+```
+
+The idempotency key `"saga-42/InventoryReserve"` is sent as an `Idempotency-Key` header on every attempt. The inventory service uses it to detect retried requests and return the previously committed result without re-executing. Without this, a retry that arrives after the first attempt succeeded would double-reserve the inventory.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/saga"
+  prereqs={["Go 1.23+"]}
+  steps={[
+    {
+      label: "Clone and run tests",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/saga\ngo test ./pkg/saga/... -v",
+    },
+    {
+      label: "Run the demo (v0/v1/v2 in sequence)",
+      cmd: "go run ./cmd/demo",
+      note: "No external dependencies — HTTP tests use httptest.Server",
+    },
+    {
+      label: "Run benchmarks",
+      cmd: "go test -bench=. -benchtime=3s ./...",
+    },
+  ]}
+/>
+
+Tests run in under 2 seconds. The demo prints a full execution trace including the event log from v1 and the HTTP retry log from v2. No external dependencies — the HTTP participant tests use `httptest.Server`.
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM (estimated figures)"
+  rows={[
+    { metric: "Saga execution (3 steps, in-memory, no log)", value: "1,800,000", unit: "sagas/sec",      note: "estimated — pure function call dispatch" },
+    { metric: "Saga execution (3 steps, with SagaLog)",      value: "650,000",   unit: "sagas/sec",      note: "estimated — append-only slice write per event" },
+    { metric: "Recovery from 6-event log",                   value: "8,500,000", unit: "recoveries/sec", note: "estimated — slice scan, no I/O" },
+    { metric: "HTTP participant round-trip (loopback)",       value: "12,000",    unit: "req/sec",        note: "estimated — httptest.Server, loopback" },
+  ]}
+/>
+
+The 2.8x slowdown from v0 to v1 (1.8M vs 650K sagas/sec) is entirely from the event log append: each step writes two events (StepStarted + StepCompleted), and a 3-step saga appends 6 events. In production, where each event write is a database insert, this ratio inverts — durable writes dominate and the saga execution overhead is negligible.
+
+The recovery benchmark (8.5M/sec) is fast because recovery is a pure slice scan with no I/O. In production with PostgreSQL, a `SELECT * WHERE saga_id = $1` with an index on `saga_id` runs in under 1ms for typical saga lengths (under 50 events). Recovery is never a hot path — it runs once per crashed saga, not once per step.
+
+## Stress tests
+
+The test suite covers these failure scenarios:
+
+**Happy path:** all 3 steps complete, result status is `completed`, no compensation functions called.
+
+**Failure at step 2:** step 1 completes, step 2 fails, step 1's compensation runs. Step 3 never runs. Exactly 1 compensation.
+
+**Failure at step 3:** steps 1 and 2 complete, step 3 fails. Compensations run in reverse: step 2 first, then step 1. Exactly 2 compensations in the correct order.
+
+**Compensation failure:** step 1 completes, step 2 fails, step 1's compensation returns an error. The orchestrator logs the failure and continues (in this case there are no more compensations). The saga result is still `compensated` — compensation failure does not change the outcome.
+
+**Recovery skips completed steps:** run a saga to completion. Replay with the same saga ID. The second run reads the event log and skips all steps. The step execute functions are called exactly once total.
+
+**Retry succeeds on 3rd attempt:** a flaky step returns `RetryableError` for the first 2 calls and succeeds on the 3rd. The saga result is `completed`. The retry counter shows exactly 3 calls.
+
+**Budget exhaustion:** a step always returns `RetryableError`. After MaxAttempts attempts, the retry budget is exhausted. Compensation runs. Any prior completed steps are compensated.
+
+**HTTP idempotency key:** an `httptest.Server` verifies that the `Idempotency-Key` header matches the expected value on every request, including retries.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "Durable saga log storage",
+      why: "Our SagaLog is an in-memory slice. Production sagas persist events to PostgreSQL or a message broker. On process restart, the orchestrator must recover all in-flight sagas by scanning the event store.",
+    },
+    {
+      thing: "Choreography-based sagas",
+      why: "Our orchestrator centrally drives the saga. Choreography-based sagas have no central orchestrator — each service publishes domain events and reacts to others. This avoids a single point of failure but makes the flow invisible.",
+    },
+    {
+      thing: "Saga execution timeout and dead-letter",
+      why: "Sagas stuck mid-flight (e.g., payment service down for 2 hours) need a timeout policy and a dead-letter queue. Manual intervention workflows for stuck sagas are a significant operational concern.",
+    },
+    {
+      thing: "Compensation failure handling",
+      why: "If compensation itself fails, the system is in an inconsistent state. Production sagas alert operators, retry compensations with longer backoffs, and may require manual SQL rollbacks.",
+    },
+    {
+      thing: "Distributed tracing across participants",
+      why: "A saga spans 3-10 services. Without a correlation ID threaded through all HTTP calls and stored in the event log, debugging a failed saga across service logs is extremely difficult.",
+    },
+    {
+      thing: "Idempotency keys at participants",
+      why: "We send an idempotency key in HTTP headers, but participants must implement idempotent handlers — checking if the key was already processed and returning the cached result. This requires a separate idempotency store per participant.",
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-statemachine"
+  mavenCoords={[
+    "org.springframework.statemachine:spring-statemachine-core:4.0.0",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/saga/java-integration"
+>
+
+The Java integration shows two things in parallel: a `SagaClient` that drives the Go orchestrator via REST, and a `SpringStateMachineComparison` that models the same order saga using Spring State Machine — highlighting the architectural difference between procedural orchestration and event-driven state machines.
+
+**SagaClient** (~55 lines) uses Spring Framework 6.1's `RestClient`:
+
+```java
+public class SagaClient {
+    private final RestClient http;
+
+    public SagaClient(String baseUrl) {
+        this.http = RestClient.builder().baseUrl(baseUrl).build();
+    }
+
+    public SagaResult runSaga(String sagaId, Map<String, Object> inputContext) {
+        var body = Map.of("sagaId", sagaId, "context", inputContext);
+        return http.post()
+                .uri("/saga/run")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(body)
+                .retrieve()
+                .body(SagaResult.class);
+    }
+
+    public SagaResult recoverSaga(String sagaId) {
+        return http.post()
+                .uri("/saga/{id}/recover", sagaId)
+                .retrieve()
+                .body(SagaResult.class);
+    }
+
+    public record SagaResult(String status, String failedStep, String error, int eventCount, List<String> log) {
+        public boolean isCompleted()   { return "completed".equals(status); }
+        public boolean isCompensated() { return "compensated".equals(status); }
+    }
+}
+```
+
+**Spring State Machine comparison** — the same order saga modelled as a state machine:
+
+```java
+public enum OrderState {
+    STARTED, INVENTORY_RESERVED, PAYMENT_CHARGED, SHIPPED,
+    COMPENSATING, COMPENSATED, COMPLETED
+}
+
+public enum OrderEvent {
+    INVENTORY_RESERVED, PAYMENT_CHARGED, SHIPMENT_CREATED,
+    STEP_FAILED, COMPENSATION_DONE
+}
+
+// Transitions (in StateMachineConfigurerAdapter):
+transitions
+    .withExternal()
+        .source(STARTED).target(INVENTORY_RESERVED).event(INVENTORY_RESERVED)
+    .and().withExternal()
+        .source(INVENTORY_RESERVED).target(PAYMENT_CHARGED).event(PAYMENT_CHARGED)
+    .and().withExternal()
+        .source(PAYMENT_CHARGED).target(SHIPPED).event(SHIPMENT_CREATED)
+    .and().withExternal()
+        .source(PAYMENT_CHARGED).target(COMPENSATING).event(STEP_FAILED)
+    .and().withExternal()
+        .source(COMPENSATING).target(COMPENSATED).event(COMPENSATION_DONE);
+```
+
+**The architectural difference:**
+
+Our Go orchestrator is **procedural**: it calls `InventoryReserve`, waits for the result, calls `PaymentCharge`, waits, calls `ShipmentCreate`. If `ShipmentCreate` fails, it triggers compensations. The flow is visible in one place — the `Saga.Run()` call. The orchestrator is the single source of truth.
+
+Spring State Machine is **event-driven**: it defines states and transitions, but external code must send events (`INVENTORY_RESERVED`, `PAYMENT_CHARGED`, etc.) to trigger transitions. The state machine tracks which state the saga is in, but YOUR code must decide what to do in each state. Spring State Machine does NOT automatically call `refundPayment()` when `STEP_FAILED` transitions to `COMPENSATING` — you wire that up separately as a state entry action.
+
+**When to use each:**
+
+Use the procedural orchestrator (our approach) when you need a single, auditable place to see the saga flow. Best for business-critical transactions where compensation logic is complex and the flow is fixed.
+
+Use Spring State Machine when your domain genuinely models stateful objects (order lifecycle, approval workflows) where external events (user approval, timer expiry) naturally drive the transitions — not just service call results.
+
+Both run the same `SagaDemoApplication`:
+
+```java
+@SpringBootApplication
+public class SagaDemoApplication {
+    @Bean
+    CommandLineRunner demo(SagaClient sagaClient) {
+        return args -> {
+            var result = sagaClient.runSaga(
+                "order-" + UUID.randomUUID(),
+                Map.of("orderId", "ord-demo", "customerId", "cust-42")
+            );
+            System.out.printf("Saga status: %s (events: %d)%n",
+                result.status(), result.eventCount());
+        };
+    }
+}
+```
+
+Start the Go demo server (`go run ./cmd/demo`) then `mvn spring-boot:run` in `java-integration/`.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The compensation ordering surprised me. With 3 steps and a failure at step 3, the log shows 10 events: StepStarted x3, StepCompleted x2, StepFailed x1, CompensationStarted x2, CompensationCompleted x2. A successful 3-step saga writes 6 events (StepStarted + StepCompleted for each). Both paths write deterministic counts — which is exactly what makes recovery deterministic. The saga leaves predictable footprints regardless of outcome, which is why ReplayLog can be a dumb slice scan with no special cases. The second surprise was how much idempotency work belongs in the participants, not the orchestrator: we thread an Idempotency-Key header through every HTTP call, but participants must implement idempotent handlers themselves — checking if the key was already processed and returning the cached result. Orchestrator-side idempotency (skipping steps already in the log as StepCompleted) handles orchestrator restarts. Participant-side idempotency handles the case where the network dropped the response after the participant committed — a completely different failure mode that the orchestrator cannot detect." />
+
+## Where to go deeper
+
+- **Chris Richardson's Saga pattern** — the canonical reference: microservices.io/patterns/data/saga.html
+- **Microservices Patterns (Richardson, 2018), Chapter 4** — covers saga isolation and semantic locks in depth
+- **Temporal workflow engine** — builds on saga ideas with durable execution: temporal.io/blog/workflow-engine-principles
+- **AWS Step Functions** — managed saga orchestration with visual flow editor: docs.aws.amazon.com/step-functions
+- **Axon Framework** — Java saga framework with event sourcing: docs.axoniq.io/axon-framework-reference
+- **Eventuate Tram** — Chris Richardson's open-source saga library for Java/Spring
+
+## Related labs and questions
+
+- **Distributed Lock (dist-lock)**: how would you prevent two saga instances from running for the same order ID simultaneously? A distributed lock prevents duplicate saga starts, but the saga's own idempotency log handles recovery from crashes.
+- **Gossip Protocol (gossip)**: in a choreography-based saga, services react to domain events published by other services. How would a gossip protocol fit into that architecture vs. a message broker?
+- **Raft Consensus (raft)**: the SagaLog is our durable state. If we replicated the SagaLog across 3 nodes using Raft, what would happen to saga correctness if the log leader failed mid-write?
+- **Kafka-lite (kafka-lite)**: replace our HTTP participant calls with event publishing. How does the at-least-once delivery guarantee of a message broker interact with participant-side idempotency?
+- **Rate Limiter (rate-limiter)**: the retry policy in v2 uses exponential backoff per step. If 1,000 sagas all hit the payment service simultaneously after a blip, they all retry at similar intervals. How would you add jitter across sagas (not just within one saga's retries)?

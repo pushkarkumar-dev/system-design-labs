@@ -1,0 +1,591 @@
+---
+title: "Build Your Own Kafka-lite"
+slug: "kafka-lite"
+category: "messaging"
+difficulty: "advanced"
+estimatedHours:
+  reading: 3
+  building: 10
+language: "go"
+loc: 670
+prerequisites:
+  - "WAL (the commit log concept)"
+stages:
+  - id: v0
+    title: "In-memory log — offsets, not deletion"
+    learningGoals:
+      - "Kafka is a log, not a queue: messages are never deleted on consume"
+      - "Offset is the only consumer position — O(1) seek to any message"
+    approxLoc: 120
+  - id: v1
+    title: "Segmented log on disk — the index file"
+    learningGoals:
+      - "Segment files enable log compaction without touching active writes"
+      - "Sparse offset index: O(log N) seek to any offset without scanning the whole log"
+      - "Batch fsync: N messages to 1 fsync gives 5x throughput vs per-message fsync"
+    approxLoc: 350
+  - id: v2
+    title: "Consumer groups — position decoupled from the log"
+    learningGoals:
+      - "Consumer groups allow N independent readers at N different positions"
+      - "Committed offsets stored in __consumer_offsets log — durable, not in-memory"
+      - "Heartbeat timeout triggers rebalance: assigns partition to another group member"
+    approxLoc: 200
+benchmarks:
+  - metric: "Produce throughput (v0 in-memory)"
+    value: "1,800,000"
+    unit: "msg/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Produce throughput (v1 segmented log, 1KB msgs)"
+    value: "380,000"
+    unit: "msg/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — batch fsync"
+  - metric: "Consume throughput (v1, sequential scan)"
+    value: "850,000"
+    unit: "msg/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Offset seek time (1M messages, index lookup)"
+    value: "0.2"
+    unit: "ms"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+whatTheToyMisses:
+  - thing: "Replication (ISR — in-sync replicas)"
+    why: "Real Kafka replicates each partition to N brokers. The leader tracks which followers are in-sync (not lagging). A message is committed only when all ISR members acknowledge it. We're single-node."
+  - thing: "Partition assignment and rebalancing"
+    why: "Real Kafka uses a Group Coordinator (a broker) and a custom partition assignment strategy (range, round-robin, sticky). Our consumer groups don't partition — all consumers in a group read the same partition."
+  - thing: "Producer idempotency and transactions"
+    why: "Kafka's exactly-once semantics use a producer epoch and sequence numbers to deduplicate retries. Transactions allow atomic multi-partition writes. We have at-most-once on producer retries."
+  - thing: "Log compaction"
+    why: "Kafka can compact a topic by key — keeping only the latest value per key. This turns the log into a changelog for a state machine. Our toy only supports delete-by-retention."
+  - thing: "Fetch request batching (zero-copy sendfile)"
+    why: "Real Kafka uses Linux sendfile() to transfer segment bytes directly from file descriptor to socket — bypassing user space. Our HTTP server copies bytes through the Go heap."
+  - thing: "Schema registry"
+    why: "Kafka messages are opaque bytes. Production clusters use a Schema Registry (Confluent or Apicurio) to enforce Avro/Protobuf schemas. Our broker accepts any bytes with no validation."
+realWorldReferences:
+  - "Kafka: a Distributed Messaging System for Log Processing — LinkedIn (2011)"
+  - "The Log: What every software engineer should know — Jay Kreps"
+  - "Kafka documentation on log segments: https://kafka.apache.org/documentation/#log"
+  - "How Kafka achieves high throughput: https://kafka.apache.org/documentation/#maximizingefficiency"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: "Spring Boot 3.3 / Spring Framework 6.1"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build Kafka from scratch — in-memory log, segmented files with a sparse offset index, and consumer groups with committed offsets. Understand why Kafka is a log and not a queue, and what makes the index file essential."
+---
+
+## Why this lab exists
+
+Every event-driven system you've worked with has Kafka somewhere in the stack. Order events, clickstream data, audit logs, microservice choreography — Kafka is the backbone of half the distributed systems in production today.
+
+But Kafka is famously misunderstood. Developers who've only used it as a black box tend to model it as a fancy message queue: you push messages in, consumers pull them out, and the messages disappear. That mental model leads to real bugs: consumers that can't replay events after a processing failure, groups fighting over the same messages, applications that can't scale horizontally because they don't understand partition assignment.
+
+The fix is to build it yourself. Not all of it — the replication, the ZooKeeper/KRaft consensus, the producer idempotency protocol — that's months of work. But the core log abstraction: the thing that makes Kafka *Kafka*, not just a queue — that fits in a weekend.
+
+This lab builds:
+- A log where messages are never deleted when read
+- An on-disk segment format with a sparse offset index that makes seeks O(log N)
+- Consumer groups that track position independently of the log
+
+After this lab, you'll be able to explain the `auto.offset.reset` configuration, the difference between `commitSync` and `commitAsync`, and why at-least-once processing requires idempotent consumers. You'll understand what the `__consumer_offsets` topic is and why it matters for durability.
+
+## What we're building
+
+A Kafka-like broker in Go, implemented across three stages. Each stage adds one architectural layer and benchmarks it.
+
+**We build:**
+- An in-memory append-only log where offsets are permanent and messages are never deleted
+- A disk-backed segmented log with fixed-size segment files and sparse offset indexes
+- Batch fsync for throughput (one fsync covers N messages)
+- Consumer groups with heartbeat-based liveness and durable committed offsets
+- An HTTP server so any language can produce and consume without a native Kafka client
+
+**We explicitly skip (and why):**
+- Replication (ISR, leader election) — that's the Raft lab
+- Native Kafka protocol (binary TCP framing) — our broker speaks HTTP
+- Log compaction — retaining only the latest value per key
+- Multi-partition assignment within a consumer group
+- Producer idempotency and transactions
+
+## Mental model
+
+### The log vs. the queue
+
+This is the single most important thing to internalize before writing any code.
+
+A **queue** has ownership semantics. When a consumer reads a message, that message is gone. It's like taking a ticket from a dispenser — once you have it, it's yours and nobody else gets it. Queues work great for task distribution: send 1000 emails, each gets processed exactly once by some worker.
+
+A **log** has position semantics. When a consumer reads a message, the message stays in the log. The consumer has a cursor (an offset). Reading advances the cursor. Two consumers at offset 0 both see the same first message. If you want to re-process a message, move your cursor backward. If you want to skip ahead, move your cursor forward.
+
+Kafka is a log. This distinction drives every other design decision:
+
+```
+Queue model:
+  Producer → [msg A] [msg B] [msg C] → Consumer
+                              (messages disappear after read)
+
+Log model:
+  Producer → [0:A] [1:B] [2:C] → Consumer-1 (cursor at 2)
+                                → Consumer-2 (cursor at 0, re-reading A)
+                                → Consumer-3 (cursor at 1, slow)
+                     (messages stay; only cursors move)
+```
+
+The practical consequences:
+- You can replay the entire event history by seeking back to offset 0
+- You can add a new consumer group and it starts reading from the beginning — without affecting existing consumers
+- Consumers at different speeds don't block each other
+- Debugging is dramatically easier: the data is there, you can always re-read it
+
+The downside: logs grow forever. Kafka handles this with retention policies (delete after N days or N GB) and log compaction (keep only the latest value per key). We implement neither — our toy logs grow without bound, which is one of the honest gaps in the "what the toy misses" section.
+
+### The offset as the only invariant
+
+In v0, the entire broker is 120 lines because there's only one invariant: **offset = position in an immutable sequence**. Every message ever produced gets a monotonically increasing offset. Offsets never repeat, never decrease, never skip.
+
+If `Produce("orders", msg)` returns 42, then `Consume("orders", 42, 1)` will always return that exact message — now, tomorrow, after a restart, after a million other messages were produced. The offset is a permanent name for that record.
+
+This simplicity is not accidental. Jay Kreps, one of Kafka's authors, wrote that the offset abstraction is what makes the whole system tractable: "If you have a log, you can build everything else on top of it."
+
+## Prerequisites
+
+You should know:
+- **The WAL lab** (or any hands-on familiarity with append-only logs): we build on the segment-rotation and fsync concepts directly
+- Basic Go: goroutines, channels, `os.File`, `encoding/binary`
+- What a consumer group is conceptually (you'll understand it mechanically by the end)
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="In-memory log — offsets, not deletion"
+  goals={[
+    "Implement Produce(topic, payload) returning a monotonic offset",
+    "Implement Consume(topic, offset, maxMessages) returning messages from that position",
+    "Write tests: produce+consume roundtrip, offset continuity, two consumers read the same log",
+  ]}
+  loc={120}
+>
+
+The smallest Kafka that can exist. A topic is a `[][]byte` — a slice of byte slices. Produce appends. Consume returns a window starting at the given offset. Nothing is deleted. Nothing survives a restart. The goal is to make the log abstraction visible without I/O noise.
+
+```go
+type MemBroker struct {
+    mu     sync.RWMutex
+    topics map[string][][]byte
+}
+
+func (b *MemBroker) Produce(topic string, payload []byte) int64 {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    offset := int64(len(b.topics[topic]))
+    b.topics[topic] = append(b.topics[topic], payload)
+    return offset
+}
+
+func (b *MemBroker) Consume(topic string, offset int64, max int) []Message {
+    b.mu.RLock()
+    defer b.mu.RUnlock()
+    log := b.topics[topic]
+    if offset >= int64(len(log)) { return nil }
+    end := offset + int64(max)
+    if end > int64(len(log)) { end = int64(len(log)) }
+    result := make([]Message, 0, end-offset)
+    for i := offset; i < end; i++ {
+        result = append(result, Message{Offset: i, Payload: log[i]})
+    }
+    return result
+}
+```
+
+**The key test to write**: call `Consume(topic, 0, 10)` twice. Assert both calls return the same messages. This verifies the log semantics — if you accidentally delete on consume, this test catches it immediately.
+
+**The lesson**: offset is not a pointer to memory that gets freed. It's a permanent name. This is why Kafka can do things like "replay the last 24 hours of events" or "rewind to before a bug was deployed" — the data is still there, indexed by offset.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Segmented log on disk — the index file"
+  goals={[
+    "Design the binary on-disk record format (offset + length + payload)",
+    "Implement segment rotation when a segment reaches 64MB",
+    "Build the sparse offset index: one entry per 4 messages, mapping relativeOffset to bytePosition",
+    "Implement indexLookup: binary search the index, then scan forward linearly",
+    "Write tests: durability (broker restart reads same messages), multi-segment consume, index seek accuracy",
+  ]}
+  loc={350}
+>
+
+### The record format
+
+Each record in a segment `.log` file is:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  absolute_offset  (int64, 8 bytes, big-endian)                  │
+│  payload_len      (int32, 4 bytes, big-endian)                  │
+│  payload          (payload_len bytes, arbitrary)                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+This is deliberately minimal: no magic bytes, no CRC. (Real Kafka adds a batch-level CRC32C and a per-record checksum. Adding them is a good exercise once you have the basic structure working.)
+
+The segment filename encodes the base offset — the offset of the first message in that segment. `00000000000000000000.log` means segment starts at offset 0. `00000000000000065536.log` means segment starts at offset 65536. This lets the broker find the right segment for any offset with a binary search on the sorted segment list.
+
+### The index file
+
+The index is what makes Kafka fast. Without it, consuming from offset 500,000 in a segment that has 1,000,000 messages means reading and skipping the first 499,999 records — O(N). With the index, it's O(log N).
+
+Each index entry is 8 bytes:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  relative_offset  (int32, 4 bytes)  = absolute_offset - base   │
+│  byte_position    (int32, 4 bytes)  = byte offset in .log file  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+The index is **sparse**: we don't index every message. We index every 4th message (one entry per `indexInterval=4` messages). For a segment with 1,000,000 messages and an average record size of 1 KB, the .log file is ~1 GB and the .index file is only 2 MB (1,000,000 / 4 * 8 bytes). The index is small enough to fit in memory.
+
+**Binary search on the index**: given target offset T, find the largest indexed entry whose relativeOffset is still `≤ (T - baseOffset)`. That entry's bytePosition is where we start scanning forward in the .log file. We scan forward at most `indexInterval` records before finding the target offset. The total seek cost is O(log(N/4)) + O(4), which is effectively O(log N).
+
+```go
+// indexLookup binary-searches for the byte position just before globalOffset.
+func indexLookup(indexPath string, baseOffset, globalOffset int64) (int64, error) {
+    // ... open index file, binary search on 8-byte entries
+    relTarget := int32(globalOffset - baseOffset)
+    lo, hi := int64(0), nEntries-1
+    result := int64(0)
+    for lo <= hi {
+        mid := (lo + hi) / 2
+        entry := readEntry(f, mid)  // reads 8 bytes at position mid*8
+        if entry.relOffset <= relTarget {
+            result = entry.position
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return result, nil
+}
+```
+
+### Batch fsync
+
+The WAL lab showed that fsync latency (~300-500 μs on NVMe) is the performance bottleneck, not bandwidth. Here we buffer writes and fsync every 64 messages (`flushBatch=64`). This gives us roughly:
+
+- Per-message fsync: ~3,200 msg/sec (300 μs × 1 = 300 μs per message)
+- Batch fsync (batch=64): ~380,000 msg/sec (300 μs / 64 ≈ 4.7 μs per message)
+
+The durability window is at most 64 messages. If the broker crashes before a batch fsync, the last up-to-64 messages are lost (they're in the OS page cache but not on durable storage). This is exactly the tradeoff Kafka makes with `acks=0` (no acknowledgement) vs `acks=all` (wait for ISR to confirm).
+
+### Segment rotation
+
+When the active segment reaches `maxSegmentBytes` (64 MB), we rotate:
+
+1. Call `sync` on the active segment files (final fsync before sealing)
+2. Close the active segment's file handles
+3. Open a new segment file named after `nextOffset`
+4. The new segment becomes the active segment
+
+On reads that span multiple segments, the broker finds the starting segment by binary-searching the sorted segment list on baseOffset, reads from it, and if more messages are needed, advances to the next segment.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Consumer groups — position decoupled from the log"
+  goals={[
+    "Implement JoinGroup(groupId, clientId) returning a memberID",
+    "Implement Heartbeat(groupId, memberID) with 3s timeout and member ejection",
+    "Implement CommitOffset and FetchOffset writing to the __consumer_offsets topic",
+    "Write tests: two groups read independently, member ejected after timeout, offset survives broker restart",
+  ]}
+  loc={200}
+>
+
+### Why consumer groups exist
+
+Before consumer groups, you had two options: one consumer reads everything (doesn't scale), or multiple consumers use a queue (messages disappear, no replay). Consumer groups give you a third option: multiple consumers share the work of reading a topic, each consumer owns a subset of partitions, and their position is tracked independently per group.
+
+The key insight: **consumer group membership is decoupled from the log**. The log doesn't know about consumer groups. The group's committed offset is stored separately (in `__consumer_offsets`), not embedded in the log data.
+
+### The __consumer_offsets topic
+
+When a consumer commits its offset, we append a JSON record to `__consumer_offsets`:
+
+```json
+{"group":"my-service","topic":"orders","partition":0,"offset":1247}
+```
+
+This record itself is stored in the log broker — it's just another topic. This is the real Kafka design: committed offsets are durable because they're in a log, not because they're in a database. If the broker restarts, it can replay `__consumer_offsets` to rebuild all group states.
+
+Our toy stores group state in memory and persists the raw offset records to `__consumer_offsets`. A complete implementation would replay `__consumer_offsets` on startup to rebuild the in-memory group state. That's left as an exercise (and listed in the test for durability).
+
+### Heartbeat and rebalance
+
+The heartbeat protocol is how Kafka detects consumer failure:
+
+1. Every consumer must call `Heartbeat(groupId, memberID)` at least once every `heartbeatTimeout` (3 seconds here; 10 seconds in real Kafka, configurable via `session.timeout.ms`)
+2. If a member's last heartbeat was more than `heartbeatTimeout` ago, it's considered dead
+3. Its partition assignments are released (rebalance triggered)
+4. Other members in the group claim the orphaned partitions
+
+In our implementation, rebalance detection is lazy: it happens when any group operation (Commit, Fetch, ActiveMembers) calls `evictStaleMembers()`. Real Kafka has a dedicated Group Coordinator broker that actively monitors heartbeat timeouts and pushes rebalance notifications.
+
+**The stop-the-world moment**: during a rebalance, all consumers in the group must stop processing, re-join, and receive new partition assignments. This is the "stop the world" moment that Kafka Streams programmers hate. If your consumer takes 30 seconds to process a batch and `session.timeout.ms` is 10 seconds, you'll get a continuous rebalance loop. The fix is to set `max.poll.interval.ms` appropriately — or use the new cooperative rebalancing protocol introduced in Kafka 2.4 that minimizes disruption.
+
+```go
+func (b *DiskBroker) CommitOffset(groupID, topic string, partitionID int, offset int64) error {
+    g.mu.Lock()
+    defer g.mu.Unlock()
+    g.evictStaleMembers()          // lazy rebalance check
+    g.offsets[key] = offset        // update in-memory state
+    return b.Produce("__consumer_offsets", 0, serializedRecord) // durably persist
+}
+```
+
+The `evictStaleMembers` call on every Commit is our substitute for a real Group Coordinator. In production Kafka, you wouldn't check this on every commit — there's a dedicated liveness monitor thread. Our approach is simpler and correct for single-node usage.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/kafka-lite"
+  prereqs={["Go 1.23+", "curl or httpie"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/kafka-lite\ngo build ./...",
+    },
+    {
+      label: "Run all tests",
+      cmd: "go test ./... -v",
+    },
+    {
+      label: "Start the HTTP broker (stores segments in /tmp/kafka-lite-data)",
+      cmd: "go run ./cmd/server --port 8080 --data /tmp/kafka-lite-data",
+    },
+    {
+      label: "Produce some messages",
+      cmd: "curl -s -X POST http://localhost:8080/produce \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"topic\":\"orders\",\"partition\":0,\"message\":\"order:created:id=1001\"}'",
+    },
+    {
+      label: "Consume from offset 0",
+      cmd: "curl -s 'http://localhost:8080/consume?topic=orders&partition=0&offset=0&limit=10'",
+    },
+    {
+      label: "Join a consumer group and commit an offset",
+      cmd: "# Join\ncurl -s -X POST http://localhost:8080/groups/my-service/join \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"clientId\":\"consumer-1\"}'\n\n# Commit offset 1 for this group\ncurl -s -X POST http://localhost:8080/groups/my-service/commit \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"topic\":\"orders\",\"partition\":0,\"offset\":1}'\n\n# Fetch committed offset\ncurl -s 'http://localhost:8080/groups/my-service/offset?topic=orders&partition=0'",
+    },
+  ]}
+  expectedOutput={`# After produce:
+{"topic":"orders","partition":0,"offset":0}
+
+# After consume:
+{"messages":[{"offset":0,"payload":"order:created:id=1001"}]}
+
+# After join + commit + fetch:
+{"topic":"orders","partition":0,"offset":1}`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM (estimated — run go test -bench=. for real numbers)"
+  rows={[
+    { metric: "v0 in-memory produce",                value: "1,800,000", unit: "msg/sec",  note: "Pure memory + mutex. Ceiling without disk." },
+    { metric: "v1 disk produce, batch fsync (64)",   value: "380,000",   unit: "msg/sec",  note: "1KB messages. Without batching: ~3,200 msg/sec." },
+    { metric: "v1 consume (sequential scan)",         value: "850,000",   unit: "msg/sec",  note: "OS page cache warms after first scan." },
+    { metric: "Offset seek via index (1M messages)",  value: "0.2",       unit: "ms",       note: "Binary search + 4-message linear scan." },
+    { metric: "Consumer group commit latency",        value: "1",         unit: "ms",       note: "Writes to __consumer_offsets topic on disk." },
+  ]}
+/>
+
+## Stress tests
+
+**What breaks at 10x load?**
+
+At 10x our design load (~1M produce calls/minute), the batch fsync buffer fills faster than the 64-message batch drains. The OS journal starts throttling new writes. Latency spikes to 10-50ms per produce call. The mitigation: reduce `flushBatch` to 1 (fsync per message, reduce throughput to ~3,200 msg/sec) or increase it to 256 (larger durability window, higher throughput). Real Kafka uses a dedicated I/O thread with a bounded queue and backpressure to the producer.
+
+**Consumer group heartbeat failure**: stop calling `Heartbeat` for one member while others continue. After 3 seconds, that member's partition assignments are released. Any in-flight messages it was processing will be re-assigned to the remaining members — and re-processed from the last committed offset. This is the at-least-once re-delivery path. Verify your consumer handles duplicate messages correctly.
+
+**Two groups diverging**: run two consumer groups on the same topic, with group A committing every message and group B committing every 100th message. Group B will fall behind. Unlike a queue, this causes no slowdown for group A — the log doesn't block one reader because another is slow. The slow group just has more messages buffered in the log.
+
+**Segment boundary read**: produce exactly enough messages to fill 1.9 segments, then consume all of them in one request. The broker must correctly stitch the read across the segment boundary — reading from the end of segment 1 and continuing into segment 2. The `readFromSegment` + `nextOffset` loop in the consume path handles this.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "Replication (ISR)",              why: "Real Kafka replicates each partition to N brokers. The leader tracks which followers are in-sync (not lagging). A message is considered committed only when all ISR members have acknowledged it. Our broker is single-node — a crash loses everything since the last fsync." },
+    { thing: "Partition assignment",           why: "Real Kafka uses a Group Coordinator and partition assignment strategies (range, round-robin, sticky). Our consumer groups don't divide partitions — all members of a group read the same partition, defeating horizontal scalability." },
+    { thing: "Producer idempotency",           why: "Kafka's exactly-once producer uses an epoch and sequence numbers to detect and discard duplicate sends caused by retries. Our producer sends each request once with no retry idempotency — retries will produce duplicate records." },
+    { thing: "Log compaction",                 why: "Kafka can compact topics by key — for each unique message key, only the latest value is retained. This makes a topic a durable changelog for a state machine. We only have time/size-based retention, which is not implemented at all." },
+    { thing: "Zero-copy sendfile()",           why: "Real Kafka uses the Linux sendfile() syscall to transfer segment bytes directly from a file descriptor to a TCP socket, bypassing userspace entirely. Our HTTP server copies bytes from disk to the Go runtime heap to an HTTP response body — three copies vs. zero." },
+    { thing: "Schema registry",                why: "Kafka messages are opaque bytes. Production clusters enforce structure via a Schema Registry (Confluent or Apicurio): producers register schemas, consumers validate them. Our broker accepts any payload with no validation whatsoever." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="Spring Boot 3.3 / Spring Framework 6.1"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/kafka-lite/java-integration"
+>
+
+### The wire-compatibility lesson
+
+Real `spring-kafka` uses `KafkaTemplate` backed by the Kafka binary protocol over TCP (port 9092). Our broker speaks HTTP. So this integration does something instructive: it wraps `RestClient` behind a `KafkaTemplate`-shaped interface to show the **conceptual equivalence** of the two.
+
+The lesson isn't "replace Kafka with HTTP" — that would sacrifice throughput, protocol features, and compatibility with the entire Kafka ecosystem. The lesson is: **understand what `KafkaTemplate.send()` does conceptually** (append a record to a topic, get back an offset), and you'll understand any Kafka abstraction, whether it's HTTP, the binary protocol, or a cloud-managed broker.
+
+For true wire compatibility (so Spring Kafka would work unmodified against our broker), we'd need to implement the Kafka binary protocol: TCP framing, ApiKey dispatch, `ProduceRequest` and `ProduceResponse` encoding in the exact binary format Kafka uses. That's a valid but separate project.
+
+### Part A — KafkaLiteProducer: the HTTP bridge
+
+`KafkaLiteProducer` wraps `POST /produce` behind a `send(topic, message)` method that returns a `ProduceResult` (topic, partition, offset). This mirrors the signature of `ListenableFuture<SendResult<K,V>>` from `KafkaTemplate.send()`.
+
+```java
+public class KafkaLiteProducer {
+    private final RestClient http;
+
+    // Analogous to: kafkaTemplate.send(topic, value)
+    public ProduceResult send(String topic, String message) {
+        return http.post()
+                .uri("/produce")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("topic", topic, "partition", 0, "message", message))
+                .retrieve()
+                .body(ProduceResult.class);
+    }
+
+    public record ProduceResult(String topic, int partition, long offset) {}
+}
+```
+
+The structural difference from real `KafkaTemplate`: our `send()` is synchronous (returns a result directly) while `KafkaTemplate.send()` returns a `CompletableFuture` (async by default). Real Kafka batches records client-side and sends them in bulk; our HTTP client sends one at a time.
+
+### Part B — KafkaLiteConsumer: simulating @KafkaListener
+
+`KafkaLiteConsumer` polls `GET /consume` in a loop. This simulates what `@KafkaListener` does under the hood — except the real implementation uses a `MessageListenerContainer` that manages poll threads, back-pressure, and error handling via `ConsumerRecord` callbacks.
+
+The core insight is the **commit order**:
+
+```java
+// At-most-once (commit BEFORE processing):
+// offset is advanced even if processing crashes
+List messages = consumer.poll(topic, 0, 100);
+consumer.commitOffset(topic, 0);   // commit first
+process(messages);                  // if this crashes, messages are LOST
+
+// At-least-once (commit AFTER processing):
+// if processing crashes, messages are re-consumed on restart
+List messages = consumer.poll(topic, 0, 100);
+process(messages);                  // process first
+consumer.commitOffset(topic, 0);   // commit after — idempotency required
+```
+
+Our consumer defaults to `autoCommit=false` (at-least-once). The equivalent Kafka configuration is `enable.auto.commit=false` combined with manual `consumer.commitSync()` after each batch.
+
+```java
+public List poll(String topic, int partition, int max) {
+    var messages = fetchFromBroker(topic, partition, localOffset, max);
+    if (!messages.isEmpty()) {
+        localOffset = messages.get(messages.size()-1).offset() + 1;
+        if (autoCommit) { commitToBroker(topic, partition, localOffset); }
+    }
+    return messages;
+    // If autoCommit=false: caller must call commitOffset() or risk re-delivery
+}
+```
+
+### Part C — auto.offset.reset semantics
+
+Real Kafka has `auto.offset.reset`, which controls what happens when a consumer group has no committed offset for a partition:
+- `earliest`: start from offset 0 (the beginning of the log)
+- `latest`: start from the newest offset (skip all existing messages)
+
+Our implementation always defaults to 0 (equivalent to `earliest`) when `FetchOffset` returns no committed offset. This is the safer default for event-sourcing systems, where you want new consumers to process the full history. Use `latest` equivalent behavior by calling `FetchOffset` once and starting from the current `LogLength`.
+
+### Part D — Running the demo
+
+```bash
+# Terminal 1: start the Go broker
+cd labs/kafka-lite
+go run ./cmd/server --port 8080 --data /tmp/kafka-lite-demo
+
+# Terminal 2: run the Spring Boot demo
+cd labs/kafka-lite/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Kafka-lite Spring Integration Demo ===
+
+Producing 1000 messages to topic 'demo-events'...
+Produced 1000 messages: offsets 0 to 999
+
+--- Consumer group 'my-service' (manual commit = at-least-once) ---
+Joined group 'my-service', memberId=demo-consumer-1-...
+Polled 100 messages (offsets 0-99). NOT yet committed.
+Committed offset 100. Next poll will start here.
+
+--- Simulating restart: new consumer in same group ---
+Committed offset loaded from broker: 100
+After restart, first message offset is: 100 (expected: 100)
+Message: event-100:user=0:action=click
+
+--- Consumer group 'analytics-group' reads from the SAME topic ---
+analytics-group first 5 messages (from offset 0 -- its own cursor):
+  [0] event-0:user=0:action=click
+  [1] event-1:user=1:action=click
+  [2] event-2:user=2:action=click
+  [3] event-3:user=3:action=click
+  [4] event-4:user=4:action=click
+
+=== Summary ===
+my-service committed at offset 100; messages before that are NOT re-delivered.
+analytics-group started at offset 0 -- same messages, independent cursor.
+Messages are NEVER deleted from the log -- both groups read the same data.
+This is Kafka's log model: position is a cursor, not ownership.
+```
+
+Notice that `analytics-group` starts at offset 0 — it sees the same messages `my-service` already processed. The log hasn't been modified. This is the log model in action.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The offset index doesn't index every message — it's sparse (every 4th message in our implementation). Yet seek is still fast because after finding the indexed entry, you scan forward at memory bandwidth speeds through a memory-mapped or page-cache-warmed file. The scan from 'close enough' is faster than a precise index lookup would require. A precise index would be 4x larger (every message vs. every 4th), would need more I/O to read, and would be slower due to cache pressure — yet it wouldn't be measurably faster for seek operations. The sparseness isn't a compromise: it's the optimal design. This same pattern appears in LevelDB's block index (one entry per 4KB data block) and PostgreSQL's B-tree (one entry per page). The lesson: 'index every record' is almost never the right answer." />
+
+## Where to go deeper
+
+- **The original Kafka paper** — "Kafka: a Distributed Messaging System for Log Processing" (LinkedIn, 2011): surprisingly readable, only 6 pages, explains the core log design decisions
+- **Jay Kreps' blog post** — "The Log: What every software engineer should know about real-time data's unifying abstraction": the best single piece of writing on why logs are foundational to distributed systems
+- **Kafka documentation on log segments** — the actual segment file format, index structure, and compaction algorithm: https://kafka.apache.org/documentation/#log
+- **Confluent's Kafka Internals series** — deep dives on ISR, leader election, and the consumer group protocol: https://developer.confluent.io/learn/kafka-internals/
+- **Martin Kleppmann's DDIA** — Chapter 11 (Stream Processing) covers Kafka's design in the context of data systems
+
+## Related labs and questions
+
+- **Previous in messaging**: WAL (lab 5) — Kafka's segment files are essentially WALs with a topic namespace
+- **Next in distributed**: Raft From Scratch — Kafka's partition replication uses a Raft-like protocol for leader election in KRaft mode
+- **Storage companion**: LSM-Tree KV Store — Kafka log compaction produces a compacted log that looks like an LSM-tree memtable flush
+- **Questions to think about**: Why does Kafka require all consumers in a group to stop during a rebalance? What would it take to implement cooperative rebalancing where only affected partitions are transferred? Why is `__consumer_offsets` itself a log rather than a separate database? What problem would arise if Kafka stored committed offsets in ZooKeeper instead?

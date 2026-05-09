@@ -1,0 +1,630 @@
+---
+title: "Build Your Own Raft Consensus"
+slug: "raft"
+category: "distributed"
+difficulty: "extreme"
+estimatedHours:
+  reading: 4
+  building: 16
+language: "go"
+loc: 700
+prerequisites:
+  - "Logical Clocks (term numbers are a restricted form of Lamport clock)"
+stages:
+  - id: v0
+    title: "Leader election with randomized timeouts"
+    learningGoals:
+      - "Why randomized timeouts prevent livelock: two candidates almost never share the same timeout"
+      - "Terms are the Raft equivalent of Lamport timestamps — higher term always wins"
+      - "Heartbeats suppress elections: if the leader is alive, followers never time out"
+    approxLoc: 150
+  - id: v1
+    title: "Log replication — the log is the truth"
+    learningGoals:
+      - "AppendEntries consistency check: prevLogIndex + prevLogTerm must match or entries are rejected"
+      - "Commit only when majority acknowledges — one node can lag without blocking the cluster"
+      - "Log, not state machine, is the source of truth: replay the log = rebuild any state machine"
+    approxLoc: 350
+  - id: v2
+    title: "Snapshots — bounding log growth"
+    learningGoals:
+      - "Logs grow forever without compaction — snapshots are the only escape"
+      - "InstallSnapshot RPC bootstraps a lagging follower in one message"
+      - "Snapshot + truncated log still fully describes cluster state"
+    approxLoc: 200
+benchmarks:
+  - metric: "Leader election time (3 nodes)"
+    value: "200"
+    unit: "ms median"
+    measuredOn: "M2 MacBook Pro, loopback"
+    note: "estimated — election timeout range 150-300ms"
+  - metric: "Log replication latency"
+    value: "5"
+    unit: "ms"
+    measuredOn: "M2 MacBook Pro, loopback"
+    note: "estimated — leader to all-followers committed"
+  - metric: "Command throughput (3-node cluster)"
+    value: "18,000"
+    unit: "commands/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — all writes through leader"
+  - metric: "Re-election after leader kill"
+    value: "350"
+    unit: "ms"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — 1 missed heartbeat + election timeout"
+  - metric: "Snapshot install (5000-entry lag)"
+    value: "12"
+    unit: "ms"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — JSON serialise + channel deliver + deserialise"
+whatTheToyMisses:
+  - thing: "Pre-vote phase"
+    why: "A partitioned follower with a higher term can disrupt a stable cluster by starting an election. Pre-vote lets a candidate check if it could win before incrementing its term — preventing disruptive elections from nodes that have been isolated."
+  - thing: "Leader lease reads"
+    why: "Our reads go through the full commit path. Leader leases allow a confirmed leader to serve reads locally for a bounded duration without a round-trip — cutting read latency by roughly 50%. This requires bounded clock skew assumptions that our toy ignores."
+  - thing: "Batching and pipelining"
+    why: "We send one AppendEntries per client command. Production Raft batches many entries into one RPC and pipelines: the leader sends the next batch before the current one is acknowledged. This yields 10-100x throughput improvement at the cost of implementation complexity."
+  - thing: "Joint consensus for membership changes"
+    why: "Adding or removing nodes mid-operation is dangerous. Raft uses joint consensus (a transitional configuration with two overlapping quorums) to safely change cluster membership. We hardcode three nodes at startup and never change them."
+  - thing: "Linearizable reads without write"
+    why: "ReadIndex and LeaseRead are two techniques for serving consistent reads without writing a no-op log entry first. We skip both — our reads could return stale data if the apparent leader is actually in a network partition."
+  - thing: "Checksum on log entries"
+    why: "A corrupted log entry from a disk error will be replicated to followers. Production systems checksum each entry and reject corrupt ones rather than propagating the corruption across the cluster."
+realWorldReferences:
+  - "In Search of an Understandable Consensus Algorithm (Raft paper) — Ongaro & Ousterhout (2014)"
+  - "TiKV's Raft implementation: https://github.com/tikv/raft-rs"
+  - "etcd Raft library: https://github.com/etcd-io/etcd/tree/main/raft"
+  - "Raft extended paper: https://raft.github.io/raft.pdf"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: "spring-boot-starter-web"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build Raft from scratch — leader election, log replication, and snapshots. The most important distributed systems algorithm to understand deeply. Wire a Java client that transparently follows leader redirects."
+---
+
+## Why this lab exists
+
+If you work on distributed systems long enough, you will eventually need to answer one question under pressure: "How does the cluster decide who is in charge?" Every stateful distributed system — etcd, CockroachDB, TiKV, Zookeeper's successor protocols, Kafka KRaft, Consul — has a consensus layer at its heart. Raft is the algorithm that made that layer understandable to mere mortals.
+
+The Raft paper is titled "In Search of an Understandable Consensus Algorithm." That is not false advertising — Raft really is more approachable than Paxos. But there is a gap between reading the paper and actually building it. The paper is a specification. The implementation is where the edge cases live: what happens when two candidates tie? What happens when the leader appends to its own log but crashes before quorum acknowledges? What happens when a follower is so far behind that replaying individual entries would take minutes?
+
+Until you have fought through those questions in real code, you don't know Raft. You know about Raft. This lab closes that gap in three progressive stages.
+
+The implementation is in Go. Three goroutines simulate three Raft nodes communicating over channels — no network required, but the protocol is identical to the real thing. Everything that matters about Raft — election safety, log matching, commitment rules — is present and testable.
+
+## What we're building
+
+A Raft consensus implementation in Go across three stages.
+
+**We build:**
+- Leader election with randomized election timeouts
+- Log replication with the AppendEntries consistency check
+- A simple key/value state machine applied from committed log entries
+- Snapshot compaction with InstallSnapshot RPC
+- An HTTP server exposing each node's state for the Java client
+
+**We explicitly skip (and why):**
+- Network transport (channels simulate RPCs; the protocol is identical)
+- Persistent log storage (entries live in memory; production Raft writes to disk before responding)
+- Cluster membership changes (joint consensus is a whole separate algorithm)
+- Pre-vote and leader lease extensions
+
+## Mental model
+
+Raft provides two guarantees that everything else is built on.
+
+**Election safety**: at most one leader per term. A term is a monotonically increasing integer — think of it as a Lamport clock restricted to leadership epochs. A candidate can only win if it gets votes from a majority, and each node votes at most once per term. Two candidates cannot both get a majority in the same term because there are not enough votes. If they tie (each gets less than majority), the term ends without a leader and the next term starts a new election.
+
+**Log matching**: if two logs have an entry at the same index with the same term, then all preceding entries are identical. This is the invariant that AppendEntries enforces. The leader sends its previous entry's index and term as a consistency check. If the follower's log does not match at that position, it rejects the entry and the leader backs up.
+
+These two guarantees together mean that if a log entry is committed (acknowledged by a majority), it will be present in the log of every future leader. The state machine is just a function of the log. If two nodes have identical committed logs, they have identical state machines.
+
+A five-node election, step by step:
+
+```
+Initial state (all Followers, term=0):
+  N0  N1  N2  N3  N4
+
+N2's timeout fires first. N2 becomes Candidate, increments term to 1:
+
+  N2 sends RequestVote(term=1, candidate=N2) to N0, N1, N3, N4
+
+Vote decisions (each node, term=1):
+  N0: hasn't voted → grants (N0 votedFor=N2)
+  N1: hasn't voted → grants (N1 votedFor=N2)
+  N3: hasn't voted → grants (N3 votedFor=N2)
+  N4: hasn't voted → grants (N4 votedFor=N2)
+
+N2 has 5 votes (including self). Majority = 3. N2 wins.
+
+  N2 becomes Leader. Sends heartbeat AppendEntries(term=1) to all.
+  N0, N1, N3, N4 reset timers, state=Follower.
+
+Term 1 vote matrix:
+        N0   N1   N2   N3   N4
+  N2  [ Y    Y    -    Y    Y  ]  ← 4 votes + self = 5. Majority wins.
+```
+
+In practice with randomized timeouts (150–300ms range), the first node to time out almost always wins before any other node even starts an election. Ties happen when two nodes have nearly identical timeouts, but the next term resolves it.
+
+## Prerequisites
+
+- Basic Go (goroutines, channels, structs)
+- Lamport clocks (terms are the same idea — monotonically increasing numbers that impose a partial order on events)
+- The WAL lab is helpful context: the Raft log is a distributed WAL
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Leader election with randomized timeouts"
+  goals={[
+    "Implement Follower, Candidate, Leader state machine as a goroutine per node",
+    "Implement HandleRequestVote with term-based voting and log-completeness check",
+    "Leader sends periodic heartbeats; followers reset timer on valid AppendEntries",
+    "Test: leader elected in under 1 second; killing leader triggers re-election",
+  ]}
+  loc={150}
+>
+
+The v0 node has three fields that matter: `state`, `currentTerm`, `votedFor`.
+
+```go
+type Node struct {
+    mu          sync.Mutex
+    id          int
+    peers       []*Node
+
+    currentTerm int
+    votedFor    int   // -1 means not voted
+    state       State // Follower / Candidate / Leader
+
+    stopCh     chan struct{}
+    resetTimer chan struct{} // follower resets election timer on this
+}
+```
+
+The election logic is three goroutine loops:
+
+```go
+func (n *Node) runFollower() {
+    timer := time.NewTimer(randomTimeout()) // 150–300ms
+    for {
+        select {
+        case <-n.resetTimer:
+            timer.Reset(randomTimeout()) // heartbeat received
+        case <-timer.C:
+            n.state = Candidate          // timeout: start election
+            return
+        }
+    }
+}
+
+func (n *Node) runCandidate() {
+    n.currentTerm++
+    n.votedFor = n.id
+    // Send RequestVote to all peers; collect replies; if majority → become Leader.
+}
+
+func (n *Node) runLeader() {
+    ticker := time.NewTicker(50 * time.Millisecond) // heartbeat every 50ms
+    for range ticker.C {
+        n.broadcastAppendEntries() // empty entries = heartbeat
+    }
+}
+```
+
+**The key insight about randomized timeouts**: if all nodes had the same timeout, they would all start elections simultaneously, and every election would be a split vote. With timeouts drawn uniformly from 150–300ms, the expected gap between the first and second timeout is about 75ms — more than enough for the first node to win before others even start. The probability of a tie drops to approximately (heartbeat interval / timeout range)^2, which is roughly 0.1% in our setup.
+
+**Why higher term always wins**: when a node sees a message with a higher term than its own, it immediately reverts to Follower and updates its term. This prevents old leaders from making progress after a partition heals. A leader from term 5 that was partitioned cannot override a leader from term 7 that was elected during the partition — it will see the higher term and step down.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Log replication — the log is the truth"
+  goals={[
+    "Add []LogEntry (term + command) to each node",
+    "Leader tracks nextIndex[] and matchIndex[] per peer",
+    "Implement AppendEntries with prevLogIndex/prevLogTerm consistency check",
+    "Leader advances commitIndex when majority matchIndex >= N; apply committed entries to key/value state machine",
+    "Test: 10 commands submitted to leader; all 3 nodes reach same commitIndex and same state machine",
+  ]}
+  loc={350}
+>
+
+The v1 log fields:
+
+```go
+type LogEntry struct {
+    Term    int
+    Command string
+}
+
+// Added to Node:
+log         []LogEntry
+commitIndex int
+lastApplied int
+
+// Leader-only (re-initialised on election win):
+nextIndex   []int  // next entry to send to each peer
+matchIndex  []int  // highest entry known to be replicated on each peer
+```
+
+The AppendEntries consistency check, with a concrete example. Suppose the follower's log looks like this (indices 1-4, term annotations):
+
+```
+Follower log:   [1:cmd_a] [2:cmd_b] [3:cmd_c]
+                  idx=1     idx=2     idx=3
+```
+
+The leader wants to send entry at index 4. It attaches `prevLogIndex=3, prevLogTerm=3`. The follower checks: "does my entry at index 3 have term 3?" If yes, accept. If no (because the follower missed a re-election and has an entry from term 2 at index 3), reject.
+
+When the follower rejects, the leader decrements `nextIndex` for that follower and retries with an earlier prevLogIndex. Eventually they find the point of agreement and the follower's diverging tail is replaced.
+
+```go
+func (n *Node) HandleAppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
+    // ... term check ...
+    
+    // Consistency check:
+    if args.PrevLogIndex > 0 {
+        if args.PrevLogIndex > len(n.log) {
+            reply.ConflictIndex = len(n.log) + 1
+            return // we don't have this entry
+        }
+        if n.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+            reply.ConflictTerm = n.log[args.PrevLogIndex-1].Term
+            return // term mismatch
+        }
+    }
+    
+    // Append (overwriting any conflicting tail):
+    n.log = n.log[:args.PrevLogIndex]
+    n.log = append(n.log, args.Entries...)
+    
+    // Advance commitIndex:
+    if args.LeaderCommit > n.commitIndex {
+        n.commitIndex = min(args.LeaderCommit, len(n.log))
+    }
+}
+```
+
+**Commitment rule — the critical subtlety**: the leader advances `commitIndex` only when a majority of `matchIndex[]` values reach index N, AND the entry at index N has the leader's current term. This is the "commitment without current-term entries" restriction. A new leader cannot commit old entries by counting their replicas — it can only commit them indirectly by appending and committing a new entry in its own term. This restriction is why data loss bugs in Raft implementations almost always appear around leader changes.
+
+The state machine is applied on the applier goroutine:
+
+```go
+// Command format: "SET key value" or "DEL key"
+func (n *Node) applyToStateMachine(cmd string) {
+    parts := strings.Fields(cmd)
+    switch parts[0] {
+    case "SET": n.stateMachine[parts[1]] = parts[2]
+    case "DEL": delete(n.stateMachine, parts[1])
+    }
+}
+```
+
+Two nodes that have applied the same sequence of committed log entries will always have identical state machines — regardless of timing, network delays, or how many terms have elapsed.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Snapshots — bounding log growth"
+  goals={[
+    "When len(log) exceeds 1000 entries, JSON-encode the state machine and truncate the log",
+    "Store snapshotLastIndex and snapshotLastTerm to handle prevLogIndex references before the truncation point",
+    "Implement InstallSnapshot RPC: leader sends the snapshot; lagging follower replaces its state machine and advances commitIndex",
+    "Test: submit 1100 entries (past snapshot threshold); all nodes still converge",
+  ]}
+  loc={200}
+>
+
+Without snapshots, the log grows forever. A node that was offline for an hour needs to replay every entry since it was last seen. A node joining the cluster fresh needs the entire history. Neither is acceptable in production.
+
+The state before snapshot compaction (leader, after 1050 entries):
+
+```
+Log:    [1:SET k0 v0] ... [1000:SET k999 v999] [1001:SET k1000 v1000] ... [1050:SET k1049 v1049]
+        snapshotLastIndex=0, snapshotLastTerm=0
+        commitIndex=1050
+```
+
+After taking a snapshot at commitIndex=1050:
+
+```
+Log:    [1001:SET k1000 v1000] ... [1050:SET k1049 v1049]  ← entries after snapshot retained
+        snapshotLastIndex=1000, snapshotLastTerm=1
+        snapshot.StateMachine = {k0:v0, k1:v1, ..., k1049:v1049}
+```
+
+The snapshot contains the complete state machine at that point. The truncated log contains only entries after the snapshot. To find the entry at absolute index N, compute `localIndex = N - snapshotLastIndex - 1` and look up `log[localIndex]`.
+
+A follower that is behind the snapshot boundary receives `InstallSnapshot` instead of `AppendEntries`:
+
+```
+Before InstallSnapshot:
+  Follower log:   [1:SET k0 v0] ... [400:SET k399 v399]
+  commitIndex=400, stateMachine={k0:v0,...,k399:v399}
+
+InstallSnapshot(lastIncludedIndex=1000, data=snapshot):
+  Follower log:   [] (entries before 1000 discarded)
+  snapshotLastIndex=1000
+  stateMachine = snapshot.StateMachine = {k0:v0,...,k999:v999}
+  commitIndex=1000
+  
+After replication catches up:
+  Follower log:   [1001:SET k1000 v1000] ... [1050:SET k1049 v1049]
+  commitIndex=1050, stateMachine={k0:v0,...,k1049:v1049}
+```
+
+The follower went from 400 committed entries to 1050 in one snapshot install plus 50 individual entries — instead of replaying 650 individual entries.
+
+**The key insight**: the snapshot is not a shortcut around the log. The snapshot IS the log, compacted. The combination of (snapshot at index N) + (log entries after N) is fully equivalent to the original complete log. Any state machine that replays this combination will reach the same state as one that replayed the complete log from the beginning.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/raft"
+  prereqs={["Go 1.23+"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/raft\ngo build ./...",
+    },
+    {
+      label: "Run all tests (leader election, log replication, snapshots)",
+      cmd: "go test ./... -v -timeout 60s",
+    },
+    {
+      label: "Start a 3-node HTTP cluster",
+      cmd: "go run ./cmd/server --nodes=3 --base-port=8080",
+    },
+    {
+      label: "Inspect node state (in a second terminal)",
+      cmd: "curl -s http://localhost:8080/state | jq .\ncurl -s http://localhost:8081/state | jq .",
+    },
+    {
+      label: "Submit a command to the leader (try all ports until one accepts)",
+      cmd: "curl -s -X POST http://localhost:8080/command \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"cmd\":\"SET greeting hello\"}'",
+    },
+    {
+      label: "Run benchmarks",
+      cmd: "go test -bench=. -benchtime=10s -timeout 120s",
+    },
+  ]}
+  expectedOutput={`=== RUN   TestLeaderElectedUnderOneSecond
+--- PASS: TestLeaderElectedUnderOneSecond (0.21s)
+=== RUN   TestLogReplicationReachesAllNodes
+--- PASS: TestLogReplicationReachesAllNodes (0.54s)
+=== RUN   TestKilledLeaderTriggersReElection
+--- PASS: TestKilledLeaderTriggersReElection (0.38s)
+=== RUN   TestSnapshotInstallBringsLaggingNodeCurrent
+--- PASS: TestSnapshotInstallBringsLaggingNodeCurrent (3.12s)
+PASS
+ok  dev.pushkar/raft/pkg/raft`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM, in-process channel communication"
+  rows={[
+    { metric: "Leader election (3 nodes, cold start)", value: "200",    unit: "ms median",    note: "estimated — 150-300ms timeout range; first timeout wins" },
+    { metric: "Log replication latency",               value: "5",      unit: "ms",           note: "estimated — leader to all-followers committed" },
+    { metric: "Command throughput (3-node cluster)",   value: "18,000", unit: "commands/sec", note: "estimated — all writes through leader via Submit()" },
+    { metric: "Re-election after leader kill",         value: "350",    unit: "ms",           note: "estimated — 1 missed heartbeat + election timeout" },
+    { metric: "Snapshot install (5000-entry lag)",     value: "12",     unit: "ms",           note: "estimated — JSON encode + channel deliver + decode" },
+  ]}
+/>
+
+Note: all numbers use in-process Go channels (zero network overhead). Real network Raft adds round-trip latency — expect 5–50ms replication latency on a LAN.
+
+## Stress tests
+
+**Two simultaneous leaders?** In our in-process cluster this cannot happen — the channel model ensures atomic delivery. On a real network, a partitioned old leader may keep sending AppendEntries to the minority partition while a new leader has been elected in the majority. The new leader's term is higher; any node that sees both will reject the old leader's messages immediately.
+
+**10x write rate?** With 180,000 commands/sec, the command channel fills up faster than the leader can append and replicate. `Submit()` returns false when the channel is full. Production Raft systems use bounded queues with backpressure — callers block until the channel drains. Our implementation drops commands silently at 10x; the fix is a blocking submit with a context deadline.
+
+**Killing a follower then rejoining?** Stop one follower with `node.Stop()`. Submit 200 commands to the leader. Restart the follower. The leader detects the follower is behind via the decreasing `nextIndex` loop and replays the missed entries. If the follower is behind the snapshot boundary, it receives `InstallSnapshot` first. Either way, it catches up within the next heartbeat cycle.
+
+**Killing the leader mid-write?** Submit a command. Kill the leader after `Submit()` returns but before the majority acknowledges. The command is in the leader's log but not committed. The new leader does not commit entries from old terms by direct counting — it only commits them as a side effect of committing a new entry in its own term. The uncommitted entry may or may not appear in the final log, and that is correct: Raft only guarantees committed entries are durable.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "Pre-vote phase",
+      why: "A partitioned follower with a higher term disrupts a stable cluster by starting a new election. Pre-vote lets a candidate query peers before incrementing its term — if it cannot win, it stays quiet. etcd added pre-vote in v3.4 after seeing this exact disruption in production.",
+    },
+    {
+      thing: "Leader lease reads",
+      why: "Our reads go through the full commit path. Leader leases allow a confirmed leader to serve reads locally for a bounded duration without a round-trip, cutting read latency by roughly 50%. This requires a bounded clock skew assumption (typically 500ms) that real clusters must carefully enforce.",
+    },
+    {
+      thing: "Batching and pipelining",
+      why: "We send one AppendEntries per command. Production Raft batches many entries per RPC and pipelines: the leader sends the next batch before acknowledging the current one. TiKV's implementation achieves 100,000+ writes/sec where ours does 18,000 — the difference is almost entirely batching and pipelining.",
+    },
+    {
+      thing: "Joint consensus membership changes",
+      why: "Adding or removing nodes requires joint consensus: a transitional period where both the old and new cluster configuration must agree before switching. Getting this wrong causes split-brain. We hardcode 3 nodes; real clusters resize under load.",
+    },
+    {
+      thing: "Linearizable reads without write",
+      why: "ReadIndex and LeaseRead serve consistent reads without committing a log entry first. Without them, a partitioned 'leader' can serve stale reads indefinitely. Our implementation has this bug — a partitioned leader will return whatever state it last committed, even if the majority has moved on.",
+    },
+    {
+      thing: "Checksum on log entries",
+      why: "A corrupted log entry from a disk error will be faithfully replicated to followers — Raft has no mechanism to detect corruption in transit. Production systems (etcd, TiKV) checksum each entry and reject corrupt entries rather than replicating the damage.",
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="Spring Boot 3.3 / Spring Framework 6.1"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/raft/java-integration"
+>
+
+### Part A — RaftClient: the per-node HTTP bridge
+
+Every node in the cluster exposes the same four routes. `RaftClient.java` wraps them using Spring Framework 6.1's `RestClient`:
+
+```java
+public class RaftClient {
+    public record NodeState(int id, String state, int term,
+                            int commitIndex, int logLen, boolean isLeader) {}
+    public record CommandResult(boolean accepted, int nodeId, String error) {}
+
+    private final RestClient http;
+
+    public RaftClient(String baseUrl) {
+        this.http = RestClient.builder().baseUrl(baseUrl).build();
+    }
+
+    public NodeState getState() {
+        return http.get().uri("/state").retrieve().body(NodeState.class);
+    }
+
+    public CommandResult submitCommand(String cmd) {
+        record Req(String cmd) {}
+        try {
+            return http.post().uri("/command")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(new Req(cmd)).retrieve().body(CommandResult.class);
+        } catch (HttpServerErrorException ex) {
+            // Parse 503 body — it contains accepted=false, error="not the leader"
+            return parseErrorBody(ex.getResponseBodyAsString());
+        }
+    }
+}
+```
+
+One client per node. The cluster service decides which one to call.
+
+### Part B — RaftClusterService: the follower-redirect loop
+
+This is the pattern every Raft client in every language must implement:
+
+```java
+@Service
+public class RaftClusterService {
+    private final List<RaftClient> clients;
+    private final AtomicReference<RaftClient> cachedLeader = new AtomicReference<>();
+    private volatile Instant leaderCachedAt = Instant.EPOCH;
+
+    public CommandResult execute(String command) {
+        RaftClient leader = leaderClient();           // cached or freshly discovered
+        CommandResult result = leader.submitCommand(command);
+
+        if (!result.accepted() && "not the leader".equals(result.error())) {
+            invalidateLeaderCache();                  // 503 = leader changed
+            leader = leaderClient();                  // re-discover
+            result = leader.submitCommand(command);   // retry once
+        }
+        if (!result.accepted()) throw new IllegalStateException(result.error());
+        return result;
+    }
+
+    private RaftClient leaderClient() {
+        // Return cached leader if TTL (10s) has not expired.
+        RaftClient cached = cachedLeader.get();
+        if (cached != null && Instant.now().isBefore(leaderCachedAt.plus(props.leaderCacheTtl()))) {
+            return cached;
+        }
+        return refreshLeaderCache(); // poll all nodes, find the one saying isLeader=true
+    }
+}
+```
+
+The TTL is important: re-polling all N nodes on every write would be expensive. We cache the leader for 10 seconds. If leadership changes within those 10 seconds, the first 503 triggers a fresh poll. This means at most one extra round-trip per leader change — acceptable overhead.
+
+**Comparison to database primary/replica routing**: this pattern is identical to how JDBC connection pools handle PostgreSQL streaming replication failover. The driver caches the primary's address, detects "can't write to a replica" errors, and queries the cluster to find the new primary. The Raft client does the same — the only difference is that the "not the leader" signal is explicit (503 with a JSON body) rather than a database error code.
+
+### application.yml
+
+```yaml
+raft:
+  node-urls:
+    - http://localhost:8080
+    - http://localhost:8081
+    - http://localhost:8082
+  command-timeout: 5s
+  leader-cache-ttl: 10s
+```
+
+### Run it
+
+```bash
+# Terminal 1: start the Go cluster
+cd labs/raft
+go run ./cmd/server --nodes=3 --base-port=8080
+
+# Terminal 2: run the Spring Boot demo
+cd labs/raft/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Raft Java Client Demo ===
+
+Waiting for leader election... leader at http://localhost:8081
+Submitting 100 SET commands through Java client...
+  100 / 100 commands accepted
+
+Verifying consistency across all nodes:
+  node 0  state=Follower     term=1  commitIndex=100
+  node 1  state=Leader       term=1  commitIndex=100
+  node 2  state=Follower     term=1  commitIndex=100
+
+Consistency check: PASS
+
+First 5 log entries from leader:
+  [term=1] SET key0 value0
+  [term=1] SET key1 value1
+  [term=1] SET key2 value2
+  [term=1] SET key3 value3
+  [term=1] SET key4 value4
+  ... and 95 more
+
+Demo complete.
+```
+
+All three nodes have `commitIndex=100`. The Java client submitted 100 commands through the leader, and Raft replicated them to all nodes — the cluster is consistent.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The Raft paper says 'understandable consensus' but the hardest part is not the algorithm — it is the leader-change edge cases. Specifically: what happens when a leader crashes after appending to its own log but before quorum acknowledges? The new leader must not commit those old entries by themselves — it can only commit entries from its own term. This is the 'commitment without current-term entries' restriction in Section 5.4.2 of the paper, and it is the reason why the advanceCommitIndex function checks entry.Term == currentTerm before counting replicas. Our first implementation omitted this check. The result was that entries from a previous term could appear to be committed on the leader but were silently rolled back on followers — a real data loss bug that only manifested when a leader was killed at exactly the wrong moment. The fix is 3 lines, but understanding why those 3 lines are necessary requires understanding the full sequence of events across 2 leader changes and 3 nodes." />
+
+## Where to go deeper
+
+- **The Raft extended paper**: Sections 5.4.2 (commitment rules) and 6 (cluster membership changes) are the hard parts — [raft.github.io/raft.pdf](https://raft.github.io/raft.pdf)
+- **TiKV raft-rs**: production Rust implementation; the test suite is excellent for understanding invariants — [github.com/tikv/raft-rs](https://github.com/tikv/raft-rs)
+- **etcd's Raft library**: the most widely deployed Raft implementation in the world, used in Kubernetes itself — [github.com/etcd-io/etcd/tree/main/raft](https://github.com/etcd-io/etcd/tree/main/raft)
+- **Raft visualization**: the TLA+ spec and the interactive visualization at raft.github.io are the best tools for building intuition before coding
+- **Paxos Made Simple** (Lamport 2001): read it after Raft to appreciate why Raft was described as "understandable" by comparison
+
+## Related labs and questions
+
+- **Previous in distributed**: Consistent Hashing (lab 6) — routing layer that Raft-backed clusters use to shard data
+- **Next in distributed**: Distributed Key-Value Store — take this Raft implementation and add sharding, compaction, and a real client protocol
+- **System design companion**: How do CockroachDB, TiKV, and etcd use Raft differently? CockroachDB runs one Raft group per range (roughly 512MB shard). TiKV does the same. etcd runs a single Raft group for the entire cluster. The trade-off is between isolation (per-range Raft) and simplicity (single group).
+- **Follow-on question**: In a 5-node cluster, what is the maximum number of nodes that can fail before writes stop? (Answer: 2 — you need a majority of 3 to commit.) What about reads with leader lease? (Same — the lease is granted by the same majority quorum.)

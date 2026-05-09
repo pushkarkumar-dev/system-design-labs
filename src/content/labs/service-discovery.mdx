@@ -1,0 +1,662 @@
+---
+title: "Build Your Own Service Discovery"
+slug: "service-discovery"
+category: "distributed"
+difficulty: "intermediate"
+estimatedHours:
+  reading: 2
+  building: 7
+language: "go"
+loc: 730
+prerequisites:
+  - "Go HTTP server basics"
+  - "Microservices architecture basics"
+  - "sync.RWMutex usage"
+stages:
+  - id: v0
+    title: "In-Memory Registry"
+    learningGoals:
+      - "Register/Deregister/Lookup with RWMutex"
+      - "Tag-based filtering for service selection"
+    approxLoc: 180
+    branchOrTag: "service-discovery-v0"
+  - id: v1
+    title: "Health Checks + TTL + Watch Stream"
+    learningGoals:
+      - "TTL-based expiry removes crashed instances automatically"
+      - "Watch stream pushes instance changes to clients"
+    approxLoc: 480
+    branchOrTag: "service-discovery-v1"
+  - id: v2
+    title: "Client-Side Load Balancing"
+    learningGoals:
+      - "ServiceClient caches instances locally for fast resolution"
+      - "Round-robin selection with watch-driven cache invalidation"
+    approxLoc: 730
+    branchOrTag: "service-discovery-v2"
+benchmarks:
+  - metric: "Registry.Lookup (100 instances)"
+    value: "12,000,000"
+    unit: "lookups/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — RWMutex + slice copy"
+  - metric: "Registry.Register"
+    value: "4,500,000"
+    unit: "registrations/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — map write under exclusive lock"
+  - metric: "ServiceClient.Resolve (cached, 5 instances)"
+    value: "35,000,000"
+    unit: "resolves/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — atomic counter + in-process slice"
+  - metric: "Watch event delivery latency"
+    value: "0.1"
+    unit: "ms"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — buffered channel, loopback"
+whatTheToyMisses:
+  - thing: "Distributed registry consensus"
+    why: "Our registry is a single in-memory server. Production systems (etcd, Consul) replicate the registry across 3-5 nodes using Raft. A single-node registry is a single point of failure."
+  - thing: "Active health checks"
+    why: "We rely on client heartbeats (passive). Consul also runs active TCP/HTTP/gRPC health checks from the registry server, so even a client that forgets to heartbeat gets removed."
+  - thing: "DNS-based service discovery"
+    why: "Kubernetes uses DNS SRV records for service discovery — every service gets a name like payment.default.svc.cluster.local. No client library is needed; any DNS resolver works."
+  - thing: "Service metadata versioning"
+    why: "Rolling deployments need to route traffic by version (v1 vs v2). This requires version metadata on instances and routing rules in the client, not just name-based lookup."
+  - thing: "Zone-aware routing"
+    why: "Cloud deployments span multiple availability zones. Latency-optimized clients should prefer instances in the same zone. This requires zone metadata on instances and zone-aware selection logic."
+  - thing: "Registry event ordering guarantees"
+    why: "Our Watch channel delivers events in insertion order but with no sequence numbers. Production systems (etcd) assign monotonic revision numbers to every event, enabling clients to detect missed events and re-sync."
+realWorldReferences:
+  - "Consul service discovery: https://developer.hashicorp.com/consul/docs/concepts/service-discovery"
+  - "Eureka at Netflix: https://netflixtechblog.com/eureka-the-netflix-service-registry-790a8432f8a"
+  - "etcd watch API: https://etcd.io/docs/v3.5/learning/api/#watch-api"
+  - "Kubernetes Endpoints API: https://kubernetes.io/docs/concepts/services-networking/service/"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.cloud:spring-cloud-starter-netflix-eureka-client:4.1.3"
+    - "org.springframework.cloud:spring-cloud-starter-loadbalancer:4.1.4"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  springModule: "spring-cloud-netflix-eureka"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a service discovery registry from in-memory registration to TTL-based expiry with watch streams to client-side round-robin load balancing — then compare with Spring Cloud DiscoveryClient."
+---
+
+## Why this lab exists
+
+Every microservice deployment has a version of the same problem: service A needs to call service B, but it doesn't know where service B is running. On a laptop with a single process, you hardcode `localhost:8080`. In a Kubernetes cluster with 20 replicas of service B each getting a different IP on each pod restart, hardcoding doesn't work.
+
+The na&#xEF;ve answer is a config file with a list of IP addresses. That breaks as soon as any instance crashes or a deployment rolls out new pods. The real answer is a service registry: a living index of what is running, where, and whether it is healthy.
+
+Service discovery underpins every distributed system you deploy. Kubernetes uses it internally through the Endpoints API and DNS. Netflix built Eureka because they needed something that survived partial network failures better than ZooKeeper. Consul added health checking and a KV store on top of the core registry idea. HashiCorp Nomad, Linkerd, and Istio all have their own takes on the same problem.
+
+This lab builds the core mechanism from scratch: a registry you can actually run, inspect, and break. By the end you will understand what Consul's health check interval setting actually does, why Eureka's 90-second TTL is a deliberate design choice rather than an oversight, and what Spring Cloud's `@LoadBalanced` annotation is hiding behind the convenience.
+
+## What we're building
+
+A service discovery registry in Go across three stages, each adding one real capability.
+
+**We build:**
+- An in-memory registry with thread-safe register/deregister/lookup and tag-based filtering
+- A TTL-based health model where instances expire if they stop sending heartbeats
+- A Watch stream that pushes registry changes to clients via channels and SSE
+- A client-side load balancer (`ServiceClient`) that caches the registry locally and uses round-robin selection
+
+**We explicitly skip (and why):**
+- Distributed consensus across registry nodes (that is the Raft lab)
+- DNS-based discovery (no raw DNS implementation here — covered in the DNS Resolver lab)
+- mTLS between services (that is the security/OAuth lab)
+- Service mesh sidecar injection (Istio/Linkerd are infrastructure concerns, not protocol implementations)
+
+## Mental model
+
+Think of the registry as a phone book with an expiry system. When a service instance starts, it calls in: "I'm payment-service, running on 10.0.0.3:8080, here are my tags." The registry writes that down. Any other service that wants to call payment-service asks the phone book: "Who is running payment-service right now?" The phone book returns all live entries.
+
+The expiry system is what makes this different from a static config file. Each entry has a TTL. The instance must call in periodically ("I'm still here") to prevent its entry from expiring. If it crashes or loses network, it stops calling in. After the TTL, the registry removes the entry automatically. Callers who cached the old list now get a 404 or a timeout, which is a signal to refresh.
+
+```
+Timeline for a crashed instance (TTL=30s, cleaner runs every 10s):
+
+  T=0   Instance crashes. Last heartbeat was at T=0.
+  T=10  Cleaner runs. Instance not yet expired (0+30=30 > 10). Still listed.
+  T=20  Cleaner runs. Instance not yet expired (30 > 20). Still listed.
+  T=30  Instance is now expired, but cleaner hasn't run yet.
+  T=30-40  Cleaner runs next. Removes the expired instance. Watch event fires.
+  T=40  Callers who refresh now see 0 instances of this service.
+```
+
+The worst-case window is TTL + one cleaner interval = 30 + 10 = 40 seconds. Netflix's Eureka uses a 90-second TTL with a 30-second heartbeat interval, accepting up to approximately 3 minutes of stale data in exchange for resilience to transient network blips that would otherwise cause unnecessary deregistrations.
+
+**The Watch stream** replaces polling. Instead of asking "what is currently registered?" every second, a client subscribes once and receives notifications whenever the registry changes. This is the same model as etcd's Watch API, Kubernetes informers, and Redis keyspace notifications.
+
+## Prerequisites
+
+- Go HTTP server basics (`net/http`, `http.ServeMux`)
+- `sync.RWMutex` — multiple concurrent readers, exclusive writers
+- Microservices mental model — why static IP config doesn't work
+- Basic understanding of TTL (time-to-live) concepts
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="In-Memory Registry"
+  goals={[
+    "Define ServiceInstance with ID, ServiceName, Host, Port, Tags, Metadata",
+    "Registry: map[serviceName][]ServiceInstance with sync.RWMutex",
+    "Register(instance), Deregister(id), Lookup(name), LookupByTag(name, tag)",
+    "HTTP API: POST /register, DELETE /instances/{id}, GET /instances/{svc}",
+    "8 tests: register, deregister, lookup, multi-instance, tag filter, concurrent",
+  ]}
+  loc={180}
+>
+
+The smallest registry that proves the concept. A `ServiceInstance` is just a struct with an ID and some metadata. The `Registry` is a map from service name to a slice of instances, protected by a read-write mutex.
+
+```go
+type ServiceInstance struct {
+    ID           string
+    ServiceName  string
+    Host         string
+    Port         string
+    Tags         []string
+    Metadata     map[string]string
+    RegisteredAt time.Time
+}
+
+type Registry struct {
+    mu        sync.RWMutex
+    instances map[string][]ServiceInstance // serviceName -> instances
+    byID      map[string]string            // instanceID -> serviceName
+}
+```
+
+The `byID` reverse index is the key design choice in v0. Without it, `Deregister(id)` would require scanning every service's instance slice — O(total instances). With it, deregister is O(1) to find the service name, then O(n) to remove from that service's slice where n is the number of instances of that service (typically small).
+
+**Lookup returns a copy**, not the internal slice. This is important: if we returned a pointer to the internal slice, a caller could modify it concurrently without holding the lock, creating a data race. The copy is cheap — typically 3-10 instances per service.
+
+```go
+func (r *Registry) Lookup(serviceName string) []ServiceInstance {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+    instances := r.instances[serviceName]
+    result := make([]ServiceInstance, len(instances))
+    copy(result, instances)
+    return result
+}
+```
+
+**Tag filtering** runs on the copy returned by Lookup — no additional locking needed. A tag is just a string label ("primary", "us-east", "v2"). The canonical pattern for canary deployments is to register v2 instances with a "canary" tag and use `LookupByTag("payment-service", "canary")` to direct test traffic only.
+
+**The HTTP API** uses Go's standard `net/http` with a `ServeMux`. No external dependencies. POST /register accepts a JSON `ServiceInstance` body. DELETE `/instances/{id}` deregisters. GET `/instances/{serviceName}` returns all instances as JSON. The full server fits in about 60 lines.
+
+**The concurrent registration test** is the most important v0 test. It launches 100 goroutines that all call `Register` simultaneously. Without the mutex, this would be a data race on the internal map. With it, all 100 registrations succeed, and the final `Lookup` returns exactly 100 instances.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Health Checks + TTL + Watch Stream"
+  goals={[
+    "Add TTL and LastHeartbeat to each instance entry",
+    "Heartbeat(id): update LastHeartbeat to time.Now()",
+    "expiryCleaner goroutine: runs every TTL/3, removes expired instances",
+    "Watch(serviceName) chan RegistryEvent: delivers Added/Removed events",
+    "HTTP adds: PUT /instances/{id}/heartbeat, GET /watch/{svc} (SSE)",
+    "6 tests: TTL expiry, heartbeat prevents expiry, watch add, watch remove, watch expiry, multiple watchers",
+  ]}
+  loc={480}
+>
+
+v0 has no concept of health. A registered instance stays registered forever, even if its process crashes. v1 adds the TTL mechanism that makes the registry self-healing.
+
+The key new struct is `ttlEntry` — an internal wrapper that adds `TTL` and `LastHeartbeat` to each instance:
+
+```go
+type ttlEntry struct {
+    inst          ServiceInstance
+    TTL           time.Duration
+    LastHeartbeat time.Time
+}
+
+func (e ttlEntry) isExpired(now time.Time) bool {
+    return now.After(e.LastHeartbeat.Add(e.TTL))
+}
+```
+
+**Heartbeat** is the simplest function in the whole lab — update a timestamp:
+
+```go
+func (hr *HealthRegistry) Heartbeat(id string) error {
+    hr.mu.Lock()
+    defer hr.mu.Unlock()
+    entry, exists := hr.entries[id]
+    if !exists {
+        return fmt.Errorf("instance %q not found", id)
+    }
+    entry.LastHeartbeat = time.Now()
+    return nil
+}
+```
+
+**The expiry cleaner** runs as a background goroutine. It wakes up every `TTL/3`, scans all entries, removes those whose `LastHeartbeat + TTL` has elapsed, and fires `EventRemoved` notifications to watchers. The critical design choice is that notifications happen *outside* the write lock to prevent deadlock:
+
+```go
+func (hr *HealthRegistry) cleanExpired() {
+    now := time.Now()
+
+    hr.mu.Lock()
+    var expired []ServiceInstance
+    for id, e := range hr.entries {
+        if e.isExpired(now) {
+            expired = append(expired, e.inst)
+            delete(hr.entries, id)
+            hr.removeFromByName(e.inst.ServiceName, id)
+        }
+    }
+    hr.mu.Unlock()
+
+    // Notify watchers outside the write lock.
+    for _, inst := range expired {
+        hr.notify(inst.ServiceName, RegistryEvent{Type: EventRemoved, Instance: inst})
+    }
+}
+```
+
+**The Watch stream** uses Go channels. `Watch(serviceName)` creates a buffered channel (capacity 64) and registers it in a `watchers` map. When an instance is registered, deregistered, or expires, `notify()` sends an event to every channel watching that service. The channel buffer prevents the registry from blocking if a watcher is slow:
+
+```go
+func (hr *HealthRegistry) notify(serviceName string, ev RegistryEvent) {
+    hr.watchMu.Lock()
+    chs := make([]chan RegistryEvent, len(hr.watchers[serviceName]))
+    copy(chs, hr.watchers[serviceName])
+    hr.watchMu.Unlock()
+
+    for _, ch := range chs {
+        select {
+        case ch <- ev:
+        default: // Watcher is not consuming; drop event.
+        }
+    }
+}
+```
+
+**Server-Sent Events** expose the Watch stream over HTTP. `GET /watch/{serviceName}` responds with `Content-Type: text/event-stream` and writes one `data: {...}\n\n` line per event. This is the same format used by Consul's blocking queries and GitHub's event streams — it works with any HTTP client without a special library.
+
+**Why `TTL/3` for the cleaner?** If the cleaner ran every TTL, a crash at T=0 would not be detected until T=2×TTL (the instance expires at T=TTL, but the next cleaner run is at T=2×TTL). Running every TTL/3 means the detection window is between TTL and TTL+TTL/3 — about 33% overhead over the TTL, which is the standard tradeoff.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Client-Side Load Balancing"
+  goals={[
+    "ServiceClient wraps HealthRegistry with a per-service local cache",
+    "Watch goroutine keeps the cache current without polling",
+    "Resolve(serviceName) -> (host, port, err) using atomic round-robin counter",
+    "ResolveAll(serviceName) -> []ServiceEndpoint with weight/priority fields",
+    "ErrNoInstances: graceful degradation when all instances are expired",
+    "5 tests: round-robin across 3 instances, expiry degradation, cache refresh on watch, ResolveAll, empty name error",
+  ]}
+  loc={730}
+>
+
+v1's `Lookup()` requires calling the registry on every resolution. For a high-traffic service that resolves endpoints thousands of times per second, even an in-process function call with a mutex is overhead. v2 adds a client-side cache that makes resolution purely in-process: an atomic counter plus a slice index — no lock, no function call to the registry.
+
+**The cache structure:**
+
+```go
+type serviceCache struct {
+    mu        sync.RWMutex
+    instances []ServiceInstance
+    counter   atomic.Uint64 // round-robin index
+}
+
+func (sc *serviceCache) next() *ServiceInstance {
+    sc.mu.RLock()
+    defer sc.mu.RUnlock()
+    if len(sc.instances) == 0 {
+        return nil
+    }
+    idx := sc.counter.Add(1) - 1
+    inst := sc.instances[idx % uint64(len(sc.instances))]
+    return &inst
+}
+```
+
+The `atomic.Uint64` counter increments without a lock. The modulo maps the counter to a valid index even when the slice length changes between reads. This is the same technique used in HAProxy's round-robin and Go's `rand.globalRand` — atomic ops are roughly 10x cheaper than mutex lock/unlock on amd64.
+
+**Cache coherency via Watch:** instead of polling the registry every N seconds, a background goroutine subscribes to the Watch stream and rebuilds the cache on every event:
+
+```go
+func (sc *ServiceClient) watchService(serviceName string, cache *serviceCache) {
+    events := sc.hr.Watch(serviceName)
+    defer sc.hr.Unwatch(serviceName, events)
+
+    for {
+        select {
+        case _, ok := <-events:
+            if !ok { return }
+            // Refresh the full cache from the registry on any change.
+            instances := sc.hr.Lookup(serviceName)
+            cache.update(instances)
+        case <-sc.stopCh:
+            return
+        }
+    }
+}
+```
+
+**Lazy initialization:** the Watch goroutine starts on the first `Resolve()` call for a service, not at `NewServiceClient()` time. This means `ServiceClient` only subscribes to services it actually resolves — a service with 100 registered names and 3 active callers only has 3 active Watch goroutines.
+
+**Graceful degradation:** when the cache is empty (all instances expired, or none registered), `Resolve` returns `ErrNoInstances`. The caller can check for this specifically and either queue the request for retry, return a 503, or fall back to a cached result with a warning. This is explicit rather than hidden behind a panic or a zero-value return.
+
+**SRV-record-style `ServiceEndpoint`:**
+
+```go
+type ServiceEndpoint struct {
+    ServiceName string
+    Host        string
+    Port        string
+    Weight      int
+    Priority    int
+}
+```
+
+DNS SRV records carry weight and priority so a client can prefer lower-priority records and distribute load proportionally across weights. Our `ResolveAll` returns this shape so callers that do their own selection (e.g., weighted-random for canary splits) have the fields available. The `Resolve()` convenience method ignores weight and priority, using pure round-robin.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/service-discovery"
+  prereqs={["Go 1.23+"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/service-discovery\ngo build ./...",
+    },
+    {
+      label: "Run all tests",
+      cmd: "go test ./... -v -timeout 60s",
+    },
+    {
+      label: "Start the registry server (port 8080, 30s default TTL)",
+      cmd: "go run ./cmd/server --port 8080 --ttl 30s",
+    },
+    {
+      label: "Register a service instance (separate terminal)",
+      cmd: "curl -s -X POST http://localhost:8080/register \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"id\":\"pay-1\",\"serviceName\":\"payment\",\"host\":\"10.0.0.1\",\"port\":\"8080\",\"tags\":[\"primary\"],\"ttl_seconds\":30}' | jq .",
+    },
+    {
+      label: "Look up healthy instances",
+      cmd: "curl -s http://localhost:8080/instances/payment | jq .",
+    },
+    {
+      label: "Send a heartbeat to keep the instance alive",
+      cmd: "curl -s -X PUT http://localhost:8080/instances/pay-1/heartbeat | jq .",
+    },
+    {
+      label: "Watch the registry for changes (SSE stream, Ctrl+C to stop)",
+      cmd: "curl -N http://localhost:8080/watch/payment",
+    },
+    {
+      label: "Run benchmarks",
+      cmd: "go test -bench=. -benchmem -benchtime=3s ./...",
+    },
+  ]}
+  expectedOutput={`[
+  {
+    "id": "pay-1",
+    "serviceName": "payment",
+    "host": "10.0.0.1",
+    "port": "8080",
+    "tags": ["primary"],
+    "metadata": null,
+    "registeredAt": "2026-05-08T10:00:00Z"
+  }
+]`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "Registry.Lookup (100 instances)", value: "12,000,000", unit: "lookups/sec",       note: "estimated — RWMutex + slice copy" },
+    { metric: "Registry.Register",               value: "4,500,000",  unit: "registrations/sec", note: "estimated — map write under exclusive lock" },
+    { metric: "ServiceClient.Resolve (cached, 5 instances)", value: "35,000,000", unit: "resolves/sec", note: "estimated — atomic counter + in-process slice" },
+    { metric: "Watch event delivery latency",    value: "0.1",         unit: "ms",                note: "estimated — buffered channel, loopback" },
+  ]}
+/>
+
+## Stress tests
+
+**What breaks at 10,000 instances?** The `Lookup` function copies the entire slice on every call. With 10,000 instances, that is 10,000 struct copies per lookup. Each `ServiceInstance` is about 200 bytes (strings, slice headers, map), so 10,000 copies is 2MB of allocation per lookup call. At 100 lookups/second that is 200MB/sec of GC pressure. The fix is either pagination (return the first N instances) or the v2 approach (cache locally so Lookup is called rarely).
+
+**TTL timing under load:** run 1,000 goroutines all sending heartbeats for 1,000 different instances simultaneously. Each heartbeat takes the write lock. With 1,000 concurrent writers, the lock becomes the bottleneck. The fix used by production registries is sharded locking — split the instance map into N shards, each with its own mutex. This is the same technique used by `sync.Map` internally for the dirty map.
+
+**Watch channel overflow:** if a watcher goroutine blocks on processing an event and 64 more events arrive (our channel buffer size), subsequent events are dropped silently. The watcher's view of the registry becomes inconsistent. Production fix: use a version counter alongside events. On reconnect, the client fetches the full state and resumes the watch from the latest version. This is exactly how etcd's Watch API works with its `ModRevision` field.
+
+**Registry server crash:** when the registry server restarts, all in-memory state is lost. Callers that cached instances still have stale data; they will try to call those instances and get connection refused. The production fix is to persist the registry to disk (or replicate it across nodes with Raft) so it can recover state on restart. Consul uses a combination of Raft replication and a WAL for exactly this reason.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "Distributed registry consensus",    why: "Our registry is a single in-memory server. Production systems (etcd, Consul) replicate the registry across 3-5 nodes using Raft. A single-node registry is a single point of failure." },
+    { thing: "Active health checks",              why: "We rely on client heartbeats (passive). Consul also runs active TCP/HTTP/gRPC health checks from the registry server, so even a client that forgets to heartbeat gets removed." },
+    { thing: "DNS-based service discovery",       why: "Kubernetes uses DNS SRV records for service discovery — every service gets a name like payment.default.svc.cluster.local. No client library is needed; any DNS resolver works." },
+    { thing: "Service metadata versioning",       why: "Rolling deployments need to route traffic by version (v1 vs v2). This requires version metadata on instances and routing rules in the client, not just name-based lookup." },
+    { thing: "Zone-aware routing",                why: "Cloud deployments span multiple availability zones. Latency-optimized clients should prefer instances in the same zone. This requires zone metadata on instances and zone-aware selection logic." },
+    { thing: "Registry event ordering guarantees", why: "Our Watch channel delivers events in insertion order but with no sequence numbers. Production systems (etcd) assign monotonic revision numbers to every event, enabling clients to detect missed events and re-sync." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-cloud-netflix-eureka"
+  mavenCoords={[
+    "org.springframework.cloud:spring-cloud-starter-netflix-eureka-client:4.1.3",
+    "org.springframework.cloud:spring-cloud-starter-loadbalancer:4.1.4",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+  ]}
+  repoPath="labs/service-discovery/java-integration"
+>
+
+### Why this integration matters
+
+When a Spring Boot service calls another service using a `@LoadBalanced` `RestTemplate`, it is implicitly using a `DiscoveryClient` — Spring Cloud injects a `LoadBalancerInterceptor` that calls `discoveryClient.getInstances("service-name")` before every request and applies a load-balancing algorithm. This integration makes that mechanism explicit: our `DiscoveryClient.java` does the same lookup against our Go registry so the pattern is visible without the Spring Cloud abstraction in the way.
+
+### Part A — DiscoveryClient: the HTTP bridge
+
+`DiscoveryClient.java` wraps the Go registry's four HTTP endpoints using Spring Framework 6.1's `RestClient`. The key method is `getInstances()` — the same name Spring Cloud uses for its own `DiscoveryClient` interface, for intentional comparison.
+
+```java
+public class DiscoveryClient {
+    private final RestClient http;
+
+    public DiscoveryClient(String baseUrl) {
+        this.http = RestClient.builder()
+                .baseUrl(baseUrl)
+                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
+                .build();
+    }
+
+    public List<ServiceInstance> getInstances(String serviceName) {
+        var result = http.get()
+                .uri("/instances/{svc}", serviceName)
+                .retrieve()
+                .body(new ParameterizedTypeReference<List<ServiceInstance>>() {});
+        return result != null ? result : List.of();
+    }
+
+    public void register(ServiceInstance instance, int ttlSeconds) {
+        http.post().uri("/register")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of(
+                    "id",          instance.id(),
+                    "serviceName", instance.serviceName(),
+                    "host",        instance.host(),
+                    "port",        instance.port(),
+                    "ttl_seconds", ttlSeconds))
+                .retrieve().toBodilessEntity();
+    }
+
+    public void heartbeat(String instanceId) {
+        http.put().uri("/instances/{id}/heartbeat", instanceId)
+                .retrieve().toBodilessEntity();
+    }
+
+    // Java 17 record — immutable DTO with no boilerplate.
+    public record ServiceInstance(
+            String id, String serviceName, String host, String port,
+            List<String> tags, Map<String, String> metadata, Instant registeredAt
+    ) {
+        public String address() { return host + ":" + port; }
+    }
+}
+```
+
+### Part B — How Spring Cloud does the same thing
+
+Spring Cloud's `DiscoveryClient` is the interface; `EurekaDiscoveryClient` is the Eureka implementation. The `@LoadBalanced` annotation tells Spring to inject a `LoadBalancerInterceptor` into the `RestTemplate`:
+
+```java
+// With Spring Cloud Eureka (compare with our explicit client above):
+
+@EnableDiscoveryClient       // activates EurekaDiscoveryClient
+@SpringBootApplication
+public class PaymentConsumer { ... }
+
+@Bean @LoadBalanced
+RestTemplate restTemplate() { return new RestTemplate(); }
+
+// Usage — Spring resolves "payment-service" to a real IP:
+String response = restTemplate.getForObject(
+    "http://payment-service/pay", String.class);
+
+// What LoadBalancerInterceptor does internally (same as our getInstances):
+List<ServiceInstance> instances =
+    discoveryClient.getInstances("payment-service");
+// → [ServiceInstance{host=10.0.0.1, port=8080}, ...]
+// Then pick one with round-robin, rewrite the URL, and send.
+```
+
+**Four key differences from our implementation:**
+
+1. **Registry replication**: Eureka replicates across 3+ servers with eventual consistency. Our registry is a single process with no replication.
+
+2. **Active health checks**: Consul runs TCP/HTTP probes from the registry server. Spring Cloud Consul uses this to remove instances that stop responding even if they continue sending heartbeats. Our registry only removes instances that stop heartbeating.
+
+3. **Local cache refresh**: Spring Cloud LoadBalancer caches the instance list and refreshes it on a schedule (default 35 seconds). Our `ServiceClient` uses a Watch-driven cache that refreshes within milliseconds of a change — much faster, but requires a persistent connection to the watch endpoint.
+
+4. **Automatic registration**: Spring Cloud's `@EnableDiscoveryClient` registers the current service on startup and deregisters on graceful shutdown. Our demo registers manually. The production pattern is to wire registration into `ApplicationReadyEvent` and deregistration into `ContextClosedEvent`.
+
+### Part C — DiscoveryProperties: typed configuration
+
+```java
+@ConfigurationProperties(prefix = "discovery")
+public record DiscoveryProperties(
+        String baseUrl,
+        int defaultTtlSeconds,
+        Duration connectTimeout
+) {
+    public DiscoveryProperties {
+        if (baseUrl == null || baseUrl.isBlank()) baseUrl = "http://localhost:8080";
+        if (defaultTtlSeconds <= 0)              defaultTtlSeconds = 30;
+        if (connectTimeout == null)              connectTimeout = Duration.ofSeconds(2);
+    }
+}
+```
+
+### application.yml
+
+```yaml
+discovery:
+  base-url: http://localhost:8080
+  default-ttl-seconds: 30
+  connect-timeout: PT2S
+```
+
+### Run the demo
+
+```bash
+# Terminal 1: start the Go registry server
+cd labs/service-discovery
+go run ./cmd/server --port 8080 --ttl 30s
+
+# Terminal 2: run the Spring Boot demo
+cd labs/service-discovery/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Service Discovery — Spring Integration Demo ===
+
+Registering 3 payment-service instances...
+  Registered: payment-1 (10.0.0.1:8080)
+  Registered: payment-2 (10.0.0.2:8080)
+  Registered: payment-3 (10.0.0.3:8080)
+
+Looking up payment-service (round-robin over 6 calls):
+  Registry reports 3 healthy instances
+  Call 1 -> payment-1 (10.0.0.1:8080)
+  Call 2 -> payment-2 (10.0.0.2:8080)
+  Call 3 -> payment-3 (10.0.0.3:8080)
+  Call 4 -> payment-1 (10.0.0.1:8080)
+  Call 5 -> payment-2 (10.0.0.2:8080)
+  Call 6 -> payment-3 (10.0.0.3:8080)
+
+Deregistering payment-2...
+  Registry now reports 2 healthy instances:
+    payment-1 (10.0.0.1:8080)
+    payment-3 (10.0.0.3:8080)
+
+Sending heartbeat for payment-1...
+  Heartbeat sent — TTL renewed.
+
+Cleaning up: deregistering all instances...
+  Done.
+
+=== Demo complete ===
+```
+
+### Run the tests
+
+```bash
+cd labs/service-discovery/java-integration
+mvn test
+```
+
+The 6 unit tests cover: `address()` concatenation, record field access, empty tag list, null metadata, default property values, and custom property values. Tests run without a live Go server.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The TTL expiry timing surprised me. With a 30-second TTL and a cleaner running every 10 seconds, an instance that crashes at T=0 is not removed until T=10-40 seconds — a 40-second worst case. Netflix's Eureka uses a 90-second TTL with a 30-second heartbeat interval, accepting up to 3 minutes of stale data in exchange for resilience to transient network partitions. The tradeoff is explicit: prefer availability over immediate consistency. The number that got me was 3 minutes — that means for up to 3 minutes after a deployment, callers may still be directed to the old version. This is why blue-green deployments with a traffic drain period exist: you wait 3+ minutes after shifting traffic before terminating the old instances." />
+
+## Where to go deeper
+
+- **Consul service discovery**: the definitive production implementation — [developer.hashicorp.com/consul/docs](https://developer.hashicorp.com/consul/docs/concepts/service-discovery)
+- **Eureka at Netflix**: the original write-up on why Netflix built their own registry instead of using ZooKeeper — [netflixtechblog.com/eureka](https://netflixtechblog.com/eureka-the-netflix-service-registry-790a8432f8a)
+- **etcd Watch API**: the clearest example of event ordering with revision numbers — [etcd.io/docs/v3.5/learning/api](https://etcd.io/docs/v3.5/learning/api/#watch-api)
+- **Kubernetes Endpoints API**: how Kubernetes implements service discovery without a separate registry process — [kubernetes.io/docs/concepts/services-networking](https://kubernetes.io/docs/concepts/services-networking/service/)
+- **Spring Cloud LoadBalancer internals**: the `ReactiveLoadBalancer` interface and how `RoundRobinLoadBalancer` implements it — useful for understanding where our `ServiceClient` maps to the Spring abstraction
+
+## Related labs and questions
+
+- **Prerequisite for**: Consistent Hashing — once you know which instances are registered, you need a stable assignment of requests to instances. Consistent hashing solves this for cache sharding.
+- **Builds on**: Gossip Protocol (SWIM) — Consul's service discovery uses a gossip layer underneath for membership and health state propagation. The gossip lab explains what is happening below the HTTP API.
+- **Companion**: Load Balancer lab — service discovery tells you who is running; the load balancer decides which one to call. Both are needed for robust inter-service communication.
+- **Follow-up question**: why does Kubernetes use DNS for service discovery (stable names like `payment.default.svc.cluster.local`) rather than an HTTP registry like Eureka? What does this choice cost and what does it gain?
+- **Design question**: if your service registry goes down for 5 minutes, what happens to services that use it? Design a caching strategy that keeps service-to-service calls working during a registry outage, and explain the consistency trade-off.

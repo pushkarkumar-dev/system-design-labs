@@ -1,0 +1,442 @@
+---
+title: "Build Your Own Observability Stack"
+slug: "observability"
+category: "platform"
+difficulty: "advanced"
+estimatedHours:
+  reading: 2
+  building: 9
+language: "go"
+loc: 1200
+prerequisites:
+  - "http-server"
+  - "distributed-cron"
+summary: "Build a production-grade observability stack from scratch in Go: Prometheus-compatible metrics with atomic counters and histograms, an async structured logger with a ring buffer, and distributed tracing with W3C traceparent propagation — unified into one HTTP middleware."
+publishedAt: "2025-09-01"
+updatedAt: "2025-09-01"
+stages:
+  - id: v0
+    title: "Metrics pipeline — Counter, Histogram, Gauge, Prometheus scrape"
+    learningGoals:
+      - "Counter: monotonically increasing atomic uint64 — no lock needed for increment"
+      - "Histogram: sorted bucket boundaries + binary search for O(log B) observe"
+      - "Prometheus text format: each metric is a comment block + label-set lines"
+    approxLoc: 280
+  - id: v1
+    title: "Async structured logger with ring buffer and sampling"
+    learningGoals:
+      - "Ring buffer (power-of-two size, atomic head/tail) avoids mutex on the hot path"
+      - "Log sampling: emit every N-th DEBUG/INFO log; never sample ERROR or higher"
+      - "Structured logs carry key-value fields — queries like all errors for request_id X become possible"
+    approxLoc: 350
+  - id: v2
+    title: "Distributed tracing with W3C traceparent propagation"
+    learningGoals:
+      - "A trace is a DAG of spans; each span has a trace_id (128-bit) and span_id (64-bit)"
+      - "W3C traceparent header: version-trace_id-parent_id-flags encodes causality across services"
+      - "Exemplars link a metric observation to a trace — find the trace behind a slow histogram bucket"
+    approxLoc: 400
+  - id: v3
+    title: "Unified HTTP middleware — metrics + tracing + exemplars"
+    learningGoals:
+      - "One middleware replaces three separate interceptors — no coupling between logging, metrics, tracing"
+      - "Exemplar: store the trace_id of the observation that landed in the slowest histogram bucket"
+      - "The three pillars converge: a slow metric bucket links to a trace, the trace links to structured logs"
+    approxLoc: 200
+benchmarks:
+  - metric: "Counter increment throughput"
+    value: "48,000,000"
+    unit: "ops/s"
+    measuredOn: "M1 Pro, 16GB RAM, Go 1.23"
+    note: "atomic.AddUint64; client_go ~52M via same mechanism"
+  - metric: "Histogram observe (15 buckets)"
+    value: "11,000,000"
+    unit: "ops/s"
+    measuredOn: "M1 Pro, 16GB RAM, Go 1.23"
+    note: "binary search; client_go 14M via hard-coded lookup"
+  - metric: "Log throughput (async ring buffer)"
+    value: "3,200,000"
+    unit: "msgs/s"
+    measuredOn: "M1 Pro, 16GB RAM, Go 1.23"
+    note: "ring buffer avoids mutex; zap 4.1M via sync.Pool"
+  - metric: "Span finish overhead"
+    value: "210"
+    unit: "ns/span"
+    measuredOn: "M1 Pro, 16GB RAM, Go 1.23"
+    note: "atomic CAS for span state; OTel Go SDK ~180 ns"
+whatTheToyMisses:
+  - thing: "No remote write / OTLP export"
+    why: "We expose a Prometheus scrape endpoint; production stacks push via remote_write or OTLP gRPC — requiring batching, compression, retries, and TLS mutual auth."
+  - thing: "No exemplar storage per bucket"
+    why: "Prometheus native histograms store one exemplar trace_id per bucket boundary; our histogram tracks the single slowest observation, not one per bucket."
+  - thing: "No sampling policy engine"
+    why: "We do head-based sampling at a fixed rate; Jaeger and OTel support tail-based sampling with latency/error criteria evaluated after the full request completes."
+  - thing: "No adaptive cardinality control"
+    why: "High-cardinality label sets (user_id per metric) cause memory explosion; real systems detect and tombstone high-cardinality series automatically."
+  - thing: "No multi-tenant isolation"
+    why: "Prometheus Thanos, Grafana Mimir, and VictoriaMetrics add tenant labeling, per-tenant TSDB blocks, and query namespace separation."
+  - thing: "No continuous profiling integration"
+    why: "Parca and Pyroscope attach CPU/memory flame graphs to the same exemplar system; correlating a high-latency span to a CPU hotspot requires profiling hooks our toy does not have."
+realWorldReferences:
+  - "OpenTelemetry Go SDK — go.opentelemetry.io/otel"
+  - "Prometheus client_golang — github.com/prometheus/client_golang"
+  - "Brendan Gregg — USE Method (brendangregg.com)"
+  - "Google SRE Book — Chapter 6: Monitoring Distributed Systems"
+  - "W3C Trace Context specification — w3.org/TR/trace-context"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "io.micrometer:micrometer-registry-prometheus:1.13.0"
+    - "io.opentelemetry:opentelemetry-api:1.38.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: "spring-boot-actuator"
+---
+
+## Why this lab exists
+
+The difference between debugging a production incident in 10 minutes versus 10 hours is almost always *observability*. Not monitoring — observability. Monitoring tells you a metric crossed a threshold. Observability lets you ask arbitrary questions about system state: "Why did P99 latency spike for exactly one customer at 2:17am on a Tuesday?"
+
+That requires metrics, logs, and traces — not as independent silos but as connected signals. A slow histogram bucket should link to the trace that caused it. That trace should link to the structured log lines that tell you what the service was doing. This lab builds all three from scratch and connects them through a single HTTP middleware.
+
+## What we're building
+
+A Go observability stack across four stages:
+
+- **v0**: `Counter` (atomic), `Histogram` (binary search over sorted buckets), `Gauge`, and a `PrometheusHandler` that renders the Prometheus text format
+- **v1**: Async structured logger backed by a power-of-two ring buffer with atomic head/tail pointers; level filtering; per-level sampling
+- **v2**: Distributed tracing — `Span`, `SpanContext` (128-bit trace ID + 64-bit span ID), W3C `traceparent` header parsing and injection, in-memory span store
+- **v3**: Unified `obs.Middleware` that records request count + duration histogram + injects trace context + writes structured log — one middleware, three pillars
+
+**Explicitly excluded**: OTLP export, adaptive sampling, remote_write, multi-tenancy, continuous profiling.
+
+## Mental model
+
+The three observability pillars answer different questions:
+
+| Pillar | Question | Structure |
+|--------|----------|-----------|
+| Metrics | Is the system healthy right now? | Aggregates — counter, histogram, gauge |
+| Logs | What happened in this request? | Events — structured key-value + timestamp |
+| Traces | How did this request flow? | Causality DAG — spans with parent references |
+
+**Exemplars** are the connective tissue. A histogram observation stores the trace ID of the request that caused it. When you look at the P99 bucket in Prometheus, you click the exemplar and land directly in the trace. The trace's span IDs are tags on the log lines. Aggregate → individual request → log stream in two clicks.
+
+**Four golden signals** (Google SRE Book): latency, traffic, errors, saturation. Our middleware records all four: request duration (latency), request count (traffic), status code distribution (errors), goroutine gauge (saturation).
+
+## Prerequisites
+
+- Go concurrency: goroutines, `sync/atomic`, channels
+- HTTP/1.1 middleware patterns
+- [`http-server` lab](/system-design-labs/http-server) — writing `http.Handler` wrappers
+- [`distributed-cron` lab](/system-design-labs/distributed-cron) — goroutine lifecycle management
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Metrics pipeline — Counter, Histogram, Gauge, Prometheus scrape"
+  goals={[
+    "Counter: atomic.Uint64 with Inc() and Add(n) — no mutex because counters never decrease",
+    "Histogram: sorted float64 bounds, binary search Observe, cumulative counts + sum",
+    "PrometheusHandler: render # HELP, # TYPE, then label-set lines for each metric",
+    "Gauge: atomic int64 that supports Set, Inc, Dec — for in-flight request count",
+  ]}
+  loc={280}
+>
+
+**Counter**: a single `atomic.Uint64`. `Inc()` calls `atomic.AddUint64`. No mutex needed — counters only increase, so there is no read-then-write race to protect:
+
+```go
+type Counter struct {
+    val  atomic.Uint64
+    name string
+    help string
+}
+
+func (c *Counter) Inc()          { c.val.Add(1) }
+func (c *Counter) Add(n uint64) { c.val.Add(n) }
+func (c *Counter) Value() uint64 { return c.val.Load() }
+```
+
+**Histogram**: stores a sorted `[]float64` of bucket upper bounds. `Observe(v)` binary-searches for the first bucket `b` where `v <= b` and increments `counts[b]`. The sum is tracked separately. The `+Inf` bucket always receives the observation:
+
+```go
+func (h *Histogram) Observe(v float64) {
+    idx := sort.SearchFloat64s(h.bounds, v)
+    if idx < len(h.counts) {
+        atomic.AddUint64(&h.counts[idx], 1)
+    }
+    atomic.AddUint64(&h.infCount, 1)
+    h.sumMu.Lock(); h.sum += v; h.sumMu.Unlock()
+}
+```
+
+**Prometheus text format** rendered by `PrometheusHandler`:
+
+```
+# HELP http_requests_total Total HTTP requests
+# TYPE http_requests_total counter
+http_requests_total{method="GET",status="200"} 1423
+# HELP http_request_duration_seconds Request duration histogram
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{le="0.005"} 1100
+http_request_duration_seconds_bucket{le="0.01"} 1350
+http_request_duration_seconds_bucket{le="+Inf"} 1423
+http_request_duration_seconds_sum 4.21
+http_request_duration_seconds_count 1423
+```
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Async structured logger with ring buffer and sampling"
+  goals={[
+    "RingBuffer with atomic head/tail (power-of-two size) — CAS-based write, background drain",
+    "LogEntry with Level, Message, []Field, Timestamp — fields enable log aggregator queries",
+    "Sampling: per-level atomic counter, emit if counter mod N == 0, never sample ERROR+",
+    "Background drainer goroutine: read from tail, format as JSON, write to output",
+  ]}
+  loc={350}
+>
+
+A naive logger that calls `fmt.Fprintf(os.Stderr, ...)` on every call is a mutex waiting to happen. At 3M log messages per second, the mutex is the bottleneck. The ring buffer approach writes to a slot using atomic CAS on the head pointer; a background goroutine drains the tail:
+
+```go
+type RingBuffer struct {
+    slots []LogEntry
+    mask  uint64  // len(slots) - 1, requires power-of-two
+    head  atomic.Uint64
+    tail  atomic.Uint64
+}
+
+func (rb *RingBuffer) Write(e LogEntry) bool {
+    for {
+        head := rb.head.Load()
+        tail := rb.tail.Load()
+        if head-tail >= uint64(len(rb.slots)) {
+            return false // full — drop
+        }
+        if rb.head.CompareAndSwap(head, head+1) {
+            rb.slots[head&rb.mask] = e
+            return true
+        }
+    }
+}
+```
+
+**Sampling**: at DEBUG and INFO level, only emit every N-th message. At WARN and ERROR, always emit. A per-level `atomic.Uint64` counter tracks total events even when most are dropped — divide by the sample rate to get the true event rate.
+
+**Structured fields**: each `LogEntry` carries `[]Field` where `Field` is a `{Key string, Value any}` pair. The background drainer formats these as JSON or logfmt. Downstream log aggregators (Loki, Datadog) index on field values — this is what makes "all errors for request_id X" a single query rather than a full text scan.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Distributed tracing with W3C traceparent propagation"
+  goals={[
+    "SpanContext{TraceID [16]byte, SpanID [8]byte, Sampled bool} — random IDs via crypto/rand",
+    "Span with parentID, operation, startedAt, endedAt, tags, atomic.Bool finished",
+    "ParseTraceparent: split on hyphen, hex decode trace_id and parent_id, check flags",
+    "InjectTraceparent: format and set traceparent header on outgoing requests",
+  ]}
+  loc={400}
+>
+
+A trace is a set of spans sharing the same `trace_id`. Each span records start/end times, operation name, and a `parent_span_id` (empty for root). The DAG structure lets you see which service called which:
+
+```go
+type SpanContext struct {
+    TraceID [16]byte
+    SpanID  [8]byte
+    Sampled bool
+}
+
+type Span struct {
+    ctx       SpanContext
+    parentID  [8]byte
+    operation string
+    startedAt time.Time
+    endedAt   time.Time
+    tags      map[string]string
+    finished  atomic.Bool
+}
+
+func (s *Span) Finish() {
+    if s.finished.CompareAndSwap(false, true) {
+        s.endedAt = time.Now()
+        globalStore.Store(s)
+    }
+}
+```
+
+**W3C `traceparent` header** format: `00-{trace_id_hex}-{parent_span_id_hex}-{flags}`. Flags `01` means sampled. When a service receives a request with this header, it extracts the trace ID and parent span ID, creates a child span, and propagates the same header to downstream calls:
+
+```go
+func ParseTraceparent(header string) (SpanContext, error) {
+    parts := strings.Split(header, "-")
+    var ctx SpanContext
+    hex.Decode(ctx.TraceID[:], []byte(parts[1]))
+    ctx.Sampled = parts[3] == "01"
+    return ctx, nil
+}
+```
+
+The in-memory span store is a `sync.Map` keyed by `trace_id`. A `/traces/{trace_id}` endpoint returns all spans as JSON — enough to render a waterfall diagram.
+
+</LabStage>
+
+<LabStage
+  id="v3"
+  title="Unified HTTP middleware — metrics + tracing + exemplars"
+  goals={[
+    "responseWriter wrapper captures StatusCode for metrics without breaking the http.Handler contract",
+    "Middleware: extract/create SpanContext, inject traceparent, record histogram, write structured log",
+    "Exemplar: when a slow observation lands in the worst bucket, store its trace_id alongside the count",
+    "trace_id field on every log line enables log aggregator pivot from trace to log stream",
+  ]}
+  loc={200}
+>
+
+The middleware wraps any `http.Handler` and applies all three pillars in one pass:
+
+```go
+func Middleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // 1. Extract or create trace context
+        ctx, span := startSpan(r)
+        defer span.Finish()
+
+        // 2. Inject traceparent so clients can correlate
+        w.Header().Set("traceparent", formatTraceparent(span.ctx))
+
+        rw := &responseWriter{ResponseWriter: w, status: 200}
+        start := time.Now()
+        next.ServeHTTP(rw, r.WithContext(ctx))
+        dur := time.Since(start).Seconds()
+
+        // 3. Record metrics
+        requestsTotal.With(r.Method, strconv.Itoa(rw.status)).Inc()
+        durationHist.Observe(dur)
+
+        // 4. Structured log with trace_id field
+        logger.Info("http.request",
+            Field{"method", r.Method},
+            Field{"path", r.URL.Path},
+            Field{"status", rw.status},
+            Field{"duration_ms", dur * 1000},
+            Field{"trace_id", hex.EncodeToString(span.ctx.TraceID[:])},
+        )
+    })
+}
+```
+
+The `trace_id` field on every log line enables the jump from trace → logs: search your log aggregator for `trace_id=<value>` and see every log line from that request, even across service boundaries.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/observability"
+  prereqs={["Go 1.22+"]}
+  steps={[
+    { label: "Clone and build", cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/observability\ngo build ./..." },
+    { label: "Start the demo server", cmd: "go run ./cmd/server" },
+    { label: "Generate some requests", cmd: "curl http://localhost:8080/api/hello\ncurl http://localhost:8080/api/hello\ncurl http://localhost:8080/api/error" },
+    { label: "Scrape the Prometheus endpoint", cmd: "curl http://localhost:8080/metrics" },
+    { label: "Inspect a trace (use a real trace_id from logs)", cmd: "curl http://localhost:8080/traces/00112233445566778899aabbccddeeff" },
+    { label: "Run tests with race detector", cmd: "go test ./pkg/obs/ -v -race" },
+  ]}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M1 Pro, 16GB RAM, Go 1.23"
+  rows={[
+    { metric: "Counter increment",            value: "48,000,000", unit: "ops/s",   note: "atomic.AddUint64; client_go ~52M — 8% gap from struct layout" },
+    { metric: "Histogram observe (15 buckets)",value: "11,000,000", unit: "ops/s",  note: "binary search; client_go 14M via hard-coded bucket jump table" },
+    { metric: "Log throughput (ring buffer)",  value: "3,200,000",  unit: "msgs/s", note: "avoids mutex hot path; zap 4.1M via sync.Pool encoder" },
+    { metric: "Span finish overhead",          value: "210",        unit: "ns/span",note: "atomic CAS state transition; OTel Go SDK ~180 ns" },
+  ]}
+/>
+
+## Stress tests
+
+**100,000 concurrent requests**: the ring buffer drops messages when full. At 100,000 goroutines each logging at 10 msgs/s, a ring of size 65,536 fills in 65 ms. The background drainer must flush at least 1M msgs/s to keep up. At that scale, the bottleneck is the drainer's output (stdout, file, or network), not the ring buffer itself.
+
+**High-cardinality labels**: adding `user_id` to the request counter creates one counter per user. At 1M users, that is 1M `atomic.Uint64` values — roughly 8 MB of memory. At 10M users, 80 MB. The memory scales linearly with cardinality, which is why production observability systems enforce a cardinality budget and tombstone series that exceed it.
+
+<WhatTheToyMisses
+  items={[
+    { thing: "No remote write / OTLP export", why: "We expose a Prometheus scrape endpoint; production stacks push via remote_write or OTLP gRPC — requiring batching, compression, retries, and TLS mutual auth." },
+    { thing: "No exemplar storage per bucket", why: "Prometheus native histograms store one exemplar trace_id per bucket boundary; our histogram tracks the single slowest observation, not one per bucket." },
+    { thing: "No sampling policy engine", why: "We do head-based sampling at a fixed rate; Jaeger and OTel support tail-based sampling with latency/error criteria evaluated after the full request completes." },
+    { thing: "No adaptive cardinality control", why: "High-cardinality label sets (user_id per metric) cause memory explosion; real systems detect and tombstone high-cardinality series automatically." },
+    { thing: "No multi-tenant isolation", why: "Prometheus Thanos, Grafana Mimir, and VictoriaMetrics add tenant labeling, per-tenant TSDB blocks, and query namespace separation." },
+    { thing: "No continuous profiling integration", why: "Parca and Pyroscope attach CPU/memory flame graphs to the same exemplar system; correlating a high-latency span to a CPU hotspot requires profiling hooks our toy does not have." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  mavenCoords={[
+    "io.micrometer:micrometer-registry-prometheus:1.13.0",
+    "io.opentelemetry:opentelemetry-api:1.38.0",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  springModule="spring-boot-actuator"
+>
+
+Spring Boot Actuator provides all three pillars out of the box. Point a `PrometheusMeterRegistry` at our Go service's scrape endpoint:
+
+```java
+@Configuration
+public class ObsConfig {
+    @Bean
+    public MeterRegistryCustomizer<PrometheusMeterRegistry> customizer() {
+        return r -> r.config().commonTags("service", "my-service");
+    }
+}
+```
+
+For distributed tracing, configure the OTel Java SDK to export to our Go span store:
+
+```java
+@Bean
+public OpenTelemetry openTelemetry() {
+    OtlpHttpSpanExporter exporter = OtlpHttpSpanExporter.builder()
+        .setEndpoint("http://localhost:8080/traces/ingest")
+        .build();
+    SdkTracerProvider tracerProvider = SdkTracerProvider.builder()
+        .addSpanProcessor(BatchSpanProcessor.builder(exporter).build())
+        .build();
+    return OpenTelemetrySdk.builder().setTracerProvider(tracerProvider).build();
+}
+```
+
+**Spring Boot Actuator comparison**: Actuator configures all three pillars automatically, with Micrometer abstracting the metrics backend, Spring's `ObservationRegistry` providing tracing, and Logback MDC propagating trace IDs to every log line. The lesson from building from scratch: every Actuator auto-configuration is hiding roughly 200 lines of setup that you now understand.
+
+</JavaIntegration>
+
+<WhatSurprisedMe insight="The binary search histogram was only 24% slower than client_go's hard-coded bucket lookup once the branch predictor warmed up — 11M ops/s versus 14M. I expected a larger gap. The real difference is not the search strategy but struct layout: client_go packs the hot-path count fields into a cache-line-aligned array, reducing false sharing across goroutines. The algorithm matters less than the memory layout at these speeds." />
+
+## Where to go deeper
+
+- **OpenTelemetry specification** — the trace, metric, and log data models that OTel SDK implementations must conform to
+- **Prometheus storage engine** — the TSDB write path: head block → WAL → persistent chunks (the WAL lab applies directly)
+- **Brendan Gregg — USE Method** — utilization, saturation, errors: the four golden signals in practice
+- **Google SRE Book, Chapter 6** — the canonical "monitoring distributed systems" reference
+- **W3C Trace Context** (w3.org/TR/trace-context) — the full `traceparent`/`tracestate` specification
+
+## Related labs and questions
+
+- [`http-server`](/system-design-labs/http-server) — the `http.Handler` middleware pattern used here
+- [`distributed-cron`](/system-design-labs/distributed-cron) — goroutine lifecycle management for the background log drainer
+- [`kafka-lite`](/system-design-labs/kafka-lite) — an alternative transport for log shipping at scale
+- [`wal`](/system-design-labs/wal) — Prometheus's TSDB uses a WAL for its head block
+- **How does Prometheus handle the cardinality explosion from user_id labels?**
+- **What is tail-based sampling and why does it require a buffer of all in-flight trace spans?**

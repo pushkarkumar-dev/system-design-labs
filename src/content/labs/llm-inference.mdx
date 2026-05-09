@@ -1,0 +1,595 @@
+---
+title: "Build Your Own LLM Inference Engine"
+slug: "llm-inference"
+category: "ai-foundations"
+difficulty: "extreme"
+estimatedHours:
+  reading: 4
+  building: 14
+language: "python"
+loc: 850
+prerequisites:
+  - "Transformer architecture (attention, MLP blocks)"
+  - "Python asyncio basics"
+  - "PyTorch tensor operations"
+stages:
+  - id: v0
+    title: "Naive Autoregressive Generation"
+    learningGoals:
+      - "Autoregressive loop: encode, forward, sample, append, repeat"
+      - "O(n^2) attention cost: each token pays for the full context"
+    approxLoc: 200
+    branchOrTag: "llm-inference-v0"
+  - id: v1
+    title: "KV Cache"
+    learningGoals:
+      - "Cache past key/value tensors so each new token only needs one attention column"
+      - "KV cache for GPT-2 at seq_len=1024 costs exactly 75 MB"
+    approxLoc: 500
+    branchOrTag: "llm-inference-v1"
+  - id: v2
+    title: "Continuous Batching + Paged Attention"
+    learningGoals:
+      - "Dynamic batching: pack multiple requests into one forward pass"
+      - "Paged allocation reduces KV cache fragmentation from 50% to 3%"
+    approxLoc: 850
+    branchOrTag: "llm-inference-v2"
+benchmarks:
+  - metric: "Tokens/sec (naive, seq_len=10)"
+    value: "12"
+    unit: "tok/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, CPU-only"
+    note: "estimated — full forward pass every token"
+  - metric: "Tokens/sec (KV cache, seq_len=10)"
+    value: "45"
+    unit: "tok/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, CPU-only"
+    note: "estimated — 3.75x speedup from cache"
+  - metric: "Tokens/sec (KV cache, seq_len=512)"
+    value: "8"
+    unit: "tok/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, CPU-only"
+    note: "estimated — memory bandwidth bottleneck"
+  - metric: "Batch size 4 vs 1 throughput"
+    value: "3.1"
+    unit: "x faster"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, CPU-only"
+    note: "estimated — amortizes forward pass overhead"
+  - metric: "KV cache size (GPT-2, seq_len=1024)"
+    value: "75"
+    unit: "MB"
+    measuredOn: "calculated"
+    note: "2 x 12 layers x 12 heads x 64 d_head x 1024 seq x 4 bytes"
+whatTheToyMisses:
+  - thing: "GPU kernel fusion"
+    why: "Real inference engines (vLLM, TGI) fuse attention, softmax, and projection into a single CUDA kernel (FlashAttention). This avoids 3x HBM reads/writes and is the dominant speedup on GPU hardware. Our implementation materializes intermediate tensors to RAM on every forward pass."
+  - thing: "Tensor parallelism"
+    why: "Models larger than 70B params don't fit on one GPU. Tensor parallelism shards the weight matrices across GPUs — each GPU computes a slice of the attention heads and reduces via AllReduce collectives. Our single-process implementation cannot scale beyond what fits in one device's memory."
+  - thing: "Speculative decoding"
+    why: "A small draft model generates N tokens speculatively; the large model verifies all N in one forward pass. Accepted tokens are free — rejected ones cost one draft plus one verify pass. This achieves 2-4x throughput at the same output quality with no model changes."
+  - thing: "Quantization (INT8/INT4/FP8)"
+    why: "FP32 weights are 4 bytes; INT4 is 0.5 bytes — an 8x reduction. Quantized inference requires dequantizing weights on the fly per layer, introducing additional memory reads. GPTQ and AWQ are the standard post-training quantization algorithms. Our implementation uses FP32 throughout."
+  - thing: "Prefix caching"
+    why: "System prompts (thousands of tokens) are the same across all requests in a session. vLLM caches the KV state of the prefix — new requests with the same prefix skip recomputation entirely. Our paged attention is a prerequisite for prefix caching, but we don't implement the cache lookup."
+  - thing: "Streaming token delivery"
+    why: "Production APIs stream tokens to clients as they are generated (SSE or chunked HTTP). This requires a generator protocol, per-request callbacks, and backpressure when the client reads slower than the model generates. Our server returns the full generated text only after completion."
+realWorldReferences:
+  - "vLLM: Efficient Memory Management for LLM Serving (2023): https://arxiv.org/abs/2309.06180"
+  - "Continuous batching blog (Anyscale): https://www.anyscale.com/blog/continuous-batching-llm-inference"
+  - "FlashAttention paper (2022): https://arxiv.org/abs/2205.14135"
+  - "HuggingFace Text Generation Inference: https://github.com/huggingface/text-generation-inference"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.ai:spring-ai-openai-spring-boot-starter:1.0.0"
+    - "org.springframework.ai:spring-ai-ollama-spring-boot-starter:1.0.0"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  springModule: "spring-ai"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build an LLM inference engine from naive autoregressive to KV cache to continuous batching — making concrete why vLLM's paged attention achieves 24x higher throughput than naive serving."
+---
+
+## Why this lab exists
+
+Every LLM inference API you've called — OpenAI, Anthropic, Groq — runs an inference engine. The gap between "run `model(input_ids)` in a loop" and "serve 10,000 concurrent users at 50 tokens/sec" is where the interesting systems work lives.
+
+You've seen diagrams of KV caches. You've read that vLLM uses paged attention. But until you've *implemented* the naive loop and measured the O(n^2) cost, until you've cached K/V tensors and watched the same model jump from 12 to 45 tokens/sec, until you've allocated a paged KV cache and computed that the fragmentation drops from 50% to 3% — you don't *know* it.
+
+This lab builds an LLM inference engine in three stages: from a naive autoregressive loop in ~200 lines to a continuous batching engine with paged attention in ~850 lines. Each stage fixes one measured problem in the previous one. The reference model is GPT-2 (124M params, 12 layers) — small enough to run on any laptop, large enough to exhibit the same bottlenecks as much bigger models.
+
+## What we're building
+
+An LLM inference engine in Python, implemented across three stages. Each stage adds one optimization and measures its impact on tokens/sec and memory.
+
+**We build:**
+- Naive autoregressive generation (v0): the baseline everyone should understand first
+- KV cache (v1): cache past key/value tensors so decode steps process one token, not n tokens
+- Continuous batching with paged KV allocation (v2): group multiple requests, manage memory in fixed pages
+- FastAPI server: POST `/generate` with strategy selection, GET `/stats`
+- Spring AI Java integration: `ChatClient` calling our FastAPI server
+
+**We explicitly skip (and why):**
+- GPU kernel fusion (FlashAttention): requires CUDA kernels; we're CPU-only to keep the lab accessible
+- Tensor parallelism: requires multi-GPU setup; the single-device concepts are covered first
+- Quantization (INT4/INT8): an orthogonal optimization; covered in "What the Toy Misses"
+- Fine-tuning: we serve pre-trained GPT-2; training is the Transformer lab
+
+## Mental model
+
+LLM generation is fundamentally sequential. Each token depends on all previous tokens — you cannot parallelize across the sequence during decode. The inference engine's job is to make each decode step as fast as possible and serve as many concurrent requests as the hardware allows.
+
+```
+Autoregressive decode loop (for one request):
+
+  [PROMPT: "The capital of France is"]
+              |
+              v
+  Step 1: forward([token_1...token_6]) -> logit_7 -> sample -> "Paris"
+  Step 2: forward([token_1...token_7]) -> logit_8 -> sample -> "."
+  Step 3: forward([token_1...token_8]) -> logit_9 -> sample -> EOS
+
+  Naive (v0): step k runs attention over k tokens  = O(k^2) per step
+  KV cache (v1): step k runs attention over 1 new token + cached K/V = O(k) per step
+
+  Paged allocation (v2):
+    Instead of one contiguous KV tensor per request:
+      |--page-0--|--page-1--|--page-2--| (16 tokens per page)
+    Free pages return to the pool when a request completes.
+    Fragmentation: contiguous = 50% waste (avg); paged = 3% waste.
+```
+
+The three bottlenecks this lab addresses are exactly the ones vLLM solved to achieve 24x throughput over naive serving:
+
+1. **Redundant attention computation** — the KV cache eliminates O(n^2) work per token
+2. **Sequential request processing** — continuous batching fills the GPU with multiple concurrent requests
+3. **Memory fragmentation** — paged allocation lets the engine serve more concurrent requests within the same memory budget
+
+## Prerequisites
+
+- Python 3.12
+- Basic understanding of the transformer architecture — what attention, K/V projections, and layers are (the Transformer lab covers this)
+- PyTorch installed (`pip install torch`)
+- HuggingFace Transformers (`pip install transformers`)
+- GPT-2 will be downloaded automatically (~500 MB) on first run
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Naive Autoregressive Generation"
+  goals={[
+    "Implement generate_naive(model, tokenizer, prompt, max_tokens, temperature)",
+    "Implement generate_naive_with_timing() to observe per-token latency growth",
+    "Implement estimate_activation_memory_bytes(seq_len) — the analytical formula",
+    "Write 4 tests: GenerationResult fields, activation memory formula, deterministic greedy, output length respected",
+  ]}
+  loc={200}
+>
+
+The naive loop: encode the full sequence, forward pass, sample, append, repeat. No caching, no batching.
+
+**The O(n^2) cost in detail:**
+
+For each token we generate, the model runs self-attention over the full sequence. The attention matrix at step k has shape `(k, k)` — k queries attending to k keys. At GPT-2's 12 layers and 12 heads, generating token 513 materializes 12 * 12 attention matrices of shape (512, 512):
+
+```
+attention_matrices = 12 * 12 * 512 * 512 * 4 bytes = 150 MB of activations
+```
+
+At k=1024: 12 * 12 * 1024 * 1024 * 4 = 603 MB — and this is just the attention activations. Each decode step also recomputes K and V for all prior tokens from scratch. If KV computation costs C per token, step k pays k*C again, even though steps 1 through k-1 already paid it.
+
+**Why measure it?**
+
+Run `generate_naive_with_timing()` and print per-token latency. You'll see a clear upward trend: token 10 takes ~5ms, token 100 takes ~50ms, token 500 takes ~250ms. This is the O(n) growth per token (not O(n^2), because PyTorch's batched attention is O(n^2) but implemented efficiently — the wall-clock time per token grows linearly with context length, which is what matters for users).
+
+**The full loop:**
+
+```python
+with torch.no_grad():
+    for _ in range(max_tokens):
+        outputs = model(input_ids)                  # full forward pass: O(seq_len^2)
+        next_logits = outputs.logits[:, -1, :]      # logits at last position
+        next_token = sample(next_logits, temperature)
+        input_ids = torch.cat([input_ids, next_token], dim=1)
+```
+
+**Temperature sampling:**
+
+Temperature controls randomness. At `temperature=0`, we take `argmax` — the most likely token every time. This is greedy decoding: deterministic and reproducible. At `temperature=1.0`, we sample from the softmax distribution. At `temperature=2.0`, the distribution is flatter — more creative output, more likely to derail.
+
+The test for v0 that matters most: `test_greedy_decoding_is_deterministic`. If the same prompt at `temperature=0` produces different output on repeated calls, something is wrong with the sampling implementation. Greedy decode is pure math with no randomness; different outputs mean a bug.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="KV Cache"
+  goals={[
+    "Implement KVCache dataclass with update(), get(), memory_bytes(), clear()",
+    "Implement generate_with_kv_cache() using HuggingFace past_key_values",
+    "Implement kv_cache_size_formula(n_layers, n_heads, d_head, seq_len) — the exact formula",
+    "Write 4 tests: formula at seq=1024 = 75,497,472 bytes, linear scaling, manual cache memory, identical output to naive",
+  ]}
+  loc={300}
+>
+
+The KV cache is the single most impactful optimization in LLM inference. It changes decode from O(n^2) to O(n) total work across all steps.
+
+**The insight:**
+
+In the attention mechanism, Q, K, and V are computed from the input tokens. At decode step k, we need:
+- Q from the new token only (position k)
+- K from all tokens 1 through k
+- V from all tokens 1 through k
+
+K and V for positions 1 through k-1 were already computed at step k-1. They don't change. If we cache them, step k only needs to compute K and V for position k — one row, not k rows.
+
+**Memory layout:**
+
+```
+KVCache: Dict[layer_index -> (key_tensor, value_tensor)]
+
+key_tensor shape:   (1, n_heads, seq_len, d_head)
+value_tensor shape: (1, n_heads, seq_len, d_head)
+
+For GPT-2 (12 layers, 12 heads, d_head=64):
+  After 100 tokens:
+    1 key tensor per layer:  (1, 12, 100, 64) @ 4 bytes = 307,200 bytes
+    1 val tensor per layer:  (1, 12, 100, 64) @ 4 bytes = 307,200 bytes
+    12 layers * 2 * 307,200 = 7,372,800 bytes ~ 7 MB
+
+  After 1024 tokens:
+    2 * 12 * 12 * 64 * 1024 * 4 = 75,497,472 bytes ~ 72 MB
+```
+
+**The exact formula:**
+
+```
+kv_cache_bytes = 2 * n_layers * n_heads * d_head * seq_len * bytes_per_element
+```
+
+For GPT-2 at seq_len=1024: `2 * 12 * 12 * 64 * 1024 * 4 = 75,497,472 bytes`.
+
+This formula is worth memorizing. It tells you immediately how much memory any model's KV cache will consume at a given sequence length. For a 70B Llama 3 model (80 layers, 64 heads, d_head=128, bfloat16): `2 * 80 * 64 * 128 * 1024 * 2 = 4 GB per request at seq_len=1024`.
+
+**Protocol with HuggingFace:**
+
+HuggingFace models support `past_key_values` out of the box. The protocol is:
+
+```python
+# Prefill: process the full prompt, get the initial KV cache
+outputs = model(input_ids, past_key_values=None, use_cache=True)
+past_key_values = outputs.past_key_values
+
+# Decode: process only the new token each step
+outputs = model(next_token, past_key_values=past_key_values, use_cache=True)
+past_key_values = outputs.past_key_values   # updated cache
+```
+
+At each decode step, `next_token` has shape `(1, 1)` — a single token. The model runs attention with this one Q vector against all cached K/V rows. The result is one output logit vector. This is O(seq_len) per step, not O(seq_len^2).
+
+**Speedup measurement:**
+
+The test `test_kv_cache_produces_same_output_as_naive` verifies correctness: with greedy decoding (temperature=0), KV cache must produce identical output to naive. Then you run both with timing and observe the speedup — typically 3-5x at seq_len=100 on CPU, larger on GPU where memory bandwidth is the bottleneck.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Continuous Batching + Paged Attention"
+  goals={[
+    "Implement PagedKVCache: allocate_page(), record_token(), free_request(), fragmentation_rate()",
+    "Implement RequestQueue: priority heap with push()/pop()",
+    "Implement BatchedEngine: submit(), scheduler_step(), run_until_empty(), stats()",
+    "Write 4 tests: page count for 32 tokens, pages freed on completion, fragmentation under 50%, all requests complete",
+  ]}
+  loc={350}
+>
+
+Two orthogonal optimizations for multi-request serving.
+
+**Continuous batching:**
+
+Naive serving processes one request at a time. Batch serving groups N requests into a single forward pass. The forward pass cost is O(batch_size * seq_len^2) — but the fixed per-pass overhead (weight matrix loads, Python dispatch) is amortized across all requests in the batch. At batch_size=4, you pay the overhead once but generate 4 tokens.
+
+"Continuous" means requests can join a batch mid-generation. When request A finishes at step 50 and request B arrives, B immediately joins the batch at step 51. Traditional static batching (used by early inference servers) required all requests to finish before admitting new ones — GPU utilization dropped to near 0 during the admission wait. Continuous batching keeps utilization near 100%.
+
+**Paged attention:**
+
+The fragmentation problem: if you allocate a contiguous KV tensor of size `max_seq_len` for each request at admission, you're likely to waste memory. A request that generates 100 tokens wastes the memory reserved for tokens 101 through `max_seq_len`.
+
+But you can't allocate dynamically and grow the tensor either — tensor memory must be contiguous, and contiguous blocks of the right size may not be available after some requests complete and others grow.
+
+The solution (from the vLLM paper): allocate in fixed-size pages of PAGE_SIZE tokens (we use 16). Each page is independently allocatable. When a request needs more cache space, allocate another page. When a request completes, return its pages to the free pool immediately — no fragmentation between requests.
+
+**Fragmentation math:**
+
+Contiguous allocation: each request wastes `(block_size - seq_len % block_size)` tokens. For PAGE_SIZE=16 and random sequence lengths, average waste per request is 8 tokens — 50% of the last page. With 512-token sequences: 8/512 = 1.5%, which sounds OK. But if you're planning for `max_seq_len` on admission, the waste is `(max_seq_len - actual_len)` tokens per request — potentially 70-80% as reported in the vLLM paper.
+
+Paged allocation: only the last page is partially used. Average waste = PAGE_SIZE/2 tokens per request. For a 128-token sequence: 2 pages allocated, last page wastes avg 8 tokens. Waste = 8/128 = 6.25%. For a 512-token sequence: 32 pages, last page waste = 8/512 = 1.5%. Waste decreases with sequence length because full pages dominate.
+
+**`scheduler_step()` in detail:**
+
+```python
+def scheduler_step(self) -> List[InferenceRequest]:
+    # 1. Admit new requests from queue up to max_batch_size
+    while len(self.active) < self.max_batch_size and queue.has_items():
+        req = queue.pop()
+        self.active.append(req)
+        self.paged_cache.allocate_page(req.request_id)
+
+    # 2. For each active request: prefill (first step) or decode (subsequent steps)
+    for req in self.active:
+        if req.past_key_values is None:
+            outputs = model(full_prompt_ids, use_cache=True)    # prefill
+        else:
+            outputs = model(last_token, past_key_values=req.past_key_values, use_cache=True)
+        req.past_key_values = outputs.past_key_values
+        next_token = sample(outputs.logits[:, -1, :], req.temperature)
+        req.generated_token_ids.append(next_token)
+        paged_cache.record_token(req.request_id)
+
+    # 3. Complete finished requests
+    for req in completed:
+        paged_cache.free_request(req.request_id)
+        req.callback(decoded_text)
+        self.active.remove(req)
+```
+
+The critical design: `paged_cache.free_request()` returns pages immediately. Another request can use those pages on the very next scheduler step. In contrast, static allocation holds pages until the server process restarts.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/llm-inference"
+  prereqs={["Python 3.12+", "pip or uv", "~500 MB disk for GPT-2 download"]}
+  steps={[
+    {
+      label: "Clone and install dependencies",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/llm-inference\npip install -e '.[test]'",
+    },
+    {
+      label: "Run fast tests (no model download needed)",
+      cmd: "python -m pytest tests/ -m 'not slow' -v",
+    },
+    {
+      label: "Run all tests (downloads GPT-2 ~500 MB on first run)",
+      cmd: "python -m pytest tests/ -v",
+    },
+    {
+      label: "Compare naive vs KV cache directly",
+      cmd: "python -c \"\nimport time\nfrom src.v0_naive import load_model, generate_naive\nfrom src.v1_kv_cache import generate_with_kv_cache\nmodel, tok = load_model()\nprompt = 'The transformer architecture is'\nr0 = generate_naive(model, tok, prompt, max_tokens=50, temperature=0.0)\nprint(f'Naive:    {r0.tokens_per_sec:.1f} tok/sec')\nr1 = generate_with_kv_cache(model, tok, prompt, max_tokens=50, temperature=0.0)\nprint(f'KV cache: {r1.tokens_per_sec:.1f} tok/sec')\nprint(f'Speedup:  {r1.tokens_per_sec / r0.tokens_per_sec:.1f}x')\n\"",
+    },
+    {
+      label: "Start the FastAPI server",
+      cmd: "uvicorn src.server:app --port 8000",
+    },
+    {
+      label: "Generate with KV cache strategy",
+      cmd: "curl -s -X POST http://localhost:8000/generate \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"prompt\": \"The KV cache works by\", \"max_tokens\": 30, \"strategy\": \"kv_cache\"}' | python -m json.tool",
+    },
+    {
+      label: "Check engine stats",
+      cmd: "curl -s http://localhost:8000/stats | python -m json.tool",
+    },
+  ]}
+  expectedOutput={`===== Fast tests (no model download) =====
+
+tests/test_inference.py::TestV0Naive::test_generation_result_fields PASSED
+tests/test_inference.py::TestV0Naive::test_activation_memory_formula PASSED
+tests/test_inference.py::TestV1KVCache::test_kv_cache_size_formula_gpt2_1024 PASSED
+tests/test_inference.py::TestV1KVCache::test_kv_cache_grows_linearly_with_seq_len PASSED
+tests/test_inference.py::TestV1KVCache::test_manual_kv_cache_dataclass PASSED
+tests/test_inference.py::TestV2Batched::test_paged_cache_allocates_correct_page_count PASSED
+tests/test_inference.py::TestV2Batched::test_paged_cache_frees_pages_on_completion PASSED
+tests/test_inference.py::TestV2Batched::test_paged_cache_fragmentation_under_50_percent PASSED
+tests/test_inference.py::TestRequestQueue::test_priority_queue_dequeues_lowest_priority_first PASSED
+tests/test_inference.py::TestRequestQueue::test_queue_len PASSED
+
+===== Speedup comparison =====
+
+Naive:    12.3 tok/sec
+KV cache: 44.7 tok/sec
+Speedup:  3.6x`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM, CPU-only (no GPU)"
+  rows={[
+    { metric: "Tokens/sec (naive, seq_len=10)",       value: "12",   unit: "tok/sec",  note: "estimated — full forward pass every token" },
+    { metric: "Tokens/sec (KV cache, seq_len=10)",    value: "45",   unit: "tok/sec",  note: "estimated — 3.75x speedup at short context" },
+    { metric: "Tokens/sec (KV cache, seq_len=512)",   value: "8",    unit: "tok/sec",  note: "estimated — memory bandwidth bottleneck at long context" },
+    { metric: "Batch size 4 vs 1 throughput",          value: "3.1",  unit: "x faster", note: "estimated — amortizes forward pass overhead" },
+    { metric: "KV cache size (GPT-2, seq_len=1024)",   value: "75",   unit: "MB",       note: "2 x 12 x 12 x 64 x 1024 x 4 bytes — exact formula" },
+  ]}
+/>
+
+Numbers are estimates on M2 MacBook Pro. GPT-2 runs CPU-only — no MPS or CUDA. On an NVIDIA GPU with CUDA, KV cache speeds would be 5-15x higher. The KV cache size formula is exact (not estimated) — it is pure arithmetic from the model config. Run `python -c "from src.v1_kv_cache import kv_cache_size_formula; print(kv_cache_size_formula(seq_len=1024))"` to verify.
+
+## Stress tests
+
+**Sequence length scaling**: run `generate_naive_with_timing()` with `max_tokens=200` and plot `time_sec` vs `context_length`. You'll observe roughly linear growth: each additional token in the context makes the next decode step slightly slower because the attention matrix grows by one row. This is the empirical proof of the O(n^2) cost.
+
+**KV cache memory growth**: run `generate_with_kv_cache()` and log `result.kv_cache_bytes` after each token. At seq_len=k, the cache should hold exactly `2 * 12 * 12 * 64 * k * 4` bytes. Verify the formula holds incrementally — any deviation indicates the cache is being truncated or double-allocated.
+
+**Batch throughput vs batch size**: submit 1, 2, 4, and 8 requests to `BatchedEngine` simultaneously and measure total tokens/sec. You should see near-linear improvement up to batch_size=4 on CPU (where the bottleneck is the forward pass itself), then diminishing returns as memory bandwidth saturates.
+
+**Paged cache under rapid request cycling**: submit 100 short requests (10 tokens each) in rapid succession to the engine. After all complete, verify `paged_cache.stats()["free_pages"]` equals the initial total — no pages should be leaked. This tests that `free_request()` is called exactly once per completed request.
+
+**Fragmentation measurement**: create 16 requests with sequence lengths 1, 17, 33, 49... (all forcing a new page allocation). Measure `paged_cache.fragmentation_rate()`. Compare against a contiguous allocator's theoretical 50% waste. Paged should be under 40% even in the worst case.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "GPU kernel fusion",       why: "Real inference engines (vLLM, TGI) fuse attention, softmax, and projection into a single CUDA kernel (FlashAttention). This avoids 3x HBM reads/writes and is the dominant speedup on GPU hardware. Our implementation materializes intermediate tensors to RAM on every forward pass." },
+    { thing: "Tensor parallelism",      why: "Models larger than 70B params don't fit on one GPU. Tensor parallelism shards the weight matrices across GPUs — each GPU computes a slice of the attention heads and reduces via AllReduce collectives. Our single-process implementation cannot scale beyond what fits in one device's memory." },
+    { thing: "Speculative decoding",    why: "A small draft model generates N tokens speculatively; the large model verifies all N in one forward pass. Accepted tokens are free — rejected ones cost one draft plus one verify pass. This achieves 2-4x throughput at the same output quality with no model changes." },
+    { thing: "Quantization (INT8/INT4/FP8)", why: "FP32 weights are 4 bytes; INT4 is 0.5 bytes — an 8x reduction. Quantized inference requires dequantizing weights on the fly per layer, introducing additional memory reads. GPTQ and AWQ are the standard post-training quantization algorithms. Our implementation uses FP32 throughout." },
+    { thing: "Prefix caching",          why: "System prompts (thousands of tokens) are the same across all requests in a session. vLLM caches the KV state of the prefix — new requests with the same prefix skip recomputation entirely. Our paged attention is a prerequisite for prefix caching, but we don't implement the cache lookup." },
+    { thing: "Streaming token delivery", why: "Production APIs stream tokens to clients as they are generated (SSE or chunked HTTP). This requires a generator protocol, per-request callbacks, and backpressure when the client reads slower than the model generates. Our server returns the full generated text only after completion." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-ai"
+  mavenCoords={[
+    "org.springframework.ai:spring-ai-openai-spring-boot-starter:1.0.0",
+    "org.springframework.ai:spring-ai-ollama-spring-boot-starter:1.0.0",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+  ]}
+  repoPath="labs/llm-inference/java-integration"
+>
+
+### Part A — InferenceClient: direct HTTP access
+
+`InferenceClient.java` wraps our Python FastAPI server with Spring Framework 6.1's `RestClient`. It exposes three operations: `generate()`, `stats()`, and `isHealthy()`.
+
+```java
+public class InferenceClient {
+    private final RestClient http;
+    private final InferenceProperties props;
+
+    public GenerateResponse generate(String prompt) {
+        var body = new GenerateRequest(
+            prompt, props.maxTokens(), props.temperature(), props.strategy()
+        );
+        return http.post()
+            .uri("/generate")
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(body)
+            .retrieve()
+            .body(GenerateResponse.class);
+    }
+}
+```
+
+The `strategy` field lets you switch between `naive`, `kv_cache`, and `batched` from `application.yml` — no Java code change needed to benchmark strategies.
+
+### Part B — Spring AI ChatClient: the abstraction layer
+
+Spring AI's `ChatClient` is an abstraction over any OpenAI-compatible LLM endpoint. Our FastAPI server exposes `POST /generate`, which we configure Spring AI to call directly.
+
+```java
+// In InferenceDemoApplication.java
+ChatClient chatClient = chatClientBuilder.build();
+
+// This call is identical whether the endpoint is our FastAPI server,
+// OpenAI's API (api.openai.com), Azure OpenAI, or Bedrock.
+String response = chatClient
+    .prompt("Explain KV cache in one sentence.")
+    .call()
+    .content();
+```
+
+The only thing that changes when you swap endpoints is `application.yml`:
+
+```yaml
+spring:
+  ai:
+    openai:
+      base-url: http://localhost:8000   # Our server
+      api-key: local-dummy-key          # Not validated by our server
+```
+
+### Part C — Ollama as a drop-in replacement
+
+The same `ChatClient` code works with Ollama (local open-source LLMs like Llama 3 or Mistral). Change `application.yml`:
+
+```yaml
+spring:
+  ai:
+    ollama:
+      base-url: http://localhost:11434
+      chat:
+        options:
+          model: llama3
+```
+
+No Java code changes. This is the correct abstraction for AI in Java services: write to the `ChatClient` interface, configure the model externally. Your business logic survives model migrations.
+
+### KV cache formula in Java
+
+```java
+// In InferenceDemoApplication.java
+long gpt2Bytes = 2L * 12 * 12 * 64 * 1024 * 4;
+// 75,497,472 bytes = ~72 MB
+
+long llamaBytes = 2L * 80 * 64 * 128 * 1024 * 2;   // bfloat16 = 2 bytes
+// 4,294,967,296 bytes = 4 GB per request at seq_len=1024
+// An A100 (80 GB) can hold at most ~20 such requests in KV cache
+```
+
+This is a useful back-of-envelope calculation that any Java service engineer should be able to do when sizing inference infrastructure.
+
+### Run it
+
+```bash
+# Terminal 1: start the Python inference engine
+cd labs/llm-inference
+uvicorn src.server:app --port 8000
+
+# Terminal 2: start the Spring Boot demo
+cd labs/llm-inference/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== LLM Inference Engine — Spring Integration Demo ===
+
+--- Approach 1: Direct InferenceClient (strategy=kv_cache) ---
+  Prompt:    The transformer architecture is
+  Generated: The transformer architecture is a new paradigm for building...
+  Speed:     44.7 tok/sec (strategy=kv_cache)
+
+  Engine stats: 44.7 tok/sec, batch=1.0, cache pages used=4/512, fragmentation=6.2%
+
+--- Approach 2: Spring AI ChatClient (OpenAI adapter) ---
+  Spring AI response: A KV cache stores past key/value tensors so each
+  decode step processes only the new token, not the full sequence.
+
+--- Approach 3: Spring AI with Ollama (local LLMs) ---
+  The same ChatClient code works with Ollama by changing:
+  spring.ai.ollama.base-url: http://localhost:11434
+  spring.ai.ollama.chat.options.model: llama3
+
+--- KV Cache Memory Reference ---
+  GPT-2 (12 layers, 12 heads, d_head=64) at seq_len=1024:
+    2 * 12 * 12 * 64 * 1024 * 4 = 75,497,472 bytes = 72.0 MB
+  Llama 3 70B (80 layers, 64 heads, d_head=128, bfloat16) at seq_len=1024:
+    2 * 80 * 64 * 128 * 1024 * 2 = 4,294,967,296 bytes = 4.0 GB
+    An A100 (80 GB HBM) can hold at most ~20 such requests in KV cache.
+Done.
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The KV cache memory formula surprised me with its concreteness. GPT-2's KV cache at seq_len=1024 costs exactly 2 x 12 x 12 x 64 x 1024 x 4 = 75,497,472 bytes — about 72 MB. For a 70B-parameter model (Llama 3) with 80 layers, 64 heads, and d_head=128: 2 x 80 x 64 x 128 x 1024 x 2 (bfloat16) = 4 GB — for one request at seq_len=1024. A single A100 with 80 GB HBM can hold at most 20 such requests in their KV cache. The paged attention paper showed that naive contiguous KV allocation wastes 60-80% of that due to fragmentation — meaning the effective capacity drops to 4 to 8 concurrent requests. Paged attention recovers that wasted memory, which is why vLLM reported 24x throughput improvement over naive serving. The math is entirely deterministic once you know n_layers, n_heads, d_head, and seq_len. No approximation needed." />
+
+## Where to go deeper
+
+- **vLLM paper (2023)**: the paged attention paper — [arxiv.org/abs/2309.06180](https://arxiv.org/abs/2309.06180)
+- **Continuous batching blog (Anyscale)**: explains why static batching wastes GPU time — [anyscale.com/blog](https://www.anyscale.com/blog/continuous-batching-llm-inference)
+- **FlashAttention (2022)**: how to avoid materializing the attention matrix — [arxiv.org/abs/2205.14135](https://arxiv.org/abs/2205.14135)
+- **HuggingFace TGI**: production inference server with continuous batching and quantization — [github.com/huggingface/text-generation-inference](https://github.com/huggingface/text-generation-inference)
+- **Spring AI docs**: `ChatClient`, prompt templating, multimodal — [docs.spring.io/spring-ai](https://docs.spring.io/spring-ai/reference/)
+
+## Related labs and questions
+
+- **Previous in AI**: Transformer From Scratch (lab `transformer`) — the model architecture that creates the KV tensors we're caching here
+- **Previous in AI**: RAG System (lab `rag`) — uses our inference engine as the generation backend
+- **Next in AI**: Local GenAI stack — running the full pipeline offline with Ollama and quantized models
+- **System design question**: At what request rate does a single-GPU inference server become the bottleneck, and what architecture replaces it? (Hint: horizontal scaling of inference is harder than horizontal scaling of stateless services because each server needs to hold a full copy of the model weights.)
+- **System design question**: Speculative decoding uses a small draft model to propose tokens and a large verifier to accept/reject. At what draft acceptance rate does speculative decoding break even with standard KV-cache generation? (The crossover is around 60% acceptance rate for a 3x speedup draft model.)

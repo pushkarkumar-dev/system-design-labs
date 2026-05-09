@@ -1,0 +1,733 @@
+---
+title: "Build Your Own B+Tree KV Store"
+slug: "btree-kv"
+category: "storage"
+difficulty: "advanced"
+estimatedHours:
+  reading: 3
+  building: 10
+language: "rust"
+loc: 550
+prerequisites:
+  - "WAL (write-ahead log basics)"
+stages:
+  - id: v0
+    title: "In-memory B+Tree with leaf linking"
+    learningGoals:
+      - "Why B+Trees store all data in leaves (not internal nodes)"
+      - "Doubly-linked leaf list enables O(1) range continuation"
+      - "Node splits propagate upward — root split grows tree height"
+    approxLoc: 100
+  - id: v1
+    title: "Page-managed B+Tree on disk"
+    learningGoals:
+      - "Fixed 4096-byte pages match OS page size — minimise read amplification"
+      - "Page cache (LRU) keeps hot pages in memory"
+      - "Write amplification: O(log N) dirty pages per insert"
+    approxLoc: 250
+  - id: v2
+    title: "WAL + free list — durability and space reuse"
+    learningGoals:
+      - "WAL protects against partial page writes (torn write problem)"
+      - "Free list reclaims pages from deletes without compaction"
+      - "Shadow paging alternative: copy-on-write, no WAL needed (but reads explode)"
+    approxLoc: 200
+benchmarks:
+  - metric: "Sequential insert (v0 in-memory)"
+    value: "400,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — run cargo bench for real numbers"
+  - metric: "Random get (v0 in-memory)"
+    value: "600,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Page-cached get (v1, hot pages)"
+    value: "180,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Range scan 100 keys (v1)"
+    value: "50,000"
+    unit: "ranges/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Insert with WAL (v2)"
+    value: "80,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+whatTheToyMisses:
+  - thing: "B-link tree (concurrent B+Tree)"
+    why: "Production B+Trees use the B-link variant where each node holds a right-sibling pointer and a high-key. This allows concurrent reads and writes to different paths without global locks — our implementation uses a Mutex around the whole tree."
+  - thing: "Buffer pool manager"
+    why: "Real databases use a buffer pool with a sophisticated replacement policy (LRU-K, CLOCK). Our LRU page cache is correct but doesn't handle dirty-page write-back correctly under memory pressure."
+  - thing: "MVCC (Multi-Version Concurrency Control)"
+    why: "B+Trees in real databases (InnoDB, PostgreSQL) store multiple versions of each row for snapshot reads. Our tree stores only the latest value — no time-travel queries, no REPEATABLE READ isolation."
+  - thing: "Merge on underflow"
+    why: "We split nodes on overflow but don't merge on underflow. Real B+Trees merge or redistribute when a node drops below 50% full — otherwise repeated deletes leave a sparse tree that wastes pages."
+  - thing: "Prefix compression in leaf nodes"
+    why: "Adjacent keys often share a common prefix (e.g., user:001, user:002). InnoDB and WiredTiger compress these. Our fixed-width key approach wastes space on string keys."
+  - thing: "Bulk loading"
+    why: "Building a B+Tree by inserting one key at a time from sorted input is inefficient. Real systems bulk-load: write leaves left-to-right, then build internal levels bottom-up. 10x faster for initial construction."
+realWorldReferences:
+  - "Modern B-Tree Techniques — Goetz Graefe (2011)"
+  - "Architecture of a Database System — Hellerstein, Stonebraker, Hamilton (2007)"
+  - "InnoDB B+Tree implementation notes: https://blog.jcole.us/2013/01/10/the-physical-structure-of-innodb-index-pages/"
+  - "WiredTiger storage engine: https://source.wiredtiger.com/develop/arch-btree.html"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "com.github.ben-manes.caffeine:caffeine (via spring-boot-starter-cache)"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: "spring-boot-starter-web"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a B+Tree from scratch — the data structure inside every SQL database and many NoSQL engines. Go from in-memory node splits to a page-managed on-disk tree with WAL durability."
+---
+
+## Why this lab exists
+
+Every SQL database you have ever used — MySQL, PostgreSQL, SQLite, Oracle — stores its indexes as a B+Tree. When you add `CREATE INDEX` to a billion-row table and then write `WHERE user_id = 42`, that lookup completes in 4–5 page reads because of the B+Tree structure underneath. Yet most engineers who can explain B+Tree theory at a whiteboard have never actually implemented one.
+
+This lab changes that. You will build a complete B+Tree key-value store in three stages: from an in-memory proof-of-concept that fits in your head, to a page-managed on-disk tree, to a WAL-protected tree with a free list. By the end you will have touched every concept that makes databases fast: page-aligned I/O, LRU page caches, node splits, write-ahead logging, and the leaf linked list that makes range scans efficient.
+
+This lab is also the natural companion to the LSM-Tree lab. The two data structures solve the same problem — durable ordered KV storage — with fundamentally different tradeoffs. Building both lets you understand why databases choose one over the other.
+
+## What we are building
+
+A B+Tree KV store where:
+- Keys and values are byte strings
+- The tree is ordered by lexicographic byte comparison
+- All data lives in leaf nodes (internal nodes are router-only)
+- Leaf nodes are doubly-linked for efficient range scans
+- Nodes live on 4096-byte disk pages (v1+)
+- Writes are protected by a WAL (v2)
+
+**Explicit scope exclusions**: no transactions, no MVCC, no concurrent access (single Mutex), no merge-on-underflow rebalancing, no prefix compression, no bulk loading.
+
+## Mental model
+
+### B+Tree vs LSM-Tree: read-optimized vs write-optimized
+
+The central architectural choice in storage engines is B+Tree vs LSM-Tree. They solve the same problem with opposite tradeoffs:
+
+```
+B+Tree                          LSM-Tree
+------                          --------
+Write path:                     Write path:
+  put(k, v)                       put(k, v)
+     |                               |
+     v                               v
+  find leaf (O(log N))          memtable (BTreeMap)
+     |                          (no disk I/O)
+     v
+  write leaf page (1 I/O)
+  + possibly split + write
+    O(log N) dirty pages total
+
+Read path:                      Read path:
+  get(k)                          get(k)
+     |                               |
+  traverse root→leaf             memtable?
+  O(log N) page reads            |  miss
+  (1 per level)                  v
+                               SSTable 1 (newest)
+                                  |  miss
+                                  v
+                               SSTable 2 ...
+                               O(levels) SSTables
+```
+
+For a tree of 1 billion keys with ORDER=512 (4096-byte pages with 8-byte keys), the tree is at most 4 levels deep. A get costs exactly 4 page reads. An LSM-Tree with 7 levels checks up to 7 SSTables on a read — and compaction adds write amplification on top.
+
+**B+Tree is read-optimized**: O(log N) reads, predictable latency.
+**LSM-Tree is write-optimized**: O(1) writes (memtable insert), but reads and compaction are expensive.
+
+InnoDB and PostgreSQL choose B+Tree. RocksDB, Cassandra, and TiKV choose LSM-Tree. The choice depends on read/write ratio: if reads heavily outnumber writes, B+Tree wins. If writes are the bottleneck, LSM-Tree wins.
+
+### The leaf linked list: why range scans are cheap
+
+The most important structural difference between a B-Tree and a B+Tree is the leaf linked list. In a B-Tree (no plus), data lives in every node — internal and leaf. In a B+Tree, **all data lives in leaf nodes**, and leaf nodes are linked in key order.
+
+```
+Internal nodes (router-only, no data):
+         [user:500]
+        /            \
+  [user:250]        [user:750]
+  /       \          /      \
+
+Leaf nodes (doubly-linked, hold all data):
+[user:001..249] <-> [user:250..499] <-> [user:500..749] <-> [user:750..999]
+```
+
+To answer `range("user:200", "user:350")`:
+1. Traverse from root to the leaf containing `user:200` — O(log N) traversal
+2. Scan remaining keys in that leaf — O(keys per leaf)
+3. Follow `next` pointer to adjacent leaf — O(1) per hop
+4. Repeat until key exceeds `user:350`
+
+Total cost: O(log N + result_size). Without the leaf linked list, step 3 would require a full tree traversal for each adjacent leaf — O(result_size times log N). For a range of 10,000 keys with tree height 4, that is 4 vs 40,000 page reads.
+
+### Node splits
+
+When a node reaches capacity (ORDER-1 keys), the next insert must split it:
+
+```
+Before split (ORDER=4, max 3 keys, leaf is full):
+  Leaf: [a=1, b=2, c=3]
+
+Insert d=4:
+  Split at mid (index 2):
+    Left:  [a=1, b=2]
+    Right: [c=3, d=4]
+    Promote: c (smallest key in right leaf)
+  
+  Parent internal node absorbs (c, right_ptr):
+    [c] → (left_ptr, right_ptr)
+
+If parent is also full, it splits too.
+If root splits, a new root is created — the only way tree height increases.
+```
+
+This propagation is what makes inserts O(log N) in the worst case: a split can cascade all the way to the root. In practice, most inserts touch only 1–2 nodes.
+
+## Prerequisites
+
+Complete the [WAL lab](/system-design-labs/wal) first. The v2 stage uses the same MAGIC+CRC32+LEN+DATA format. Understanding why WAL exists — the torn write problem — makes v2's design obvious.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="In-memory B+Tree with leaf linking"
+  goals={[
+    "Define Node enum: InternalNode (keys + child indices) and LeafNode (keys + values + prev/next)",
+    "Implement insert(key, value): find leaf, insert sorted, split on overflow",
+    "Implement get(key): traverse root to leaf, binary search in leaf",
+    "Implement delete(key): find leaf, remove key (lazy, no rebalancing)",
+    "Implement range(start, end): find start leaf, walk linked list to end",
+    "Write tests: put/get/delete, trigger splits, range scan across leaves",
+  ]}
+  loc={100}
+>
+
+The in-memory tree uses a Vec arena for nodes (index = node ID). This avoids Rust's reference cycle problems with doubly-linked structures and makes the page-ID abstraction clear for v1.
+
+```rust
+pub enum Node {
+    Internal(InternalNode),
+    Leaf(LeafNode),
+}
+
+pub struct InternalNode {
+    pub keys: Vec<Key>,
+    pub children: Vec<usize>,  // arena indices
+}
+
+pub struct LeafNode {
+    pub keys: Vec<Key>,
+    pub values: Vec<Value>,
+    pub prev: Option<usize>,   // linked list
+    pub next: Option<usize>,
+}
+```
+
+**The insert algorithm** — `insert_recursive` descends the tree and returns `InsertResult { split: Option<(promoted_key, new_right_idx)> }`. If the child split, the parent incorporates the promoted key. If the root splits, a new root is created:
+
+```rust
+pub fn insert(&mut self, key: Key, value: Value) {
+    let result = self.insert_recursive(0, key, value);  // 0 = root
+    if let Some((mid_key, right_idx)) = result.split {
+        // Root split: move current root to a new arena slot,
+        // create new root pointing to both halves.
+        let old_root_idx = self.allocate_node(self.nodes[0].clone());
+        let new_root = Node::Internal(InternalNode {
+            keys: vec![mid_key],
+            children: vec![old_root_idx, right_idx],
+        });
+        self.nodes[0] = new_root;
+    }
+}
+```
+
+**Leaf split** — the tricky part is maintaining the linked list. When leaf L splits into L (left) and R (right):
+- L.next = R
+- R.prev = L
+- R.next = old L.next
+- old L.next.prev = R (if old L.next exists)
+
+The promoted key is `R.keys[0]` — the smallest key in the right half. This is a B+Tree property: the promoted key stays in both the parent and the right leaf. In a B-Tree (without plus), the promoted key is removed from the node. The difference matters for range scans.
+
+**Range scan using the leaf list**:
+
+```rust
+pub fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Key, Value)> {
+    let mut result = Vec::new();
+    let mut leaf_idx = self.find_leaf(0, start);  // O(log N)
+
+    loop {
+        let leaf = self.nodes[leaf_idx].as_leaf();
+        for (i, k) in leaf.keys.iter().enumerate() {
+            if k.as_slice() < start { continue; }
+            if k.as_slice() > end   { return result; }
+            result.push((k.clone(), leaf.values[i].clone()));
+        }
+        match leaf.next {
+            Some(next_idx) => leaf_idx = next_idx,  // O(1) hop
+            None => break,
+        }
+    }
+    result
+}
+```
+
+This is O(result_size) after the initial O(log N) traversal. The loop never goes back up the tree.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Page-managed B+Tree on disk"
+  goals={[
+    "Define the 4096-byte page format: header + key slots + value/child slots",
+    "Implement encode_page(node) and decode_page(buf) — node serialization",
+    "Build PageCache: LRU eviction with HashMap + VecDeque for MRU ordering",
+    "Implement BTree::open(path): create or reopen from disk",
+    "Wire insert/get/delete/range through the page cache",
+    "Write tests: insert + reopen = recovery, range after splits",
+  ]}
+  loc={250}
+>
+
+Each node becomes a fixed 4096-byte page on disk. The root is always page 0. Page ID = byte offset in the file divided by PAGE_SIZE.
+
+**Page format** (14-byte header + key slots + value/child slots):
+
+```
+Offset  Size  Field
+──────  ────  ─────────────────────────────────────────────────
+0       1     node_type (0x01=internal, 0x02=leaf)
+1       2     key_count (u16 LE)
+3       4     next_page (u32 LE) — leaf linked list
+7       4     prev_page (u32 LE) — leaf linked list
+11      3     padding
+
+After header:
+  Keys:     key_count × KEY_SLOT bytes
+              [key_len(2)][key_bytes...(KEY_MAX-2 zero-padded)]
+  
+  Children (internal):
+              (key_count+1) × 4 bytes (u32 LE page IDs)
+  
+  Values (leaf):
+              key_count × VAL_SLOT bytes
+              [val_len(2)][val_bytes...(VAL_SLOT-2 zero-padded)]
+```
+
+**Why fixed-size slots?** Variable-length serialization would require parsing the entire key section to find where children start. Fixed slots let us compute any child's offset as `HEADER + key_count * KEY_SLOT + child_index * 4` — O(1) random access within a page.
+
+**LRU page cache** uses a `HashMap` for O(1) lookup and a `VecDeque` as the access-order queue:
+
+```rust
+pub struct PageCache {
+    capacity: usize,
+    map: HashMap<u32, Node>,
+    order: VecDeque<u32>,  // front = most recently used
+}
+
+pub fn get(&mut self, page_id: u32) -> Option<&Node> {
+    if self.map.contains_key(&page_id) {
+        // Move to front (MRU)
+        self.order.retain(|&id| id != page_id);
+        self.order.push_front(page_id);
+        self.map.get(&page_id)
+    } else {
+        None
+    }
+}
+```
+
+**Write amplification for one insert**: a leaf split writes the modified leaf + the new right leaf. If the parent internal node also splits, that's another 2 page writes. In the worst case (all ancestors split), it's O(log N) page writes — 4 pages for a billion-key tree. Each page is 4096 bytes, so one insert costs at most 4 × 4096 = 16 KB of disk I/O, regardless of key size.
+
+**Why 4096-byte pages?** This matches the OS virtual memory page size on x86/ARM. The kernel never gives you a partial page on a crash — a 4096-byte write either completes or it doesn't (the "torn write" problem only applies within a page, not across pages). Our CRC check on open detects a corrupted page. A multi-page operation (node split) still needs the WAL (v2) to be atomic.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="WAL + free list — durability and space reuse"
+  goals={[
+    "Add WAL file (same format as the WAL lab: MAGIC + CRC32 + LEN + DATA)",
+    "Log each page-modifying operation before writing the page",
+    "Implement replay_wal(path): re-apply logged page writes on startup",
+    "Add free list in page 1: track freed page IDs for reuse",
+    "Wire allocate_page() to check free list before extending the file",
+    "Write tests: recovery after simulated crash, delete + reuse page",
+  ]}
+  loc={200}
+>
+
+**The torn write problem** — without WAL, a node split involves at least 3 page writes:
+1. Write right leaf (new page)
+2. Write left leaf (updated next pointer)
+3. Write parent internal node (new key + child pointer)
+
+If a crash happens after step 1 but before step 3, the parent's pointer to the new right child points to a page that was written, but the parent's key array doesn't include the new key. The B+Tree is silently inconsistent. On reopen, some range of keys is unreachable.
+
+**The WAL fix** — before writing any modified page, log the intent:
+
+```
+WAL record: [MAGIC(1)][CRC32(4)][LEN(4)][page_id(4)][page_content(4096)]
+```
+
+On recovery:
+1. Open the WAL
+2. Read records until CRC mismatch or EOF
+3. For each valid record, write `page_content` to `page_id` in the data file
+4. Open the tree (now consistent)
+
+Because WAL records are written and fsynced before data pages, a crash at any point leaves a recoverable state:
+- Crash before WAL write: neither WAL nor data changed — old state recovers correctly
+- Crash after WAL write but before data write: WAL replay re-applies the data write
+- Crash after both WAL and data write: WAL replay is idempotent (writes same bytes again)
+
+**Free list** — page 1 is the free list header. When a leaf becomes empty after deletes, its page ID is added to the free list. On `allocate_page()`, we check the free list first:
+
+```rust
+fn allocate_page(&mut self) -> io::Result<u32> {
+    let mut free_list = self.read_free_list()?;
+    if let Some(page_id) = free_list.pop() {
+        self.write_free_list(&free_list)?;
+        return Ok(page_id);  // reuse freed page
+    }
+    // Extend the file
+    let id = self.next_page_id;
+    self.next_page_id += 1;
+    Ok(id)
+}
+```
+
+The free list update is itself a page write (page 1), so it must also be WAL-protected. This is why WAL + free list go together: without WAL, a crash during free list update corrupts the free list.
+
+**Shadow paging as an alternative** — some databases (SQLite in WAL mode, LMDB) use copy-on-write instead of WAL. On a write, they allocate a new page, write the new content there, and update a pointer in a "root of truth" page. The old page is freed only after the pointer update is durable. This gives crash safety without a WAL, but requires maintaining two copies of every modified page chain — reads can hit either the old or new version depending on which root pointer you use. MVCC adds more versions. The read amplification cost is why most production databases prefer WAL.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/btree-kv"
+  prereqs={["Rust 1.83+", "cargo"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/btree-kv\ncargo build",
+    },
+    {
+      label: "Run the demo (v0 in-memory + v2 on-disk with recovery)",
+      cmd: "cargo run --example demo",
+    },
+    {
+      label: "Run all tests",
+      cmd: "cargo test",
+    },
+    {
+      label: "Run benchmarks (generates HTML report in target/criterion/)",
+      cmd: "cargo bench",
+    },
+    {
+      label: "Start the HTTP server (for Java integration)",
+      cmd: "BTREE_DATA_DIR=/tmp/btree-data PORT=8080 cargo run --bin btree-server",
+    },
+    {
+      label: "Test the HTTP API",
+      cmd: "curl -X POST http://localhost:8080/put -H 'Content-Type: application/json' -d '{\"key\":\"hello\",\"value\":\"world\"}'\ncurl 'http://localhost:8080/get?key=hello'\ncurl 'http://localhost:8080/range?start=h&end=i'\ncurl 'http://localhost:8080/health'",
+    },
+  ]}
+  expectedOutput={`=== v0 — in-memory B+Tree ===
+
+put 6 keys (2 users, 2 products, 2 orders)
+get user:001 = Some("alice")
+get user:002 = Some("bob")
+overwrite user:001
+get user:001 = Some("alice-updated")
+delete user:002
+get user:002 (deleted) = None
+
+range scan [product:sku:100, product:sku:200]:
+  product:sku:101 = Widget A - $9.99
+  product:sku:102 = Gadget B - $24.99
+
+bulk inserting 30 keys to trigger multiple splits...
+tree size: 35 keys
+range [bulk:0010, bulk:0014]: 5 pairs
+
+(v0: nothing survives restart — all data is in-memory)
+
+=== v2 — WAL-protected B+Tree on disk ===
+
+wrote 3 orders to disk with WAL protection
+get order:9002 = Some("user=bob,total=12.50")
+
+[simulating restart — reopening B+Tree from disk]
+recovered. get order:9001 = Some("user=alice,total=49.99")
+recovered. get order:9003 = Some("user=carol,total=99.00")
+delete order:9002
+get order:9002 = None`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM, Apple NVMe SSD"
+  rows={[
+    { metric: "Sequential insert (v0 in-memory)", value: "~400,000", unit: "ops/sec", note: "estimated — O(log N) splits, no I/O" },
+    { metric: "Random get (v0 in-memory)", value: "~600,000", unit: "ops/sec", note: "estimated — O(log N) traversal, hot cache" },
+    { metric: "Page-cached get (v1, hot pages)", value: "~180,000", unit: "ops/sec", note: "estimated — LRU cache hit; no disk I/O" },
+    { metric: "Range scan 100 keys (v1)", value: "~50,000", unit: "ranges/sec", note: "estimated — O(100) leaf hops after O(log N) traversal" },
+    { metric: "Insert with WAL (v2)", value: "~80,000", unit: "ops/sec", note: "estimated — WAL fsync ~300-500μs per write on NVMe" },
+    { metric: "Mixed 80% read / 20% write (v0)", value: "~500,000", unit: "ops/sec", note: "estimated — hot in-memory dominated by read" },
+  ]}
+/>
+
+These numbers are estimates. Run `cargo bench` on your machine for real measurements. The WAL insert number (80k ops/sec) reflects fsync latency, not tree traversal — a group commit optimization (batching multiple inserts into one fsync) would push this to 300k+ ops/sec.
+
+## Stress tests
+
+To verify correctness under load, the test suite includes:
+
+**Leaf list integrity after many splits**: insert 50 keys to force multiple split cascades, then verify that a full range scan returns all 50 keys. If any `next` pointer is stale, the range scan will miss entries.
+
+**Persistence and recovery**: insert keys, close the tree (drop), reopen, verify all keys are still accessible. Tests the page serialization round-trip.
+
+**Overwrite correctness**: insert the same key multiple times with different values, verify only the latest value is returned. Checks that the binary search in leaf_insert finds and overwrites the existing slot.
+
+**Range boundary conditions**: range with disjoint bounds (no results), range spanning multiple leaves, range of exactly one key.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "B-link tree (concurrent B+Tree)",
+      why: "Production B+Trees use the B-link variant where each node holds a right-sibling pointer and a high-key. This allows concurrent reads and writes to different paths without global locks — our implementation uses a Mutex around the whole tree.",
+    },
+    {
+      thing: "Buffer pool manager",
+      why: "Real databases use a buffer pool with a sophisticated replacement policy (LRU-K, CLOCK). Our LRU page cache is correct but doesn't handle dirty-page write-back correctly under memory pressure.",
+    },
+    {
+      thing: "MVCC (Multi-Version Concurrency Control)",
+      why: "B+Trees in real databases (InnoDB, PostgreSQL) store multiple versions of each row for snapshot reads. Our tree stores only the latest value — no time-travel queries, no REPEATABLE READ isolation.",
+    },
+    {
+      thing: "Merge on underflow",
+      why: "We split nodes on overflow but don't merge on underflow. Real B+Trees merge or redistribute when a node drops below 50% full — otherwise repeated deletes leave a sparse tree that wastes pages.",
+    },
+    {
+      thing: "Prefix compression in leaf nodes",
+      why: "Adjacent keys often share a common prefix (e.g., user:001, user:002). InnoDB and WiredTiger compress these. Our fixed-width key approach wastes space on string keys.",
+    },
+    {
+      thing: "Bulk loading",
+      why: "Building a B+Tree by inserting one key at a time from sorted input is inefficient. Real systems bulk-load: write leaves left-to-right, then build internal levels bottom-up. 10x faster for initial construction.",
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="Spring Boot 3.3"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "com.github.ben-manes.caffeine:caffeine (via spring-boot-starter-cache)",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/btree-kv/java-integration"
+>
+
+### Part A — BTreeClient: the HTTP bridge
+
+`BTreeClient.java` wraps the Rust B+Tree server's five REST endpoints using Spring Framework 6.1's `RestClient`. The range query is where B+Tree shines:
+
+```java
+public class BTreeClient {
+    private final RestClient http;
+
+    // POST /put — write a key-value pair
+    public void put(String key, String value) {
+        http.post().uri("/put")
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(new PutRequest(key, value))
+            .retrieve().toBodilessEntity();
+    }
+
+    // GET /get?key=... — returns Optional.empty() on 404
+    public Optional<String> get(String key) {
+        try {
+            var resp = http.get().uri("/get?key={key}", key)
+                    .retrieve().body(GetResponse.class);
+            return resp != null ? Optional.of(resp.value()) : Optional.empty();
+        } catch (RestClientResponseException e) {
+            if (e.getStatusCode().value() == 404) return Optional.empty();
+            throw e;
+        }
+    }
+
+    // GET /range?start=&end= — B+Tree leaf-list walk at the server
+    public List<KeyValue> range(String start, String end) {
+        var result = http.get()
+                .uri("/range?start={start}&end={end}", start, end)
+                .retrieve().body(KeyValue[].class);
+        return result != null ? List.of(result) : List.of();
+    }
+
+    // Java 17 records — immutable DTOs
+    record PutRequest(String key, String value) {}
+    public record KeyValue(String key, String value) {}
+}
+```
+
+The `range()` method is O(result_size) at the Rust server (leaf-list walk), not O(result_size times log N). Results arrive pre-sorted — the Java caller does not need to sort.
+
+### Part B — BTreeService: write-through cache (the buffer pool analogy)
+
+The Spring service is the Java analog of InnoDB's buffer pool. InnoDB keeps hot B+Tree pages in memory — reads serve from the buffer pool without going to disk. `BTreeService` keeps hot keys in a Caffeine cache — reads serve from Caffeine without an HTTP round-trip to the Rust server.
+
+```java
+@Service
+public class BTreeService implements HealthIndicator {
+    private final BTreeClient client;
+    private final Cache<String, String> kvCache;
+
+    // Write-through: cache AND forward to B+Tree
+    public void put(String key, String value) {
+        client.put(key, value);     // B+Tree O(log N) page writes
+        kvCache.put(key, value);    // Caffeine O(1)
+    }
+
+    // Cache-first: no HTTP for hot keys
+    public Optional<String> get(String key) {
+        var cached = kvCache.getIfPresent(key);
+        if (cached != null) return Optional.of(cached);  // O(1), no network
+
+        // Cache miss: B+Tree O(log N) page reads
+        var result = client.get(key);
+        result.ifPresent(v -> kvCache.put(key, v));  // populate on read-through
+        return result;
+    }
+
+    // Range: bypass per-key cache (we don't know which keys are in cache)
+    public List<BTreeClient.KeyValue> range(String start, String end) {
+        return client.range(start, end);  // B+Tree leaf walk
+    }
+
+    // delete: evict + B+Tree delete
+    public void delete(String key) {
+        kvCache.invalidate(key);
+        client.delete(key);
+    }
+}
+```
+
+**Why range queries bypass the cache**: the per-key cache can't answer "all keys between A and Z" without scanning the entire cache map — which is O(cache_size), not O(result_size). The B+Tree leaf walk is O(result_size + log N), so it's always faster than a full cache scan for ranges. If you need hot-range caching, you would need a separate range cache with invalidation on puts/deletes to the affected key range — a much more complex design.
+
+**HealthIndicator output** at `/actuator/health`:
+
+```json
+{
+  "btreeServer": {
+    "status": "UP",
+    "details": {
+      "engine": "v2",
+      "cacheHitRate": "82.5%",
+      "cacheSize": 3127
+    }
+  }
+}
+```
+
+### application.yml
+
+```yaml
+btree:
+  base-url: http://localhost:8080   # Rust B+Tree server
+  cache:
+    max-entries: 10000              # Hot keys in Caffeine
+    ttl: 10m                        # Evict after 10 minutes
+
+management:
+  endpoint:
+    health:
+      show-details: always          # See engine, cacheHitRate in /actuator/health
+```
+
+### Run it
+
+```bash
+# Terminal 1: start the Rust B+Tree server
+cd labs/btree-kv
+BTREE_DATA_DIR=/tmp/btree-data cargo run --bin btree-server
+
+# Terminal 2: run the Spring Boot demo
+cd labs/btree-kv/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== B+Tree KV Spring Integration Demo ===
+
+B+Tree health: UP
+put 6 keys (write-through: cached + forwarded to B+Tree)
+Cache hit rate after writes: 0.0%
+
+Read back (cache-first — no B+Tree I/O):
+  user:1001 = alice:premium:2024-01
+  user:1002 = bob:free:2024-03
+Cache hit rate after point reads: 50.0%
+
+Range query [product:sku:100, product:sku:200] (B+Tree leaf walk):
+  product:sku:101 = widget-a:9.99:usd
+  product:sku:102 = gadget-b:24.99:usd
+  product:sku:103 = doohickey-c:4.99:usd
+Results are sorted by key — B+Tree leaf list guarantees order.
+
+delete user:1002 (cache evicted + B+Tree delete)
+get user:1002 = (not found — correct)
+
+overwrite user:1001 with new plan
+get user:1001 = alice:enterprise:2024-12
+
+Final cache hit rate: 75.0%
+Check /actuator/health for engine, cacheHitRate, and cacheSize.
+```
+
+The 75% hit rate: 3 of 4 reads hit Caffeine. The delete+re-read was the cache miss (we invalidated, then had to fall back to the server). For read-heavy production workloads with a hot working set, expect 95%+ hit rates — the B+Tree server barely sees traffic for popular keys.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The reason databases use 4096-byte pages isn't just to match the OS page size — it's that the OS will never return a partial page on a crash (torn write only happens within a page). So a single page-write failure is detectable via CRC; a multi-page-write failure needs the WAL. I assumed WAL was about individual byte-level corruption. The actual threat is coarser: a node split touching 3 pages is the dangerous operation. If any of the 3 page writes are lost, the tree is inconsistent. The CRC per page catches physical corruption; the WAL catches logical inconsistency across pages. Two different problems, two different solutions." />
+
+## Where to go deeper
+
+- **InnoDB B+Tree internals**: the definitive visual walkthrough — [blog.jcole.us/2013/01/10/the-physical-structure-of-innodb-index-pages/](https://blog.jcole.us/2013/01/10/the-physical-structure-of-innodb-index-pages/)
+- **Modern B-Tree Techniques** — Goetz Graefe (2011): the academic survey covering B-link trees, concurrency, and recovery — freely available via Foundations and Trends in Databases
+- **WiredTiger architecture** (MongoDB's storage engine, also uses B+Tree): [source.wiredtiger.com/develop/arch-btree.html](https://source.wiredtiger.com/develop/arch-btree.html)
+- **SQLite's B-Tree** implementation — small, readable, well-commented: [sqlite.org/btreemodule.html](https://www.sqlite.org/btreemodule.html)
+- **Architecture of a Database System** — Hellerstein, Stonebraker, Hamilton: the free textbook that explains buffer managers, B+Trees, and WAL in detail
+
+## Related labs and questions
+
+- **Previous in storage**: [Write-Ahead Log](/system-design-labs/wal) — the WAL format used in v2 of this lab
+- **Previous in storage**: [LSM-Tree KV Store](/system-design-labs/lsm-kv) — the write-optimized alternative to B+Tree; understanding both clarifies why each database made its choice
+- **Related questions to think about**: If your B+Tree is 4 levels deep and a cache miss costs 5ms (cold SSD read), what is the worst-case latency for a get? For an insert? How does a buffer pool hit rate of 99% change those numbers?
+- **Design question**: InnoDB uses a clustered B+Tree where the primary key IS the leaf data (not a pointer to a heap). What happens to secondary indexes when the primary key is updated? Why does InnoDB recommend monotonically increasing primary keys (like AUTO_INCREMENT)?

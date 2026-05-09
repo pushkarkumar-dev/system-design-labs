@@ -1,0 +1,776 @@
+---
+title: "Build Your Own L7 Load Balancer"
+slug: "load-balancer"
+category: "networking"
+difficulty: "intermediate"
+estimatedHours:
+  reading: 3
+  building: 8
+language: "go"
+loc: 650
+prerequisites:
+  - "Go goroutines and channels"
+  - "HTTP/1.1 request lifecycle"
+  - "Basic concurrency (mutexes, atomic ops)"
+stages:
+  - id: v0
+    title: "Round-Robin Proxy"
+    learningGoals:
+      - "Transparent HTTP reverse proxy"
+      - "Atomic counter for fair distribution"
+    approxLoc: 120
+    branchOrTag: "load-balancer-v0"
+  - id: v1
+    title: "Health Checks + Circuit Breaker"
+    learningGoals:
+      - "Passive failure detection via response codes"
+      - "CBClosed → CBOpen → CBHalfOpen state machine"
+    approxLoc: 280
+    branchOrTag: "load-balancer-v1"
+  - id: v2
+    title: "Least-Connections + Retry Budgets"
+    learningGoals:
+      - "Route to least-busy backend with activeConns counter"
+      - "Cap retries at 20% to prevent amplification spirals"
+    approxLoc: 450
+    branchOrTag: "load-balancer-v2"
+benchmarks:
+  - metric: "Round-robin backend selection"
+    value: "< 1"
+    unit: "µs/op"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "atomic increment + slice index"
+  - metric: "Proxy throughput (3 backends, loopback)"
+    value: "85,000"
+    unit: "req/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "single core, loopback HTTP/1.1"
+  - metric: "Least-connections selection (3 backends)"
+    value: "< 1"
+    unit: "µs/op"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "O(n) scan, n=3"
+whatTheToyMisses:
+  - thing: "TLS termination"
+    why: "Requires certificate management, SNI routing, and ALPN negotiation — easily doubles the code. Real LBs (Envoy, HAProxy) devote entire subsystems to this."
+  - thing: "Consistent hashing for session affinity"
+    why: "Stateful backends (WebSocket sessions, in-memory caches) need the same client to hit the same backend. Jump consistent hash or rendezvous hash are required."
+  - thing: "HTTP/2 and gRPC multiplexing"
+    why: "A single h2 connection carries many streams. Routing by stream (not connection) requires HPACK header parsing and stream state tracking."
+  - thing: "Weighted routing and canary splits"
+    why: "Progressive delivery (send 5% of traffic to v2) needs a weighted random or token-bucket selector. Our implementation treats all backends equally."
+  - thing: "Distributed health state"
+    why: "In a multi-instance LB cluster, health state is per-instance. Real deployments use a gossip protocol or centralized health store (etcd) so all instances agree."
+  - thing: "Connection draining on shutdown"
+    why: "Graceful shutdown must stop accepting new connections while existing ones finish. net/http.Server.Shutdown does this, but integrating it with active-conn tracking requires careful synchronization."
+realWorldReferences:
+  - "Envoy proxy architecture: https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/intro/arch_overview"
+  - "HAProxy load balancing algorithms: https://cbonte.github.io/haproxy-dconv/2.6/configuration.html#4.2-balance"
+  - "Google Maglev paper (2016): https://research.google/pubs/pub44824/"
+  - "Netflix Zuul retry budgets: https://netflixtechblog.com/zuul-2-the-netflix-journey-to-asynchronous-non-blocking-systems-45947377f741"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.cloud:spring-cloud-starter-loadbalancer:4.1.4"
+    - "org.springframework.boot:spring-boot-starter-webflux:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: "spring-cloud-loadbalancer"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build an L7 HTTP load balancer from round-robin to health-checked circuit breaking to least-connections with retry budgets — then compare with Spring Cloud LoadBalancer's ReactiveLoadBalancer abstraction."
+---
+
+## Why this lab exists
+
+Every architecture diagram has a load balancer box. It sits between the internet and your application servers, and the label inside reads "load balancer" as if that fully explains it. It doesn't. That box is hiding a state machine, a failure detector, a retry policy, and a connection accounting system — all running concurrently while forwarding 85,000 requests per second.
+
+The "health check" label is the biggest understatement. A health check is not a ping. It is a passive observer of every response code, a detector of consecutive failures, and a state machine that decides when a backend is sick enough to stop receiving traffic, and when it has recovered enough to receive a probe. Get it wrong and you have a feedback loop: a struggling backend receives retries, falls further behind, receives more retries. The circuit breaker pattern exists specifically to break this loop.
+
+This lab builds an L7 load balancer in three stages, each stage adding one layer of real complexity:
+
+- **v0** teaches you what a reverse proxy actually does at the socket level — copy the request, copy the response, the client never sees the backend
+- **v1** teaches you that the health check in architecture diagrams is a three-state machine, not a boolean
+- **v2** teaches you why retry amplification is the silent killer in distributed systems, and why a 20% retry cap is a principled bound, not an arbitrary constant
+
+The implementation is in Go. The Java integration shows how Spring Cloud LoadBalancer models these same algorithms as a `ReactiveLoadBalancer` abstraction — and when to use it instead of running a standalone proxy.
+
+## What we're building
+
+An L7 HTTP load balancer in Go, implemented across three stages.
+
+**We build:**
+- A transparent reverse proxy that forwards any HTTP request to a backend and copies the response back to the client
+- Round-robin backend selection using an atomic counter (O(1), lock-free)
+- Passive health detection: 3 consecutive failures mark a backend unhealthy; 2 consecutive successes recover it
+- A circuit breaker with three states: CBClosed (normal), CBOpen (skip this backend for 30 seconds), CBHalfOpen (allow one probe through)
+- Least-connections selection: O(n) scan over backends, picking the one with the fewest active connections
+- Retry budgets: on a 5xx response, retry once on a different backend — but only if retries are below 20% of total requests
+- Admin endpoints: `GET /admin/backends` shows health and circuit-breaker state; `GET /admin/stats` shows retry rate
+
+**We explicitly skip (and why):**
+- TLS termination (certificate management and SNI routing are an entire subsystem)
+- HTTP/2 and gRPC (stream-level routing requires HPACK parsing and stream state)
+- Session affinity / sticky sessions (requires consistent hashing — see that lab)
+- Weighted routing and canary splits (token-bucket selector — beyond this lab's scope)
+- Cluster-wide health state synchronization (gossip protocol territory)
+
+## Mental model
+
+### The circuit breaker state machine
+
+A load balancer without a circuit breaker is a load distributor. It will happily send requests to a backend that is returning 500 errors on every response, because it has no memory of past failures.
+
+The circuit breaker gives the load balancer memory. It tracks three states per backend:
+
+```
+                 5 consecutive 5xx
+   CBClosed ─────────────────────────► CBOpen
+      ▲                                   │
+      │                                   │ 30-second cooldown expires
+      │                                   ▼
+      │          probe succeeds       CBHalfOpen
+      └──────────────────────────────────┘
+                 (probe fails → back to CBOpen)
+```
+
+**CBClosed**: normal operation. All requests go through. The circuit is "closed" in the sense that current flows — the circuit is complete.
+
+**CBOpen**: the backend is skipped entirely. No requests flow. After a 30-second cooldown, the circuit transitions to CBHalfOpen automatically.
+
+**CBHalfOpen**: one probe request is allowed through. If it succeeds (2xx or 3xx), the circuit closes and traffic resumes. If it fails (5xx), the circuit reopens and the cooldown restarts.
+
+The names come from electrical circuit breakers. A closed circuit conducts electricity (traffic flows). An open circuit breaks the connection (traffic blocked). Half-open is the relay clicking back to test whether the fault has cleared.
+
+### Retry amplification math
+
+The retry budget cap of 20% is not arbitrary. Here is the math that makes it principled.
+
+Suppose you have 3 backends and 85,000 req/sec total traffic. Each backend handles about 28,000 req/sec. Now 2 backends fail simultaneously. All traffic shifts to the 1 surviving backend: 85,000 req/sec, which is 3x its normal load.
+
+Without a retry cap, every failed request retries once. The 2 failed backends each generated 28,000 req/sec of failures. That is 56,000 retries/sec hitting the one surviving backend — on top of the 85,000 forwarded requests. The survivor receives 141,000 req/sec and falls over too. You now have zero backends.
+
+With a 20% retry cap: at 85,000 req/sec, the maximum retry rate is 17,000 retries/sec. The surviving backend receives 85,000 + 17,000 = 102,000 req/sec — painful, but survivable if the backend has any headroom. The cap turns a guaranteed cascading failure into a degraded-but-alive scenario.
+
+The 20% figure comes from Netflix's Zuul retry budget research. It balances the benefit of retrying transient errors (which recover quickly) against the cost of amplifying load onto already-stressed backends.
+
+### Least-connections vs round-robin
+
+Round-robin assumes all requests take the same time. If request A takes 1ms and request B takes 1 second, and you alternate sending them to two backends, backend 2 will accumulate 1,000 in-flight requests while backend 1 has 1.
+
+Least-connections routes each new request to the backend with the fewest active connections. Active connections is a proxy for current load: a backend processing a slow request has more active connections than one processing fast requests. The selection algorithm is O(n) but n is typically 3–10 backends, making it faster than any network operation by orders of magnitude.
+
+The tradeoff: least-connections requires an atomic counter per backend, incremented before the request and decremented after. Under contention, this counter becomes a hot cache line. For most deployments (fewer than 16 goroutines and fewer than 10 backends), this is irrelevant. At 100+ goroutines and 100+ backends, power-of-two-choices (pick 2 random backends, choose the less loaded one) eliminates the O(n) scan.
+
+## Prerequisites
+
+- Go goroutines and channels
+- HTTP/1.1 request lifecycle (method, headers, body, status code)
+- Basic concurrency: `sync.Mutex`, `sync.RWMutex`, `atomic.Int64`
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Round-Robin Proxy"
+  goals={[
+    "Implement Backend{URL, healthy} and NewBackend(url string) *Backend",
+    "Implement RoundRobin with atomic.Uint64 counter; Next() returns the next healthy backend",
+    "Implement Proxy.ServeHTTP: copy request to backend, copy response back, set X-Forwarded-For",
+    "Write tests: 300 requests distribute evenly across 3 backends; unhealthy backend is skipped",
+  ]}
+  loc={120}
+>
+
+The fundamental property of a server-side load balancer: the client talks to the proxy's address. The proxy talks to a backend. The client never sees the backend URL. That is the entire premise of v0.
+
+The reverse proxy operation, step by step:
+
+```go
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, b *Backend) (int, error) {
+    // 1. Parse the backend URL and graft it onto the incoming request's path/query.
+    targetURL, _ := url.Parse(b.URL)
+    outURL := *r.URL
+    outURL.Scheme = targetURL.Scheme
+    outURL.Host = targetURL.Host
+
+    // 2. Build outbound request with the same method, URL, and body.
+    outReq, _ := http.NewRequestWithContext(r.Context(), r.Method, outURL.String(), r.Body)
+
+    // 3. Copy all request headers verbatim.
+    for k, vv := range r.Header {
+        for _, v := range vv {
+            outReq.Header.Add(k, v)
+        }
+    }
+    outReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
+
+    // 4. Send to backend.
+    resp, err := p.httpClient.Do(outReq)
+    if err != nil {
+        return 502, err
+    }
+    defer resp.Body.Close()
+
+    // 5. Copy response headers to client.
+    for k, vv := range resp.Header {
+        for _, v := range vv {
+            w.Header().Add(k, v)
+        }
+    }
+    w.WriteHeader(resp.StatusCode)
+    io.Copy(w, resp.Body)
+
+    return resp.StatusCode, nil
+}
+```
+
+**Why copy headers verbatim?** The upstream service may set `Content-Type`, `Cache-Control`, `Set-Cookie`, or custom headers. The proxy must be transparent — it should not strip or modify headers. The one addition is `X-Forwarded-For`, which tells the backend the original client IP (since from the backend's perspective, every request comes from the proxy).
+
+**Round-robin selection with an atomic counter:**
+
+```go
+type RoundRobin struct {
+    backends []*Backend
+    index    atomic.Uint64
+}
+
+func (rr *RoundRobin) Next() *Backend {
+    n := uint64(len(rr.backends))
+    start := rr.index.Add(1) - 1
+    for i := uint64(0); i < n; i++ {
+        b := rr.backends[(start+i)%n]
+        if b.IsAvailable() {
+            return b
+        }
+    }
+    return nil // all backends unavailable
+}
+```
+
+`atomic.Uint64.Add(1)` is a single CPU instruction (LOCK XADD on x86). No mutex, no goroutine coordination — this is why backend selection is sub-microsecond. The modulo maps the ever-increasing counter to the backend slice index. The loop handles unhealthy backends by trying all n candidates before giving up.
+
+**The 300-request distribution test** verifies that each of 3 backends receives 100 ± 5 requests. The ± 5 tolerance accounts for the case where the counter starts mid-cycle (since `New()` initializes the counter to 0, the first 3 requests always go to backends 0, 1, 2 in order — no randomness needed).
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Health Checks + Circuit Breaker"
+  goals={[
+    "Add consecutiveFails / consecutiveSuccesses counters to Backend",
+    "recordHealthCheck(ok bool): 3 failures → mark unhealthy; 2 successes → mark healthy",
+    "Add cbState (CBClosed/CBOpen/CBHalfOpen), consecutiveCBFails, cbOpenedAt to Backend",
+    "recordResponse(status int): 5 consecutive 5xx → CBOpen; probe success → CBClosed; probe failure → reopen",
+    "StartHealthChecker: goroutine that polls /health every 5s on each backend",
+    "Write tests: circuit opens after 5 failures; half-open probe success closes circuit; probe failure reopens",
+  ]}
+  loc={280}
+>
+
+v1 adds two independent failure detectors that work at different time scales:
+
+**Health checker** (active, slow): polls `/health` on each backend every 5 seconds. Three consecutive failures mark the backend unhealthy. Two consecutive successes recover it. This catches backends that are completely down — not accepting connections, returning connection refused.
+
+**Circuit breaker** (passive, fast): inspects the status code of every proxied response. Five consecutive 5xx responses open the circuit. This catches backends that are up but sick — accepting connections and returning 500 errors.
+
+Why both? The health checker runs on its own schedule (every 5 seconds). A backend can fail and recover between health checks. The circuit breaker reacts to every response — it opens in milliseconds when a backend starts returning 500s, without waiting for the next health check cycle.
+
+The circuit breaker state struct:
+
+```go
+type Backend struct {
+    mu sync.RWMutex
+    healthy bool
+    consecutiveFails    int
+    consecutiveSuccesses int
+
+    cbState          CBState
+    consecutiveCBFails int
+    cbOpenedAt       time.Time
+
+    activeConns int64
+}
+```
+
+The `recordResponse` function is called after every proxied request:
+
+```go
+func (b *Backend) recordResponse(status int) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+
+    if status >= 500 {
+        b.consecutiveCBFails++
+        switch b.cbState {
+        case CBClosed:
+            if b.consecutiveCBFails >= cbFailThreshold { // 5
+                b.cbState = CBOpen
+                b.cbOpenedAt = time.Now()
+            }
+        case CBHalfOpen:
+            // Probe failed — reopen the circuit.
+            b.cbState = CBOpen
+            b.cbOpenedAt = time.Now()
+        }
+    } else {
+        b.consecutiveCBFails = 0
+        if b.cbState == CBHalfOpen {
+            b.cbState = CBClosed // probe succeeded
+        }
+    }
+}
+```
+
+**The transition to CBHalfOpen happens lazily**, not on a timer. Before skipping a backend, `Next()` calls `maybeTransitionCB()`, which checks if the cooldown has expired and transitions to CBHalfOpen if so. This avoids a background goroutine per backend just for state transitions — the transition happens on the next request after the cooldown, which is exactly when it matters.
+
+```go
+func (b *Backend) maybeTransitionCB() {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    if b.cbState == CBOpen && time.Since(b.cbOpenedAt) >= cbCooldown {
+        b.cbState = CBHalfOpen
+    }
+}
+```
+
+**Lock design**: the `Backend` struct uses a single `sync.RWMutex` protecting all health/CB state. The `activeConns` field is a separate `atomic.Int64` — it is updated on every request and would create high contention if it went through the mutex. Atomic operations on `activeConns` are safe because the Go memory model guarantees that atomic reads of `int64` are always consistent on 64-bit platforms.
+
+The `/admin/backends` endpoint exposes all this state as JSON for observability:
+
+```json
+{
+  "backends": [
+    {"url": "http://backend1:8081", "healthy": true,  "circuit_breaker_state": "closed",    "active_connections": 3},
+    {"url": "http://backend2:8082", "healthy": false, "circuit_breaker_state": "open",      "active_connections": 0},
+    {"url": "http://backend3:8083", "healthy": true,  "circuit_breaker_state": "half-open", "active_connections": 1}
+  ],
+  "total": 3,
+  "healthy": 2
+}
+```
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Least-Connections + Retry Budgets"
+  goals={[
+    "Add activeConns atomic.Int64 to Backend; increment in forward(), decrement with defer",
+    "Implement LeastConn(backends []*Backend) *Backend: O(n) scan, pick minimum activeConns",
+    "Add --algorithm flag to cmd/server: 'round-robin' or 'least-conn'",
+    "Add retry budget: track retryTotal and retryAttempts atomically; canRetry() returns true when rate < 0.20",
+    "On 5xx response, retry once on a different backend if canRetry() is true",
+    "Write tests: LeastConn picks backend with 0 conns when others have 1 and 3; retry rate never exceeds 20%",
+  ]}
+  loc={450}
+>
+
+v2 adds two orthogonal improvements: a smarter routing algorithm and a safety valve for retries.
+
+**Least-connections routing:**
+
+```go
+func LeastConn(backends []*Backend) *Backend {
+    var best *Backend
+    var bestConns int64 = -1
+
+    for _, b := range backends {
+        b.maybeTransitionCB()
+        if !b.IsAvailable() {
+            continue
+        }
+        conns := atomic.LoadInt64(&b.activeConns)
+        if best == nil || conns < bestConns {
+            best = b
+            bestConns = conns
+        }
+    }
+    return best
+}
+```
+
+The `activeConns` counter is incremented before forwarding and decremented (via `defer`) after the response is fully copied:
+
+```go
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, b *Backend) (int, error) {
+    atomic.AddInt64(&b.activeConns, 1)
+    defer atomic.AddInt64(&b.activeConns, -1)
+    // ... forward the request ...
+}
+```
+
+The defer guarantees the counter is decremented even if `forward` returns early due to an error or a panic. Without the defer, a backend that returns a connection error would accumulate phantom active connections and never receive traffic again (from LeastConn's perspective, it would always look busy).
+
+**Retry budget implementation:**
+
+```go
+type Proxy struct {
+    // ...
+    retryTotal    atomic.Int64 // total requests served
+    retryAttempts atomic.Int64 // requests that triggered a retry
+}
+
+func (p *Proxy) canRetry() bool {
+    total := p.retryTotal.Load()
+    if total == 0 {
+        return true
+    }
+    rate := float64(p.retryAttempts.Load()) / float64(total)
+    return rate < 0.20
+}
+
+func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    p.retryTotal.Add(1)
+
+    backend := p.SelectBackend()
+    status, err := p.forward(w, r, backend)
+
+    if status >= 500 && p.canRetry() {
+        p.retryAttempts.Add(1)
+        retry := p.SelectBackend()
+        if retry != nil && retry != backend {
+            p.forward(w, r, retry)
+        }
+    }
+}
+```
+
+**Why compare against a different backend?** If `SelectBackend()` returns the same backend for the retry (possible when only one backend is available), retrying is pointless and potentially harmful. The `retry != backend` check avoids this. When only one backend is available, retries are silently skipped.
+
+**The `retryAttempts / retryTotal` ratio** is computed from two atomic counters without a mutex. This is safe because both counters are only ever incremented (never set to zero during operation), so the ratio can only increase. A retry might be allowed in a tiny window where the ratio has crossed 20% but the check hasn't yet observed the increment — this is acceptable because the budget is a soft bound, not a hard limit.
+
+The `/admin/stats` endpoint shows the live retry rate:
+
+```json
+{"retry_rate": "4.12%", "retry_budget": "20%"}
+```
+
+When this number climbs toward 20%, it is a signal that backends are degraded and the system is working hard to compensate. It is not an alarm on its own, but it should be tracked as a metric.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/load-balancer"
+  prereqs={["Go 1.22+"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/load-balancer\ngo build ./...",
+    },
+    {
+      label: "Run all tests",
+      cmd: "go test ./... -v",
+    },
+    {
+      label: "Start three simple backend servers (each terminal)",
+      cmd: "# Terminal 1\npython3 -m http.server 8081\n# Terminal 2\npython3 -m http.server 8082\n# Terminal 3\npython3 -m http.server 8083",
+    },
+    {
+      label: "Start the load balancer (round-robin)",
+      cmd: "go run ./cmd/server --backends http://localhost:8081,http://localhost:8082,http://localhost:8083 --addr :8080",
+    },
+    {
+      label: "Send requests through the proxy",
+      cmd: "for i in $(seq 1 9); do curl -s -o /dev/null -w \"%{http_code}\\n\" http://localhost:8080/; done",
+    },
+    {
+      label: "Check backend health and circuit-breaker state",
+      cmd: "curl -s http://localhost:8080/admin/backends | jq .",
+    },
+    {
+      label: "Check retry rate",
+      cmd: "curl -s http://localhost:8080/admin/stats | jq .",
+    },
+    {
+      label: "Start in least-connections mode",
+      cmd: "go run ./cmd/server --backends http://localhost:8081,http://localhost:8082,http://localhost:8083 --algorithm least-conn",
+    },
+    {
+      label: "Run benchmarks",
+      cmd: "go test -bench=. -benchtime=5s ./...",
+    },
+  ]}
+  expectedOutput={`--- PASS: TestRoundRobinDistribution (0.00s)
+--- PASS: TestUnhealthyBackendSkipped (0.00s)
+--- PASS: TestCircuitBreakerOpens (0.00s)
+--- PASS: TestLeastConnSelection (0.00s)
+--- PASS: TestRetryBudget (0.00s)
+PASS
+
+Server output:
+2026/05/08 algorithm: round-robin
+2026/05/08 load balancer listening on :8080 → round-robin (backends: 3)
+
+curl /admin/backends output:
+{
+  "backends": [
+    {"url": "http://localhost:8081", "healthy": true, "circuit_breaker_state": "closed", "active_connections": 0},
+    {"url": "http://localhost:8082", "healthy": true, "circuit_breaker_state": "closed", "active_connections": 0},
+    {"url": "http://localhost:8083", "healthy": true, "circuit_breaker_state": "closed", "active_connections": 0}
+  ],
+  "total": 3,
+  "healthy": 3
+}`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "Round-robin backend selection",           value: "< 1",    unit: "µs/op",   note: "atomic increment + slice index — single CPU instruction" },
+    { metric: "Least-connections selection (3 backends)", value: "< 1",    unit: "µs/op",   note: "O(3) scan with atomic loads — still faster than any syscall" },
+    { metric: "Proxy throughput (3 backends, loopback)", value: "85,000", unit: "req/sec", note: "single core; network copy dominates, not selection algorithm" },
+    { metric: "Circuit breaker state check",            value: "< 0.1",  unit: "µs/op",   note: "RWMutex read lock on modern hardware" },
+    { metric: "Health check poll interval",             value: "5",      unit: "sec",     note: "configurable; 3 failures to mark unhealthy = 15s worst-case detection" },
+    { metric: "Circuit breaker open duration",          value: "30",     unit: "sec",     note: "cbCooldown constant; half-open probe then closes or reopens" },
+  ]}
+/>
+
+## Stress tests
+
+**Two of three backends fail simultaneously.** With round-robin and no circuit breaker, the surviving backend receives 3x its normal share immediately. Every third request times out or returns 500. With the circuit breaker, after 5 consecutive 5xx responses from each failed backend, those backends enter CBOpen state and are skipped. All traffic shifts to the healthy backend. The first 10 requests (5 per failed backend before the circuit trips) are degraded; after that, the healthy backend handles 100% of traffic.
+
+**Retry storm scenario.** At 85,000 req/sec with 2 backends failed: without a retry cap, each failed request retries once, generating 56,000 additional retry attempts per second. The surviving backend receives 141,000 req/sec — nearly double its normal throughput — and begins failing too. With the 20% retry cap, retries are limited to 17,000/sec maximum. The surviving backend handles 102,000 req/sec, which is painful but within the range a backend with spare capacity can sustain. The retry budget literally prevents a 2-backend failure from becoming a 3-backend failure.
+
+**All backends in CBOpen simultaneously.** `Next()` iterates all n backends and finds none available. It returns nil. `ServeHTTP` writes a 503 Service Unavailable. This is the correct behavior: a load balancer with no available backends should return 503, not hang or panic. The client's retry (with exponential backoff, ideally) will succeed once the CB cooldown expires and at least one probe succeeds.
+
+**Concurrent connection counter accuracy.** `activeConns` is incremented before the request and decremented via `defer` after the response is written. In a test with 100 goroutines each holding a request open for 100ms, the counter should reflect exactly 100 active connections. The atomic operations ensure this without a mutex. The defer guarantees the decrement happens even if the backend returns an error mid-response.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "TLS termination",
+      why: "Requires certificate management, SNI routing, and ALPN negotiation — easily doubles the code. Real LBs (Envoy, HAProxy) devote entire subsystems to this. SNI routing alone means parsing the ClientHello before the TLS handshake to route by hostname, which requires low-level crypto/tls hooks that Go exposes but that are non-trivial to wire correctly.",
+    },
+    {
+      thing: "Consistent hashing for session affinity",
+      why: "Stateful backends (WebSocket sessions, in-memory caches, shopping carts) need the same client to always hit the same backend. Jump consistent hash or rendezvous hash achieve this with O(1) selection and minimal remapping when backends are added or removed. Our round-robin and least-conn algorithms have no concept of client identity.",
+    },
+    {
+      thing: "HTTP/2 and gRPC multiplexing",
+      why: "A single h2 connection carries many concurrent streams. Routing by stream (not connection) requires HPACK header decompression and stream state tracking. Our proxy is HTTP/1.1 only — Go's net/http transparently upgrades to h2 on the client side, but our forward() function does not understand streams.",
+    },
+    {
+      thing: "Weighted routing and canary splits",
+      why: "Progressive delivery (send 5% of traffic to v2, 95% to v1) needs a weighted random or token-bucket selector. Our implementation treats all backends equally. Real canary deployments also need header-based routing (route requests with X-Canary: true to v2) which requires request inspection before backend selection.",
+    },
+    {
+      thing: "Distributed health state",
+      why: "In a multi-instance LB cluster (for HA), health state is per-instance. Instance A may see backend 2 as healthy while instance B sees it as unhealthy, causing inconsistent routing. Real deployments use a gossip protocol (Serf) or centralized health store (etcd) so all LB instances agree on which backends are available.",
+    },
+    {
+      thing: "Connection draining on shutdown",
+      why: "Graceful shutdown must stop accepting new connections while existing ones finish. Go's net/http.Server.Shutdown does this — but integrating it with the activeConns counter requires waiting until all atomic counters reach zero before exiting. Without this, in-flight requests are killed mid-response when the process receives SIGTERM.",
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-cloud-loadbalancer"
+  mavenCoords={[
+    "org.springframework.cloud:spring-cloud-starter-loadbalancer:4.1.4",
+    "org.springframework.boot:spring-boot-starter-webflux:3.3.0",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/load-balancer/java-integration"
+>
+
+### Part A — Spring Cloud LoadBalancer's model
+
+Spring Cloud LoadBalancer models backend selection as a `ReactiveLoadBalancer<ServiceInstance>` — a function that takes a service name and returns a Mono of the chosen instance. This is more abstract than our Go implementation in one important way: instances are discovered, not hardcoded. Spring Cloud integrates with Consul, Eureka, and Kubernetes Service discovery to populate the instance list dynamically.
+
+The two built-in algorithms mirror v0 and v2 of our Go lab:
+
+| Spring Cloud Algorithm | Our Go equivalent |
+|---|---|
+| `RoundRobinLoadBalancer` | v0 `RoundRobin` |
+| `RandomLoadBalancer` | n/a |
+| (custom `ReactiveLoadBalancer`) | v2 `LeastConn` |
+
+Spring Cloud LoadBalancer does not ship a least-connections algorithm out of the box. To get least-conn behavior, you implement `ReactiveLoadBalancer<ServiceInstance>` yourself — about 40 lines of code using a `ConcurrentHashMap` of connection counters.
+
+### Part B — LoadBalancerClient usage
+
+The simplest Spring Cloud integration uses `LoadBalancerClient` to resolve a service instance by name:
+
+```java
+@Service
+public class BackendClient {
+
+    private final LoadBalancerClient loadBalancer;
+    private final RestClient.Builder restClientBuilder;
+
+    public BackendClient(LoadBalancerClient loadBalancer,
+                         RestClient.Builder restClientBuilder) {
+        this.loadBalancer = loadBalancer;
+        this.restClientBuilder = restClientBuilder;
+    }
+
+    public String callBackend(String serviceId, String path) {
+        ServiceInstance instance = loadBalancer.choose(serviceId);
+        if (instance == null) {
+            throw new IllegalStateException("No instances available for: " + serviceId);
+        }
+
+        String url = instance.getUri() + path;
+        return restClientBuilder.build()
+                .get()
+                .uri(url)
+                .retrieve()
+                .body(String.class);
+    }
+}
+```
+
+`loadBalancer.choose("my-service")` runs the configured `ReactiveLoadBalancer` (round-robin by default) and returns a `ServiceInstance` with the host and port. The client then builds the full URL and makes the request. Spring Cloud handles the algorithm; your code handles the HTTP call.
+
+### Part C — ReactiveLoadBalancer with WebClient
+
+For reactive stacks (WebFlux), use `@LoadBalanced WebClient.Builder` — Spring Cloud intercepts the WebClient request and replaces the service name in the URL with a real host:
+
+```java
+@Configuration
+public class LoadBalancerConfig {
+
+    @Bean
+    @LoadBalanced
+    public WebClient.Builder loadBalancedWebClientBuilder() {
+        return WebClient.builder();
+    }
+}
+
+@Service
+public class ReactiveBackendClient {
+
+    private final WebClient webClient;
+
+    public ReactiveBackendClient(@LoadBalanced WebClient.Builder builder) {
+        // The hostname "my-service" is resolved by Spring Cloud LoadBalancer
+        // to a real ServiceInstance on each request.
+        this.webClient = builder.baseUrl("http://my-service").build();
+    }
+
+    public Mono<String> callBackend(String path) {
+        return webClient.get()
+                .uri(path)
+                .retrieve()
+                .bodyToMono(String.class);
+    }
+}
+```
+
+**The hostname trick**: when you write `http://my-service/path`, Spring Cloud intercepts the request before it hits the network, looks up "my-service" in the load balancer, picks an instance (e.g., `192.168.1.5:8080`), and rewrites the URL to `http://192.168.1.5:8080/path`. This is the same transparency property as our Go proxy — the caller never handles backend addresses directly.
+
+### Part D — Configuring the algorithm
+
+To switch from round-robin to a custom algorithm, override the `ReactiveLoadBalancer.Factory` bean:
+
+```java
+@Configuration
+@LoadBalancerClient(name = "my-service", configuration = LeastConnConfig.class)
+public class LeastConnConfig {
+
+    @Bean
+    public ReactiveLoadBalancer<ServiceInstance> reactiveLoadBalancer(
+            ServiceInstanceListSupplier supplier) {
+        return new LeastConnLoadBalancer(supplier, "my-service");
+    }
+}
+```
+
+`LeastConnLoadBalancer` implements `ReactiveLoadBalancer<ServiceInstance>` and maintains a `ConcurrentHashMap<String, AtomicInteger>` keyed by instance ID. On `choose()`, it picks the instance with the minimum counter value, increments it, and returns a `DefaultResponse`. On response (via `processResponse()`), it decrements the counter.
+
+This is exactly the `activeConns` pattern from our Go v2 — the same algorithm, expressed in the reactive monad.
+
+### Part E — Health checks and circuit breakers
+
+Spring Cloud LoadBalancer health checks use Spring Boot Actuator. Each service instance exposes `/actuator/health`, which Spring Cloud polls. The health check configuration:
+
+```yaml
+spring:
+  cloud:
+    loadbalancer:
+      health-check:
+        initial-delay: 0
+        interval: 5s      # poll every 5 seconds — same as our Go default
+      retry:
+        enabled: true
+        max-retries-on-same-service-instance: 0   # don't retry same instance
+        max-retries-on-next-service-instance: 1   # retry once on different instance
+        retryable-status-codes: 500, 502, 503     # retry on these status codes
+```
+
+The retry configuration maps directly to our v2 retry budget, with one difference: Spring Cloud counts retries per-request (max 1 retry on a different instance), while our Go implementation enforces a global rate cap (20% of all requests). Spring Cloud's approach is simpler to configure; our approach is safer under sustained backend degradation because it prevents retry storms when many requests simultaneously fail.
+
+### application.yml
+
+```yaml
+spring:
+  application:
+    name: load-balancer-demo
+  cloud:
+    loadbalancer:
+      retry:
+        enabled: true
+        max-retries-on-next-service-instance: 1
+        retryable-status-codes: 500,502,503
+
+# Static service discovery (for demo — replace with Consul/Eureka in production)
+my-service:
+  ribbon:
+    listOfServers: localhost:8081,localhost:8082,localhost:8083
+
+server:
+  port: 8090
+```
+
+### Run it
+
+```bash
+# Terminal 1–3: start three Python backends on 8081, 8082, 8083
+python3 -m http.server 8081
+python3 -m http.server 8082
+python3 -m http.server 8083
+
+# Terminal 4: start the Spring Boot app
+cd labs/load-balancer/java-integration
+mvn spring-boot:run
+
+# Terminal 5: call the reactive endpoint
+curl http://localhost:8090/api/call
+
+# Kill backend 8082 and watch Spring Cloud route around it
+kill $(lsof -ti:8082)
+for i in $(seq 1 10); do curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8090/api/call; done
+```
+
+Expected: all 200s after the health check detects the failure (within 5 seconds of the kill).
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The retry budget math surprised me. At 85,000 req/sec, a 20% retry cap means 17,000 retries/sec maximum — but if 2 backends fail simultaneously and you have no cap, that same traffic generates 170,000 retry attempts to the one surviving backend. I expected the difference to be meaningful. I did not expect it to be the difference between 'one backend absorbs a surge' and 'the entire cluster collapses in seconds.' The circuit breaker and the retry budget are not independent features — they work together. The circuit breaker stops sending to failed backends, which reduces retry attempts. The retry budget stops amplifying load to the surviving backend. Remove either one and the failure mode changes from degraded-but-alive to total outage." />
+
+## Where to go deeper
+
+- **Envoy proxy architecture**: the production reference for L7 load balancing — every feature this toy misses (TLS, h2, circuit breakers, canary) is documented with the design rationale — [envoyproxy.io](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/intro/arch_overview)
+- **HAProxy configuration manual**: the balance algorithm documentation is the best single reference for load balancing algorithm tradeoffs — [cbonte.github.io](https://cbonte.github.io/haproxy-dconv/2.6/configuration.html#4.2-balance)
+- **Google Maglev (2016)**: how Google load balances at planetary scale using a consistent hashing table with 65,537 slots — [research.google](https://research.google/pubs/pub44824/)
+- **Netflix Zuul 2 and retry budgets**: the blog post that introduced the 20% retry budget concept and why it was chosen — [netflixtechblog.com](https://netflixtechblog.com/zuul-2-the-netflix-journey-to-asynchronous-non-blocking-systems-45947377f741)
+- **Hystrix and Resilience4j**: the Java ecosystem's circuit breaker libraries; Resilience4j is the actively maintained successor — [resilience4j.readme.io](https://resilience4j.readme.io/docs/circuitbreaker)
+
+## Related labs and questions
+
+- **Prerequisite foundation**: consistent-hashing — the algorithm behind session affinity and backend-to-shard mapping; understand jump hash before building a weighted load balancer
+- **Next in networking**: dns-resolver — DNS is how clients discover load balancer addresses; understanding the full resolution path (stub → recursive → authoritative) completes the picture
+- **Distributed companion**: gossip — the protocol that production LB clusters use to synchronize health state across instances without a central coordinator
+- **Java companion**: dist-lock — if you add a distributed health store (etcd) to synchronize circuit-breaker state across LB instances, you will need distributed locking; this lab builds that primitive

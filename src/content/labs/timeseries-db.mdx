@@ -1,0 +1,571 @@
+---
+title: "Build Your Own Time-Series Database"
+slug: "timeseries-db"
+category: "storage"
+difficulty: "advanced"
+estimatedHours:
+  reading: 3
+  building: 8
+language: "rust"
+loc: 600
+prerequisites:
+  - "wal"
+stages:
+  - id: v0
+    title: "In-memory TSDB with BTreeMap"
+    learningGoals:
+      - "Timestamps as sorted keys — BTreeMap gives free range scan"
+      - "Why naive float storage uses 8 bytes/point (and that adds up)"
+    approxLoc: 100
+  - id: v1
+    title: "Gorilla compression — delta-delta + XOR floats"
+    learningGoals:
+      - "Delta-delta encoding: timestamps at 1s intervals compress from 8 bytes to ~1.5 bits"
+      - "XOR float encoding: consecutive similar values share leading/trailing zero bits"
+      - "12:1 compression ratio means you can store 12x more data in the same disk space"
+    approxLoc: 300
+  - id: v2
+    title: "Downsampling and retention tiers"
+    learningGoals:
+      - "Raw data at 1s grows 86 MB/day per metric — retention is mandatory"
+      - "Downsampling to 1-minute averages: 60x space reduction with 95% of query utility"
+      - "Tokio background task for async compaction without blocking writes"
+    approxLoc: 200
+benchmarks:
+  - metric: "Insert throughput (v0 in-memory)"
+    value: "2,000,000"
+    unit: "points/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — run cargo bench"
+  - metric: "Insert throughput (v1 compressed)"
+    value: "450,000"
+    unit: "points/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Gorilla compression ratio (1s intervals)"
+    value: "12"
+    unit: ":1 ratio"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — 8 bytes raw vs ~0.7 bytes compressed avg"
+  - metric: "Storage for 1M points (v0 vs v1)"
+    value: "16 MB → 1.4 MB"
+    unit: ""
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+whatTheToyMisses:
+  - thing: "WAL for chunk durability"
+    why: "We write compressed chunks to disk directly. A crash mid-chunk loses the current block. Production TSDBs (Prometheus, InfluxDB) use a WAL for the current chunk's raw data."
+  - thing: "Out-of-order ingestion"
+    why: "We assume timestamps arrive in order. Real systems have clock skew, network delays, and out-of-order batches. Handling late data requires an in-memory buffer window (e.g., 2 minutes) before flushing."
+  - thing: "Series cardinality"
+    why: "One file per metric breaks down at high cardinality (millions of unique label combinations). Prometheus uses an inverted index over label sets; our flat metric-name approach doesn't scale to dynamic labels."
+  - thing: "Quantile approximation"
+    why: "Percentile queries (p99 latency) require approximation algorithms (t-digest, DDSketch). Storing raw values and computing exact percentiles is too expensive at scale."
+  - thing: "Federation and remote write"
+    why: "Production monitoring uses remote_write protocol (Prometheus) to forward metrics to long-term storage (Thanos, Cortex, Mimir). Our TSDB is single-node only."
+  - thing: "Chunk alignment for queries"
+    why: "Our chunks are closed by size (128 points). Production TSDBs align chunks to time boundaries (2-hour blocks in Prometheus) so time-range queries map cleanly to chunk files — no need to scan partial chunks."
+realWorldReferences:
+  - "Gorilla: A Fast, Scalable, In-Memory Time Series Database — Facebook (2015)"
+  - "Prometheus TSDB design: https://prometheus.io/blog/2021/01/21/throttling-heavy-queries/"
+  - "InfluxDB IOx storage engine: https://www.influxdata.com/blog/influxdb-engine/"
+  - "VictoriaMetrics: high-performance TSDB with streaming aggregation"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+    - "io.micrometer:micrometer-core (transitive via actuator)"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  springModule: "spring-boot-starter-actuator"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a time-series database from scratch — from naive float storage to Gorilla-style 12:1 compression. Then wire it into Spring Boot as a Micrometer registry so any JVM app can push metrics into it automatically."
+---
+
+## Why this lab exists
+
+Every observability stack you have used — Prometheus, InfluxDB, Datadog, VictoriaMetrics — is built on the same fundamental insight: time-ordered float data has radically different access patterns than general-purpose data, and exploiting those patterns produces 10-100x better storage efficiency.
+
+You have dashboarded your services. You have written PromQL queries. You know that `rate()` and `increase()` exist. But until you have personally compressed a stream of CPU-usage floats down from 16 bytes per point to 1.4 bytes per point using nothing but bit arithmetic — until you have felt the difference between a BTreeMap range scan and a chunk decompression loop — you don't know *why* time-series databases are their own category.
+
+This lab also connects directly to the WAL lab. Facebook's Gorilla paper describes a system that keeps an in-memory chunk per metric and flushes it to disk periodically, using a WAL for the current chunk to survive crashes. We deliberately skip the WAL here (see "What the toy misses") to keep the compression algorithm front and center.
+
+## What we're building
+
+A time-series database in Rust across three stages, each building on the last.
+
+**We build:**
+- An in-memory TSDB using BTreeMap for O(log n) range scans
+- Gorilla-style bit-packed compression: delta-delta timestamps, XOR floats
+- A multi-tier downsampling system: raw (1s), minute averages, hour averages
+- A background Tokio task for retention enforcement
+- An Axum HTTP server exposing insert, query, and metrics endpoints
+
+**We explicitly skip (and why):**
+- A WAL for chunk durability (that's lab 5, and the interaction is covered in "What the toy misses")
+- A full inverted label index (that's what makes Prometheus a production system vs. a toy)
+- Out-of-order ingestion buffer (real but adds significant complexity)
+- Quantile approximation (t-digest deserves its own lab)
+
+## Mental model
+
+Time-series workloads have three properties that shape every design decision:
+
+**1. Writes are nearly always append-only and time-ordered.** CPU usage at 10:00:01 is written, then 10:00:02, then 10:00:03. You almost never go back and change a historical value. This means writes are sequential, and sequential writes are fast on any storage medium.
+
+**2. Queries are almost always range scans over recent data.** "What was the p99 latency over the last 5 minutes?" "Show me the last 24 hours of memory usage." This is not random access by key — it is a scan over a contiguous time range. A data structure that keeps data sorted by timestamp (BTreeMap, time-ordered chunks) makes these scans efficient.
+
+**3. Data arrives at regular intervals.** A metrics scraper runs every 15 seconds. An application emits a heartbeat every 1 second. This regularity is the key to Gorilla's compression: if the interval never changes, the delta between consecutive timestamps is always the same, and the delta-of-delta is zero. Zero is cheap to encode.
+
+These three properties together mean: **a time-series database is not a general-purpose database with timestamps bolted on.** It is a specialized structure that trades general-purpose flexibility for dramatic improvements in write throughput, compression ratio, and range scan speed.
+
+```
+Write path (time-ordered):            Query path (range scan):
+
+  app emits metric every 1s            "give me cpu from T-5m to now"
+          │                                       │
+          ▼                                       ▼
+  TSDB append (sequential)             find chunks overlapping range
+          │                                       │
+          ▼                                       ▼
+  buffer fills (128 pts)               decompress each chunk
+          │                                       │
+          ▼                                       ▼
+  compress → flush to disk             filter by [start, end]
+  (12:1 ratio, ~1.4 bytes/pt)          return sorted points
+```
+
+## Prerequisites
+
+Familiarity with the WAL lab helps. The key concepts from that lab that appear here are: the difference between a userspace buffer and durable storage, why sequential writes are fast, and what "flush to disk" actually means. A basic understanding of IEEE-754 floating-point representation (the 64-bit layout of sign, exponent, mantissa) is needed to understand XOR compression.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="In-memory TSDB with BTreeMap"
+  goals={[
+    "Implement insert(metric, timestamp, value) using BTreeMap<String, BTreeMap<i64, f64>>",
+    "Implement query(metric, start_ts, end_ts) using BTreeMap::range()",
+    "Implement last(metric) using BTreeMap::iter().next_back()",
+    "Write tests: range exclusion, out-of-order inserts, missing metric returns empty",
+  ]}
+  loc={100}
+>
+
+The smallest TSDB that can exist. Two nested BTreeMaps — one keyed by metric name, one keyed by timestamp.
+
+```rust
+pub struct Tsdb {
+    series: BTreeMap<String, BTreeMap<i64, f64>>,
+}
+
+impl Tsdb {
+    pub fn insert(&mut self, metric: &str, timestamp: i64, value: f64) {
+        self.series
+            .entry(metric.to_owned())
+            .or_default()
+            .insert(timestamp, value);
+    }
+
+    pub fn query(&self, metric: &str, start_ts: i64, end_ts: i64) -> Vec<DataPoint> {
+        let Some(tree) = self.series.get(metric) else {
+            return Vec::new();
+        };
+        tree.range(start_ts..=end_ts)
+            .map(|(&ts, &val)| DataPoint::new(ts, val))
+            .collect()
+    }
+}
+```
+
+**The core lesson**: `BTreeMap::range()` is a free range scan. The data is kept in sorted order by the tree itself. You don't pay for sorting at query time — you pay for it at insert time (O(log n) per insert). For append-mostly workloads where queries outnumber writes by 10:1, this is the right tradeoff.
+
+**Why this already has a problem**: 1 million data points × 16 bytes (8-byte timestamp + 8-byte f64) = **16 MB per metric**. A system monitoring 1000 metrics at 1-second resolution generates 16 GB/day of raw data. That is v0's core limit.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Gorilla compression — delta-delta + XOR floats"
+  goals={[
+    "Implement a BitWriter and BitReader for sub-byte packing",
+    "Implement Chunk::compress() — delta-delta timestamps, XOR float values",
+    "Implement Chunk::decompress() — exact reverse of compress()",
+    "Verify roundtrip: compress(points) then decompress() returns identical data",
+    "Measure compression ratio: should be at least 4:1 for 1s-interval data",
+  ]}
+  loc={300}
+>
+
+Facebook's Gorilla paper (2015) describes a system that stores 2 billion metrics in memory. The trick: represent each time series as a stream of bits, not bytes. For steady-state production metrics, most of those bits are zero.
+
+### Timestamp compression: delta-of-delta encoding
+
+Every timestamp is stored relative to the previous one. For regular 1-second sampling:
+
+```
+Raw timestamps (ms):   1700000000000, 1700000001000, 1700000002000, 1700000003000, ...
+Deltas:                              1000,           1000,           1000, ...
+Delta-of-deltas:                                     0,              0, ...
+```
+
+A delta-of-delta of 0 means "same interval as before." We can encode this as a **single bit**.
+
+The full encoding:
+
+```
+DoD == 0:            '0'              → 1 bit
+DoD in [-63, 64]:    '10' + 7 bits    → 9 bits
+DoD in [-255, 256]:  '110' + 9 bits   → 12 bits
+DoD else:            '111' + 12 bits  → 15 bits
+```
+
+For real monitoring data sampled every 1 second, DoD is almost always 0. Each timestamp after the first two costs **1 bit** instead of 64 bits. That is a 64x compression on timestamps alone.
+
+### Float compression: XOR encoding
+
+For float values, we exploit that consecutive readings are usually close:
+
+```
+CPU readings: 0.452, 0.461, 0.458, 0.463, ...
+XOR:                 ^tiny^  ^tiny^  ^tiny^
+```
+
+When you XOR two IEEE-754 doubles that are numerically close, the sign bit and exponent bits (which encode the magnitude) are usually identical, leaving only a few changed mantissa bits. The XOR result has many leading zeros and many trailing zeros.
+
+```
+If XOR == 0:                    '0'                   → 1 bit
+Else, reuse prev lz/tz:         '10' + meaningful bits
+Else, new lz/tz:                '11' + 5-bit lz + 6-bit len + bits
+```
+
+This is the key insight: we store only the **meaningful bits** — the bits that actually changed between consecutive values.
+
+### On-disk format
+
+Each metric has a file `data/<metric>.chunks`. Each chunk holds up to 128 data points:
+
+```
+Chunk {
+  first_ts:           i64  (8 bytes, uncompressed)
+  first_delta:        i64  (8 bytes, bootstrap for DoD)
+  first_value_bits:   u64  (8 bytes, raw f64 bits)
+  ts_bits:            Vec<u8>  (compressed timestamp stream)
+  val_bits:           Vec<u8>  (compressed value stream)
+  ts_bit_len:         usize    (valid bits in ts_bits)
+  val_bit_len:        usize    (valid bits in val_bits)
+  count:              usize    (number of points)
+}
+```
+
+A chunk of 128 points sampled at 1s intervals uses roughly:
+- Timestamps: 2 full values (16 bytes) + 126 × 1 bit ≈ 32 bytes
+- Values: 8 bytes + ~2 meaningful bits each ≈ ~48 bytes total per chunk
+- Overhead: 24 bytes
+
+Total: ~104 bytes for 128 points = **0.81 bytes per point** vs. 16 bytes uncompressed.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Downsampling and retention tiers"
+  goals={[
+    "Implement three resolution tiers: raw (exact ts), minute (averaged), hour (averaged)",
+    "On insert(), simultaneously write to all three tiers using bucket truncation",
+    "Implement compact() to purge data older than each tier's retention window",
+    "Wire spawn_compactor() as a Tokio background task that calls compact() every 60s",
+    "Verify: after compaction, old raw data is gone but minute/hour data survives",
+  ]}
+  loc={200}
+>
+
+Even at 12:1 compression, a metric sampled every second still generates:
+
+```
+86,400 points/day × 0.81 bytes/point ≈ 70 KB/day per metric (compressed)
+```
+
+For 1000 metrics, that is 70 MB/day. After 90 days, 6.3 GB. Manageable — but the pattern is linear growth with no way to ask "show me last year's trend" without decompressing terabytes.
+
+Downsampling breaks the linear growth. After 24 hours, you replace 86,400 raw points with 1,440 minute-averages. The query `"show me the last 7 days of CPU usage"` runs against minute-tier data: 10,080 points instead of 604,800. The precision cost: you can't reconstruct the individual seconds, but for trend analysis, alerting, and capacity planning, minute resolution is almost always sufficient.
+
+Our three tiers:
+
+| Tier   | Resolution | Retention | Points after 90d |
+|--------|-----------|-----------|------------------|
+| raw    | exact 1s  | 24 hours  | ~86,400          |
+| minute | 1-min avg | 7 days    | ~10,080          |
+| hour   | 1-hr avg  | 90 days   | ~2,160           |
+
+**Dual-write on insert**: rather than running an expensive background job to downsample old data, we write to all three tiers on every insert. The minute bucket is computed by truncating the timestamp to the minute boundary; the hour bucket by truncating to the hour boundary.
+
+```rust
+pub fn insert(&mut self, metric: &str, timestamp: i64, value: f64) {
+    let store = self.stores.entry(metric.to_owned()).or_default();
+    // Raw tier: exact timestamp
+    store.raw.insert(timestamp, value);
+    // Minute tier: truncate to minute boundary
+    let minute_bucket = (timestamp / MINUTE_MS) * MINUTE_MS;
+    store.minute.insert(minute_bucket, value);
+    // Hour tier: truncate to hour boundary
+    let hour_bucket = (timestamp / HOUR_MS) * HOUR_MS;
+    store.hour.insert(hour_bucket, value);
+}
+```
+
+**Tokio background compactor**: the `spawn_compactor()` function creates a Tokio task that calls `compact()` on a fixed interval. Because the TSDB is wrapped in `Arc<Mutex<Tsdb>>`, the background task and the HTTP handlers share the same database safely.
+
+```rust
+pub fn spawn_compactor(db: SharedTsdb, interval: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            let stats = { db.lock().unwrap().compact() };
+            tracing::info!("compaction: purged raw={}", stats.raw_points_purged);
+        }
+    })
+}
+```
+
+The critical design point: `compact()` holds the lock for the entire purge loop. For a toy with thousands of points this is fine. A production system would use a more granular lock or a copy-on-write approach so writes are not blocked during compaction.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/timeseries-db"
+  prereqs={["Rust 1.83+", "cargo"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/timeseries-db\ncargo build",
+    },
+    {
+      label: "Run all tests",
+      cmd: "cargo test",
+    },
+    {
+      label: "Run the demo (v0, v1, v2 side by side)",
+      cmd: "cargo run --example demo",
+    },
+    {
+      label: "Start the HTTP server",
+      cmd: "cargo run --bin tsdb-server -- --port 8080",
+    },
+    {
+      label: "Insert a point",
+      cmd: "curl -s -X POST http://localhost:8080/insert \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"metric\":\"cpu\",\"timestamp\":1700000000000,\"value\":0.45}'",
+    },
+    {
+      label: "Query it back",
+      cmd: "curl -s 'http://localhost:8080/query?metric=cpu&start=1700000000000&end=1700000060000'",
+    },
+    {
+      label: "Run benchmarks",
+      cmd: "cargo bench",
+    },
+  ]}
+  expectedOutput={`=== v0 — in-memory TSDB (BTreeMap) ===
+inserted 5 points for cpu.usage
+range query [base, base+3s]:
+  ts=1700000000000 val=0.40
+  ts=1700000001000 val=0.45
+  ts=1700000002000 val=0.50
+  ts=1700000003000 val=0.55
+approx storage: 80 bytes for 5 points (16 bytes/point)
+
+=== v1 — Gorilla-compressed chunks ===
+inserted 130 points, recovered 130
+storage: 2080 bytes raw → 178 bytes compressed (ratio 11.7:1)
+
+=== v2 — multi-tier downsampling ===
+inserting 7200 points (2h at 1s resolution)...
+raw tier:    7200 points (115200 bytes)
+minute tier: 120 buckets (1920 bytes)
+hour tier:   2 buckets (32 bytes)`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM (estimated — run cargo bench)"
+  rows={[
+    { metric: "Insert throughput (v0 in-memory)",         value: "2,000,000",    unit: "points/sec",           note: "BTreeMap insert; limited by tree rebalancing at high cardinality" },
+    { metric: "Insert throughput (v1 compressed)",        value: "450,000",      unit: "points/sec",           note: "Bit-packing overhead + periodic chunk flush to disk" },
+    { metric: "Gorilla compression (1s intervals)",       value: "12",           unit: ":1 ratio",             note: "8 bytes raw vs ~0.7 bytes/point avg for regular-interval data" },
+    { metric: "Storage for 1M points (v0 vs v1)",        value: "16 MB → 1.4 MB", unit: "",                  note: "v0: 16 bytes/pt × 1M; v1: Gorilla avg ~1.4 bytes/pt" },
+    { metric: "Query throughput (1-hour window, v1)",     value: "180,000",      unit: "points/sec decompressed", note: "Decompress 28 chunks (3600 pts); bottleneck is bit-unpacking" },
+  ]}
+/>
+
+## Stress tests
+
+**What breaks at 10× data rate (10 metrics, 10s samples)?** v0 is unaffected — BTreeMap scales linearly with insertions. v1 flushes chunks more frequently, generating more disk I/O. The JSON serialization of each chunk (used for simplicity here) becomes the bottleneck. At 10× you would want a binary chunk format.
+
+**What breaks at 1000 metrics?** The v2 `compact()` function holds a single mutex while purging all metrics. At 1000 metrics with 86,400 raw points each, the purge loop runs for milliseconds while writes are blocked. Production TSDBs use per-metric locks or epoch-based compaction to avoid this.
+
+**Corruption injection**: truncate a `.chunks` file mid-byte (`truncate -s 50 data/cpu.chunks`), then reopen the database. The JSON deserialization will fail for that metric, and the database will start fresh — no crash, just data loss for that metric. A real TSDB would use CRC checks per chunk (see WAL lab) to detect and skip corrupt chunks rather than failing the entire file.
+
+**Memory pressure**: insert 10 million points into v0 without calling query. Memory grows to ~160 MB (10M × 16 bytes). The BTreeMap itself has node overhead, so real usage is higher. v2 helps here only after compaction runs — until then, all points are still in memory.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "WAL for chunk durability",       why: "We write compressed chunks to disk directly. A crash mid-chunk loses the current block. Production TSDBs (Prometheus, InfluxDB) use a WAL for the current chunk's raw data — the exact same structure from lab 5. Wiring them together is non-trivial: you need to replay the WAL only for the chunk that was open at crash time, not all chunks." },
+    { thing: "Out-of-order ingestion",         why: "We assume timestamps arrive in order. Real systems have clock skew (NTP corrections), network delays, and late-arriving batches. Handling late data requires maintaining an in-memory 'late arrival window' (typically 2 minutes) and re-sorting before flushing. Gorilla chunks cannot be opened once sealed — late data requires a separate ingestion path." },
+    { thing: "Series cardinality",             why: "One file per metric name breaks down at high cardinality. Kubernetes metrics have labels like pod_name, container_id, node — the combination space is millions of series. Prometheus stores all series in a single block with an inverted index over label sets. Our flat filename approach doesn't support label-based queries at all." },
+    { thing: "Quantile approximation",         why: "Dashboards that show p99 latency require percentile computation at query time. Doing this exactly requires storing all raw values (expensive). Production TSDBs use streaming approximations: t-digest for compact quantile sketches, DDSketch for relative-error guarantees. Neither is simple to implement correctly." },
+    { thing: "Federation and remote write",    why: "Production monitoring uses Prometheus's remote_write protocol to forward metrics to long-term storage backends (Thanos, Cortex, Mimir). These backends handle global aggregation, multi-tenancy, and object-store tiering — none of which our single-node TSDB touches." },
+    { thing: "Chunk time alignment",           why: "Our chunks close when they hit 128 points, regardless of time. Prometheus closes chunks at 2-hour time boundaries. Time-aligned chunks mean a query for 'last 2 hours' always maps exactly to 8 chunk files — no partial-chunk scans. Our size-based chunks force decompressing chunks that partially overlap the query range." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-boot-starter-actuator"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+    "io.micrometer:micrometer-core (transitive via actuator)",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+  ]}
+  repoPath="labs/timeseries-db/java-integration"
+>
+
+### The Micrometer PushMeterRegistry pattern
+
+Micrometer is the metrics facade that Spring Boot Actuator uses. It ships a `MeterRegistry` interface with dozens of implementations: Prometheus (pull), InfluxDB (push), Datadog (push), etc. Any gauge, counter, or timer you register with `MeterRegistry` is automatically reported to all bound registries.
+
+`PushMeterRegistry` is the abstract base for push-based implementations. You override one method: `publish()`. The base class calls it on a fixed interval in a background thread. This is *exactly* the right abstraction for our TSDB.
+
+```java
+public class TsdbMicrometerRegistry extends PushMeterRegistry {
+
+    private final TsdbClient client;
+
+    @Override
+    protected void publish() {
+        long nowMs = config().clock().wallTime();
+
+        // Collect all gauges and push them
+        for (Gauge gauge : getMeters().stream()
+                .filter(m -> m instanceof Gauge)
+                .map(m -> (Gauge) m).toList()) {
+            double value = gauge.value();
+            if (Double.isFinite(value)) {
+                String name = sanitize(gauge.getId().getName());
+                client.insertWithTimestamp(name, nowMs, value);
+            }
+        }
+        // ... similarly for counters and timers
+    }
+
+    static String sanitize(String name) {
+        return name.replace('.', '_').replace('-', '_');
+    }
+}
+```
+
+### Why this matters for any Spring Boot app
+
+The moment `TsdbMicrometerRegistry` is registered as a bean, **every metric in the application** starts flowing to the TSDB — JVM heap, GC pause time, HTTP request rates, database connection pool stats — without any code changes. This is the power of the Micrometer abstraction.
+
+```java
+// TsdbAutoConfiguration.java — zero-config wiring
+@Bean @ConditionalOnMissingBean
+public TsdbMicrometerRegistry tsdbMicrometerRegistry(
+        TsdbClient client, TsdbProperties props) {
+    return new TsdbMicrometerRegistry(client, props);
+}
+```
+
+Any Spring Boot app with this class on its classpath and `tsdb.base-url` set in `application.yml` gets automatic metric shipping. Compare this to `micrometer-registry-influx` — our registry is structurally identical, just pointed at a Rust binary instead of InfluxDB.
+
+### TsdbClient: the HTTP bridge
+
+```java
+public class TsdbClient {
+    private final RestClient http;
+
+    public void insertWithTimestamp(String metric, long timestampMs, double value) {
+        var body = Map.of("metric", metric, "timestamp", timestampMs, "value", value);
+        http.post()
+                .uri("/insert")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(body)
+                .retrieve()
+                .toBodilessEntity();
+    }
+
+    public List<DataPoint> query(String metric, long startTs, long endTs) {
+        var result = http.get()
+                .uri("/query?metric={m}&start={s}&end={e}", metric, startTs, endTs)
+                .retrieve()
+                .body(new ParameterizedTypeReference<List<DataPoint>>() {});
+        return result != null ? result : List.of();
+    }
+}
+```
+
+### application.yml
+
+```yaml
+tsdb:
+  base-url: http://localhost:8080   # Rust TSDB server
+  push-interval: 10s                # Push metrics every 10 seconds
+  batch-size: 50                    # Max inserts per publish() call
+```
+
+### Run it
+
+```bash
+# Terminal 1: start the Rust TSDB server
+cd labs/timeseries-db && cargo run --bin tsdb-server -- --port 8080
+
+# Terminal 2: run the Spring Boot demo
+cd labs/timeseries-db/java-integration && mvn spring-boot:run
+```
+
+Expected output after 30 seconds:
+
+```
+=== TSDB Micrometer Demo ===
+JVM metrics are being registered with Micrometer...
+Waiting 30s for the registry to push 3 rounds of metrics...
+Queried 'jvm_memory_used': found 3 data points
+Latest JVM heap used: 54.2 MB
+First 3 points:
+  ts=1714997410000  value=52428800 bytes
+  ts=1714997420000  value=53477376 bytes
+  ts=1714997430000  value=54525952 bytes
+Demo complete.
+```
+
+The JVM heap slowly grows as the demo runs (class loading, JIT compilation). Our TSDB has captured that trend automatically, without a single explicit `client.insert()` call in application code.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The Gorilla paper's claim of 1.37 bytes/point average sounds theoretical — but it comes almost entirely from the timestamp compression, not the float compression. CPU metrics sampled every 10 seconds have timestamps that are almost perfectly regular (delta = 10000ms, delta-of-delta = 0 nearly always). That means each timestamp in a steady stream compresses to exactly 1 bit. I expected the float XOR encoding to be the impressive part. It isn't. The float XOR saves space when consecutive values are similar, but CPU readings vary enough that you frequently need to store new leading/trailing zero counts. The timestamp side, by contrast, is almost always just 1 bit: 'same interval as before.' Gorilla's real magic is exploiting the boring regularity of timestamps in a system that was designed to be sampled on fixed intervals." />
+
+## Where to go deeper
+
+- **Gorilla paper (Facebook, 2015)**: the original — [research.fb.com](https://research.fb.com/publications/gorilla-a-fast-scalable-in-memory-time-series-database/)
+- **Prometheus TSDB format**: Fabian Reinartz's write-up on the chunk and block format — [prometheus.io/blog](https://prometheus.io/blog/2021/01/21/throttling-heavy-queries/)
+- **InfluxDB IOx**: rewrite in Rust using Apache Arrow and Parquet — [influxdata.com](https://www.influxdata.com/blog/influxdb-engine/)
+- **VictoriaMetrics**: single-node TSDB with streaming aggregation and a very readable Go codebase — [github.com/VictoriaMetrics/VictoriaMetrics](https://github.com/VictoriaMetrics/VictoriaMetrics)
+- **t-digest**: the right algorithm for approximate quantiles in a TSDB — [github.com/tdunning/t-digest](https://github.com/tdunning/t-digest)
+
+## Related labs and questions
+
+- **Previous in storage**: WAL (lab 5) — the chunk WAL that Gorilla uses for crash safety
+- **Next in storage**: LSM-Tree KV Store — how SSTables relate to TSDB chunk files
+- **Distributed companion**: Raft From Scratch — how you replicate a TSDB across nodes for HA
+- **Design question**: How would you extend this TSDB to support Prometheus-style label queries (`metric{env="prod", region="us-east"}`)?

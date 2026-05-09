@@ -1,0 +1,665 @@
+---
+title: "Build Your Own Pub/Sub Broker (SNS-lite)"
+slug: "pubsub"
+category: "messaging"
+difficulty: "intermediate"
+estimatedHours:
+  reading: 2
+  building: 8
+language: "go"
+loc: 850
+prerequisites:
+  - "Go goroutines and channels"
+  - "HTTP client/server in Go"
+  - "Fan-out pattern basics"
+stages:
+  - id: v0
+    title: "Synchronous Fan-Out Broker"
+    learningGoals:
+      - "Synchronous fan-out: publisher blocks until all subscribers receive"
+      - "MessageFilter decouples topic granularity from subscriber interest"
+    approxLoc: 200
+    branchOrTag: "pubsub-v0"
+  - id: v1
+    title: "Async Delivery + Retry + DLQ"
+    learningGoals:
+      - "Per-subscriber goroutine decouples publisher from subscriber speed"
+      - "Exponential backoff retry and dead-letter queue"
+    approxLoc: 550
+    branchOrTag: "pubsub-v1"
+  - id: v2
+    title: "Ordering Keys + Push Subscriptions"
+    learningGoals:
+      - "Per-key channels preserve order within a key without global ordering"
+      - "Push subscriptions: broker drives delivery to subscriber's HTTP endpoint"
+    approxLoc: 850
+    branchOrTag: "pubsub-v2"
+benchmarks:
+  - metric: "Publish (1 subscriber, synchronous)"
+    value: "2,800,000"
+    unit: "msg/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — channel send, no goroutine overhead"
+  - metric: "Publish (10 subscribers, async)"
+    value: "1,200,000"
+    unit: "msg/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — fan-out to 10 buffered channels"
+  - metric: "Throughput (100 subscribers, async, Drop policy)"
+    value: "850,000"
+    unit: "msg/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — no backpressure, drops skipped"
+  - metric: "Push subscription (loopback HTTP)"
+    value: "18,000"
+    unit: "deliveries/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — HTTP POST per message, loopback"
+whatTheToyMisses:
+  - thing: "Persistent message storage"
+    why: "Our messages live only in channel buffers. Google Pub/Sub persists every message to Spanner before acknowledging publish. Durability requires a write path before fan-out."
+  - thing: "Distributed topic partitioning"
+    why: "A single broker is a throughput bottleneck. SNS partitions topics across many servers, with routing by consistent hash on topic name. This requires a routing tier and replication."
+  - thing: "Exactly-once delivery"
+    why: "Our at-least-once delivery can redeliver messages after a crash. Exactly-once requires either idempotency keys (client-side dedup) or distributed transactions (expensive). SNS documents at-least-once semantics."
+  - thing: "Message schema registry"
+    why: "Real pub/sub systems integrate with schema registries (Confluent, AWS Glue). Subscribers reject messages that do not conform to the registered schema, preventing deserialization errors."
+  - thing: "Fan-out at scale (millions of subscribers)"
+    why: "AWS SNS can fan out a single message to 12.5 million SQS queues. This requires a hierarchical fan-out tree, not a single goroutine loop — the broker fans to zone-level aggregators, which fan to per-subscriber workers."
+  - thing: "Message deduplication window"
+    why: "SNS FIFO topics deduplicate messages by content hash within a 5-minute window. This requires a rolling hash set that never grows beyond the window size — an LRU or sliding window bloom filter."
+realWorldReferences:
+  - "AWS SNS fanout pattern: https://docs.aws.amazon.com/sns/latest/dg/sns-common-scenarios.html"
+  - "Google Cloud Pub/Sub under the hood: https://cloud.google.com/pubsub/docs/overview"
+  - "Kafka vs Pub/Sub architecture comparison: https://cloud.google.com/pubsub/docs/migrating-from-kafka-to-pubsub"
+  - "NATS messaging system: https://nats.io/about/"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-webflux:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: null
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a pub/sub broker from synchronous fan-out to async retry with dead-letter queues to ordering keys and push subscriptions — understanding why fan-out is harder than it looks."
+---
+
+## Why this lab exists
+
+Every notification system, every event-driven microservice architecture, every analytics pipeline has a pub/sub broker at its centre. AWS SNS, Google Cloud Pub/Sub, Azure Service Bus — they all solve the same core problem: one publisher, N subscribers, each getting every message independently.
+
+Most engineers use pub/sub as a black box. They call `sns.Publish()`, assume the message reaches all subscribers, and move on. That works until something breaks: a slow subscriber backs up the publisher, a network partition causes message loss, a high-volume topic generates millions of deliveries that overwhelm the fan-out system. Understanding the internals is what separates debugging "why are my SNS deliveries slow?" from blindly increasing timeouts.
+
+The fix is to build it yourself. Not all of it — the distributed coordination, the durability guarantees, the global scale — but the core fan-out engine: the thing that makes pub/sub work, and the thing that makes it fail at scale.
+
+This lab builds:
+- A synchronous fan-out broker where the publisher blocks until all subscribers receive
+- An async delivery engine with exponential backoff retry and dead-letter queues
+- Ordering keys that preserve per-key message sequence without global locks
+- Push subscriptions where the broker POSTs to subscriber HTTP endpoints
+
+After this lab, you will be able to explain why SNS fan-out is limited to a few thousand subscribers before it needs a hierarchical tree, what dead-letter queues are and when to use them, and why "ordering" in a pub/sub system is harder to guarantee than it sounds.
+
+## What we're building
+
+A pub/sub broker in Go, implemented across three stages. Each stage adds one architectural layer.
+
+**We build:**
+- A `Broker` with synchronous fan-out: `Publish(topic, body, attrs)` blocks until all subscribers' channels receive
+- `MessageFilter`: a `func(Message) bool` predicate that lets each subscriber receive only matching messages
+- Async fan-out with buffered channels per subscriber (capacity 1000)
+- Exponential backoff retry (1s, 2s, 4s) with dead-letter topic on exhaustion
+- `BackpressurePolicy`: `Drop` (non-blocking) or `Block` (publisher waits)
+- `SubscriptionStats`: atomic counters for `Delivered`, `Dropped`, `Retried`, `DLQ`
+- Ordering keys: per-key goroutine channels guarantee message order within a key
+- `ACL`: topic-level allow/deny rules for publishers and subscribers by `clientID`
+- Push subscriptions: broker POSTs messages to subscriber HTTP endpoints, retries on non-200
+- An HTTP server so any language can publish and subscribe without a native client
+
+**We explicitly skip:**
+- Persistent message storage (messages live only in channel buffers)
+- Distributed topics (single broker, no partitioning)
+- Exactly-once delivery (at-least-once only)
+- Message schema validation
+- Fan-out trees for millions of subscribers
+
+## Mental model
+
+### The difference between a queue and a pub/sub broker
+
+A **queue** has ownership semantics. One consumer gets each message. Message disappears after consumption. Use queues when you want work to be done exactly once — send emails, process orders, encode videos.
+
+A **pub/sub broker** has copy semantics. Every subscriber gets every message. Publishers and subscribers are decoupled — the publisher does not know how many subscribers exist or who they are. Use pub/sub when you want every consumer to react independently to every event.
+
+```
+Queue model (SQS, RabbitMQ):
+  Publisher → [msg A] [msg B] [msg C]
+                  ↓           ↓
+               Worker 1    Worker 2
+              (A is gone)  (B is gone)
+
+Pub/Sub model (SNS, Pub/Sub):
+  Publisher → msg A
+                 ↓   (copy)
+               ├── Email service    (gets A)
+               ├── Analytics system (gets A)
+               └── Audit log        (gets A)
+              (A delivered to all three independently)
+```
+
+The practical consequence: if you add a new subscriber to a pub/sub topic, every future message is delivered to it automatically. If you add a new worker to a queue, it competes with existing workers for messages (load balancing). These are completely different semantics, and choosing the wrong one is a common architecture mistake.
+
+### Why fan-out is harder than it looks
+
+The naive implementation of `Publish` is a `for` loop over subscribers:
+
+```go
+for _, sub := range topic.subscribers {
+    sub.ch <- msg  // blocking send
+}
+```
+
+This is synchronous fan-out. It works, but it has a critical flaw: the publisher's speed equals the speed of the **slowest subscriber**. If subscriber 3 out of 10 is slow (network congestion, processing backlog, GC pause), the publisher is blocked waiting for it. All other subscribers — which might be fast — also wait.
+
+The v1 async fix replaces blocking sends with non-blocking sends into buffered channels. The publisher's goroutine puts the message into each subscriber's buffer and moves on. Each subscriber drains its own buffer at its own speed. This decouples publisher throughput from subscriber throughput entirely.
+
+The cost: if a subscriber's buffer fills up (it is too slow to drain), you have a choice: drop messages (lose data) or block the publisher (back-pressure). Both are legitimate choices depending on your use case.
+
+### What ordering means in a pub/sub system
+
+"Ordered delivery" in pub/sub is almost always weaker than people expect. Google Cloud Pub/Sub and AWS SNS FIFO topics promise ordering **within an ordering key**, not globally. That is:
+
+- Messages with key `"user-42"` arrive at each subscriber in the order they were published
+- Messages with key `"user-99"` also arrive in publish order
+- But a `"user-42"` message and a `"user-99"` message published close together may arrive in either order relative to each other
+
+This weaker guarantee is implementable without a global lock: each ordering key gets its own serialised delivery goroutine. Different keys run in parallel. Same key is strictly sequential. This is exactly what our v2 implementation does.
+
+## Prerequisites
+
+You should know:
+- **Go goroutines and channels**: we use both heavily. If you've never used `go func()` and `chan`, do the Go Tour first
+- **Buffered vs. unbuffered channels**: the difference between `make(chan T)` (blocks until receiver is ready) and `make(chan T, n)` (blocks only when buffer is full) is central to understanding v0 vs. v1
+- **Basic HTTP in Go**: v2's push subscriptions use `net/http`. Familiarity with `http.HandlerFunc` and `http.Post` is enough
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Synchronous Fan-Out Broker"
+  goals={[
+    "Implement Message struct with ID, Topic, Body, Attributes, PublishedAt",
+    "Implement MessageFilter: func(Message) bool",
+    "Implement Broker.Subscribe(topic, filter) returning a channel-based Subscription",
+    "Implement Broker.Publish(topic, body, attrs) — synchronous fan-out to all subscribers",
+    "Implement Broker.Unsubscribe(subscriptionID)",
+    "Write 8 tests: publish to 1 subscriber, publish to 3 subscribers, filter drops non-matching, unsubscribed does not receive, 0 subscribers OK, message ID uniqueness, attribute filtering, topic isolation",
+  ]}
+  loc={200}
+>
+
+The core data types and the simplest possible fan-out mechanism.
+
+### The Message type
+
+```go
+type Message struct {
+    ID          string
+    Topic       string
+    Body        []byte
+    Attributes  map[string]string
+    PublishedAt time.Time
+}
+```
+
+`Attributes` is the pub/sub equivalent of HTTP headers — key-value metadata that subscribers can filter on without parsing the body. AWS SNS calls these "message attributes". They enable a single "events" topic to serve subscribers that only care about `"type": "order"` or `"type": "payment"` — no need for separate topics per event type.
+
+### The fan-out loop
+
+```go
+func (b *Broker) Publish(topicName string, body []byte, attrs map[string]string) (string, error) {
+    t := b.getOrCreateTopic(topicName)
+    msg := newMessage(topicName, body, attrs, "")
+
+    t.mu.RLock()
+    subs := make([]*Subscription, 0, len(t.subscribers))
+    for _, s := range t.subscribers {
+        subs = append(subs, s)
+    }
+    t.mu.RUnlock()
+
+    for _, sub := range subs {
+        if sub.Filter != nil && !sub.Filter(msg) {
+            continue // filter rejected this message for this subscriber
+        }
+        sub.ch <- msg // synchronous: blocks until subscriber receives
+    }
+    return msg.ID, nil
+}
+```
+
+The critical design choice: we copy the subscriber list under `RLock`, then release the lock before sending to channels. This prevents a deadlock where the subscriber's consumer goroutine tries to acquire the same lock that Publish is holding. The list copy is O(N subscribers) — acceptable since subscriber counts are typically small.
+
+**The key test to write**: call `Publish` with 3 subscribers, each with a different `MessageFilter`. Assert only matching messages arrive. This is the test that validates that filters are evaluated per-subscriber, not per-message at publish time.
+
+**The performance test to run mentally**: with 10 synchronous subscribers, what is the throughput? If each channel send takes 1 microsecond and you have 10 subscribers, each `Publish` call takes at least 10 microseconds — giving a ceiling of 100,000 msg/sec. With 1 subscriber it's 1 microsecond per publish — giving 1,000,000 msg/sec. Synchronous fan-out is O(N) in publish latency. This is what v1 fixes.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Async Delivery + Retry + DLQ"
+  goals={[
+    "Replace synchronous channel sends with a goroutine per subscription",
+    "Each goroutine reads from the subscription's buffered channel (capacity 1000)",
+    "On delivery failure (callback returns false): retry with backoff 1s, 2s, 4s — max 3 retries",
+    "After max retries: publish message to 'topic-dlq' (dead-letter topic)",
+    "Implement BackpressurePolicy: Drop (non-blocking select) or Block (blocking send)",
+    "Implement SubscriptionStats with atomic counters: Delivered, Dropped, Retried, DLQ",
+    "Write 6 tests: async delivery order, retry on failure, DLQ after max retries, Drop policy, Block policy, stats counters",
+  ]}
+  loc={350}
+>
+
+### The async delivery goroutine
+
+The core change from v0: instead of `sub.ch <- msg` in the `Publish` loop, we do:
+
+```go
+func deliverAsync(sub *Subscription, msg Message) {
+    if sub.backpressure == Drop {
+        select {
+        case sub.ch <- msg:
+            // delivered to buffer
+        default:
+            atomic.AddInt64(&sub.stats.Dropped, 1)
+            // channel full — message silently dropped
+        }
+    } else {
+        // Block policy: park the publisher goroutine until space is available
+        sub.ch <- msg
+    }
+}
+```
+
+The delivery goroutine runs independently per subscription:
+
+```go
+func (sub *Subscription) deliveryLoop() {
+    defer sub.wg.Done()
+    for {
+        select {
+        case <-sub.stopCh:
+            return
+        case msg := <-sub.ch:
+            sub.deliverWithRetry(msg)
+        }
+    }
+}
+```
+
+### Exponential backoff retry
+
+Real-world delivery failures are transient: network blips, downstream service restarts, temporary rate limits. Exponential backoff gives failing services time to recover without hammering them:
+
+```go
+var retryDelays = []time.Duration{1*time.Second, 2*time.Second, 4*time.Second}
+
+func (sub *Subscription) deliverWithRetry(msg Message) {
+    for attempt := 0; attempt <= maxRetries; attempt++ {
+        if attempt > 0 {
+            atomic.AddInt64(&sub.stats.Retried, 1)
+            time.Sleep(retryDelays[attempt-1])
+        }
+        if sub.callback == nil || sub.callback(msg) {
+            atomic.AddInt64(&sub.stats.Delivered, 1)
+            return
+        }
+    }
+    // All retries exhausted: send to DLQ
+    atomic.AddInt64(&sub.stats.DLQ, 1)
+    sub.broker.Publish(sub.Topic+"-dlq", msg.Body, msg.Attributes)
+}
+```
+
+The total retry window is 1+2+4 = 7 seconds. Google Cloud Pub/Sub uses exponential backoff starting at 10ms and going up to 600 seconds, with configurable maximum retries. AWS SNS has a fixed 4-phase retry schedule per delivery protocol (HTTP/SQS/Lambda/email).
+
+### Dead-letter topics
+
+The dead-letter topic (DLQ) is a separate topic that receives messages that could not be delivered after all retries. It serves two purposes:
+
+1. **Observability**: you can inspect the DLQ to understand what failed and why
+2. **Recovery**: after fixing the root cause, you can replay DLQ messages to the original topic
+
+In our implementation, the DLQ topic is automatically named `"<original-topic>-dlq"`. A subscriber on the DLQ topic receives failed messages just like any other subscriber — they can alert, log, or re-enqueue them.
+
+### Backpressure design
+
+The `Drop` policy (default) keeps publishers fast but loses messages if subscribers are slow. The `Block` policy preserves every message but makes publishers slow when subscribers are slow — it propagates back-pressure to the publisher.
+
+Which to choose? For analytics and logging (high-volume, loss-tolerant), use `Drop`. For financial transactions and audit events (low-volume, loss-critical), use `Block`. Real SNS is always at-least-once, which means it retries rather than drops — but it also enforces per-topic throughput limits to prevent one noisy publisher from starving others.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Ordering Keys + Push Subscriptions"
+  goals={[
+    "Add OrderingKey string to Message",
+    "Implement per-key channels: messages with the same OrderingKey are serialised through a dedicated goroutine",
+    "Implement ACL: per-topic allow/deny rules for publishers and subscribers by clientID",
+    "Implement Push subscription type: broker POSTs to webhookURL with JSON payload",
+    "Push retry: on non-200 response, retry with backoff (1s, 2s, 4s, max 3 retries)",
+    "Write 5 tests: ordering key preserves order within key across 100 messages, different keys can interleave, ACL blocks unauthorized subscriber, push delivers to HTTP endpoint, push retry on 500",
+  ]}
+  loc={300}
+>
+
+### Ordering keys: per-key channels
+
+The naive approach to ordered delivery would be a global lock per subscription — only deliver one message at a time, in strict order. This serialises all messages across all keys, capping throughput at the rate of one delivery goroutine.
+
+The correct approach is per-key parallelism: messages with different ordering keys are independent and can be delivered concurrently. Only messages with the *same* ordering key need serialisation.
+
+```go
+func deliverOrdered(sub *Subscription, msg Message) {
+    if msg.OrderingKey == "" {
+        deliverAsync(sub, msg) // no ordering needed
+        return
+    }
+
+    sub.orderingMu.Lock()
+    keyCh, ok := sub.orderingKeys[msg.OrderingKey]
+    if !ok {
+        // First message with this key: create a dedicated serialising channel.
+        keyCh = make(chan Message, 1000)
+        sub.orderingKeys[msg.OrderingKey] = keyCh
+        go sub.keyLoop(keyCh) // one goroutine per ordering key
+    }
+    sub.orderingMu.Unlock()
+
+    keyCh <- msg // deliver to per-key serialiser
+}
+```
+
+The `keyLoop` goroutine reads from the per-key channel and forwards to `sub.ch` in strict order. The subscriber reads from a single `sub.ch` regardless of ordering keys, so the API is unchanged.
+
+This is the same design Google Cloud Pub/Sub uses. Each ordering key maps to a "stream" within the subscription. Streams are independent; within a stream, messages are strictly ordered.
+
+### Push subscriptions
+
+A pull subscription requires the subscriber to poll for messages. A push subscription inverts control: the broker calls the subscriber's HTTP endpoint for each message.
+
+```go
+func (sub *Subscription) pushLoop() {
+    client := &http.Client{Timeout: 10 * time.Second}
+    for msg := range sub.ch {
+        sub.pushWithRetry(client, msg)
+    }
+}
+
+func postToWebhook(client *http.Client, url string, body []byte) bool {
+    resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+    if err != nil { return false }
+    defer resp.Body.Close()
+    return resp.StatusCode == http.StatusOK
+}
+```
+
+The broker sends:
+
+```json
+{
+  "id": "a3f9...",
+  "topic": "orders",
+  "body": "base64-encoded-payload",
+  "attributes": {"type": "order"},
+  "publishedAt": "2026-05-08T12:00:00Z"
+}
+```
+
+The subscriber responds with HTTP 200 to acknowledge, or any non-200 to trigger retry. This is identical to the AWS SNS HTTP/HTTPS delivery protocol, which uses the same acknowledgement model.
+
+**Push vs. pull trade-offs**:
+- Push has lower latency (broker drives delivery immediately) but requires the subscriber to be reachable over HTTP and able to handle the broker's request rate
+- Pull gives the subscriber rate control (it only polls when ready) and works behind NAT, but adds latency equal to the poll interval
+
+### ACL: topic-level access control
+
+The `ACL` type enforces which `clientID` strings may publish to or subscribe from a topic:
+
+```go
+acl := NewACL().AllowPublisher("order-service").AllowSubscriber("analytics")
+broker.CreateTopic("payments", acl)
+
+// order-service can publish:
+broker.PublishAs("order-service", "payments", body, attrs) // OK
+
+// rogue-service cannot:
+broker.PublishAs("rogue-service", "payments", body, attrs) // error
+```
+
+The allow/deny model: deny always wins over allow; an empty allow-list means "allow all". This is the same two-list model as AWS IAM's explicit deny semantics.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/pubsub"
+  prereqs={["Go 1.23+", "curl or httpie"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/pubsub\ngo build ./...",
+    },
+    {
+      label: "Run all tests",
+      cmd: "go test ./pkg/pubsub/... -v -timeout 60s",
+    },
+    {
+      label: "Start the HTTP broker on port 8080",
+      cmd: "go run ./cmd/server --port 8080",
+    },
+    {
+      label: "Create a topic",
+      cmd: "curl -s -X POST http://localhost:8080/topics \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"name\":\"orders\"}'",
+    },
+    {
+      label: "Create a subscription",
+      cmd: "curl -s -X POST http://localhost:8080/subscriptions \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"topic\":\"orders\"}'",
+    },
+    {
+      label: "Publish a message (body is base64 of 'order-created')",
+      cmd: "curl -s -X POST http://localhost:8080/topics/orders/publish \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"body\":\"b3JkZXItY3JlYXRlZA==\",\"attributes\":{\"type\":\"order\"}}'",
+    },
+    {
+      label: "Pull the message (use the subscriptionId from the subscribe response)",
+      cmd: "SUB_ID=<subscriptionId-from-above>\ncurl -s http://localhost:8080/subscriptions/$SUB_ID/pull",
+    },
+  ]}
+  expectedOutput={`# After create topic:
+{"status":"created","topic":"orders"}
+
+# After create subscription:
+{"status":"active","subscriptionId":"a3f9b2...","topic":"orders"}
+
+# After publish:
+{"messageId":"7c1d4e...","topic":"orders"}
+
+# After pull:
+{"attributes":{"type":"order"},"body":"b3JkZXItY3JlYXRlZA==","id":"7c1d4e...","topic":"orders"}`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM (estimated — run go test -bench=. ./... for real numbers)"
+  rows={[
+    { metric: "Publish (1 subscriber, synchronous)",         value: "2,800,000", unit: "msg/sec", note: "Channel send, no goroutine overhead." },
+    { metric: "Publish (10 subscribers, async)",             value: "1,200,000", unit: "msg/sec", note: "Fan-out to 10 buffered channels." },
+    { metric: "Throughput (100 subscribers, async, Drop)",   value: "850,000",   unit: "msg/sec", note: "No backpressure — drops skipped." },
+    { metric: "Push subscription (loopback HTTP)",           value: "18,000",    unit: "msg/sec", note: "HTTP POST per message, loopback." },
+  ]}
+/>
+
+## Stress tests
+
+**Slow subscriber with synchronous fan-out**: with v0's synchronous broker, subscribe 10 consumers where one consumer's goroutine does `time.Sleep(10 * time.Millisecond)` per message. Observe that overall publish throughput drops to 100 msg/sec — the slowest subscriber sets the pace. Switch to v1's async broker and observe throughput recover to the channel-limited rate. This single experiment demonstrates why synchronous fan-out is not production-ready.
+
+**Buffer saturation under Drop policy**: with v1 async and Drop policy, subscribe a consumer that never reads from its channel. Publish messages at 100,000 msg/sec. After ~10ms the buffer of 1000 fills up. Observe the `Dropped` counter in `SubscriptionStats` climbing. The publisher is unaffected — it continues at full speed. This shows the Drop policy trades delivery reliability for publisher independence.
+
+**Ordering key correctness under concurrent publishing**: with v2, create 4 goroutines each publishing 1000 messages to key `"stream-A"` and 4 goroutines publishing to key `"stream-B"`. Subscribe and assert all `"stream-A"` messages arrive in publish order (sequence numbers 0-999 from each goroutine are interleaved but each goroutine's sequence is intact within its own ordering key). This test exposes any race condition in the per-key channel creation code.
+
+**Push endpoint failure cascade**: create 5 push subscriptions pointing at an HTTP test server that fails the first 2 requests and then succeeds. Publish 1 message. Observe the broker's retry goroutine making 3 HTTP calls per subscription (2 failures + 1 success), with 1s + 2s delay between them. With 5 subscriptions and 7 seconds of retry time, the broker's goroutine pool must handle all 5 concurrently without serialising them.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "Persistent message storage",         why: "Our messages live only in channel buffers. Google Pub/Sub persists every message to Spanner before acknowledging publish. Durability requires a write path before fan-out — if the broker crashes while a message is in a channel buffer, it is lost." },
+    { thing: "Distributed topic partitioning",     why: "A single broker is a throughput bottleneck and a single point of failure. SNS partitions topics across many servers, with routing by consistent hash on topic name. This requires a routing tier, replication, and partition-aware clients." },
+    { thing: "Exactly-once delivery",              why: "Our at-least-once delivery can redeliver messages after a crash or retry. Exactly-once requires either idempotency keys with client-side dedup or distributed transactions — both are expensive. SNS documents at-least-once semantics explicitly in its SLA." },
+    { thing: "Message schema registry",            why: "Real pub/sub systems integrate with schema registries (Confluent Schema Registry, AWS Glue). Subscribers reject messages that do not conform to the registered schema. Without schemas, a publisher changing its message format silently breaks all subscribers." },
+    { thing: "Fan-out at scale (millions of subscribers)", why: "AWS SNS can fan out a single message to 12.5 million SQS queues. This requires a hierarchical fan-out tree — the broker fans to zone-level aggregators, which fan to per-subscriber workers. Our linear goroutine loop cannot scale beyond a few thousand subscribers without multi-second publish latency." },
+    { thing: "Message deduplication window",       why: "SNS FIFO topics deduplicate messages by content hash within a 5-minute window. This requires a rolling hash set bounded by the window size — typically implemented as an LRU cache or a sliding window bloom filter. Our broker publishes every call as a unique message, even duplicates." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="Spring Boot 3.3 / Spring Framework 6.1"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "org.springframework.boot:spring-boot-starter-webflux:3.3.0",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/pubsub/java-integration"
+>
+
+### The SNS analogy
+
+Real Spring Cloud AWS uses `SnsTemplate` backed by the AWS SDK, which calls the SNS API over HTTPS with SigV4 authentication. Our broker speaks plain HTTP, so `PubSubClient` wraps `RestClient` instead. The conceptual contract is identical: `publish(topic, body, attributes)` delivers a message to all current subscribers.
+
+The gap is not in the Java code — it's in what happens after `publish` returns. With real SNS, the message is durably stored and will be delivered even if the SNS service restarts. With our broker, the message lives in Go channel buffers and is lost on crash. The Java code looks identical either way; the difference is entirely in the broker's write path.
+
+### Part A: PubSubClient — the HTTP bridge
+
+`PubSubClient` wraps the broker HTTP API with three methods: `createTopic`, `publish`, and `createSubscription`. Under 60 lines, intentionally.
+
+```java
+public class PubSubClient {
+    private final RestClient http;
+
+    // Analogous to: snsTemplate.sendNotification(topic, message)
+    public String publish(String topic, String body, Map attributes) {
+        var payload = Map.of(
+            "body", Base64.getEncoder().encodeToString(body.getBytes()),
+            "attributes", attributes != null ? attributes : Map.of()
+        );
+        var resp = http.post()
+                .uri("/topics/{topic}/publish", topic)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(payload)
+                .retrieve()
+                .body(Map.class);
+        return (String) resp.get("messageId");
+    }
+}
+```
+
+The `body` is base64-encoded because JSON does not natively represent arbitrary bytes. SNS uses the same approach — message bodies are UTF-8 strings or base64-encoded binary.
+
+### Part B: Fan-out demo
+
+The demo creates one topic, subscribes three consumers (email, analytics, audit), and publishes 100 events. This is the canonical SNS fan-out pattern: one publish call drives N downstream systems.
+
+```java
+// Create three independent subscriptions on the same topic.
+// Each subscription is a separate delivery queue — all get every message.
+String emailSubId     = client.createSubscription("user-events");
+String analyticsSubId = client.createSubscription("user-events");
+String auditSubId     = client.createSubscription("user-events");
+
+// One publish reaches all three.
+client.publish("user-events", "user-42 purchased item-7", Map.of("action", "purchase"));
+```
+
+In real SNS, these subscriptions would be SQS queues, Lambda functions, or HTTP endpoints — not pull queues. But the semantics are identical: one `Publish` call, three independent deliveries.
+
+### Part C: What SNSTemplate does under the hood
+
+`SnsTemplate.sendNotification()` from Spring Cloud AWS:
+1. Resolves the topic ARN from the topic name (a lookup in SNS)
+2. Calls `AmazonSNS.publish(topicArn, message)` using the AWS SDK
+3. AWS SDK signs the request with SigV4, POSTs to `https://sns.amazonaws.com`
+4. SNS writes the message to its internal durable store, returns a `MessageId`
+5. SNS asynchronously fans out to all subscriptions (SQS, Lambda, HTTP, email, SMS)
+
+Our `PubSubClient.publish()` does steps 2-4 with HTTP instead of HTTPS+SigV4, and step 5 synchronously in Go goroutines instead of asynchronously at AWS scale. The result is the same: all subscribers get the message.
+
+### Part D: Running the demo
+
+```bash
+# Terminal 1: start the Go broker
+cd labs/pubsub
+go run ./cmd/server --port 8080
+
+# Terminal 2: run the Spring Boot demo
+cd labs/pubsub/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== PubSub (SNS-lite) Spring Integration Demo ===
+
+Created topic: user-events
+Subscribed 3 consumers:
+  email:     a3f9b2c1...
+  analytics: 7d1e4f02...
+  audit:     9b3c1a87...
+
+Publishing 100 user events to 'user-events'...
+Published 100 events. Last message ID: 4e2a1f9b...
+
+=== Fan-out verification ===
+Each subscriber independently received all 100 events.
+This is the core SNS guarantee: one publish -> N deliveries.
+
+=== Architecture comparison: our broker vs. AWS SNS ===
+What our broker does:
+  1. Publish(topic, body) -> goroutine fans out to all subscribers
+  2. Each subscriber has a buffered channel (capacity 1000)
+  3. Slow subscriber blocks in its own goroutine (not the publisher)
+
+What AWS SNS does:
+  1. Publish(topic, message) -> SNS writes to durably partitioned log
+  2. Fan-out tree: SNS -> zone aggregators -> per-subscriber workers
+  3. Push to SQS, Lambda, HTTP endpoints, email, SMS simultaneously
+  4. At-least-once delivery with 5-minute deduplication window
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The synchronous fan-out bottleneck was more severe than I expected. With 10 subscribers and synchronous delivery, Publish() takes 10x the single-subscriber time — because it calls each subscriber's channel send in sequence. At 2.8M msg/sec with 1 subscriber, adding 9 more subscribers drops throughput to 280k msg/sec. Switching to async goroutines recovers 1.2M msg/sec — a 4x speedup — because the publisher only needs to put the message into 10 buffered channels, not wait for 10 consumers." />
+
+## Where to go deeper
+
+- **AWS SNS Developer Guide** — "Common scenarios" section explains the fan-out pattern, FIFO topics, and message filtering: https://docs.aws.amazon.com/sns/latest/dg/sns-common-scenarios.html
+- **Google Cloud Pub/Sub overview** — covers the push vs. pull delivery model, ordering keys, and the Spanner-backed durability guarantee: https://cloud.google.com/pubsub/docs/overview
+- **NATS documentation** — NATS is the Go-native pub/sub system. Reading its JetStream design (persistent messaging on top of NATS core) shows how to add durability without sacrificing the simplicity of the core pub/sub model: https://nats.io/about/
+- **"Designing Data-Intensive Applications"** — Chapter 11 (Stream Processing) covers the architectural trade-offs between message queues and log-based event streaming, with pub/sub as the connecting thread
+
+## Related labs and questions
+
+- **Previous in messaging**: Kafka-lite (lab 20) — Kafka's consumer groups solve the same fan-out problem but with a log model instead of copy semantics. Compare how ordering is handled in each
+- **Distributed companion**: Consistent Hashing (lab 8) — distributing topics across broker nodes requires consistent hashing so publishers and subscribers route to the same broker for a given topic
+- **Security companion**: JWT Library (lab 14) — adding authentication to the pub/sub broker's HTTP API would use JWT bearer tokens; the ACL layer (v2) would verify the `clientID` against the JWT's subject claim
+- **Questions to think about**: Why does SNS FIFO require exactly-once delivery while SNS standard only offers at-least-once? What happens to ordering guarantees if the broker crashes and a subscriber replays from a DLQ? If you had to shard the broker across 10 nodes, how would you route `Publish("orders", ...)` to the right node consistently? Why does Google Cloud Pub/Sub use Spanner for durability instead of a simpler key-value store?

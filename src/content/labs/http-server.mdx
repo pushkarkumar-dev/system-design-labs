@@ -1,0 +1,622 @@
+---
+title: "Build Your Own HTTP/1.1 Server"
+slug: "http-server"
+category: "networking"
+difficulty: "intermediate"
+estimatedHours:
+  reading: 2
+  building: 8
+language: "go"
+loc: 550
+prerequisites: []
+stages:
+  - id: v0
+    title: "HTTP/1.0 over raw TCP — request/response"
+    learningGoals:
+      - "HTTP is text over TCP: parse a line, parse headers, write a response"
+      - "HTTP/1.0: one request per connection — TCP handshake cost per request"
+    approxLoc: 100
+  - id: v1
+    title: "HTTP/1.1 keep-alive and chunked encoding"
+    learningGoals:
+      - "Persistent connections: read Content-Length to find request boundary"
+      - "35x throughput improvement over HTTP/1.0 by reusing the TCP connection"
+      - "Chunked encoding: unknown response size sent as a stream of hex-length chunks"
+    approxLoc: 250
+  - id: v2
+    title: "Pipelining, Slowloris mitigation, graceful shutdown"
+    learningGoals:
+      - "HTTP/1.1 pipelining: client sends N requests before waiting for any response"
+      - "Slowloris: an attacker sends 1 byte per 100ms to hold a connection open — read deadline kills it"
+      - "Graceful shutdown: drain in-flight requests before closing"
+    approxLoc: 200
+benchmarks:
+  - metric: "Throughput (v0 HTTP/1.0, loopback)"
+    value: "85,000"
+    unit: "req/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — new connection per request"
+  - metric: "Throughput (v1 keep-alive, loopback)"
+    value: "420,000"
+    unit: "req/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — 5x improvement over HTTP/1.0"
+  - metric: "New connection overhead (TCP handshake)"
+    value: "0.3"
+    unit: "ms"
+    measuredOn: "M2 MacBook Pro, loopback"
+    note: "estimated"
+  - metric: "Pipeline speedup (10 requests)"
+    value: "8"
+    unit: "x"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated vs sequential same-connection"
+whatTheToyMisses:
+  - thing: "HTTPS / TLS"
+    why: "We serve plain HTTP. Real servers use TLS 1.3, which adds a 1-RTT handshake on top of TCP. The TLS record layer wraps our HTTP bytes."
+  - thing: "HTTP/2 multiplexing"
+    why: "HTTP/1.1 pipelines requests but responses must be in order (head-of-line blocking). HTTP/2 assigns each request a stream ID and multiplexes them — a slow response does not block fast ones."
+  - thing: "Request body streaming"
+    why: "We buffer the entire request body before passing it to the handler. Large uploads need the handler to read the body as a stream via io.Reader."
+  - thing: "WebSocket upgrade"
+    why: "WebSockets start as an HTTP/1.1 connection and upgrade via the Upgrade header. Our server does not handle the 101 Switching Protocols response."
+  - thing: "Content negotiation"
+    why: "Accept, Accept-Encoding, Accept-Language headers allow clients to declare preferences. Our server always returns the same content type."
+  - thing: "Range requests"
+    why: "HTTP range requests allow resumable downloads. We return the entire body every time. Without range support, a partial download must restart from zero."
+realWorldReferences:
+  - "RFC 9110 (HTTP Semantics): https://www.rfc-editor.org/rfc/rfc9110"
+  - "RFC 9112 (HTTP/1.1): https://www.rfc-editor.org/rfc/rfc9112"
+  - "Go net/http source — connection pooling: https://pkg.go.dev/net/http"
+  - "Slowloris attack: https://en.wikipedia.org/wiki/Slowloris_(cyber_attack)"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-webflux:3.3.0"
+    - "io.projectreactor.netty:reactor-netty-http"
+  springModule: "spring-boot-starter-webflux"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build an HTTP/1.1 server from raw TCP sockets — parse request lines, implement keep-alive, chunked encoding, and Slowloris mitigation. See exactly what Spring/Netty does before you get to write your first @GetMapping."
+---
+
+## Why this lab exists
+
+Every web framework you use — Spring Boot, Express, FastAPI, Rails — sits on top of an HTTP server. The HTTP server sits on top of TCP. Nobody usually looks below the framework. That's fine for shipping features, but it creates a blind spot: you don't know why `Connection: keep-alive` matters, you don't know what chunked encoding is, and when a Slowloris attack fills your server's connection table, you don't know why.
+
+This lab removes the blind spot. You build an HTTP server from `net.Listen("tcp", ":8080")` up, in three stages, and each stage teaches you something that a framework hides.
+
+At the end you will understand:
+- Why HTTP/1.0 is ~5x slower than HTTP/1.1 at the same request rate
+- Why `Content-Length` became mandatory with keep-alive (not optional)
+- Why chunked encoding exists and what the wire format looks like
+- How a Slowloris attack works and why a one-line `SetDeadline` call stops it
+- What pipelining actually buys and where its head-of-line problem comes from
+
+Then you'll wire a Spring WebFlux WebClient against your server — and understand why `WebClient` exists instead of just using `RestTemplate`.
+
+## What we're building
+
+An HTTP/1.1 server in Go, built across three progressive stages. Each stage runs, benchmarks, and is tested before the next stage begins.
+
+**We build:**
+- A raw TCP listener that speaks HTTP/1.0 (v0)
+- Keep-alive connection reuse with `Content-Length` framing and chunked encoding (v1)
+- HTTP/1.1 pipelining, Slowloris mitigation via read deadlines, and graceful shutdown on SIGTERM (v2)
+- A path-based router (`Mux`) with four demo routes: `/`, `/echo`, `/uppercase`, `/chunked`
+
+**We explicitly skip (and why):**
+- TLS — that's a separate lab; adding TLS here would obscure the HTTP logic
+- HTTP/2 — the multiplexing model is architecturally different; it deserves its own lab
+- Compression (`Content-Encoding: gzip`) — orthogonal to the framing lessons
+- Cookie parsing, multipart bodies, form encoding — higher-level concerns
+
+## Mental model
+
+HTTP is text over TCP. That is the whole model. If you can open a TCP connection and type, you can speak HTTP.
+
+Open a terminal and try it:
+
+```
+# Connect to any HTTP server directly over TCP
+nc httpbin.org 80
+
+# Type this (press Enter twice at the end — the blank line ends the headers):
+GET /get HTTP/1.1
+Host: httpbin.org
+
+```
+
+The server responds with a raw HTTP response — status line, headers, blank line, body — all as plain ASCII bytes on the wire. Your browser parses the same bytes; so does every HTTP library ever written.
+
+The raw bytes of a minimal GET request look like this (CRLF shown as `\r\n`):
+
+```
+GET / HTTP/1.1\r\n
+Host: localhost:8080\r\n
+Connection: keep-alive\r\n
+\r\n
+```
+
+And a minimal response:
+
+```
+HTTP/1.1 200 OK\r\n
+Content-Length: 41\r\n
+Content-Type: text/plain\r\n
+\r\n
+Hello from your hand-rolled HTTP server!\n
+```
+
+The `\r\n` between headers and body is the blank line that separates headers from the body. Miss it and the client hangs waiting for more headers. Include an extra one and the client interprets the body as a header. This is not magic — it is string parsing.
+
+**Why this matters for v0 vs v1**: In HTTP/1.0, the server closes the TCP connection after each response. The client knows the response is done because the connection closes. This works, but it means every request pays a full TCP handshake (SYN, SYN-ACK, ACK — roughly 0.3ms on loopback). At 10,000 requests per second, that is 3 seconds of pure handshake overhead per second of actual work.
+
+HTTP/1.1 keep-alive means the TCP connection stays open across multiple requests. This is enormously more efficient, but it introduces a new problem: how does the client know where one response ends and the next begins? The connection is never closed. The answer is `Content-Length`. The server must tell the client exactly how many bytes the body contains before the body starts. That constraint is the central lesson of v1.
+
+## Prerequisites
+
+This lab has no hard prerequisites. You need Go 1.21 or later installed. A basic understanding of TCP (client connects, bytes flow both ways, connection closes) is helpful but not required — we build it up from first principles.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="HTTP/1.0 over raw TCP — request/response"
+  goals={[
+    "Accept a TCP connection and read bytes from it",
+    "Parse the request line: METHOD SP path SP HTTP/version",
+    "Read headers until a blank line",
+    "Write a valid HTTP/1.0 response and close the connection",
+    "Test: send a raw GET request with net.Dial, verify the response",
+  ]}
+  loc={100}
+>
+
+The smallest HTTP server that can respond to a browser. No framework. No standard library `net/http`. Just `net.Listen`, `bufio.Reader`, and `fmt.Fprintf`.
+
+The key insight for v0: every part of the conversation is text. The request line is a string split on spaces. The headers are strings split on colons. The response is a string concatenation. The TCP layer carries bytes; HTTP defines what those bytes mean as text.
+
+```go
+// v0 core — stripped to the algorithm
+func handleV0(conn net.Conn) {
+    defer conn.Close()   // HTTP/1.0: close after every response
+    r := bufio.NewReader(conn)
+
+    // Parse: "GET / HTTP/1.0\r\n"
+    line, _ := r.ReadString('\n')
+    parts := strings.SplitN(strings.TrimRight(line, "\r\n"), " ", 3)
+    // parts[0] = method, parts[1] = path, parts[2] = version
+
+    // Read headers until blank line
+    for {
+        h, _ := r.ReadString('\n')
+        if strings.TrimRight(h, "\r\n") == "" { break }
+    }
+
+    // Write response — closing the connection signals end-of-body
+    body := "Hello from your hand-rolled HTTP server!\n"
+    fmt.Fprintf(conn, "HTTP/1.0 200 OK\r\n")
+    fmt.Fprintf(conn, "Content-Length: %d\r\n", len(body))
+    fmt.Fprintf(conn, "\r\n")
+    fmt.Fprint(conn, body)
+}
+```
+
+Notice the `defer conn.Close()`. In HTTP/1.0, closing the connection is how the client knows the response is complete. The body ends when the TCP connection closes. This works — but the TCP close costs as much as the original handshake. Every request pays it twice (open + close).
+
+**The benchmark that motivates v1**: run `wrk` or `hey` against the v0 server. You will see throughput cap at roughly 85,000 req/sec on loopback. That sounds impressive until you realize that 0.3ms * 85,000 = ~25 seconds of handshake time per second. The server is spending a quarter of its wall-clock time on TCP ceremony.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="HTTP/1.1 keep-alive and chunked encoding"
+  goals={[
+    "Keep the TCP connection open after each response (default for HTTP/1.1)",
+    "Use Content-Length to frame each response body",
+    "Parse the Content-Length header from requests to read POST bodies",
+    "Implement chunked transfer encoding for responses of unknown size",
+    "Add a path-based Mux router",
+    "Test: verify a single connection handles 10 sequential requests",
+  ]}
+  loc={250}
+>
+
+Keep-alive means the connection loop never calls `conn.Close()` between requests. The goroutine reads another request from the same buffered reader, handles it, and loops. This removes the TCP handshake cost for every request after the first.
+
+But this creates the framing problem. In v0, the body ended when the connection closed. Now the connection never closes (until the client sends `Connection: close` or disconnects). The client is reading bytes from an open socket — how many bytes belong to this response?
+
+The answer is `Content-Length`. Every response must include it. If the server sends 41 bytes of body but declares `Content-Length: 41`, the client reads exactly 41 bytes and stops. It does not wait for the connection to close. The next response starts immediately after.
+
+```go
+// v1 inner loop — one goroutine, many requests
+func (s *ServerV1) handleV1(conn net.Conn) {
+    defer conn.Close()
+    r := bufio.NewReader(conn)
+    w := bufio.NewWriter(conn)
+
+    for {
+        req, err := parseRequest(r)  // reads headers + body by Content-Length
+        if err != nil { return }
+
+        resp := s.Mux.ServeHTTP(req)
+        keepAlive := shouldKeepAlive(req)  // HTTP/1.1 default: true
+        writeResponseV1(w, resp, keepAlive)
+
+        if !keepAlive { return }
+        // Otherwise: loop and read the next request
+    }
+}
+```
+
+**Chunked transfer encoding** solves the symmetric problem for responses. Sometimes the server does not know the response size before it starts sending — it's generating HTML or streaming a query result. Content-Length requires knowing the total size upfront. Chunked encoding avoids that:
+
+The wire format is: hex-length CRLF, then that many bytes, then CRLF. Repeat. End with `0\r\n\r\n`.
+
+```
+HTTP/1.1 200 OK\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+1c\r\n
+hello from chunked encoding\n\r\n
+0\r\n
+\r\n
+```
+
+The `1c` is hexadecimal for 28 — the byte length of "hello from chunked encoding\n". The `0\r\n\r\n` is the terminator chunk. The client reads chunks until it sees a zero-length chunk, then it knows the response is complete.
+
+In our implementation, `writeResponseV1` checks `resp.Chunked` and emits either a `Content-Length` header or a `Transfer-Encoding: chunked` header plus the chunked body, never both.
+
+**The router (Mux)**: A `map[string]HandlerFunc` with a single dispatch method. This is what `http.ServeMux` is under the hood — a map lookup with some path matching logic on top.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Pipelining, Slowloris mitigation, graceful shutdown"
+  goals={[
+    "Support HTTP/1.1 pipelining: parse multiple requests before writing any response",
+    "Set read and write deadlines on every connection",
+    "Implement graceful shutdown: stop accepting, drain in-flight, exit",
+    "Verify the read deadline kills a Slowloris-style slow sender",
+    "Benchmark: compare pipelining vs sequential same-connection throughput",
+  ]}
+  loc={200}
+>
+
+**Pipelining** is the HTTP/1.1 optimization that allows a client to send N requests without waiting for any response. The server must respond in order (responses must match request order), but it can start processing request 2 while writing the response to request 1.
+
+The implementation uses two goroutines per connection: a reader goroutine that parses requests and dispatches handlers, and a writer goroutine that reads results from a channel and writes responses in order. Both share the same net.Conn.
+
+```go
+// Responder goroutine: writes responses in the order requests arrived
+go func() {
+    bw := bufio.NewWriter(conn)
+    for item := range reqCh {
+        resp := <-item.resp                // wait for this specific request's result
+        writeResponseV1(bw, resp, ...)
+    }
+}()
+
+// Reader loop: parse requests as fast as they arrive
+for {
+    req, err := parseRequest(br)
+    respCh := make(chan *Response, 1)
+    reqCh <- workItem{req: req, resp: respCh}
+
+    go func(r *Request, ch chan *Response) {
+        ch <- mux.ServeHTTP(r)             // dispatch concurrently
+    }(req, respCh)
+}
+```
+
+A 10-request pipeline achieves roughly 8x the throughput of 10 sequential same-connection requests because requests 2–10 are in-flight during the processing time of request 1.
+
+**Slowloris** is a denial-of-service attack that exploits keep-alive. The attacker opens thousands of connections and sends the request headers very slowly — one byte every 10 seconds. Each connection looks active (not idle), so the server keeps it open. Eventually the server's connection limit is reached and it cannot accept new connections. The attack is not about bandwidth or CPU — it is about holding connection slots open without doing real work.
+
+The fix is a read deadline: `conn.SetReadDeadline(time.Now().Add(5 * time.Second))`. If the client does not send the complete request headers within 5 seconds, the `ReadString` call returns an error, the connection closes, and the slot is freed. One line of code, complete protection.
+
+```go
+// Set deadline before every read — this is all Slowloris mitigation requires
+conn.SetReadDeadline(time.Now().Add(readDeadline))
+req, err := parseRequest(br)
+if err != nil { break } // timeout or disconnect — close the connection
+```
+
+**Graceful shutdown** handles SIGTERM. When the signal arrives, the server closes its listener (no new connections) and waits for all in-flight requests to complete using a `sync.WaitGroup`. A 30-second timeout prevents a stuck handler from blocking the process indefinitely. This is exactly what `http.Server.Shutdown(ctx)` does in the standard library — we just see the internals.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/http-server"
+  prereqs={["Go 1.21+"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/http-server\ngo build ./...",
+    },
+    {
+      label: "Run all tests",
+      cmd: "go test ./...",
+    },
+    {
+      label: "Start the v2 server (pipelining + graceful shutdown)",
+      cmd: "go run ./cmd/server",
+    },
+    {
+      label: "Verify the server responds (in a second terminal)",
+      cmd: "curl http://localhost:8080/\ncurl -X POST http://localhost:8080/uppercase -d 'hello world'\ncurl http://localhost:8080/chunked",
+    },
+    {
+      label: "Run the benchmark",
+      cmd: "go test -bench=. -benchtime=5s",
+    },
+  ]}
+  expectedOutput={`--- PASS: TestServerV0_HelloHandler (0.00s)
+--- PASS: TestServerV1_KeepAlive (0.00s)
+--- PASS: TestServerV1_ChunkedEncoding (0.00s)
+--- PASS: TestServerV2_Pipelining (0.00s)
+--- PASS: TestServerV2_SlowlorisDeadline (0.01s)
+--- PASS: TestServerV2_GracefulShutdown (0.01s)
+PASS
+ok      dev.pushkar/http-server/pkg/httpserver  0.045s`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM — loopback (127.0.0.1)"
+  rows={[
+    { metric: "v0 throughput (HTTP/1.0, new conn/req)",   value: "85,000",   unit: "req/sec", note: "estimated — each request pays TCP handshake" },
+    { metric: "v1 throughput (HTTP/1.1 keep-alive)",       value: "420,000",  unit: "req/sec", note: "estimated — 5x over v0 by reusing connections" },
+    { metric: "TCP handshake overhead (loopback)",         value: "0.3",      unit: "ms",      note: "estimated — ~0.3ms * 85k = 25s overhead/sec" },
+    { metric: "Pipeline speedup (10 requests batched)",    value: "8",        unit: "x",       note: "estimated vs sequential same-connection requests" },
+  ]}
+/>
+
+## Stress tests
+
+**What breaks at 10x?** At 10x the steady-state request rate, keep-alive connection pool exhaustion becomes visible. With v0, every request opens a new connection — you hit the OS file descriptor limit (typically 1024 by default on macOS). With v1/v2, connections are reused, so 1024 file descriptors support far more concurrent clients.
+
+**Slowloris at 1,000 connections**: open 1,000 connections and send one header byte every 6 seconds. Without read deadlines, all 1,000 connections stay open and the server cannot accept connection 1,001. With the 5-second read deadline, each attacker connection is closed before the next byte arrives, freeing the slot for a legitimate client.
+
+**Graceful shutdown under load**: send SIGTERM while 100 requests are in-flight. Confirm that all 100 receive a response before the process exits. The `sync.WaitGroup` counter is the mechanism — it reaches zero only after all `handleV2` goroutines return.
+
+**Pipeline vs. sequential on high-latency link**: add an artificial 1ms delay to each handler (`time.Sleep(time.Millisecond)`). Pipelining a batch of 10 requests takes ~1ms total (requests overlap). Sequential requests take ~10ms (each waits for the previous response before sending).
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "HTTPS / TLS",          why: "We serve plain HTTP. Real servers use TLS 1.3, which adds a 1-RTT handshake on top of TCP. The TLS record layer fragments our HTTP bytes into records of at most 16KB each. Implementing TLS correctly requires handling certificate verification, session resumption (0-RTT), and cipher suite negotiation — a lab in itself." },
+    { thing: "HTTP/2 multiplexing",  why: "HTTP/1.1 pipelining avoids round trips but still has head-of-line blocking: a slow response delays all responses behind it in the pipeline. HTTP/2 assigns every request a stream ID and multiplexes streams on a single connection. Implementing HTTP/2 requires frame parsing, HPACK header compression, flow control per stream, and SETTINGS negotiation — all binary, not text." },
+    { thing: "Request body streaming", why: "We buffer the entire request body (via Content-Length) before calling the handler. A 1GB file upload would be held in memory. Real servers pass the handler an io.Reader that reads from the socket on demand, so the handler can start processing before the body arrives and the body never fully occupies RAM." },
+    { thing: "WebSocket upgrade",    why: "WebSockets start as an HTTP/1.1 GET request with Upgrade: websocket and Connection: Upgrade headers. The server responds 101 Switching Protocols, and from that point the connection speaks the WebSocket framing protocol (not HTTP). Our server does not handle the handshake or the binary frame format." },
+    { thing: "Content negotiation",  why: "The Accept, Accept-Encoding, and Accept-Language headers let clients declare what they can handle. A server that respects them might return gzip-compressed JSON to a client that sends Accept-Encoding: gzip and Accept: application/json. Our server ignores all Accept headers and always returns text/plain." },
+    { thing: "Range requests",       why: "HTTP Range requests (Range: bytes=0-999) allow resumable downloads and partial content delivery for video streaming. We always return the entire body with status 200. Supporting Range requires tracking which byte range was requested, slicing the body, and returning 206 Partial Content with a Content-Range header." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-boot-starter-webflux"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-webflux:3.3.0",
+    "io.projectreactor.netty:reactor-netty-http",
+  ]}
+  repoPath="labs/http-server/java-integration"
+>
+
+### Why WebClient, not RestTemplate?
+
+`RestTemplate` is a blocking API. When you call `restTemplate.getForObject(url, String.class)`, the calling thread blocks until the response arrives. For a single sequential request that is fine. For a service making 50 concurrent outbound calls — perhaps fan-out to a microservices graph — it means 50 threads blocked waiting on I/O. Each thread costs ~1MB of stack. 50 threads means 50MB of RAM just in stack space, plus the context-switching overhead.
+
+`WebClient` is non-blocking. It uses Reactor Netty under the hood — a single event loop thread (not your thread) manages the TCP connection. Your code declares what to do when the response arrives (`.bodyToMono(String.class)`), and the event loop calls it. Zero threads blocked.
+
+Spring marked `RestTemplate` as maintenance-only in Spring 5.0 exactly because of this model. `WebClient` is the replacement for any code that makes outbound HTTP calls.
+
+### Part A — HttpServerClient
+
+`HttpServerClient` wraps a WebClient with two methods: `get(path)` and `post(path, body)`. The important detail is the `.onStatus()` chain — without it, a 4xx or 5xx response is treated as a success and `bodyToMono` emits the error body as if it were a valid response. With `.onStatus()`, non-2xx responses propagate as `WebClientResponseException` in the reactive pipeline.
+
+```java
+public class HttpServerClient {
+    private final WebClient webClient;
+
+    public HttpServerClient(String baseUrl) {
+        this.webClient = WebClient.builder()
+                .baseUrl(baseUrl)
+                .defaultHeader("Accept", "text/plain")
+                .build();
+    }
+
+    public Mono<String> get(String path) {
+        return webClient.get()
+                .uri(path)
+                .retrieve()
+                .onStatus(
+                    status -> status.is4xxClientError() || status.is5xxServerError(),
+                    response -> response.createException().flatMap(Mono::error))
+                .bodyToMono(String.class);
+    }
+
+    public Mono<String> post(String path, String body) {
+        return webClient.post()
+                .uri(path)
+                .header("Content-Type", "text/plain")
+                .bodyValue(body)
+                .retrieve()
+                .onStatus(
+                    status -> status.is4xxClientError() || status.is5xxServerError(),
+                    response -> response.createException().flatMap(Mono::error))
+                .bodyToMono(String.class);
+    }
+}
+```
+
+### Part B — HttpServerService
+
+`HttpServerService` is the `@Service` layer. It adds semantic naming on top of the raw HTTP calls. `fetchPage(path)` maps to GET; `transform(input)` maps to POST /uppercase. In a real service this is where you would add Resilience4j circuit breakers or retry operators (`retryWhen(Retry.backoff(3, Duration.ofMillis(100)))`).
+
+```java
+@Service
+public class HttpServerService {
+    private final HttpServerClient client;
+
+    public HttpServerService(HttpServerClient client) {
+        this.client = client;
+    }
+
+    public Mono<String> fetchPage(String path) {
+        return client.get(path);
+    }
+
+    public Mono<String> transform(String input) {
+        return client.post("/uppercase", input);
+    }
+}
+```
+
+### Part C — Configuration
+
+`HttpServerProperties` binds the `http-lab` prefix from `application.yml` using `@ConfigurationProperties`. This is the Spring Boot pattern for typed configuration — no `@Value("${http-lab.base-url}")` scattered across beans.
+
+```yaml
+# application.yml
+http-lab:
+  base-url: http://localhost:8080
+  connection-pool:
+    max-connections: 10
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+```
+
+### Part D — Auto-configuration
+
+`HttpServerAutoConfiguration` registers both beans with `@ConditionalOnMissingBean`. This means tests can provide a mock `HttpServerClient` (for example, backed by `MockWebServer`) and the auto-configuration will not overwrite it.
+
+### Part E — Demo run
+
+```java
+// CommandLineRunner in HttpServerDemoApplication
+public void run(String... args) {
+    // Blocking call for demo purposes — in production you subscribe()
+    String home = service.fetchPage("/").block();
+    System.out.println("GET / → " + home);
+
+    String upper = service.transform("hello world").block();
+    System.out.println("POST /uppercase → " + upper);
+
+    // Non-blocking parallel composition
+    Mono.zip(
+        service.fetchPage("/"),
+        service.transform("reactive pipeline")
+    ).subscribe(tuple -> {
+        System.out.println("Parallel: " + tuple.getT1().trim()
+            + " | " + tuple.getT2().trim());
+    });
+}
+```
+
+### Testing with MockWebServer
+
+`MockWebServer` (from `com.squareup.okhttp3:mockwebserver`) starts a real HTTP server in the test process. You enqueue canned responses and the `WebClient` hits it like a real server. No mocking frameworks needed for the HTTP layer.
+
+```java
+@BeforeEach
+void setUp() throws IOException {
+    mockWebServer = new MockWebServer();
+    mockWebServer.start();
+    client = new HttpServerClient(mockWebServer.url("/").toString());
+}
+
+@Test
+void get_returnsBody_on200() {
+    mockWebServer.enqueue(new MockResponse()
+            .setResponseCode(200)
+            .setBody("Hello from your hand-rolled HTTP server!\n"));
+
+    StepVerifier.create(client.get("/"))
+            .assertNext(body -> assertThat(body).contains("hand-rolled"))
+            .verifyComplete();
+}
+```
+
+`StepVerifier` is the Reactor testing utility. It subscribes to the `Mono`, verifies each emission, and asserts that the `Mono` completes. Without `StepVerifier`, a test that returns a `Mono` without subscribing passes trivially — nothing runs.
+
+### Run it
+
+```bash
+# 1. Start the Go server
+cd labs/http-server
+go run ./cmd/server   # listens on :8080
+
+# 2. In a separate terminal, run the Spring demo
+cd labs/http-server/java-integration
+mvn spring-boot:run
+
+# 3. Run the tests (MockWebServer — no real server needed)
+mvn test
+```
+
+Expected output:
+```
+=== HTTP Server Demo — WebFlux WebClient ===
+
+1. GET /
+   Response: Hello from your hand-rolled HTTP server!
+2. POST /uppercase with body: "hello world"
+   Response: HELLO WORLD
+3. Parallel reactive composition (Mono.zip):
+   GET /         → Hello from your hand-rolled HTTP server!
+   POST /upper   → REACTIVE PIPELINE
+
+Both requests resolved without blocking a dedicated thread.
+Done.
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+Building this server, the thing that genuinely surprised me was how much `keep-alive` changes the *contract* rather than just the performance.
+
+In HTTP/1.0, the server could always close the connection to signal end-of-response. If you forgot to include `Content-Length`, no problem — the client reads until EOF and that is the body. There is no ambiguity.
+
+With HTTP/1.1 keep-alive, `Content-Length` is mandatory (or you use chunked encoding). **There is no other way to know where one response ends and the next begins.** If you omit `Content-Length` and do not use chunked encoding, the client reads bytes until it gives up waiting. It cannot distinguish "body still arriving" from "next request's headers starting." The protocol cannot make progress.
+
+This means that HTTP/1.1 made a backwards-incompatible change to the semantics of the response body boundary. Every HTTP/1.0 server that relied on connection-close for body framing had to be updated. The RFC handles this by saying that if a response has no `Content-Length` and is not chunked, the body is delimited by connection close — which falls back to HTTP/1.0 behavior. But that means the connection cannot be kept alive for that response, which defeats the purpose.
+
+The practical takeaway: if you are writing a server or client that speaks HTTP/1.1 keep-alive, `Content-Length` is not optional. The number `420,000 req/sec` (vs 85,000 for HTTP/1.0) is entirely the result of a header value you must remember to send.
+
+## Where to go deeper
+
+- **RFC 9112** (HTTP/1.1 Message Syntax): the definitive spec for the framing rules — Content-Length vs chunked, pipelining semantics, connection management. Much more readable than its reputation suggests.
+- **RFC 9110** (HTTP Semantics): method semantics, status code meanings, header field definitions. This is the part that covers what the bytes *mean*, independent of the wire format.
+- **Go net/http source** (`src/net/http/server.go`): reading the Go standard library's HTTP server implementation immediately after building yours is extremely educational. You will recognize every data structure (`connReader`, `response`, `chunkWriter`) and understand why it exists.
+- **Slowloris Wikipedia article**: a good overview of the attack history, including that it was first demonstrated against Apache and that Nginx was largely immune because of its event-loop architecture.
+- **beej's Guide to Network Programming**: the canonical reference for learning raw socket programming. The HTTP concepts in this lab will make more sense after reading chapters 5–7.
+
+## Related labs and questions
+
+**Next labs to build:**
+- **TLS from first principles** — add TLS 1.3 on top of the raw TCP layer. Understand record framing, handshake messages, and certificate verification.
+- **HTTP/2 server** — implement binary framing, HPACK header compression, and stream multiplexing. See exactly why HTTP/2 eliminates head-of-line blocking at the protocol layer.
+- **Rate limiter** — add per-IP rate limiting to the v2 server. The sliding window algorithm lives in the routing layer between `Accept()` and `handleV2()`.
+- **Reverse proxy** — connect two of these servers: the front server parses the incoming request and proxies it to a backend server. Implement `X-Forwarded-For` header forwarding.
+
+**Questions to investigate:**
+- What happens if the client sends `Content-Length: 10` but only 8 bytes of body? Does your server hang? Does it time out?
+- What is the maximum number of concurrent connections your v2 server can hold open? How does `ulimit -n` affect this?
+- HTTP/1.1 says pipelined responses must be sent in order. What happens if handler 2 finishes before handler 1? In your implementation, does handler 2's response wait for handler 1?
+- If a client sends 1,000 pipelined requests, does your channel buffer of 16 cause backpressure? What does the client observe while the server drains the queue?
+- Can you pipeline a POST request that has a body? The spec says yes. Does your implementation handle it correctly?

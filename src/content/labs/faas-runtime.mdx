@@ -1,0 +1,734 @@
+---
+title: "Build Your Own FaaS Runtime"
+slug: "faas-runtime"
+category: "platform"
+difficulty: "extreme"
+estimatedHours:
+  reading: 3
+  building: 12
+language: "go"
+loc: 850
+prerequisites:
+  - "Go goroutines and context.WithTimeout"
+  - "HTTP server in Go"
+  - "Object pool pattern"
+stages:
+  - id: v0
+    title: "Function Registry + In-Process Execution"
+    learningGoals:
+      - "Per-invocation goroutine with context timeout — handler panic is isolated"
+      - "Registry maps function names to handlers — no dynamic code loading"
+    approxLoc: 200
+    branchOrTag: "faas-runtime-v0"
+  - id: v1
+    title: "Cold Start + Warm Pool"
+    learningGoals:
+      - "Warm pool: keep N idle instances ready to avoid 50ms cold start"
+      - "Eviction goroutine removes idle instances to free resources"
+    approxLoc: 550
+    branchOrTag: "faas-runtime-v1"
+  - id: v2
+    title: "Snapshotting + Billing"
+    learningGoals:
+      - "Snapshot init state: restore in 5ms vs 50ms cold start — 10x faster"
+      - "Billing = max(1ms, duration) x (memory/1024) x $0.0000166667 per GB-ms"
+    approxLoc: 850
+    branchOrTag: "faas-runtime-v2"
+benchmarks:
+  - metric: "Cold start (no warm pool)"
+    value: "50"
+    unit: "ms"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — goroutine spawn + handler init"
+  - metric: "Warm pool invocation latency"
+    value: "1"
+    unit: "ms"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — pre-warmed instance, no init"
+  - metric: "Snapshot restore time"
+    value: "5"
+    unit: "ms"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — 10x faster than cold start"
+  - metric: "Concurrent invocations (goroutine pool)"
+    value: "1,000"
+    unit: "req/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — bounded by pool cap"
+whatTheToyMisses:
+  - thing: "Process or container isolation"
+    why: "Our functions run in the same process as the runtime. Real FaaS (Lambda, Cloud Run) isolates each invocation in a separate container or microVM (Firecracker). Without isolation, a misbehaving function can affect others."
+  - thing: "Dynamic code loading"
+    why: "Real FaaS runtimes download function code from S3/GCS and load it dynamically (as a shared library, WASM module, or container image). Our registry is static — functions are compiled into the binary."
+  - thing: "VPC networking and IAM"
+    why: "Lambda functions can be placed inside a VPC for private resource access. Each invocation gets a network interface from an ENI pool. IAM role assumption gives functions fine-grained AWS API access."
+  - thing: "Concurrency control per function"
+    why: "Lambda's reserved concurrency limits how many simultaneous invocations a function can have. Our pool cap limits warm instances but not total invocations — a slow function can spawn unlimited goroutines."
+  - thing: "Extension API and layers"
+    why: "Lambda extensions (agents that run alongside the function) enable observability, security scanning, and configuration management. Extensions communicate with the runtime via a sidecar API."
+  - thing: "Response streaming"
+    why: "AWS Lambda's response streaming allows functions to start sending bytes before computing the full response — critical for LLM token streaming. Our Response is materialized before returning."
+realWorldReferences:
+  - "Firecracker MicroVM (AWS): https://firecracker-microvm.github.io/"
+  - "AWS Lambda execution environment: https://docs.aws.amazon.com/lambda/latest/dg/runtimes-context.html"
+  - "AWS Lambda SnapStart: https://docs.aws.amazon.com/lambda/latest/dg/snapstart.html"
+  - "Knative serving cold start: https://knative.dev/docs/serving/autoscaling/scale-to-zero-cooldown/"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.cloud:spring-cloud-function-web:4.1.3"
+    - "org.springframework.cloud:spring-cloud-starter-function-web:4.1.3"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  springModule: "spring-cloud-function"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a FaaS runtime from function registry to warm-pool cold-start optimization to snapshot-based restore — understanding why Lambda SnapStart achieves 10x faster cold starts for JVM functions."
+---
+
+## Why this lab exists
+
+Every time you call a Lambda function, three decisions the cloud provider made on your behalf are invisibly at work: how long it takes to start your function (cold start), whether a pre-warmed instance is waiting for you (warm pool), and how the billing clock is measured to the millisecond. These are not magic — they are engineering tradeoffs implemented in code.
+
+This lab removes the abstraction. You build a FaaS runtime from scratch in three stages, implementing the core machinery that AWS Lambda, Google Cloud Functions, and Knative all share under the hood. By the end you will know:
+
+- Why cold starts exist and what "warm pool" really means at the implementation level
+- Why Lambda SnapStart achieves near-instant cold starts for JVM functions — and why it is exactly the snapshot concept you build in v2
+- How the billing formula works: `max(1ms, ceil(duration)) x (memoryMB / 1024) x $0.0000166667`
+- Why handler panics must be recovered at the runtime level, not the handler level
+- What Spring Cloud Function does under the hood when you annotate a `@Bean` of type `Function`
+
+The mental shift this lab produces: "serverless" is not magic. It is a function registry, a pool manager, a process supervisor, and a billing counter — all running on someone else's computer.
+
+## What we're building
+
+A FaaS runtime in Go, built across three progressive stages. Each stage adds one production concept.
+
+**We build:**
+- A function registry: maps string names to `HandlerFunc` callables with per-function timeouts
+- Per-invocation goroutines with `context.WithTimeout` — handler panics are recovered and return 500
+- An HTTP server: `POST /invoke/{name}` and `GET /functions`
+- A warm instance pool: up to N idle instances per function, cold start simulation (50ms delay), background eviction
+- A snapshot store: after a cold start, save init state; restore in 5ms on subsequent cold starts (10x faster)
+- A billing engine: `max(1ms, ceiling(duration, 1ms)) x (memoryMB / 1024) x $0.0000166667 per GB-ms`
+
+**We explicitly skip (and why):**
+- Process or container isolation — real Lambda runs each function in a Firecracker microVM; we run everything in-process for simplicity
+- Dynamic code loading — our function registry is static; functions are registered at startup, not downloaded from S3
+- VPC networking, security groups, ENI pools — networking isolation is a separate lab
+- Trigger integrations (SQS, API Gateway, S3 events) — we expose only a simple HTTP POST interface
+
+## Mental model
+
+A FaaS runtime has four subsystems that interact on every invocation:
+
+```
+Registry      Instance Pool       Snapshot Store      Billing
+─────────     ─────────────       ──────────────      ───────
+name→handler  [inst1][inst2]      {fn: initState}     records[]
+              [inst3][...]
+
+Invoke("echo", req):
+  1. Registry.Lookup("echo")          → Function{handler, timeout, memMB}
+  2. Pool.Acquire("echo")             → warm hit (0ms) or cold start (50ms)
+                                         or snapshot restore (5ms)
+  3. goroutine: handler(ctx, req)     → Response (or panic → 500, timeout → 504)
+  4. Pool.Release("echo", inst)       → return to pool if under maxWarm
+  5. Billing.Record(dur, memMB)       → BillingRecord{cost = f(dur, memMB)}
+```
+
+Cold start vs warm hit is the central tradeoff. A cold start creates a new instance (container/microVM in production, a plain struct in our toy) and pays a startup penalty. A warm hit finds an idle instance and skips the penalty. The pool is bounded — you cannot keep unlimited warm instances — so traffic spikes cause cold starts no matter how large the pool is.
+
+The snapshot insight: a cold start has two phases: infrastructure startup (container/JVM boot, ~50ms in our simulation, 500ms+ for JVM in production) and function initialization (downloading config, connecting to databases, ~0ms in our simulation). SnapStart takes a memory checkpoint after initialization is complete and restores from it, skipping infrastructure startup entirely. Our v2 implements the same idea in 20 lines of Go.
+
+## Prerequisites
+
+- Go 1.23 or later
+- Basic familiarity with Go goroutines and channels
+- Understanding of `context.WithTimeout` and context cancellation
+- HTTP server concepts (handler registration, status codes)
+
+No prior FaaS knowledge is assumed. We build the concepts from first principles.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Function Registry + In-Process Execution"
+  goals={[
+    "Register handlers by name with a per-function timeout duration",
+    "Invoke each handler in a dedicated goroutine bounded by context.WithTimeout",
+    "Recover panics inside the goroutine — return 500, not a crashed server",
+    "HTTP server: POST /invoke/{name} dispatches to the handler, GET /functions lists names",
+    "Test: register+invoke, timeout fires, unknown function returns 404, concurrent invocations, panic returns 500, response headers propagated, query param access, body bytes",
+  ]}
+  loc={200}
+>
+
+The core of v0 is a map and a goroutine. `Runtime` holds a `map[string]*Function` protected by a `sync.RWMutex`. Each invocation spawns a goroutine that runs the handler:
+
+```go
+// runtime.go — the invocation loop
+func (r *Runtime) Invoke(ctx context.Context, name string, req Request) Response {
+    r.mu.RLock()
+    fn, ok := r.functions[name]
+    r.mu.RUnlock()
+
+    if !ok {
+        return Response{StatusCode: 404, Body: []byte(`{"error":"not found"}`)}
+    }
+
+    invCtx, cancel := context.WithTimeout(ctx, fn.Timeout)
+    defer cancel()
+
+    ch := make(chan Response, 1)
+    go func() { ch <- invokeHandler(invCtx, fn) }()
+
+    select {
+    case resp := <-ch:
+        return resp
+    case <-invCtx.Done():
+        return Response{StatusCode: 504, Body: []byte(`{"error":"function timeout"}`)}
+    }
+}
+```
+
+The `select` has two cases. If the handler returns before the deadline, we get its response from the channel. If the context deadline fires first, we return 504. The goroutine running the handler is not killed — Go has no goroutine cancellation primitive. In production, the process isolation boundary (container/microVM) provides the kill. Our toy leaks goroutines on timeout, which is honest about the limitation.
+
+**Panic recovery** wraps the handler call:
+
+```go
+// runtime.go — invokeHandler with recover
+func invokeHandler(ctx context.Context, fn *Function) (resp Response) {
+    defer func() {
+        if r := recover(); r != nil {
+            resp = Response{
+                StatusCode: 500,
+                Body:       []byte(fmt.Sprintf(`{"error":"handler panic: %v"}`, r)),
+            }
+        }
+    }()
+    return fn.Handler(ctx, Request{})
+}
+```
+
+The named return value `resp` allows the deferred function to set the return value after a panic. This pattern is idiomatic Go for "catch exceptions" without exceptions. If you do not recover, a panic in any goroutine crashes the entire process — unacceptable for a shared runtime serving hundreds of functions.
+
+**The HTTP handler** is a `switch` over method and path prefix:
+
+```go
+// runtime.go — ServeHTTP
+case req.Method == "POST" && strings.HasPrefix(req.URL.Path, "/invoke/"):
+    name := strings.TrimPrefix(req.URL.Path, "/invoke/")
+    body, _ := io.ReadAll(req.Body)
+    headers := lowercaseHeaders(req.Header)
+    queryParams := flattenQueryParams(req.URL.Query())
+    resp := r.InvokeWithReq(req.Context(), name, Request{Body: body,
+        Headers: headers, QueryParams: queryParams})
+    writeResponse(w, resp)
+```
+
+Headers are lowercased to match Lambda's convention — Lambda always delivers headers in lowercase to functions.
+
+**What the tests check**: `Register` followed by `Invoke` calls the handler and returns its response. A handler that sleeps 5s with a 50ms timeout returns 504. Invoking an unregistered name returns 404. 50 concurrent goroutines each incrementing an atomic counter all succeed (no data race). A panicking handler returns 500 without crashing. Headers in the `Response.Headers` map reach the caller. `QueryParams["name"]` is accessible inside the handler. `req.Body` bytes round-trip unchanged.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Cold Start + Warm Pool"
+  goals={[
+    "InstancePool keeps up to maxWarm idle instances per function",
+    "Acquire: scan idle list for a non-busy instance (warm hit) or sleep 50ms (cold start)",
+    "Release: return instance to pool if under maxWarm, else discard",
+    "Evict: background goroutine removes instances idle longer than warmTimeout",
+    "InvocationStats: atomic counters for ColdStarts, WarmHits, Timeouts, Panics",
+    "Test: warm hit skips delay, cold start on empty pool, pool cap, idle eviction, concurrent cold starts, stats count",
+  ]}
+  loc={350}
+>
+
+The warm pool is an `InstancePool` that keeps a slice of `*Instance` per function name:
+
+```go
+// pool.go — the core types
+type Instance struct {
+    lastUsed time.Time
+    busy     atomic.Bool   // CAS-protected: no mutex needed for the busy flag
+}
+
+type InstancePool struct {
+    mu      sync.Mutex
+    pools   map[string][]*Instance
+    maxWarm int
+    // ...
+}
+```
+
+`Acquire` is a scan-then-cold-start:
+
+```go
+// pool.go — Acquire
+func (p *InstancePool) Acquire(name string) (*Instance, error) {
+    p.mu.Lock()
+    for _, inst := range p.pools[name] {
+        if inst.busy.CompareAndSwap(false, true) {  // atomic: claim the instance
+            inst.lastUsed = time.Now()
+            p.mu.Unlock()
+            p.stats.addWarm()
+            return inst, nil
+        }
+    }
+    p.mu.Unlock()   // release lock before sleeping — cold starts run concurrently
+
+    time.Sleep(coldStartDelay)  // 50ms: simulates container/microVM startup
+    p.stats.addCold()
+    inst := &Instance{lastUsed: time.Now()}
+    inst.busy.Store(true)
+    return inst, nil
+}
+```
+
+The key detail: the mutex is released before `time.Sleep(coldStartDelay)`. If it were held during the sleep, concurrent cold starts would serialise — 3 cold starts would take 150ms instead of 50ms. Releasing the lock means cold starts run in parallel, each paying 50ms independently. This matches real FaaS behaviour: every concurrent invocation that cannot find a warm instance starts a new container.
+
+`Release` returns an instance to the pool only if the pool is under `maxWarm`:
+
+```go
+// pool.go — Release
+func (p *InstancePool) Release(name string, inst *Instance) {
+    inst.busy.Store(false)
+    inst.lastUsed = time.Now()
+
+    p.mu.Lock()
+    defer p.mu.Unlock()
+
+    idleCount := 0
+    for _, i := range p.pools[name] {
+        if !i.busy.Load() { idleCount++ }
+    }
+    if idleCount < p.maxWarm {
+        p.pools[name] = append(p.pools[name], inst)
+    }
+    // If pool is at maxWarm, the instance is dropped — GC handles it.
+}
+```
+
+**Eviction** runs in a background goroutine, waking every 30 seconds:
+
+```go
+// pool.go — Evict
+func (p *InstancePool) Evict() {
+    cutoff := time.Now().Add(-p.warmTimeout)
+    p.mu.Lock()
+    defer p.mu.Unlock()
+
+    for name, idle := range p.pools {
+        var keep []*Instance
+        for _, inst := range idle {
+            if inst.busy.Load() || inst.lastUsed.After(cutoff) {
+                keep = append(keep, inst)
+            }
+        }
+        p.pools[name] = keep
+    }
+}
+```
+
+Lambda's default warm instance lifetime is 15 minutes (not guaranteed). Our `warmTimeout` defaults to 5 minutes — a more aggressive eviction to free simulated resources. Eviction is why "functions get cold again" — after idle time, the warm pool drains and the next invocation pays the cold start penalty.
+
+**Stats** use atomic counters to avoid holding the pool lock during counting:
+
+```go
+// pool.go — InvocationStats
+type InvocationStats struct {
+    ColdStarts int64
+    WarmHits   int64
+    Timeouts   int64
+    Panics     int64
+}
+func (s *InvocationStats) addCold() { atomic.AddInt64(&s.ColdStarts, 1) }
+```
+
+**What the tests check**: after a cold start the instance is in the warm pool, so the second invocation completes in under 50ms. An empty pool always pays 50ms. Releasing 5 instances into a pool with `maxWarm=2` leaves exactly 2 idle. Setting `warmTimeout=1ms` and calling `Evict()` removes the instance. 3 concurrent cold starts all complete in under 200ms (they run in parallel). After 1 cold + 2 warm: `ColdStarts=1`, `WarmHits=2`.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Snapshotting + Billing"
+  goals={[
+    "SnapshotStore: Save(name, initState) after first cold start; Restore(name) sleeps 5ms and returns true",
+    "AcquireWithSnapshot: warm hit → 0ms, snapshot restore → 5ms, full cold start → 50ms + Save",
+    "BillingRecord: billableMs = max(1, ceil(actualMs)), cost = billableMs x (memMB/1024) x gbMsRate",
+    "BillingAggregator: per-function totals across all invocations (thread-safe)",
+    "Test: snapshot restore faster than cold start, billing formula correct, 1ms minimum, memory scaling, monthly aggregation",
+  ]}
+  loc={300}
+>
+
+The snapshot store is a simple `map[string]*Snapshot` behind a mutex:
+
+```go
+// snapshot.go — the core types
+type Snapshot struct {
+    FuncName      string
+    InitState     []byte
+    CreatedAt     time.Time
+    RestoredCount int
+}
+
+type SnapshotStore struct {
+    mu        sync.Mutex
+    snapshots map[string]*Snapshot
+}
+```
+
+`Restore` sleeps `snapshotRestoreDelay` (5ms) only if a snapshot exists:
+
+```go
+// snapshot.go — Restore
+func (s *SnapshotStore) Restore(name string) bool {
+    s.mu.Lock()
+    snap, ok := s.snapshots[name]
+    if ok { snap.RestoredCount++ }
+    s.mu.Unlock()
+
+    if !ok { return false }
+
+    time.Sleep(snapshotRestoreDelay)  // 5ms: S3 fetch + UFFD demand-paging
+    return true
+}
+```
+
+`AcquireWithSnapshot` adds a middle path between warm hit and full cold start:
+
+```go
+// pool.go — AcquireWithSnapshot
+func (p *InstancePool) AcquireWithSnapshot(name string, store *SnapshotStore) (*Instance, error) {
+    // 1. Try warm pool first (0ms).
+    p.mu.Lock()
+    for _, inst := range p.pools[name] {
+        if inst.busy.CompareAndSwap(false, true) {
+            p.mu.Unlock()
+            p.stats.addWarm()
+            return inst, nil
+        }
+    }
+    p.mu.Unlock()
+
+    // 2. Try snapshot restore (5ms).
+    if store.Restore(name) {
+        p.stats.addCold()
+        inst := &Instance{lastUsed: time.Now()}
+        inst.busy.Store(true)
+        return inst, nil
+    }
+
+    // 3. Full cold start (50ms) + save snapshot for next time.
+    time.Sleep(coldStartDelay)
+    store.Save(name, []byte("initialized"))
+    p.stats.addCold()
+    inst := &Instance{lastUsed: time.Now()}
+    inst.busy.Store(true)
+    return inst, nil
+}
+```
+
+This three-way hierarchy — warm pool, snapshot, cold start — directly maps to Lambda's execution environment lifecycle. The "initialized" snapshot is trivially small in our simulation. In production, a JVM snapshot is hundreds of megabytes of heap — but UFFD demand-paging means you only pay to load the pages you actually touch.
+
+**The billing formula** is the most precise part of the runtime:
+
+```go
+// billing.go — ComputeCost
+const (
+    gbMsRate     = 0.0000166667  // $ per GB-ms
+    minDurationMs = 1.0          // Lambda minimum billing unit since Dec 2020
+)
+
+func ComputeCost(actual time.Duration, memoryMB int) (billableMs int64, cost float64) {
+    actualMs := float64(actual.Nanoseconds()) / 1e6
+    ceilMs   := math.Ceil(actualMs)
+    if ceilMs < minDurationMs { ceilMs = minDurationMs }
+    billableMs = int64(ceilMs)
+    cost = ceilMs * (float64(memoryMB) / 1024.0) * gbMsRate
+    return
+}
+```
+
+`math.Ceil` rounds up to the nearest millisecond. `minDurationMs = 1.0` ensures that a 0.1ms function is billed as 1ms. The `(memoryMB / 1024.0)` term converts to GB — Lambda prices in GB-ms, not MB-ms.
+
+`BillingAggregator` accumulates records under a mutex and maintains per-function totals:
+
+```go
+// billing.go — Record
+func (b *BillingAggregator) Record(funcName string, duration time.Duration, memMB int) BillingRecord {
+    ms, cost := ComputeCost(duration, memMB)
+
+    b.mu.Lock()
+    rec := BillingRecord{FuncName: funcName, DurationMs: ms, CostUSD: cost}
+    b.records = append(b.records, rec)
+    tot := b.totals[funcName]
+    tot.TotalInvocations++
+    tot.TotalDurationMs += ms
+    tot.TotalCostUSD    += cost
+    b.mu.Unlock()
+    return rec
+}
+```
+
+**What the tests check**: after first call (cold start, 50ms, snapshot saved) and draining the pool, second call restores from snapshot in under 50ms but at least 3ms. `ComputeCost(1ms, 128)` returns `billableMs=1`. `ComputeCost(100us, 128)` returns `billableMs=1` (minimum floor). `ComputeCost(1.5ms, 512)` returns `billableMs=2`. After 3 invocations of 1ms at 128MB, total duration is 3ms and total cost is `3 x (128/1024) x 0.0000166667`.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/faas-runtime"
+  prereqs={["Go 1.23+"]}
+  steps={[
+    {
+      label: "Clone and run tests",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/faas-runtime\ngo test ./pkg/faas/ -v -timeout 120s",
+    },
+    {
+      label: "Start the FaaS HTTP server",
+      cmd: "go run ./cmd/server\n# Starts on :8080",
+    },
+    {
+      label: "Invoke the echo function (in another terminal)",
+      cmd: "curl -X POST http://localhost:8080/invoke/echo -d 'hello from curl'",
+    },
+    {
+      label: "Invoke the uppercase function",
+      cmd: "curl -X POST http://localhost:8080/invoke/upper -d 'hello world'",
+    },
+    {
+      label: "List registered functions",
+      cmd: "curl http://localhost:8080/functions",
+    },
+    {
+      label: "Check invocation stats (cold/warm counts)",
+      cmd: "curl http://localhost:8080/stats",
+    },
+    {
+      label: "Build the Java demo (Spring Cloud Function comparison)",
+      cmd: "cd java-integration\nmvn test",
+    },
+  ]}
+  expectedOutput={`--- PASS: TestRegisterAndInvoke (0.00s)
+--- PASS: TestTimeoutFires (0.05s)
+--- PASS: TestUnknownFunction (0.00s)
+--- PASS: TestConcurrentInvocations (0.00s)
+--- PASS: TestHandlerPanicReturns500 (0.00s)
+--- PASS: TestResponseHeadersPropagated (0.00s)
+--- PASS: TestQueryParamAccess (0.00s)
+--- PASS: TestBodyBytes (0.00s)
+--- PASS: TestWarmHitSkipsColdStart (0.05s)
+--- PASS: TestColdStartOnEmptyPool (0.05s)
+--- PASS: TestPoolCapLimitsWarmInstances (0.00s)
+--- PASS: TestIdleEviction (0.00s)
+--- PASS: TestConcurrentColdStarts (0.05s)
+--- PASS: TestStatsCountCorrectly (0.05s)
+--- PASS: TestSnapshotRestoreFasterThanColdStart (0.05s)
+--- PASS: TestBillingFormulaCorrect (0.00s)
+--- PASS: TestBillingMinimumOneMs (0.00s)
+--- PASS: TestBillingMemoryCeilRounding (0.00s)
+--- PASS: TestMonthlyAggregation (0.00s)
+PASS
+ok      github.com/pushkarkumar-dev/system-design-labs/labs/faas-runtime/pkg/faas  0.268s`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "Warm invocation latency",                value: "0.3",   unit: "ms",              note: "estimated — goroutine spawn + channel send" },
+    { metric: "Cold start latency (simulated)",         value: "50",    unit: "ms",              note: "estimated — 50ms sleep models container start" },
+    { metric: "Snapshot restore latency",               value: "5",     unit: "ms",              note: "estimated — 10x faster than cold start" },
+    { metric: "Warm pool throughput (3 warm instances)", value: "9,500", unit: "invocations/sec", note: "estimated — 3 instances x 3,200 req/sec each" },
+  ]}
+/>
+
+## Stress tests
+
+**What happens when all warm instances are busy?** With `maxWarm=3` and 10 concurrent requests arriving simultaneously, 3 requests get warm instances and 7 trigger cold starts. All 7 cold starts pay 50ms each but run concurrently — the tail latency is 50ms, not 350ms. The pool fills up to `maxWarm` as requests complete. Additional requests beyond `maxWarm` are discarded from the pool, not queued. This is Lambda's concurrency model: no queue, no back-pressure, just parallel cold starts up to the account concurrency limit.
+
+**Panic isolation** is critical for multi-tenant runtimes. Run a handler that panics and verify the server continues serving other functions. In our runtime, the `recover()` in `invokeHandler` catches the panic, increments `stats.Panics`, and returns a 500 to the caller. The server process stays alive. Without the recover, one misbehaving user function would bring down the entire runtime serving all other users' functions.
+
+**Billing precision under load**: run 1,000,000 invocations at various durations and verify that the total cost aggregates correctly. Floating-point accumulation errors can distort billing at scale — production billing systems use integer arithmetic in microdollars (multiply by 10^9, accumulate as int64, divide at reporting time).
+
+**Snapshot eviction**: if function code is updated, the old snapshot is stale. Delete the snapshot from the store and verify that the next invocation pays the full 50ms cold start and saves a new snapshot. In production, Lambda invalidates snapshots when a new function version is published by deleting the snapshot from S3.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "Process or container isolation", why: "Our functions run in the same process as the runtime. Real FaaS (Lambda, Cloud Run) isolates each invocation in a separate container or microVM (Firecracker). Without isolation, a misbehaving function can affect others — reading global memory, exhausting file descriptors, or killing the runtime process with an unrecoverable error." },
+    { thing: "Dynamic code loading", why: "Real FaaS runtimes download function code from S3/GCS and load it dynamically (as a shared library, WASM module, or container image). Our registry is static — functions must be compiled into the binary. Dynamic loading requires a plugin system, sandbox, and version management." },
+    { thing: "VPC networking and IAM", why: "Lambda functions can be placed inside a VPC for private resource access. Each invocation gets a network interface from an ENI pool (NITRO-managed). IAM role assumption gives functions fine-grained AWS API access via STS. Both require kernel-level networking primitives absent from our toy." },
+    { thing: "Concurrency control per function", why: "Lambda's reserved concurrency limits how many simultaneous invocations a function can have. Our pool cap limits warm instances but not total invocations — a slow function can spawn unlimited goroutines. Real concurrency control requires a per-function semaphore and a request queue with overflow rejection." },
+    { thing: "Extension API and layers", why: "Lambda extensions (agents that run alongside the function) enable observability, security scanning, and configuration management. Extensions communicate with the runtime via a sidecar HTTP API. Layers add shared code (dependencies, runtimes) without duplicating them in every function deployment package." },
+    { thing: "Response streaming", why: "AWS Lambda response streaming allows functions to start sending bytes before computing the full response — critical for LLM token streaming. Our Response is fully materialized in memory before the HTTP handler writes it. Streaming requires chunked transfer encoding and a separate response pipe from the handler goroutine." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-cloud-function"
+  mavenCoords={[
+    "org.springframework.cloud:spring-cloud-function-web:4.1.3",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+  ]}
+  repoPath="labs/faas-runtime/java-integration"
+>
+
+### Spring Cloud Function — the Java FaaS registry
+
+Spring Cloud Function is the Java equivalent of our Go function registry. Any Spring `@Bean` of type `java.util.function.Function` is automatically exposed as an HTTP endpoint by `spring-cloud-function-web`:
+
+```java
+// SpringCloudFunctionComparison.java
+@Configuration
+public class SpringCloudFunctionComparison {
+
+    // Exposed at: POST /uppercase
+    // Go equivalent: rt.Register("uppercase", handler, timeout)
+    @Bean
+    public Function<String, String> uppercase() {
+        return String::toUpperCase;
+    }
+
+    // Exposed at: POST /reverse
+    @Bean
+    public Function<String, String> reverse() {
+        return s -> new StringBuilder(s).reverse().toString();
+    }
+}
+```
+
+The Go runtime does the same thing with a map and a string key. Spring Cloud Function uses the bean name as the URL path segment. Both approaches separate "what a function does" from "how it is exposed" — the function is pure business logic; the framework handles HTTP routing, serialization, and request lifecycle.
+
+### JVM cold start — a different dimension of cold start
+
+Our Go runtime simulates a 50ms cold start representing container/microVM startup. On the JVM, cold start has an additional dimension: JIT warm-up. HotSpot starts in interpreted mode and only compiles hot methods to native code after a profiling threshold (default: 10,000 invocations for C2). Until JIT compilation happens, each method call is slower than the steady-state compiled version. A Lambda function that receives bursts of traffic separated by quiet periods never reaches JIT steady state.
+
+The timeline for a cold JVM Lambda invocation without SnapStart:
+```
+0ms    Container/microVM start (Firecracker boots)
+50ms   JVM process starts (class loading, agent initialization)
+500ms  Spring application context initialization (component scan, bean wiring)
+800ms  Function init() completes — first invocation starts executing
+```
+
+### AWS Lambda SnapStart — the v2 snapshot concept at production scale
+
+SnapStart directly implements the snapshot idea from our v2 stage, applied to full JVM process images:
+
+```
+Our Go v2:   cold start (50ms)  → save initState bytes to SnapshotStore
+             next cold start    → restore initState in 5ms (10x faster)
+
+SnapStart:   JVM init (800ms)  → Lambda snapshots JVM heap + stack + JIT cache to S3
+             next cold start   → UFFD demand-paging restores only touched pages
+                                 → ~100ms restore vs 800ms cold start (8x faster)
+```
+
+UFFD (userfaultfd) is a Linux kernel mechanism that intercepts page faults and serves pages from a custom source — in this case, the S3 snapshot. The JVM process starts instantly from the OS perspective; pages are loaded from S3 lazily as the function actually accesses memory. Our `time.Sleep(5ms)` in `Restore()` models this load time.
+
+### FaasClient — calling the Go runtime from Java
+
+`FaasClient` uses Spring's `RestClient` to invoke the Go FaaS server:
+
+```java
+// FaasClient.java (~50 lines)
+@Component
+public class FaasClient {
+
+    private final RestClient restClient;
+
+    public FaasClient(FaasProperties props) {
+        this.restClient = RestClient.builder()
+                .baseUrl(props.getBaseUrl())
+                .build();
+    }
+
+    public String invoke(String functionName, String body) {
+        return restClient.post()
+                .uri("/invoke/{name}", functionName)
+                .contentType(MediaType.TEXT_PLAIN)
+                .body(body)
+                .retrieve()
+                .body(String.class);
+    }
+}
+```
+
+The `FaasProperties` class binds `faas.base-url` and `faas.default-timeout-seconds` from `application.properties` — no `@Value` scattered across beans.
+
+### CRaC and GraalVM — alternative approaches
+
+Two Java ecosystem approaches to the cold start problem:
+
+**CRaC (Coordinated Restore at Checkpoint)**: an OpenJDK project that exposes CRIU (Checkpoint/Restore In Userspace) at the Java API level. You implement the `Resource` interface to handle pre/post checkpoint hooks (close file handles before checkpoint, reopen after restore). Spring Boot 3.2+ has built-in CRaC support — `mvn spring-boot:checkpoint` takes the snapshot.
+
+**GraalVM Native Image**: compiles the entire application to a native binary at build time using ahead-of-time compilation. Eliminates JIT warm-up entirely. Spring Boot 3.x supports `mvn -Pnative package` for native compilation. Startup time drops to ~10ms but peak throughput is lower than HotSpot JIT for long-running workloads.
+
+### Run it
+
+```bash
+# Unit tests (no Go server required)
+cd labs/faas-runtime/java-integration
+mvn test
+
+# Full demo (start Go server first)
+cd labs/faas-runtime && go run ./cmd/server &
+cd java-integration && mvn spring-boot:run
+```
+
+Expected output when Go server is running:
+```
+=== FaaS Runtime Lab — Java / Spring Cloud Function ===
+
+AWS Lambda SnapStart — the v2 snapshot concept at production scale
+Our Go v2: after cold start (50ms), serialize init state to SnapshotStore.
+SnapStart:  after JVM init() phase (500ms+), Lambda snapshots the JVM process to S3.
+
+Go FaaS server is running. Registered functions: [echo upper slow greet]
+invoke(upper, 'hello from java') = HELLO FROM JAVA
+Stats: {ColdStarts:1, WarmHits:0, Timeouts:0, Panics:0}
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+The billing formula precision surprised me. Lambda charges in 1ms increments (changed from 100ms in 2021): `max(1ms, ceiling(duration, 1ms)) x (memory_mb / 1024) x $0.0000166667`. A 0.1ms invocation costs the same as a 1ms invocation — the 1ms minimum. At 1 million invocations of a 128 MB function that each take 0.5ms, you are billed for `1,000,000 x 1ms x (128/1024) x $0.0000166667 = $0.002`. The same 1 million invocations each taking 1.5ms cost `$0.003` — a 1.5x difference from a 3x difference in actual duration, because of the 1ms minimum floor.
+
+The second surprise was how the warm pool interacts with concurrency. I initially thought "maxWarm=3 means at most 3 concurrent invocations." That is wrong. `maxWarm` is the number of idle instances kept after invocations complete. A fourth concurrent invocation triggers a cold start but the instance is not added to the pool after it finishes (pool is full). The pool size and the concurrency limit are different knobs — Lambda's reserved concurrency is the concurrency limit; `maxWarm` is a cost control knob.
+
+The third surprise was the snapshot granularity. Real Lambda SnapStart operates at the process-memory level — it snapshots the entire JVM heap. But the usefulness depends on what happened during init. If your init phase connected to a database, the snapshot contains a stale connection. SnapStart hooks (`beforeCheckpoint`, `afterRestore`) exist precisely to handle this: close the connection before the snapshot, reopen it after restore. Our `initState []byte` in `SnapshotStore` is trivially small and stateless, hiding this complication entirely.
+
+## Where to go deeper
+
+- **Firecracker MicroVM** (`firecracker-microvm.github.io`): the open-source microVM that powers AWS Lambda and Fargate. The design paper explains how Firecracker boots a Linux kernel in under 125ms using a minimal device model — the real implementation of our 50ms cold start simulation.
+- **AWS Lambda execution environment docs**: the authoritative reference for the init, invoke, and shutdown phases, the extension API, and the Firecracker sandbox boundary.
+- **AWS Lambda SnapStart docs**: explains the UFFD-based restore mechanism, the `beforeCheckpoint`/`afterRestore` hooks, and which function runtimes support SnapStart (Java 11+ on Corretto).
+- **Knative serving autoscaling**: the Kubernetes-native FaaS framework. The scale-to-zero cooldown configuration directly corresponds to our `warmTimeout` — how long to keep a warm instance before evicting it.
+- **CRIU (Checkpoint/Restore In Userspace)**: the Linux process snapshot tool that CRaC and some container runtimes use. Understanding CRIU makes SnapStart's implementation transparent.
+
+## Related labs and questions
+
+**Related labs:**
+- **Container Runtime** — builds the Firecracker-equivalent isolation layer that real FaaS runtimes use to sandbox function invocations
+- **Service Discovery** — how the FaaS control plane routes invocations to the correct worker node
+- **Rate Limiter** — per-function reserved concurrency is a rate limiter applied to invocations
+- **Message Queue** — async invocation (SQS trigger) means the FaaS runtime is a queue consumer
+
+**Questions to consider:**
+- How would you implement reserved concurrency (max simultaneous invocations per function) without blocking the pool lock?
+- What would you change in `ComputeCost` to support Lambda's tiered pricing (first 6 billion GB-ms free per month)?
+- How would you implement provisioned concurrency — pre-warmed instances that never go cold — in the `InstancePool`?
+- Why does Lambda SnapStart not work for Node.js and Python runtimes, only Java?
+- How would you implement the Lambda extension API — a sidecar HTTP server running alongside each function instance?

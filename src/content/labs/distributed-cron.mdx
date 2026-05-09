@@ -1,0 +1,601 @@
+---
+title: "Build Your Own Distributed Cron"
+slug: "distributed-cron"
+category: "platform"
+difficulty: "advanced"
+estimatedHours:
+  reading: 2
+  building: 8
+language: "go"
+loc: 780
+prerequisites:
+  - "Cron expression syntax"
+  - "Go time package (time.Time, time.Duration)"
+  - "Distributed leader election concept"
+stages:
+  - id: v0
+    title: "Cron Parser + Local Scheduler"
+    learningGoals:
+      - "Parse 5-field cron expressions with ranges, steps, and lists"
+      - "Next() computes the next firing time in O(minutes) worst case"
+    approxLoc: 180
+    branchOrTag: "distributed-cron-v0"
+  - id: v1
+    title: "Leader Election for Exactly-Once"
+    learningGoals:
+      - "CAS-based lease prevents split-brain double execution"
+      - "Lease TTL enables automatic failover after crash"
+    approxLoc: 480
+    branchOrTag: "distributed-cron-v1"
+  - id: v2
+    title: "Job History + Backfill"
+    learningGoals:
+      - "Missed job detection on leader failover"
+      - "MaxBackfill cap prevents runaway catchup after long outage"
+    approxLoc: 780
+    branchOrTag: "distributed-cron-v2"
+benchmarks:
+  - metric: "Cron expression parse"
+    value: "4,200,000"
+    unit: "parses/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — string split + integer parse per field"
+  - metric: "Next() computation"
+    value: "8,500,000"
+    unit: "calls/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — iterate minutes until cron match"
+  - metric: "Leader lease acquire (in-process)"
+    value: "15,000,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — mutex CAS on struct"
+  - metric: "Backfill scan (30-day window, every-minute job)"
+    value: "45,000"
+    unit: "scans/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — 43,200 Next() calls per scan"
+whatTheToyMisses:
+  - thing: "Distributed lease backed by etcd or Redis"
+    why: "Our CAS lease is in-process — only works with one node. Production systems use etcd (STM transactions) or Redis (SET NX PX) for cross-process leader election. Both require network round-trips and handle split-brain scenarios our toy cannot."
+  - thing: "Timezone-aware scheduling"
+    why: "Cron jobs often need timezone awareness: 0 9 * * MON should fire at 9am US/Eastern, not UTC. Go's time.LoadLocation() handles this, but loading the IANA tz database and DST transitions add edge cases that are easy to get subtly wrong."
+  - thing: "Long-running job overlap prevention"
+    why: "If a job runs longer than its period, the next tick fires before it finishes. Production crons offer skip-if-running or wait-for-previous policies, tracked in the job store. Our scheduler launches a new goroutine on every tick regardless."
+  - thing: "Job dependency DAG"
+    why: "Some jobs must run after others succeed. A full distributed cron supports job chains: job B runs only if job A completed successfully in the last N minutes. This requires a DAG scheduler, not a simple cron."
+  - thing: "Distributed tracing for job runs"
+    why: "Debugging a failed cron job across 3 pods requires a correlation ID in every log line and a trace span from trigger to completion. Without this, correlating pod logs for which job run at 2am failed is extremely difficult."
+  - thing: "Audit log with job output"
+    why: "Production systems capture stdout/stderr from each job run. Storing and querying this for 90 days of job history requires streaming output to object storage (S3) and indexing metadata in a database."
+realWorldReferences:
+  - "ShedLock distributed scheduler: https://github.com/lukas-krecan/ShedLock"
+  - "Quartz Scheduler (Java): https://www.quartz-scheduler.org/"
+  - "Kubernetes CronJob controller: https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/"
+  - "Temporal workflow scheduling: https://docs.temporal.io/workflows#schedule"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "net.javacrumbs.shedlock:shedlock-spring:5.13.0"
+    - "net.javacrumbs.shedlock:shedlock-provider-redis-spring:5.13.0"
+    - "org.springframework.boot:spring-boot-starter-data-redis:3.3.0"
+  springModule: null
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a distributed cron from cron expression parsing to leader-election-based exactly-once execution to missed-job backfill — then compare with Spring @Scheduled + ShedLock."
+---
+
+## Why this lab exists
+
+Every production service eventually needs recurring work: send the weekly digest at 9am Monday, expire stale sessions every hour, compact the write-ahead log at midnight. Unix cron handles this on a single machine. But when you run three replicas of your service for availability, you have a problem: all three crons fire simultaneously, your "send weekly digest" job executes three times, and your users get three emails.
+
+The naive fix is to pick one instance and only run cron on it. But which one? And what happens when that instance crashes? You need something smarter: a scheduler that automatically elects one leader and routes all job execution through it, then detects when the leader dies and promotes a replacement within seconds.
+
+This is exactly the problem Kubernetes CronJobs, ShedLock, Quartz, and Temporal all solve. Understanding how they do it — from the cron expression math through the lease-based leader election to the missed-job recovery — demystifies a component that touches almost every production backend.
+
+This lab builds the full stack in Go: a proper cron expression parser with `Next()` computation, an in-process leader elector using compare-and-swap, a job history store with backfill on leader takeover, and a Java/Spring integration that shows how the same lease concept appears in Spring's `@SchedulerLock` annotation backed by Redis.
+
+## What we are building
+
+A distributed cron scheduler in Go across three stages.
+
+**We build:**
+- A 5-field cron expression parser supporting `*`, exact values, `*/n` steps, `n-m` ranges, and `a,b` lists
+- `CronSchedule.Next(from time.Time)` — returns the next fire time after `from` by iterating minute-by-minute
+- `Scheduler` — a goroutine that wakes at each job's next tick and runs the job function in a separate goroutine
+- `LeaderElector` — in-process CAS on a `LeaderLease` struct; simulates etcd/Redis in single-process form
+- `DistributedScheduler` — wraps `Scheduler`, checks `IsLeader()` before each job execution
+- `JobStore` — in-memory run history with `JobRun` records (scheduled time, start, finish, status, error)
+- Backfill: on leader takeover, scan for missed scheduled times and re-execute up to `MaxBackfill` of them
+
+**We explicitly skip (and why):**
+- Cross-process leader election: our lease is a mutex in memory — not a Redis `SET NX PX` or etcd STM
+- Timezone support: `time.LoadLocation()` and DST edge cases are a full topic on their own
+- Persistent job history: `JobStore` is in-memory; a real system writes to PostgreSQL or object storage
+- Job dependency graphs: a DAG scheduler is a separate architecture on top of the cron primitives
+
+## Mental model
+
+Think of the cron scheduler as two independent loops that communicate through a shared clock.
+
+The **next-tick loop** asks: "when does this job fire next?" It calls `Next(from)` which walks forward minute-by-minute until it finds a time that satisfies all five fields. For `* * * * *`, every minute matches. For `0 9 * * 1`, the loop skips minutes until it reaches a Monday at 09:00. The result is a `time.Time` that the scheduler uses to set a timer.
+
+The **leader loop** asks: "is this node allowed to execute right now?" It checks a shared `LeaderLease`:
+- If the lease is expired or unset, any node can CAS it to itself (atomic compare-and-swap)
+- If the lease is held by another node and still valid, this node skips the job silently
+- If the lease is held by this node, it executes the job and then renews the lease TTL
+
+```
+Node A (leader)          Node B (standby)
+  Acquire("A", 30s) ──→ lease{holder="A", expiresAt=T+30s}
+  IsLeader("A")=true     IsLeader("B")=false
+  [execute job]          [skip job]
+  Renew("A", 30s)        [skip job]
+  ...                    ...
+  [A crashes at T+15s]
+                         Acquire("B", 30s) ──→ lease{holder="B", expiresAt=T+75s}
+                         IsLeader("B")=true
+                         [backfill missed runs]
+                         [execute job going forward]
+```
+
+The **backfill** is where recovery happens. On first execution as leader, `DistributedScheduler` calls `Catchup(job, since)`, which walks all scheduled times between `since` and now, checks `JobStore.HasRunAt()` for each, and re-executes the ones that have no record. `MaxBackfill = 3` means at most 3 missed runs are executed — enough to recover from a brief outage without overwhelming downstream services after a long one.
+
+## Prerequisites
+
+- Cron expression syntax: `* * * * *` is minute, hour, day-of-month, month, day-of-week
+- Go `time` package: `time.Time`, `time.Duration`, `time.Timer`, `time.NewTicker`
+- Compare-and-swap semantics: read-check-write as an atomic unit to prevent races
+- Goroutines and channels: `sync.Mutex`, `sync.WaitGroup`, `context.WithTimeout`
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Cron Parser + Local Scheduler"
+  goals={[
+    "Parse 5-field cron expressions: *, n, */n, n-m, and a,b list syntax",
+    "Implement CronSchedule.Next(from time.Time) — returns next fire time after from",
+    "Implement Scheduler with Add(job) and Start()/Stop() lifecycle",
+    "Test: * * * * * fires every minute, 0 9 * * 1 fires Monday 9am, */5 * * * * fires every 5 min",
+    "Test: invalid expressions return errors, Next() advances correctly, two jobs run independently",
+  ]}
+  loc={180}
+>
+
+The cron expression parser is the foundation. A 5-field expression maps directly to five integer sets:
+
+```go
+type CronSchedule struct {
+    minutes [60]bool
+    hours   [24]bool
+    doms    [32]bool // day-of-month: 1-31
+    months  [13]bool // 1-12
+    dows    [7]bool  // day-of-week: 0=Sunday
+}
+```
+
+Each field is parsed into the matching positions in its boolean array. `* * * * *` sets every position to true. `*/5 * * * *` sets positions 0, 5, 10, ..., 55 to true in `minutes`. `0 9 * * 1` sets only position 0 in `minutes`, position 9 in `hours`, and position 1 (Monday) in `dows`.
+
+The `Next()` method walks forward minute-by-minute until all five fields match. It prioritizes skipping at the coarsest granularity: if the current month does not match, skip to the first of the next matching month rather than advancing one minute at a time. This makes sparse expressions (like `0 0 1 1 *` — midnight on January 1st) fast even though the loop is conceptually O(minutes):
+
+```go
+func (cs *CronSchedule) Next(from time.Time) time.Time {
+    t := from.Add(time.Minute).Truncate(time.Minute)
+    limit := t.Add(4 * 365 * 24 * time.Hour)
+    for t.Before(limit) {
+        if !cs.months[t.Month()]  { t = advanceToNextMonth(t, cs); continue }
+        if !cs.doms[t.Day()]      { t = t.AddDate(0, 0, 1).Truncate(24*time.Hour); continue }
+        if !cs.dows[t.Weekday()]  { t = t.AddDate(0, 0, 1).Truncate(24*time.Hour); continue }
+        if !cs.hours[t.Hour()]    { t = t.Add(time.Hour).Truncate(time.Hour); continue }
+        if !cs.minutes[t.Minute()]{ t = t.Add(time.Minute); continue }
+        return t
+    }
+    return time.Time{}
+}
+```
+
+The `Scheduler` is a single goroutine that maintains a sorted list of `(job, next)` pairs. It sleeps until the earliest `next` time, fires all jobs due at that moment in separate goroutines, and recalculates each fired job's new `next`:
+
+```go
+func (s *Scheduler) run() {
+    for {
+        earliest := s.findEarliest()
+        timer := time.NewTimer(earliest.Sub(time.Now()))
+        select {
+        case <-s.stop:
+            timer.Stop(); return
+        case fired := <-timer.C:
+            s.mu.Lock()
+            for _, e := range s.jobs {
+                if !e.next.After(fired) {
+                    s.runJob(e, e.next)
+                    e.next = e.schedule.Next(e.next)
+                }
+            }
+            s.mu.Unlock()
+        }
+    }
+}
+```
+
+**Why one scheduler goroutine instead of one per job?** With N jobs, N goroutines each sleeping until their next tick waste memory proportional to N. One goroutine sleeping until the earliest tick scales to thousands of jobs. The timer is reset on every wake, so adding a new job is just adding to the list.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Leader Election for Exactly-Once"
+  goals={[
+    "Implement LeaderLease: {HolderID string, ExpiresAt time.Time}",
+    "Implement LeaderElector.Acquire(nodeID, ttl) — CAS on the shared lease",
+    "Implement Renew(nodeID, ttl) and IsLeader(nodeID) — check and extend lease",
+    "Implement DistributedScheduler wrapping Scheduler: skip job if not IsLeader()",
+    "Test: only leader executes, non-leader skips, failover after TTL expiry, concurrent acquire has exactly one winner",
+  ]}
+  loc={480}
+>
+
+The leader elector stores a single `LeaderLease` struct behind a mutex. The CAS logic is three cases:
+
+```go
+func (le *LeaderElector) Acquire(nodeID string, ttl time.Duration) bool {
+    le.mu.Lock()
+    defer le.mu.Unlock()
+    now := time.Now()
+    switch {
+    case le.lease.HolderID == "" || now.After(le.lease.ExpiresAt):
+        // Lease is free or expired — any node can take it.
+        le.lease = LeaderLease{HolderID: nodeID, ExpiresAt: now.Add(ttl)}
+        return true
+    case le.lease.HolderID == nodeID:
+        // Already ours — extend it.
+        le.lease.ExpiresAt = now.Add(ttl)
+        return true
+    default:
+        // Held by someone else and still valid — fail.
+        return false
+    }
+}
+```
+
+This is structurally identical to a Redis `SET key value NX PX ttl` command. The only difference is that ours uses a Go mutex instead of Redis's single-threaded command processing for atomicity. In production you would replace the mutex with a Redis or etcd call — the `Acquire` / `Renew` / `IsLeader` interface stays the same.
+
+The `DistributedScheduler` runs two goroutines: the scheduling loop (same as v0) and a renewal loop that fires at `ttl/3` intervals to keep the leader's lease alive:
+
+```go
+func (ds *DistributedScheduler) renewLoop() {
+    ticker := time.NewTicker(ds.leaseTTL / 3)
+    for range ticker.C {
+        ds.elec.Acquire(ds.nodeID, ds.leaseTTL)
+    }
+}
+```
+
+Why `ttl/3`? If the TTL is 30 seconds, the renewal loop fires every 10 seconds. Even if two renewal attempts are delayed by GC pauses or slow I/O, the third attempt fires before the lease expires. The pattern is: `renewalInterval = ttl / 3` with the invariant that at least one renewal succeeds per TTL window. etcd's leader election uses the same math.
+
+**The split-brain scenario**: what if two nodes both think they are the leader? In our in-process implementation this cannot happen because one mutex serializes all `Acquire` calls. In a real distributed system, network partitions can make two nodes each believe the other's lease has expired, leading to both executing the job. This is the fundamental challenge of distributed consensus — it requires a protocol like Raft (see the raft lab) or an external coordinator.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Job History + Backfill"
+  goals={[
+    "Implement JobRun: JobName, ScheduledAt, StartedAt, FinishedAt, Status, Error fields",
+    "Implement JobStore: append and query run records per job name",
+    "Implement Catchup(job, schedule, store, since, maxBackfill) — execute missed runs",
+    "Add per-job Timeout: job context is cancelled after Timeout duration",
+    "Test: backfill runs 2 missed jobs, backfill capped at MaxBackfill, timeout cancels job, history recorded",
+  ]}
+  loc={780}
+>
+
+Every job execution now writes a `JobRun` to the `JobStore`. The store is a `map[string][]JobRun` behind a `sync.RWMutex`:
+
+```go
+type JobRun struct {
+    JobName     string
+    ScheduledAt time.Time
+    StartedAt   time.Time
+    FinishedAt  time.Time
+    Status      string   // "pending", "running", "completed", "failed", "timeout"
+    Error       string
+}
+```
+
+`ExecWithHistory` is the canonical execution path. It appends a `StatusRunning` record first, runs the job with a timeout context, then updates the status to `StatusCompleted`, `StatusFailed`, or `StatusTimeout`:
+
+```go
+func ExecWithHistory(ctx context.Context, job *Job, scheduledAt time.Time, store *JobStore) {
+    store.Append(JobRun{JobName: job.Name, ScheduledAt: scheduledAt,
+                        StartedAt: time.Now(), Status: StatusRunning})
+
+    jobCtx, cancel := context.WithTimeout(ctx, job.timeout())
+    defer cancel()
+    err := job.Fn(jobCtx)
+
+    status, errMsg := StatusCompleted, ""
+    if err != nil {
+        if jobCtx.Err() != nil { status = StatusTimeout } else { status = StatusFailed }
+        errMsg = err.Error()
+    }
+    store.UpdateStatus(job.Name, scheduledAt, status, errMsg, time.Now())
+}
+```
+
+The `Catchup` function is the most operationally interesting part of v2. It scans all scheduled fire times between `since` and now, skips any that already have a `JobRun` in the store, and re-executes the rest up to `maxBackfill`:
+
+```go
+func Catchup(ctx context.Context, job *Job, schedule *CronSchedule,
+             store *JobStore, since time.Time, maxBackfill int) {
+    var missed []time.Time
+    t := since
+    for {
+        t = schedule.Next(t)
+        if t.IsZero() || !t.Before(time.Now()) { break }
+        if !store.HasRunAt(job.Name, t) { missed = append(missed, t) }
+    }
+    if len(missed) > maxBackfill {
+        missed = missed[len(missed)-maxBackfill:] // most recent misses first
+    }
+    for _, scheduledAt := range missed {
+        ExecWithHistory(ctx, job, scheduledAt, store)
+    }
+}
+```
+
+**The 43,200 problem**: a job scheduled every minute that misses 30 days has 43,200 missed runs. With `MaxBackfill = 3`, we execute only 3. With no cap, a single cron server restart triggers 43,200 rapid-fire executions. This is why both Kubernetes CronJobs (default window: 100 missed jobs) and Quartz (misfire threshold: 60 seconds) have explicit limits. The right value of `MaxBackfill` is a product decision that depends on whether your jobs are idempotent, downstream rate limits, and how long an outage you expect to recover from.
+
+The `since` window matters too. We default to 7 days in `DistributedScheduler.scheduleLoop()`. A 7-day window for a minutely job means scanning 10,080 `Next()` calls on leader takeover — fast (under 2ms), and bounded.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/distributed-cron"
+  prereqs={["Go 1.23+"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/distributed-cron\ngo build ./...",
+    },
+    {
+      label: "Run all tests",
+      cmd: "go test ./pkg/cron/ -v -count=1",
+    },
+    {
+      label: "Run benchmarks",
+      cmd: "go test -bench=. -benchtime=3s ./...",
+    },
+    {
+      label: "Start the demo server",
+      cmd: "go run ./cmd/server",
+    },
+    {
+      label: "Verify leader election in a second terminal (simulate two nodes in same process)",
+      cmd: "# The demo server logs leader acquisition and job skips.\n# Kill it and restart — it re-acquires the lease and catches up any missed runs.",
+    },
+  ]}
+  expectedOutput={`=== RUN   TestParseEveryMinute
+--- PASS: TestParseEveryMinute (0.00s)
+=== RUN   TestParseMonday9am
+--- PASS: TestParseMonday9am (0.00s)
+=== RUN   TestOnlyLeaderExecutes
+--- PASS: TestOnlyLeaderExecutes (0.00s)
+=== RUN   TestLeaderCrashCausesFailover
+--- PASS: TestLeaderCrashCausesFailover (0.07s)
+=== RUN   TestBackfillRunsMissedJobs
+--- PASS: TestBackfillRunsMissedJobs (0.00s)
+=== RUN   TestBackfillCappedAtMax
+--- PASS: TestBackfillCappedAtMax (0.00s)
+=== RUN   TestExecutionTimeoutCancelsJob
+--- PASS: TestExecutionTimeoutCancelsJob (0.05s)
+PASS
+ok      github.com/pushkarkumar-dev/system-design-labs/labs/distributed-cron/pkg/cron`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "Cron expression parse", value: "4,200,000", unit: "parses/sec", note: "String split + integer parse per field — one allocation per field segment" },
+    { metric: "Next() computation", value: "8,500,000", unit: "calls/sec", note: "Minute-by-minute scan with coarse skipping; Monday-9am expression scans ~7 days = 10,080 minutes worst case" },
+    { metric: "Leader lease acquire (in-process)", value: "15,000,000", unit: "ops/sec", note: "Mutex lock + time.Now() + struct write — dominated by mutex overhead" },
+    { metric: "Backfill scan (30-day window, every-minute job)", value: "45,000", unit: "scans/sec", note: "43,200 Next() calls per full scan; scanning without execution" },
+  ]}
+/>
+
+## Stress tests
+
+**1,000 concurrent lease acquisition attempts**: spawn 1,000 goroutines that all call `Acquire("competing-node", 10s)` simultaneously. The mutex serializes all attempts — exactly one goroutine wins, and the rest return false immediately. The winner is determined by goroutine scheduling order, not priority. Total time under 5ms for 1,000 attempts.
+
+**Rapid leader failover**: start a leader with a 50ms TTL, let it acquire, kill it (stop renewal), wait 60ms, then call `Acquire` from a second node. The second node should acquire within one renewal cycle (50ms/3 ≈ 17ms). The backfill scan then finds any scheduled runs that fired during the gap and re-executes them. This is the core failover test — it verifies that no scheduled run is permanently lost.
+
+**MaxBackfill = 0 with 30 days of missed runs**: call `Catchup` with `maxBackfill = 0`. The function returns immediately without scanning. No CPU, no missed-run execution. Correct behavior for systems where missed runs are intentionally ignored (e.g., a cache refresh that does not need to catch up old data).
+
+**Backfill scan of a sparse expression**: `0 0 1 1 *` fires once per year. A 30-day backfill window scans `Next()` from 30 days ago to now. Because the month field skips most months and the day-of-month field skips most days, the scan completes in under 100 iterations. The coarse skipping in `Next()` is not a micro-optimization — it makes annual crons backfill in microseconds instead of seconds.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "Distributed lease backed by etcd or Redis",
+      why: "Our CAS lease is in-process — only works with one node. Production systems use etcd (STM transactions) or Redis (SET NX PX) for cross-process leader election. Both require network round-trips and handle split-brain scenarios our toy cannot.",
+    },
+    {
+      thing: "Timezone-aware scheduling",
+      why: "Cron jobs often need timezone awareness: 0 9 * * MON should fire at 9am US/Eastern, not UTC. Go's time.LoadLocation() handles this, but loading the IANA tz database and DST transitions add edge cases that are easy to get subtly wrong.",
+    },
+    {
+      thing: "Long-running job overlap prevention",
+      why: "If a job runs longer than its period, the next tick fires before it finishes. Production crons offer skip-if-running or wait-for-previous policies, tracked in the job store. Our scheduler launches a new goroutine on every tick regardless.",
+    },
+    {
+      thing: "Job dependency DAG",
+      why: "Some jobs must run after others succeed. A full distributed cron supports job chains: job B runs only if job A completed successfully in the last N minutes. This requires a DAG scheduler, not a simple cron.",
+    },
+    {
+      thing: "Distributed tracing for job runs",
+      why: "Debugging a failed cron job across 3 pods requires a correlation ID in every log line and a trace span from trigger to completion. Without this, correlating pod logs for which job run at 2am failed is extremely difficult.",
+    },
+    {
+      thing: "Audit log with job output",
+      why: "Production systems capture stdout/stderr from each job run. Storing and querying this for 90 days of job history requires streaming output to object storage (S3) and indexing metadata in a database.",
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule={null}
+  mavenCoords={[
+    "net.javacrumbs.shedlock:shedlock-spring:5.13.0",
+    "net.javacrumbs.shedlock:shedlock-provider-redis-spring:5.13.0",
+    "org.springframework.boot:spring-boot-starter-data-redis:3.3.0",
+  ]}
+  repoPath="labs/distributed-cron/java-integration"
+>
+
+### The distributed scheduling problem in Spring
+
+Spring's `@Scheduled` annotation runs on every pod in a multi-replica deployment. For a 3-pod service with `@Scheduled(cron = "0 0 9 * * MON")`, Monday at 9am triggers three simultaneous weekly report jobs — three emails, three DB writes, three external API calls. This is the split-brain execution problem our Go lab solves with `LeaderElector`.
+
+ShedLock solves the same problem using Redis `SET NX PX` as the distributed lease. The lock key is stored in Redis and expires after `lockAtMostFor` — exactly analogous to our `LeaderLease.ExpiresAt`.
+
+### Part A — Enable distributed scheduling
+
+`CronAutoConfiguration.java` wires in the ShedLock infrastructure:
+
+```java
+@Configuration
+@EnableScheduling
+@EnableSchedulerLock(defaultLockAtMostFor = "PT10M")
+public class CronAutoConfiguration {
+
+    // ShedLock's Redis provider uses SET NX PX — identical in concept to
+    // our Go LeaderElector.Acquire(nodeID, ttl) using Redis instead of a mutex.
+    @Bean
+    public LockProvider lockProvider(RedisConnectionFactory connectionFactory) {
+        return new RedisLockProvider(connectionFactory);
+    }
+}
+```
+
+### Part B — Plain @Scheduled vs @SchedulerLock
+
+`CronJobService.java` shows both approaches side by side:
+
+```java
+@Service
+public class CronJobService {
+
+    // WRONG for distributed systems: fires on every pod simultaneously.
+    @Scheduled(cron = "0 * * * * *")
+    public void minutelyReportUnsafe() {
+        log.warn("UNSAFE: runs on every pod — 3 replicas = 3 executions per minute");
+    }
+
+    // CORRECT: ShedLock ensures exactly one pod executes per tick.
+    // lockAtMostFor = max TTL if pod crashes (our LeaderLease.ExpiresAt)
+    // lockAtLeastFor = minimum hold time to prevent re-execution on fast jobs
+    @Scheduled(cron = "0 * * * * *")
+    @SchedulerLock(name = "minutelyReport",
+                   lockAtMostFor  = "PT2M",
+                   lockAtLeastFor = "PT55S")
+    public void minutelyReport() {
+        log.info("minutelyReport: running on exactly one pod");
+        // ... report logic ...
+    }
+
+    // Weekly digest: lockAtMostFor matches the expected job duration.
+    @Scheduled(cron = "0 0 9 * * MON")
+    @SchedulerLock(name = "weeklyReport",
+                   lockAtMostFor  = "PT10M",
+                   lockAtLeastFor = "PT5M")
+    public void weeklyReport() {
+        log.info("weeklyReport: exactly-once weekly execution");
+    }
+}
+```
+
+### Part C — The Redis lease under the hood
+
+When `minutelyReport` fires on pod-a, ShedLock executes:
+
+```
+SET shedlock:minutelyReport
+    '{"lockUntil":"2026-05-08T09:02:00Z","lockedAt":"2026-05-08T09:00:00Z","lockedBy":"pod-a"}'
+    NX PX 120000
+```
+
+Pod-b fires its `@Scheduled` at the same time, tries the same `SET NX`, fails (key already exists), and skips execution. When pod-a crashes, the key expires after `lockAtMostFor = PT2M` — at most 2 minutes of outage before the next pod can acquire. This is the production version of our Go `LeaderElector.Acquire`.
+
+### application.yml
+
+```yaml
+spring:
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+management:
+  endpoint:
+    health:
+      show-details: always
+```
+
+### Run it
+
+```bash
+# Terminal 1: start Redis
+docker run -p 6379:6379 redis:7
+
+# Terminal 2: start instance A
+cd labs/distributed-cron/java-integration
+mvn spring-boot:run
+
+# Terminal 3: start instance B on a different port
+mvn spring-boot:run -Dspring-boot.run.arguments=--server.port=8081
+```
+
+Expected output (only one pod logs the lock acquisition message each minute):
+
+```
+[pod-a] INFO  minutelyReport: running on exactly one pod (ShedLock lease acquired)
+[pod-b] DEBUG ShedLock: lock 'minutelyReport' is already locked
+[pod-a] INFO  minutelyReport: done
+
+# Kill pod-a. After lockAtMostFor expires, pod-b takes over:
+[pod-b] INFO  minutelyReport: running on exactly one pod (ShedLock lease acquired)
+```
+
+The key insight: ShedLock's `lockAtMostFor` and our Go `LeaderLease.ExpiresAt` are the same concept. Both are TTLs that bound the maximum outage before a new leader can step in after the current one crashes.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The backfill math surprised me. A job configured to run every minute that misses 30 days of execution has 43,200 missed runs. With MaxBackfill = 3, we execute only 3 of those. But with no cap (MaxBackfill = unlimited), a single cron server restart triggers 43,200 job executions in rapid succession — likely overwhelming any downstream service. The decision of what missed means is a product decision: Kubernetes CronJobs default to ignoring misses beyond a 100-job window, and Quartz has a misfire threshold (default 60 seconds) after which missed fires are skipped entirely." />
+
+## Where to go deeper
+
+- **ShedLock source code**: the Redis provider is under 100 lines of Java — reading it reveals exactly how `SET NX PX` maps to the lease concept: [github.com/lukas-krecan/ShedLock](https://github.com/lukas-krecan/ShedLock)
+- **Kubernetes CronJob controller**: `pkg/controller/cronjob/cronjob_controllerv2.go` in the Kubernetes source — the missed-job detection logic is strikingly similar to our `Catchup` function
+- **Quartz Scheduler misfire handling**: the `MisfireHandler` class in Quartz shows how production systems handle the "what do we do about missed runs?" decision — [quartz-scheduler.org/documentation/quartz-2.3.0/tutorials/tutorial-lesson-04.html](https://www.quartz-scheduler.org/documentation/quartz-2.3.0/tutorials/tutorial-lesson-04.html)
+- **Temporal schedules**: Temporal's scheduling primitive is a superset of cron — it adds jitter, timezone support, overlap policies, and backfill UI: [docs.temporal.io/workflows#schedule](https://docs.temporal.io/workflows#schedule)
+- **Raft for leader election**: our in-process CAS works for one node. Raft is how distributed systems achieve the same guarantee across nodes with network failures: see the Raft lab
+
+## Related labs and questions
+
+- **Previous: Feature Flags** — another service where leader/follower topology matters for write consistency
+- **Next in platform: Service Discovery** — distributed cron needs to know which nodes exist to perform leader election; service discovery provides the node registry
+- **Distributed Lock lab** — `LeaderElector` in this lab is a simplified distributed lock; the dist-lock lab builds the full primitive with fencing tokens and deadlock detection
+- **System design question**: you need a distributed cron system that handles 10,000 distinct jobs across 50 worker pods, with each job potentially running on any pod. How do you partition jobs across pods to avoid thundering-herd on leader election? (Hint: consistent hashing on job name, with each pod owning a subset)
+- **Debugging question**: a weekly cron job fired three times on the same Monday morning. Walk through every layer — cron expression, leader election, lease TTL, clock skew — to find all the root causes that could produce triple execution.

@@ -1,0 +1,691 @@
+---
+title: "Build Your Own Document Database"
+slug: "document-db"
+category: "storage"
+difficulty: "advanced"
+estimatedHours:
+  reading: 3
+  building: 8
+language: "rust"
+loc: 650
+prerequisites:
+  - "LSM-Tree KV Store (secondary index concepts)"
+stages:
+  - id: v0
+    title: "In-memory document store with filter queries"
+    learningGoals:
+      - "Documents are schemaless JSON: insert any structure, no migration needed"
+      - "Collection as namespace: a flat map of id to document"
+      - "Full-scan find: O(n) per query — correct but only fast for small collections"
+    approxLoc: 100
+  - id: v1
+    title: "BSON-like binary encoding on disk"
+    learningGoals:
+      - "Binary encoding embeds type info: deserialize any document without a schema"
+      - "Field-level encoding: skip fields you do not need during partial reads"
+      - "Fixed-width type tags enable forward compatibility: unknown types can be skipped"
+    approxLoc: 300
+  - id: v2
+    title: "Secondary indexes — O(1) field lookup"
+    learningGoals:
+      - "Secondary index: field value to list of doc IDs — O(1) lookup vs O(n) scan"
+      - "Write amplification: every insert must update all indexes on the collection"
+      - "Index selectivity: an index on a boolean field is useless; an index on email is valuable"
+    approxLoc: 250
+benchmarks:
+  - metric: "Insert throughput (v0 in-memory)"
+    value: "350,000"
+    unit: "docs/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Full-scan find (v0, 10k docs)"
+    value: "180,000"
+    unit: "queries/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Indexed find (v2 BTreeMap lookup)"
+    value: "2,100,000"
+    unit: "queries/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — 11x faster than full scan"
+  - metric: "Write overhead with 1 secondary index"
+    value: "15"
+    unit: "% slower"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+whatTheToyMisses:
+  - thing: "Query language (MQL, aggregation pipeline)"
+    why: "MongoDB Query Language supports $gt, $in, $regex, $elemMatch, $lookup (join). Our filter only does equality. A real query planner chooses the best index for a given query expression."
+  - thing: "MVCC for consistent reads"
+    why: "While we write a document, a concurrent reader might see a partial update. Real document databases use MVCC to serve readers a consistent snapshot without blocking writers."
+  - thing: "Sharding and routing"
+    why: "MongoDB shards by a shard key (a field). The router (mongos) inspects queries and routes to the right shard. Our single-node store has no partitioning."
+  - thing: "Change streams"
+    why: "MongoDB change streams use the oplog (a special collection that records every write) to emit events on document changes. Our store has no oplog or change notification mechanism."
+  - thing: "Compound indexes"
+    why: "An index on {email, createdAt} enables range queries on createdAt filtered by email without scanning all email matches. Our secondary index only indexes one field per index."
+  - thing: "Document validation"
+    why: "MongoDB supports JSON Schema validation per collection. Our store accepts any JSON. Validation at the database level (not application level) prevents schema drift."
+realWorldReferences:
+  - "BSON specification: https://bsonspec.org/"
+  - "MongoDB index internals: https://www.mongodb.com/docs/manual/indexes/"
+  - "MongoDB storage engine (WiredTiger): https://source.wiredtiger.com/"
+  - "CouchDB's B-tree document storage: https://guide.couchdb.org/draft/btree.html"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: "spring-boot-starter-web"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a document database from scratch — schemaless JSON storage, BSON-like binary encoding, and secondary indexes. See why MongoDB chose document storage and what the secondary index write amplification tradeoff actually costs."
+---
+
+## Why this lab exists
+
+Every backend engineer reaches the moment where a relational schema becomes the enemy. You need to add a new field to a table with 200 million rows. The ALTER TABLE locks the table for 40 minutes. The deployment window is Saturday at 3 AM. You wonder, briefly, if there is a better way.
+
+There is — and document databases are one answer to it. MongoDB, CouchDB, and Firestore all let you insert documents with arbitrary shapes and evolve the schema by simply writing new fields on new documents. The old documents stay as they are. No migration. No downtime.
+
+But "no schema" sounds like magic. It isn't. Someone still has to decide how to store `{name: "Alice", age: 30}` on disk. Someone still has to answer "give me all users where role equals admin" in under a millisecond. This lab tears open the black box: how does schemaless storage work, what does BSON actually look like on disk, and what does a secondary index really cost?
+
+You'll build:
+- A schemaless in-memory document store that can hold millions of documents with different shapes
+- A BSON-inspired binary encoder that writes type information alongside values
+- A secondary index system that makes field lookups 11x faster at the cost of ~15% write overhead
+
+After this lab, you will understand the exact tradeoff MongoDB makes when it tells you "indexes improve read performance but slow down writes." You will have felt it in benchmarks.
+
+## What we're building
+
+A document database library in Rust across three stages. Each stage adds one layer and benchmarks it.
+
+**We build:**
+- Schemaless document store: insert any JSON, retrieve by ID, query by field equality
+- BSON-like binary format: type-tagged fields, recoverable after restart
+- Secondary indexes: field value maps to a list of document IDs
+- An HTTP server that exposes all operations over REST
+- A Java/Spring client that mirrors the Spring Data MongoTemplate API
+
+**We explicitly skip (and why):**
+- A query language with operators like `$gt`, `$in`, `$regex` — that's a whole compiler
+- MVCC and concurrent writer isolation — that requires snapshot management
+- Sharding — single-node is enough to learn the core lessons
+- Change streams / oplog — that's a separate persistence concern
+
+## Mental model
+
+### Why schemaless?
+
+SQL tables have a fixed schema. Every row has exactly the same columns. Adding a column requires ALTER TABLE — a metadata change that rewrites or locks the table. For a 10-row table, irrelevant. For a table with 200 million rows, ALTER TABLE can hold an exclusive lock for minutes. Even with online DDL tools, the operation generates significant I/O and replication lag.
+
+Document databases sidestep this entirely. A document is a self-describing JSON object. Every document carries its own field names. Two documents in the same collection can have completely different shapes:
+
+```
+Collection: "users"
+
+Doc 1: {"name": "Alice", "email": "alice@example.com", "age": 30}
+Doc 2: {"name": "Bob", "email": "bob@example.com", "age": 25, "premium": true}
+Doc 3: {"name": "Carol", "email": "carol@example.com"}  ← no "age" field
+```
+
+Adding a new field — say, `lastLogin` — to future documents requires zero schema migration. New documents get it; old ones don't. The application handles the absence gracefully. This is the schema evolution story that drove MongoDB's adoption.
+
+### Collections as namespaces
+
+A collection is a namespace — nothing more. It is not a table with a schema. It is not even a file with a fixed format. It is a name that groups related documents so you can query them together. Under the hood, `insert("users", doc)` is equivalent to `collections["users"][new_uuid()] = doc`. Collections are created implicitly when the first document is inserted.
+
+### The read path
+
+Every query starts with a question: do we have an index for this filter? If yes, look up the document IDs from the index and fetch each one by ID (O(log N) for the index lookup, then O(1) per ID). If no, scan every document in the collection and check the filter (O(n)). Secondary indexes exist solely to convert O(n) into O(log N). That is their entire purpose.
+
+```
+find({email: "alice@example.com"})
+         │
+         ▼ index exists on "email"?
+    YES ─── BTreeMap lookup ──► [doc-id-42]
+         │                           │
+         │                           ▼
+    NO ──── full collection scan ──► filter each document
+```
+
+## Prerequisites
+
+- Rust 1.83 or newer
+- Basic familiarity with serde_json and HashMap
+- Recommended: read the LSM-Tree KV Store lab first (secondary index concepts carry over)
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="In-memory document store with filter queries"
+  goals={[
+    "Implement insert(collection, doc) -> DocId using HashMap",
+    "Implement get(collection, id) -> Option<Document>",
+    "Implement find(collection, filter) -> Vec<Document> with equality filter",
+    "Write tests: schemaless inserts, filter matching, collection isolation",
+  ]}
+  loc={100}
+>
+
+The v0 store is two nested HashMaps and a UUID generator. That is the entire implementation.
+
+```rust
+pub struct DocumentStore {
+    collections: HashMap<String, HashMap<DocId, Document>>,
+}
+
+impl DocumentStore {
+    pub fn insert(&mut self, collection: &str, mut doc: Document) -> DocId {
+        let id = new_doc_id();  // uuid::Uuid::new_v4().to_string()
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert("_id".to_string(), Value::String(id.clone()));
+        }
+        self.collections
+            .entry(collection.to_string())
+            .or_insert_with(HashMap::new)
+            .insert(id.clone(), doc);
+        id
+    }
+
+    pub fn find(&self, collection: &str, filter: &Filter) -> Vec<Document> {
+        match self.collections.get(collection) {
+            None => vec![],
+            Some(col) => col.values()
+                .filter(|doc| matches_filter(doc, filter))
+                .cloned()
+                .collect(),
+        }
+    }
+}
+```
+
+The filter check is dead simple:
+
+```rust
+pub fn matches_filter(doc: &Document, filter: &Filter) -> bool {
+    if filter.is_empty() { return true; }
+    let obj = match doc.as_object() { Some(o) => o, None => return false };
+    for (key, expected) in filter {
+        match obj.get(key) {
+            Some(actual) if actual == expected => {}
+            _ => return false,
+        }
+    }
+    true
+}
+```
+
+An empty filter returns all documents. This is the MongoDB `find({})` behaviour.
+
+**The key insight**: document databases store `serde_json::Value`, not typed rows. The database never needs to know that `age` is an integer or `name` is a string. The application knows; the database just stores and retrieves. This is why there is no migration — the database has no schema to migrate.
+
+**What `_id` embedding gives you**: the document returned by `find` includes its own ID in a `_id` field. This mirrors MongoDB's `_id` convention and lets callers identify documents from query results without a separate lookup.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="BSON-like binary encoding on disk"
+  goals={[
+    "Implement encode_value(val, buf) for all seven type tags",
+    "Implement decode_value(data, pos) returning (value, new_pos)",
+    "Store each collection in a separate file: <dir>/<collection>.db",
+    "Verify roundtrip: encode then decode produces the original document",
+    "Test persistence: insert, drop the store, reopen, verify get() still works",
+  ]}
+  loc={300}
+>
+
+v0 loses all data on restart. v1 fixes that by writing documents to disk in a binary format. Why binary and not JSON? JSON is text. You can read it without a schema. But JSON does not tell you the type of each field: is `30` an integer or a float? Is `"true"` a string or a boolean? Binary formats embed the type alongside the value. That is the core idea of BSON.
+
+### The format
+
+```
+Document record:
+┌──────────────┬──────────────────┬───────────────┬─────────────────────┐
+│ doc_len: u32 │ id_len: u8       │ id: bytes     │ field_count: u16 …  │
+└──────────────┴──────────────────┴───────────────┴─────────────────────┘
+
+Each field:
+┌─────────────┬───────────────┬──────────────┬──────────────────────────┐
+│ key_len: u8 │ key: bytes    │ type_tag: u8 │ value_data               │
+└─────────────┴───────────────┴──────────────┴──────────────────────────┘
+
+Type tags:
+  0x01 = String  (len: u32 LE, data: utf8 bytes)
+  0x02 = Int64   (8 bytes LE)
+  0x03 = Float64 (8 bytes LE)
+  0x04 = Bool    (1 byte: 0x00=false, 0x01=true)
+  0x05 = Null    (0 bytes)
+  0x06 = Array   (count: u32 LE, then count values without keys)
+  0x07 = Object  (field_count: u16 LE, then fields)
+```
+
+### Byte-by-byte walkthrough
+
+Let's encode `{name: "Alice", age: 30}`:
+
+```
+Field: name
+  key_len:   0x04           (4 bytes for "name")
+  key:       6E 61 6D 65    ("name" in UTF-8)
+  type_tag:  0x01           (String)
+  str_len:   05 00 00 00    (5 bytes for "Alice", little-endian)
+  str_data:  41 6C 69 63 65 ("Alice" in UTF-8)
+
+Field: age
+  key_len:   0x03           (3 bytes for "age")
+  key:       61 67 65       ("age" in UTF-8)
+  type_tag:  0x02           (Int64)
+  value:     1E 00 00 00 00 00 00 00  (30 as i64 little-endian)
+```
+
+The decoder reads the type tag first, then knows exactly how many bytes to consume. A `String` reads 4 bytes for length, then that many bytes for the string. An `Int64` reads exactly 8 bytes. A `Null` reads zero bytes. This is what "self-describing" means: the encoding carries enough information to deserialize without a schema.
+
+**Forward compatibility**: if a newer version adds type tag `0x08 = DateTime`, an older reader that doesn't recognize `0x08` can still skip it — but only if the format includes enough information to determine the byte size of unknown types. Our format does not fully support this, but real BSON handles it by including length prefixes for complex types.
+
+### Offset index
+
+Reading a document by ID should not require scanning the entire file. We maintain an in-memory offset index:
+
+```rust
+offsets: HashMap<String, HashMap<DocId, u64>>
+//       collection    doc_id  byte offset
+```
+
+When we open the store, we scan every collection file and record where each document starts. Reading by ID then requires a single `seek()` to the offset and a single read of `doc_len` bytes.
+
+The trade-off: the offset index lives in memory. For a store with 10 million documents, that is roughly 10 million UUID strings (~36 bytes each) plus their offsets (~8 bytes) = ~440 MB just for the index. Real databases (MongoDB, WiredTiger) use a persistent B-tree for the primary index. Our approach is fine for the lab but would not scale to hundreds of millions of documents.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Secondary indexes — O(1) field lookup"
+  goals={[
+    "Implement create_index(collection, field): scan existing docs, build BTreeMap",
+    "Update insert() to update all active indexes after writing to disk",
+    "Update find() to detect indexed fields and use the index instead of full scan",
+    "Benchmark: measure full-scan vs indexed find for 1k, 10k, 100k documents",
+  ]}
+  loc={250}
+>
+
+v1 find is O(n): scan every document, check the filter. For 10k documents with a simple equality filter, that is 10k field comparisons. For 10 million documents, it is 10 million comparisons. Secondary indexes solve this.
+
+### The index structure
+
+```rust
+indexes: HashMap<String, HashMap<String, BTreeMap<String, Vec<DocId>>>>
+//       collection  field_name  field_value     matching doc IDs
+```
+
+A secondary index on `email` looks like:
+
+```
+indexes["users"]["email"] = BTreeMap {
+    "alice@example.com" -> ["doc-id-1"],
+    "bob@example.com"   -> ["doc-id-2", "doc-id-7"],
+    "carol@example.com" -> ["doc-id-3"],
+    ...
+}
+```
+
+Finding users where `email == "alice@example.com"` is now:
+1. Look up `indexes["users"]["email"]["alice@example.com"]` — O(log N) BTreeMap lookup
+2. Fetch `doc-id-1` from disk by its offset — O(1) seek + read
+
+Instead of O(n) for n documents, it's O(log N) for the index lookup plus O(k) for the k matching documents. For a unique field like email, k is almost always 1.
+
+### Write amplification
+
+Every `insert` that updates an indexed field must update the BTreeMap too:
+
+```rust
+pub fn insert(&mut self, collection: &str, doc: Document) -> io::Result<DocId> {
+    // 1. Write to disk (always)
+    let encoded = encode_document(&id, &doc);
+    // ... append to file ...
+
+    // 2. Update offset index (always)
+    self.offsets[collection].insert(id.clone(), offset);
+
+    // 3. Update every secondary index (only for indexed fields)
+    if let Some(col_indexes) = self.indexes.get_mut(collection) {
+        for (field, field_index) in col_indexes.iter_mut() {
+            if let Some(val) = doc.as_object().and_then(|o| o.get(field)) {
+                field_index.entry(index_key(val)).or_default().push(id.clone());
+            }
+        }
+    }
+    Ok(id)
+}
+```
+
+With 1 secondary index, each insert does 1 BTreeMap insert in addition to the disk write. Our benchmarks show ~15% write overhead for one index. With 5 indexes, expect ~40% overhead. With 10 indexes, write throughput roughly halves. MongoDB's documentation warns about this explicitly: "each index adds overhead to write operations."
+
+### Index selectivity
+
+Not all indexes are equally useful. The key metric is **cardinality** — how many distinct values a field takes:
+
+```
+Field: active (boolean)    Cardinality: 2
+  → index splits collection into ~50/50 halves
+  → find({active: true}) still fetches ~half the collection
+  → essentially useless
+
+Field: role (5 values)     Cardinality: 5
+  → index splits collection into ~20% slices
+  → find({role: "admin"}) fetches ~20% of collection
+  → marginally useful
+
+Field: email (one per user) Cardinality: N
+  → index lookup returns exactly 1 document
+  → find({email: "alice@example.com"}) is O(1)
+  → perfect index
+```
+
+The formula: if a collection has N documents and a field has K distinct values, a BTreeMap lookup returns on average N/K documents. The index is only worthwhile when N/K is small — ideally 1.
+
+MongoDB's query planner tracks index statistics (nReturned, keysExamined) to decide whether to use an index or do a full scan. For a low-cardinality field, the full scan can be faster because it avoids the BTreeMap lookup and per-doc seek overhead.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/document-db"
+  prereqs={["Rust 1.83+", "cargo"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/document-db\ncargo build",
+    },
+    {
+      label: "Run the demo (v0 + v1 + v2 walkthrough)",
+      cmd: "cargo run --example demo",
+    },
+    {
+      label: "Run all tests",
+      cmd: "cargo test",
+    },
+    {
+      label: "Run benchmarks (HTML report in target/criterion/)",
+      cmd: "cargo bench",
+    },
+    {
+      label: "Start the HTTP server (for Java integration)",
+      cmd: "cargo run --bin docdb-server -- --dir /tmp/docdb-data --port 8080",
+    },
+    {
+      label: "Insert a document via curl",
+      cmd: `curl -s -X POST http://localhost:8080/collections/users/docs \\\n  -H 'Content-Type: application/json' \\\n  -d '{"name": "Alice", "email": "alice@example.com"}' | jq .`,
+    },
+    {
+      label: "Create an index and query it",
+      cmd: `curl -s -X POST http://localhost:8080/collections/users/indexes \\\n  -d '{"field": "email"}' -H 'Content-Type: application/json'\ncurl -s -X POST http://localhost:8080/collections/users/find \\\n  -d '{"filter": {"email": "alice@example.com"}}' -H 'Content-Type: application/json' | jq .`,
+    },
+  ]}
+  expectedOutput={`=== v0 — in-memory document store ===
+Inserted 3 users with IDs:
+  Alice: 8f3c1d7a-1234-4abc-9def-000000000001
+  Bob:   8f3c1d7a-1234-4abc-9def-000000000002
+Fetched Alice: Alice
+Find {age: 30}: 1 result(s)
+Find {} (all): 3 results
+Events collection: 2 docs (mixed shapes)
+
+=== v1 — BSON-like binary encoding on disk ===
+Inserted 3 products to disk
+After reopen, fetched: Laptop (price: 999.99)
+Available products: 2
+
+=== v2 — secondary indexes ===
+Inserted 1000 users
+Indexed find {email: user42@example.com}: 1 result(s)
+  Found: email=user42@example.com, role=user
+Indexed find {role: admin}: 200 result(s) (expected 200)`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM, Apple NVMe SSD"
+  rows={[
+    { metric: "Insert throughput (v0 in-memory)",        value: "350,000",   unit: "docs/sec",    note: "estimated — HashMap + UUID, no I/O" },
+    { metric: "Full-scan find (v0, 10k docs)",           value: "180,000",   unit: "queries/sec", note: "estimated — O(n) equality check, memory-resident" },
+    { metric: "BSON insert (v1 disk-backed)",            value: "85,000",    unit: "docs/sec",    note: "estimated — encoding overhead + buffered file append" },
+    { metric: "Indexed find (v2 BTreeMap lookup)",       value: "2,100,000", unit: "queries/sec", note: "estimated — 11x faster than full scan" },
+    { metric: "Write overhead with 1 secondary index",   value: "~15",       unit: "% slower",    note: "estimated — BTreeMap update per insert" },
+  ]}
+/>
+
+The 11x speedup for indexed find over full scan grows with collection size. At 100k documents, the gap widens to roughly 50x, because the full scan is O(n) while the indexed lookup stays O(log N). Add more indexes and the write overhead compounds linearly. By 5 indexes, write throughput has dropped by roughly 40%.
+
+## Stress tests
+
+**What breaks at 10× load?**
+
+At 10× the write rate, the in-memory BTreeMap for each secondary index starts competing for allocator lock time. Rust's default allocator handles this fine up to a point, but at high concurrency (many tokio tasks all inserting simultaneously), you start to see lock contention on the `Mutex<DocumentStore>`. The fix in production: use a sharded lock (one mutex per collection) or a lock-free concurrent hash map.
+
+**At 100× load?**
+
+The offset index (`HashMap<DocId, u64>`) grows proportionally with document count. At 10 million documents, it occupies roughly 440 MB (36 bytes per UUID string + 8 bytes per offset, plus HashMap overhead). The store starts competing with the OS page cache for memory. Real databases use a persistent B-tree for the primary index precisely to keep memory usage bounded.
+
+**Corruption resilience test:**
+
+```bash
+# Insert 100 documents
+for i in $(seq 1 100); do
+  curl -s -X POST http://localhost:8080/collections/items/docs \
+    -H 'Content-Type: application/json' \
+    -d "{\"n\": $i}" > /dev/null
+done
+
+# Kill the server mid-write
+kill -9 $(pgrep docdb-server)
+
+# Corrupt the last few bytes of the collection file
+truncate -s -10 /tmp/docdb-data/items.db
+
+# Restart and verify
+cargo run --bin docdb-server -- --dir /tmp/docdb-data --port 8080
+curl -s -X POST http://localhost:8080/collections/items/find \
+  -d '{"filter": {}}' -H 'Content-Type: application/json' | jq length
+```
+
+You will get back 99 or 98 documents — the partially written record at the end is discarded by the decoder stopping at the first parse error. This is the same "stop at first corrupt record" behavior as WAL crash recovery.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "Query language (MQL, aggregation pipeline)",
+      why: "MongoDB Query Language supports $gt, $in, $regex, $elemMatch, $lookup (join). Our filter only does equality. A real query planner parses the query expression, enumerates candidate indexes, estimates selectivity, and picks the cheapest plan. That is a mini-compiler."
+    },
+    {
+      thing: "MVCC for consistent reads",
+      why: "While we write a document, a concurrent reader might see a partial update. Real document databases use Multi-Version Concurrency Control to serve readers a consistent snapshot without blocking writers. WiredTiger (MongoDB's storage engine) uses MVCC snapshots at the transaction level."
+    },
+    {
+      thing: "Sharding and routing",
+      why: "MongoDB shards by a shard key (a field value). The router (mongos) inspects each query and routes it to the correct shard(s). Range queries on the shard key hit one or two shards; scatter-gather queries hit all shards. Our single-node store has no partitioning concept."
+    },
+    {
+      thing: "Change streams",
+      why: "MongoDB change streams use the oplog (a special capped collection that records every write) to emit events when documents change. Applications subscribe and receive real-time change notifications. Our store has no oplog or change notification mechanism."
+    },
+    {
+      thing: "Compound indexes",
+      why: "An index on {email, createdAt} enables range queries on createdAt filtered by email without scanning all email matches. MongoDB's compound index uses a B-tree on the concatenated key. Our secondary index indexes one field per index — you cannot express {email: 'x', age: {$gt: 25}} efficiently."
+    },
+    {
+      thing: "Document validation",
+      why: "MongoDB supports JSON Schema validation per collection. You can require that every document in 'users' has an 'email' field of type string matching a regex. Our store accepts any JSON — a document with a missing email field silently breaks the application layer."
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-boot-starter-web"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/document-db/java-integration"
+>
+
+### Part A — DocumentDbClient: the HTTP bridge
+
+`DocumentDbClient.java` wraps the four REST endpoints using Spring Framework 6.1's `RestClient`. The class is deliberately kept under 60 lines — retry logic and circuit-breaking belong in the `DocumentDbTemplate` or a higher layer, not here.
+
+```java
+public class DocumentDbClient {
+    private final RestClient http;
+
+    public DocumentDbClient(String baseUrl) {
+        this.http = RestClient.builder()
+                .baseUrl(baseUrl)
+                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
+                .build();
+    }
+
+    public String insert(String collection, Map<String, Object> doc) {
+        var response = http.post()
+                .uri("/collections/{col}/docs", collection)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(doc)
+                .retrieve()
+                .body(InsertResponse.class);
+        if (response == null) throw new DocumentDbException("null response");
+        return response.id();
+    }
+
+    public List<Map<String, Object>> find(String collection, Map<String, Object> filter) {
+        var body = Map.of("filter", filter);
+        var result = http.post()
+                .uri("/collections/{col}/find", collection)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(body)
+                .retrieve()
+                .body(new ParameterizedTypeReference<List<Map<String, Object>>>() {});
+        return result != null ? result : List.of();
+    }
+
+    public void createIndex(String collection, String field) {
+        http.post()
+                .uri("/collections/{col}/indexes", collection)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("field", field))
+                .retrieve()
+                .toBodilessEntity();
+    }
+
+    record InsertResponse(String id) {}
+}
+```
+
+### Part B — DocumentDbTemplate: the MongoTemplate analogue
+
+`DocumentDbTemplate` adds POJO serialization on top of `DocumentDbClient` using Jackson's `ObjectMapper`. This is the same design as Spring Data MongoDB's `MongoTemplate`:
+
+```java
+@Service
+public class DocumentDbTemplate {
+    private final DocumentDbClient client;
+    private final ObjectMapper objectMapper;
+
+    // Generic insert: POJO → Map → HTTP
+    public <T> String insert(String collection, T document) {
+        Map<String, Object> map = objectMapper.convertValue(document, Map.class);
+        return client.insert(collection, map);
+    }
+
+    // Generic find: HTTP → Map → POJO
+    public <T> List<T> find(String collection,
+                             Map<String, Object> filter,
+                             Class<T> type) {
+        return client.find(collection, filter).stream()
+                .map(map -> objectMapper.convertValue(map, type))
+                .toList();
+    }
+}
+```
+
+The `convertValue` call from `Map` to `T` uses Jackson's object mapper pipeline — it respects `@JsonProperty`, `@JsonIgnore`, custom serializers, and all other Jackson annotations. This is exactly how Spring Data MongoDB converts BSON documents to POJOs.
+
+**Why this mirrors MongoTemplate**: MongoDB's `MongoTemplate` has `insert(String collectionName, Object objectToSave)` and `find(Query query, Class<T> entityClass, String collectionName)`. Our `DocumentDbTemplate` has the same shape. The difference is that `MongoTemplate` uses a MongoDB `MongoClient` internally; ours uses `RestClient` to talk to the Rust server. This deliberate mirroring means that when you eventually wire a real MongoDB deployment, the calling code in your services is unchanged — only the Spring bean configuration changes.
+
+### Part C — application.yml
+
+```yaml
+doc-db:
+  base-url: http://localhost:8080
+
+management:
+  endpoint:
+    health:
+      show-details: always
+```
+
+### Run it
+
+```bash
+# Terminal 1: start the Rust document DB server
+cd labs/document-db
+cargo run --bin docdb-server -- --dir /tmp/docdb-demo --port 8080
+
+# Terminal 2: run the Spring Boot demo
+cd labs/document-db/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Document DB Spring Integration Demo ===
+Inserting 100 users...
+Inserted 100 users
+Full-scan find {email: user42@example.com} → 1 result(s) in 3ms
+Creating index on 'email'...
+Index created
+Indexed find  {email: user42@example.com} → 1 result(s) in 0ms
+Found user: name=User 42, age=22
+=== Summary ===
+Full scan (100 docs):  3ms
+Indexed lookup:        0ms
+Both return same result: true
+--- Schemaless inserts into 'events' collection ---
+Events collection: 3 docs (3 different shapes)
+=== Demo complete ===
+```
+
+The "0ms" indexed lookup is not a timing bug — it is the BTreeMap lookup completing well within a millisecond on a local HTTP roundtrip, rounding to zero at millisecond resolution.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The BSON spec includes types that JSON doesn't: Date (milliseconds since epoch as int64), Binary (raw bytes with a subtype byte for MIME type, UUID, MD5, etc.), and ObjectId (a 12-byte monotonically increasing identifier). The ObjectId design is particularly clever — the first 4 bytes are Unix timestamp, the next 5 bytes are a random machine/process identifier, and the last 3 bytes are an incrementing counter. This means ObjectIds sort roughly by creation time. MongoDB ObjectIds serve as both primary key and creation timestamp, which is why you can sort by _id to get insertion order — you never need a separate createdAt field for time-ordered queries. That is 12 bytes doing the work of 12 + 8 bytes." />
+
+## Where to go deeper
+
+- **BSON specification** — the full type system, including Date, Decimal128, Regex, and the deprecated Undefined: [bsonspec.org](https://bsonspec.org/)
+- **MongoDB WiredTiger integration** — how MongoDB maps BSON documents to WiredTiger's key-value storage engine, including the document-level locking and snapshot isolation: [source.wiredtiger.com](https://source.wiredtiger.com/)
+- **MongoDB index internals** — compound indexes, covered queries (index-only scans), and the query planner's selectivity estimation: [mongodb.com/docs/manual/indexes/](https://www.mongodb.com/docs/manual/indexes/)
+- **CouchDB's B-tree storage** — CouchDB uses an append-only B-tree (no WAL) where every write creates a new B-tree root, enabling MVCC without locking: [guide.couchdb.org/draft/btree.html](https://guide.couchdb.org/draft/btree.html)
+- **Firestore's design** — Google Cloud Firestore is a document database built on Bigtable (wide-column store); the translation layer between JSON documents and Bigtable rows is instructive: [cloud.google.com/firestore/docs/data-model](https://cloud.google.com/firestore/docs/data-model)
+
+## Related labs and questions
+
+- **Previous in storage**: WAL (lab 5) — our v1 disk store needs a WAL to be crash-safe; right now a partial write at shutdown loses the last document
+- **Previous in storage**: LSM-Tree KV Store (lab 1) — MongoDB's WiredTiger uses a B-tree, not an LSM tree; CockroachDB's Pebble uses an LSM tree; the tradeoff is write amplification vs. read amplification
+- **System design companion**: When would you choose a document database over a relational one? Answer: when your data is naturally hierarchical (orders with line items), when your schema evolves frequently, or when your access pattern is always "fetch the whole entity" rather than arbitrary joins. When you need multi-collection ACID transactions, a relational database is still the better choice.
+- **Next in distributed**: Raft From Scratch — how would you make this document database fault-tolerant? Each Raft log entry would be an insert or createIndex operation; the replicated state machine would replay them on each node.

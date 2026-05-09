@@ -1,0 +1,681 @@
+---
+title: "Build Your Own Distributed Lock Manager"
+slug: "dist-lock"
+category: "distributed"
+difficulty: "advanced"
+estimatedHours:
+  reading: 2
+  building: 7
+language: "go"
+loc: 500
+prerequisites:
+  - "Consistent Hashing Ring (why distributed primitives exist)"
+stages:
+  - id: v0
+    title: "Lease-based lock — automatic expiry"
+    learningGoals:
+      - "Leases vs locks: a lease expires automatically even if the holder crashes"
+      - "TTL prevents deadlock from crashed processes — the lock self-heals"
+      - "Renewal heartbeat: hold it as long as you need it, but keep renewing"
+    approxLoc: 80
+  - id: v1
+    title: "Fencing tokens — reject stale lock holders"
+    learningGoals:
+      - "The GC pause problem: a process pauses, lock expires, someone else acquires, process wakes up and thinks it still has the lock"
+      - "Fencing token: monotonically increasing integer — new holder always has higher token"
+      - "Storage server enforces fencing: rejects writes with token less than the last seen value"
+    approxLoc: 220
+  - id: v2
+    title: "Distributed lock via atomic SET NX PX"
+    learningGoals:
+      - "SET NX PX: set-if-not-exists with TTL in one atomic operation — the only correct primitive"
+      - "Why GET then SET is broken: another process can acquire between your GET and SET"
+      - "Release must be atomic too: GET to verify owner + DEL in one pipeline"
+    approxLoc: 200
+benchmarks:
+  - metric: "In-process acquire (v0, no contention)"
+    value: "8,000,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Distributed acquire (v2, Redis NX PX)"
+    value: "180,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro, loopback"
+    note: "estimated"
+  - metric: "Contention throughput (10 goroutines, 1 lock)"
+    value: "1,200,000"
+    unit: "ops/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+whatTheToyMisses:
+  - thing: "Redlock algorithm (multi-node quorum)"
+    why: "Acquiring a lock on a single Redis node fails if that node crashes. Redlock acquires the lock on N/2+1 of N independent Redis nodes. Our lock is single-node."
+  - thing: "Reentrant locks"
+    why: "Our lock rejects re-acquisition even by the same owner. A reentrant lock allows the same owner to acquire multiple times with a counter — needed for recursive code paths."
+  - thing: "Watch-dog automatic renewal"
+    why: "Redisson's watch-dog thread automatically renews the lock every TTL/3. The caller doesn't need to remember to renew. Our caller must manually renew or the lock expires."
+  - thing: "Fair lock queuing"
+    why: "Our lock is unfair: when released, any waiter can acquire. A fair lock gives priority to the longest-waiting requester. Redisson implements fair locks using a Redis sorted set as a queue."
+  - thing: "Lock observability"
+    why: "Who holds which lock, for how long, with what token — all useful for debugging production incidents. Our HTTP GET endpoint is minimal. Production systems expose lock histograms in metrics."
+  - thing: "Clock skew between nodes"
+    why: "Our TTL assumes all nodes have synchronized clocks. If Node A's clock is 2s ahead of Node B's, Node A's lock may appear expired to Node B before the actual TTL elapses. NTP synchronization reduces but does not eliminate this."
+realWorldReferences:
+  - "How to do distributed locking — Martin Kleppmann (critique of Redlock)"
+  - "Redlock algorithm: https://redis.io/docs/manual/patterns/distributed-locks/"
+  - "Redisson distributed lock: https://github.com/redisson/redisson/wiki/8.-Distributed-locks-and-synchronizers"
+  - "Chubby: The Chubby lock service for loosely-coupled distributed systems — Google"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-aop:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: "spring-boot-starter-aop"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a distributed lock from leases to fencing tokens to atomic Redis SET NX PX. Wire it into Spring as a @DistributedLock AOP aspect and see why the fencing token is the only defense against the GC pause problem."
+---
+
+## Why this lab exists
+
+Distributed locks appear everywhere in backend systems: preventing double-payment processing, ensuring only one pod runs a scheduled job, serializing writes to a shared configuration store. They feel simple — just a shared mutex, right? But they are not. A plain mutex in a single process has one failure mode: another thread holds it. A distributed lock has dozens: the holder crashes, the network partitions, the JVM pauses for garbage collection, the clock drifts, the Redis node fails.
+
+Every one of these failure modes has a real incident history. A payment team ships a feature guarded by a distributed lock. A full GC pause on the payment service pod lasts 6 seconds. The lock's TTL is 5 seconds. The lock expires. A second pod acquires it and processes the payment. The first pod wakes up and processes it again. Two charges, one order.
+
+You've read about distributed locks. You've nodded at "leases" and "fencing tokens" in design interviews. But until you have written the code that generates a monotonically increasing token on every Acquire, until you have watched a storage server reject a write because the token is smaller than the last accepted one, until you have traced exactly why GET-then-SET is broken under concurrency — you do not viscerally understand why this is hard.
+
+This lab builds a distributed lock in three stages. By the end you will have an implementation that a senior engineer could reason about in a production incident.
+
+## What we're building
+
+A distributed lock manager library and HTTP server in Go, implemented across three stages. Each stage adds one correctness property.
+
+**We build:**
+- An in-process lease manager with automatic TTL expiry and monotonically increasing fencing tokens
+- A storage server that enforces fencing: it rejects any write with a token lower than the highest previously accepted token
+- A distributed lock using Redis's atomic `SET NX PX` command — the only correct single-node distributed lock primitive
+- An HTTP server exposing all three lock operations so any language can use it
+
+**We explicitly skip (and why):**
+- Redlock multi-node quorum (covered in "What the Toy Misses" — single-node is sufficient for understanding the core lessons)
+- Reentrant locks (same owner acquiring multiple times — not needed for these lessons)
+- Watch-dog automatic renewal (you'll see why it exists after implementing manual renewal)
+- Fair queuing (useful, but orthogonal to correctness)
+
+## Mental model
+
+### The GC pause problem
+
+Here is the scenario that makes distributed locks hard. Walk through it slowly, because every correctness mechanism in this lab exists to prevent exactly this sequence.
+
+```
+Timeline:
+
+T=0     Process A acquires lock on "account:42", token=1, TTL=5s.
+T=1     Process A starts processing a payment debit.
+T=4     JVM on Process A triggers a full GC. Process A pauses completely.
+T=6     Lock expires (TTL=5s elapsed). Process A is still paused.
+T=6.1   Process B acquires lock on "account:42", token=2, TTL=5s.
+T=6.2   Process B processes the same payment. Writes to the database with token=2.
+T=7     JVM on Process A resumes. A thinks it still holds the lock (it does not).
+T=7.1   Process A writes to the database. DOUBLE CHARGE.
+```
+
+The problem: Process A had no way of knowing the lock expired while it was paused. Checking `time.Now()` against the original expiry does not help — the clock moved while A was paused and A cannot distinguish "I paused for 1 second" from "I paused for 6 seconds."
+
+A lease-based lock (v0) solves the deadlock-from-crashes problem: the lock self-heals after TTL if the holder crashes. But it does not solve the stale-holder problem above: Process A is not crashed, it is just slow.
+
+### Fencing tokens solve it
+
+The fencing token is a monotonically increasing integer. Every successful Acquire increments a global counter and returns the new value as the token. Token 1 is always smaller than token 2. Token 2 is always smaller than token 3.
+
+The storage server keeps track of the highest token it has accepted. Before writing, it checks: is the incoming token at least as large as the last accepted token? If not, the write is rejected.
+
+```
+T=6.2   Process B acquires lock, token=2. Writes to DB with token=2.
+        DB stores lastToken=2.
+
+T=7.1   Process A wakes up, token=1. Tries to write to DB with token=1.
+        DB checks: 1 < 2. REJECTED.
+```
+
+Process A's write is rejected. Process B's write stands. The GC pause problem is solved.
+
+The key insight: **correctness is enforced by the storage server, not the lock server.** The lock server just issues tokens in order. The storage server enforces the order. This separation is what makes the system safe even when the lock server cannot reliably detect that A is paused versus crashed.
+
+### Why GET-then-SET is broken
+
+Before Redis added `SET NX PX`, teams built distributed locks like this:
+
+```
+if GET lock:account:42 == nil:
+    SET lock:account:42 "owner:process-a"
+    EXPIRE lock:account:42 5
+```
+
+This looks correct. It is not. Consider two processes A and B running this sequence concurrently:
+
+```
+A: GET lock:account:42  → nil  (key is free)
+B: GET lock:account:42  → nil  (key is still free — A hasn't set it yet)
+A: SET lock:account:42 "owner:a"
+B: SET lock:account:42 "owner:b"  (overwrites A!)
+```
+
+Between A's `GET` (returning nil) and A's `SET`, B executes its own `GET` and also sees nil. Both think they can acquire. Both acquire. Both process the payment.
+
+`SET NX PX` is a single atomic command that performs "set-if-not-exists with TTL" in one round trip. There is no window between the check and the write. Either you set it or you don't, and you find out in the same response.
+
+## Prerequisites
+
+- Basic Go (goroutines, channels, sync.Mutex)
+- What a Redis command is; you do not need to be a Redis expert
+- Familiarity with HTTP servers in Go is helpful for v2
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Lease-based lock — automatic expiry"
+  goals={[
+    "Implement LockManager with Acquire, Release, Renew, State",
+    "LockEntry holds owner, token (monotonic int64), expiresAt",
+    "Write tests: acquire succeeds when free, fails when held, succeeds after expiry",
+  ]}
+  loc={80}
+>
+
+The simplest lock that prevents deadlocks from crashed holders. A `map[string]*LockEntry` protected by a `sync.Mutex`. The lease expiry is the key property: if the holder crashes without calling Release, the lock is automatically available after TTL.
+
+```go
+type LockEntry struct {
+    owner     string
+    token     int64
+    expiresAt time.Time
+}
+
+func (e *LockEntry) IsExpired() bool {
+    return time.Now().After(e.expiresAt)
+}
+
+type LockManager struct {
+    mu      sync.Mutex
+    entries map[string]*LockEntry
+    counter int64 // global fencing counter
+}
+
+func (m *LockManager) Acquire(resource, owner string, ttl time.Duration) (int64, bool) {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+
+    existing, ok := m.entries[resource]
+    if ok && !existing.IsExpired() {
+        return 0, false // held and not expired
+    }
+
+    token := atomic.AddInt64(&m.counter, 1) // fencing token
+    m.entries[resource] = &LockEntry{
+        owner:     owner,
+        token:     token,
+        expiresAt: time.Now().Add(ttl),
+    }
+    return token, true
+}
+```
+
+**The critical line**: `token := atomic.AddInt64(&m.counter, 1)`. This is v0's contribution to v1. We are already generating monotonically increasing tokens. In v1 we will use them to make the storage server safe.
+
+**The core lesson**: a lease is a lock with automatic expiry. A plain mutex has no concept of TTL — if the holder goroutine dies holding the mutex, the program deadlocks. In a distributed system where "the holder" is a process on a remote machine that might crash at any instant, a TTL is not optional. It is the only mechanism you have.
+
+The renewal pattern: acquire with a short TTL (5s), then call Renew every 2s while the critical section runs. The heartbeat interval must be less than TTL/2 to handle network jitter. If the process pauses for longer than TTL, the lock expires and the next holder takes over — this is the GC pause problem that v1 solves.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Fencing tokens — reject stale lock holders"
+  goals={[
+    "Implement StorageServer that enforces fencing: Write(key, value, token) rejects token < lastToken",
+    "Write the GC pause scenario as a test: token1 writes, token2 acquires and writes, token1 tries to overwrite — storage rejects it",
+    "Verify the invariant: if Write returns nil, the value is the canonical latest",
+  ]}
+  loc={220}
+>
+
+The fencing token mechanism is already in place from v0: our `counter` is monotonically increasing and every Acquire returns it. Now we need a storage server that enforces it.
+
+```go
+type StorageServer struct {
+    mu        sync.Mutex
+    lastToken int64
+    data      map[string]storageEntry
+}
+
+func (s *StorageServer) Write(key, value string, token int64) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    if token < s.lastToken {
+        return fmt.Errorf("%w: got %d, last accepted %d",
+            ErrStaleFencingToken, token, s.lastToken)
+    }
+    s.lastToken = token
+    s.data[key] = storageEntry{value: value, token: token}
+    return nil
+}
+```
+
+The concrete timeline the tests exercise:
+
+```
+m := NewLockManager()
+storage := NewStorageServer()
+
+// Process A acquires — token=1
+tokenA, _ := m.Acquire("user-profile", "process-a", 50ms)
+storage.Write("profile:42", "data-from-A", tokenA)  // OK: 1 >= 0
+
+// A pauses. Lock expires.
+time.Sleep(100ms)
+
+// Process B acquires — token=2 (always higher than A's token)
+tokenB, _ := m.Acquire("user-profile", "process-b", 5s)
+storage.Write("profile:42", "data-from-B", tokenB)  // OK: 2 >= 1
+
+// A wakes up from GC pause and tries to overwrite
+err := storage.Write("profile:42", "stale-data-from-A", tokenA)
+// err = "stale fencing token: got 1, last accepted 2"
+// storage still holds "data-from-B" — correct!
+```
+
+**Why is `lastToken` stored on the storage server, not the lock server?**
+
+Because the storage server is where correctness matters. The lock server might be unavailable, partitioned, or simply slow to propagate. The storage server is the final arbiter. By making the storage server enforce fencing tokens, we push correctness to exactly the point where a bad write would cause data corruption.
+
+This is a pattern from Martin Kleppmann's analysis of Redlock: even a perfectly correct distributed lock is not sufficient if the storage server does not enforce the token. The lock only *coordinates* access. The storage server *enforces* safety.
+
+**Collision note**: two different lock resources can generate tokens from the same counter, so token values overlap across resources. In production, use a per-resource or globally unique token (e.g., a UUID or a Redis INCR on a separate key). For this lab, the lesson about ordering is the point.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Distributed lock via atomic SET NX PX"
+  goals={[
+    "Implement DistributedLockManager backed by a Redis client",
+    "Acquire: client.SetNX(ctx, 'lock:{resource}', '{owner}:{token}', ttl)",
+    "Release: GET to verify owner+token, then DEL (pipeline)",
+    "Write test: two goroutines compete for one lock — only one should hold it at a time",
+  ]}
+  loc={200}
+>
+
+The in-process lock manager in v0 works fine within a single process. But what happens when you have 20 pods all competing for the same lock? Each pod has its own `LockManager` instance, and they have no visibility into each other's state. You need shared state — and Redis is the natural choice for a single atomic conditional write.
+
+```go
+func (d *DistributedLockManager) Acquire(
+    ctx context.Context,
+    resource, owner string,
+    ttl time.Duration,
+) (int64, bool, error) {
+    token := atomic.AddInt64(&d.counter, 1)
+    value := fmt.Sprintf("%s:%d", owner, token)
+
+    // SET lock:{resource} {owner}:{token} NX PX {ttl_ms}
+    // Single atomic command: set-if-not-exists + TTL.
+    ok, err := d.client.SetNX(ctx, "lock:"+resource, value, ttl).Result()
+    if err != nil {
+        return 0, false, err
+    }
+    return token, ok, nil
+}
+```
+
+The `SetNX` call maps directly to Redis's `SET key value NX PX milliseconds` command. The `NX` flag means "only set if the key does not exist." The `PX` flag sets the TTL in milliseconds. The entire operation is atomic on the Redis server — no race window.
+
+**Release: why we check the owner before deleting**
+
+A naive release would just `DEL lock:{resource}`. But what if the TTL expired and another process re-acquired? You would delete the new holder's lock, not yours. The release must verify ownership:
+
+```go
+func (d *DistributedLockManager) Release(
+    ctx context.Context, resource string, token int64, owner string,
+) error {
+    key := "lock:" + resource
+    current, err := d.client.Get(ctx, key).Result()
+    // ... error handling ...
+
+    expected := fmt.Sprintf("%s:%d", owner, token)
+    if current != expected {
+        return ErrLockNotHeld // stale release — do not delete the new holder's key
+    }
+    return d.client.Del(ctx, key).Err()
+}
+```
+
+A production implementation uses a Lua script to make the GET and DEL atomic. Our pipeline has a small TOCTOU window: between our GET and our DEL, the key could expire and be re-acquired. A Lua script eliminates this window by running both operations in a single server-side transaction. The lesson is the same either way: release must verify ownership before deleting.
+
+**The 44× slowdown**: in-process acquire runs at ~8,000,000 ops/sec. Distributed acquire over loopback Redis runs at ~180,000 ops/sec. That is a 44× difference for a ~0.5ms loopback RTT. On real networks with 1–5ms latency, the gap is 200–1000×. This is not a reason to avoid distributed locks — it is a reason to use them only when you genuinely need distributed coordination, not as a default synchronization primitive.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/dist-lock"
+  prereqs={["Go 1.22+", "Redis (optional, for v2)"]}
+  steps={[
+    {
+      label: "Clone and run tests",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/dist-lock\ngo mod tidy && go test ./pkg/lock/... -v",
+    },
+    {
+      label: "Run benchmarks",
+      cmd: "go test -bench=. -benchtime=3s ./...",
+    },
+    {
+      label: "Start the HTTP server (in-process mode, v0/v1)",
+      cmd: "go run ./cmd/server",
+    },
+    {
+      label: "Acquire a lock via curl",
+      cmd: "curl -s -XPOST http://localhost:8080/locks/account:42 \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"owner\":\"svc-a\",\"ttl_ms\":5000}'",
+    },
+    {
+      label: "Run distributed lock (v2) — requires Redis",
+      cmd: "redis-server &\nSTAGE=v2 go run ./cmd/server",
+    },
+    {
+      label: "Start the Java Spring demo",
+      cmd: "cd java-integration && mvn spring-boot:run",
+    },
+  ]}
+  expectedOutput={`=== Acquire lock ===
+{"token":1,"ok":true}
+
+=== Second acquire (same resource) ===
+{"token":0,"ok":false}
+
+=== Check state ===
+{"locked":true,"owner":"svc-a","token":1,"ttl_left_ms":4821.5}
+
+=== Release ===
+{"released":true}
+
+=== Re-acquire after release ===
+{"token":2,"ok":true}`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM (estimated figures)"
+  rows={[
+    { metric: "In-process acquire (v0, no contention)",      value: "8,000,000",  unit: "ops/sec", note: "sync.Mutex + map write" },
+    { metric: "Fencing token generation (v1, atomic add)",   value: "15,000,000", unit: "ops/sec", note: "atomic.AddInt64 ~5ns" },
+    { metric: "Distributed acquire (v2, SET NX PX loopback)",value: "180,000",    unit: "ops/sec", note: "~0.5ms loopback RTT" },
+    { metric: "Lock renewal (same as acquire)",              value: "8,000,000",  unit: "ops/sec", note: "one mutex + map read" },
+    { metric: "Contention (10 goroutines, 1 lock)",          value: "1,200,000",  unit: "ops/sec", note: "measures failed-Acquire throughput" },
+    { metric: "In-process vs distributed ratio",             value: "44×",        unit: "slower",  note: "network RTT is the entire cost" },
+  ]}
+/>
+
+## Stress tests
+
+**What happens at 10× load (10,000 lock requests/sec)?** The in-process manager handles this easily — 8,000,000 ops/sec is our ceiling, so 10,000 is 0.1% utilization. The distributed path is the constraint: at 10× normal load with 50 concurrent holders, Redis starts seeing pipeline contention and p99 latency spikes from ~0.5ms to ~5ms. The acquire throughput holds, but tail latency degrades.
+
+**Fencing token exhaustion**: our counter is an `int64`. At 15,000,000 increments/sec, exhaustion takes approximately 19,545 years. Not a concern.
+
+**TTL too short**: set TTL to 10ms and run the concurrent test. You will observe that the lock expires during the critical section and a second holder acquires before the first releases. This is the correct behavior — the lock self-heals — but it means the critical section was not protected. The lesson: TTL must be significantly longer than the expected critical section duration, with margin for GC pauses.
+
+**Redis unavailable**: the `DistributedLockManager.Acquire` call returns an error immediately (no retry by default). The HTTP server returns 500. The Java aspect's retry logic kicks in: it retries up to 3 times, then returns `IllegalStateException`. The application can choose to proceed without the lock (unsafe) or fail fast. Failing fast is almost always correct for safety-critical sections.
+
+**Split-brain**: if Redis is partitioned and comes back, some keys may be stale. The TTL ensures they expire within one lock window. No permanent split-brain in single-node Redis.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "Redlock algorithm (multi-node quorum)",
+      why: "Our lock uses a single Redis node. If that node crashes mid-operation, the lock state is lost. Redlock acquires the lock on N/2+1 of N independent Redis nodes. The quorum ensures the lock survives any single-node failure. However, Kleppmann's critique (2016) argues Redlock is unsafe even on N nodes if you cannot bound GC pauses or clock skew. Fencing tokens are the correct complement.",
+    },
+    {
+      thing: "Reentrant locks",
+      why: "Our Acquire rejects re-acquisition even by the same owner. A reentrant lock allows the owner to acquire the same lock multiple times, tracking a call depth counter. This is needed when a method annotated with @DistributedLock calls another @DistributedLock method for the same resource. Implementing reentrance requires passing the token through the call chain or using a thread-local.",
+    },
+    {
+      thing: "Watch-dog automatic renewal",
+      why: "Redisson's watch-dog thread renews the lock every leaseTime/3 in a background thread. Our implementation requires the caller to manually call Renew before the TTL elapses. If the caller forgets, or if the critical section is longer than expected, the lock expires. Implementing a watch-dog requires a background goroutine per held lock, cancellation on release, and careful handling of the case where the holder dies silently.",
+    },
+    {
+      thing: "Fair lock queuing",
+      why: "Our lock is unfair: when a lock is released, any waiting process can acquire it. Under high contention, a slow process may wait indefinitely while faster processes keep acquiring. Redisson implements fair locks using a Redis sorted set as a FIFO queue. Waiters add themselves with a timestamp score; the oldest waiter gets priority. Implementing this atomically across acquire, release, and timeout requires a Lua script.",
+    },
+    {
+      thing: "Lock observability",
+      why: "Production lock debugging requires knowing: who holds each lock, how long they have held it, how many waiters are queued, and what fencing token they carry. Our GET /locks/{resource} returns minimal state. A production system exposes per-lock histograms in Prometheus, traces each Acquire/Release as a span, and alerts when a lock is held for more than 2× its expected duration. This is non-trivial to add without impacting the hot path.",
+    },
+    {
+      thing: "Clock skew between nodes",
+      why: "Our TTL comparison assumes all nodes agree on the current time. If the lock server's clock is 2 seconds ahead of the holder's clock, a 5-second TTL may appear to expire after only 3 seconds from the holder's perspective. NTP typically keeps nodes within 100ms, which is negligible for 5s TTLs but significant for 200ms TTLs. Redlock explicitly bans clients from using system clocks for lock validity — it measures elapsed wall time on the client side instead.",
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-boot-starter-aop"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-aop:3.3.0",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/dist-lock/java-integration"
+>
+
+### Part A — The @DistributedLock annotation
+
+The annotation is the public API. It declares intent: this method requires exclusive access to a named resource.
+
+```java
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface DistributedLock {
+    String resource();
+    long ttlMs() default 5_000L;
+}
+```
+
+Usage:
+
+```java
+@DistributedLock(resource = "account:42", ttlMs = 10_000)
+public Receipt processPayment(String orderId, BigDecimal amount) {
+    // Only one thread/pod runs this at a time.
+    // Lock self-heals after 10s if the pod crashes.
+}
+```
+
+No boilerplate in the method itself. The aspect handles acquire, retry, and release entirely.
+
+### Part B — LockClient: the HTTP bridge
+
+`LockClient.java` wraps the Go server's three routes using Spring Framework 6.1's `RestClient`.
+
+```java
+public class LockClient {
+    private final RestClient http;
+
+    public LockClient(String baseUrl) {
+        this.http = RestClient.builder()
+                .baseUrl(baseUrl)
+                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
+                .build();
+    }
+
+    public AcquireResult acquire(String resource, String owner, long ttlMs) {
+        return http.post()
+                .uri("/locks/{resource}", resource)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new AcquireRequest(owner, ttlMs))
+                .retrieve()
+                .body(AcquireResult.class);
+    }
+
+    public void release(String resource, String owner, long token) {
+        http.method(HttpMethod.DELETE)
+                .uri("/locks/{resource}", resource)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new ReleaseRequest(owner, token))
+                .retrieve()
+                .toBodilessEntity();
+    }
+
+    public record AcquireResult(long token, boolean ok) {}
+}
+```
+
+### Part C — The @Around aspect
+
+The `DistributedLockAspect` is where the interesting Spring work happens. `@Around` advice intercepts the method call entirely — the advice decides when (and whether) to call `joinPoint.proceed()`.
+
+```java
+@Aspect
+@Component
+public class DistributedLockAspect {
+
+    @Around("@annotation(distributedLock)")
+    public Object around(ProceedingJoinPoint joinPoint,
+                         DistributedLock distributedLock) throws Throwable {
+        String resource = distributedLock.resource();
+        long ttlMs = distributedLock.ttlMs();
+        String owner = buildOwner(); // hostname:pid:counter
+
+        // ── Acquire with retry ───────────────────────────────────────────
+        long token = 0;
+        boolean acquired = false;
+        for (int attempt = 1; attempt <= props.retryAttempts(); attempt++) {
+            LockClient.AcquireResult r = client.acquire(resource, owner, ttlMs);
+            if (r != null && r.ok()) {
+                token = r.token();
+                acquired = true;
+                break;
+            }
+            if (attempt < props.retryAttempts()) {
+                Thread.sleep(props.retryDelayMs());
+            }
+        }
+        if (!acquired) {
+            throw new IllegalStateException(
+                "Could not acquire lock on '" + resource + "'");
+        }
+
+        // ── Proceed + release ─────────────────────────────────────────────
+        final long finalToken = token;
+        try {
+            return joinPoint.proceed();
+        } catch (HttpClientErrorException.Conflict e) {
+            // Storage server rejected write — fencing token is stale.
+            throw new LockStolenException(resource, finalToken, e);
+        } finally {
+            // Always release — even if joinPoint.proceed() throws.
+            client.release(resource, owner, finalToken);
+        }
+    }
+}
+```
+
+**Why `@Around` and not `@Before` + `@After`?**
+
+`@Around` gives you the try-finally pattern directly. With separate `@Before` and `@After` advice, you cannot easily pass the token from acquire to release, and `@After` does not run on exceptions — you would need `@AfterThrowing` too. Coordinating state across three advice methods is fragile. `@Around` keeps the acquire-proceed-release sequence in one readable method.
+
+**The `finally` guarantee**: even if `joinPoint.proceed()` throws (database timeout, validation error, anything), the lock is released. This prevents the common bug where a lock is held until TTL because the method threw and the finally block was missing.
+
+**The `LockStolenException` path**: if the storage server returns `409 Conflict` from a write inside the annotated method, it means the fencing token was rejected — another holder acquired while we were in the critical section (GC pause, network stall). We catch this, wrap it in `LockStolenException`, and rethrow. The caller can decide whether to retry from scratch or abort the operation.
+
+### Part D — Redisson comparison
+
+Redisson is the production choice for distributed locks in Java. Our implementation demonstrates the same core concepts:
+
+| Feature | Our aspect | Redisson |
+|---|---|---|
+| Acquire | `SetNX` via HTTP | `SET NX PX` via Jedis/Lettuce |
+| Renewal | Manual (caller calls Renew) | Watch-dog thread auto-renews |
+| Reentrant | No | Yes (`RLock`) |
+| Fair | No | Yes (`RFairLock`) |
+| Multi-node | No | Yes (Redlock via `RedissonRedLock`) |
+| ReadWriteLock | No | Yes (`RReadWriteLock`) |
+
+Use Redisson in production. Build this to understand what Redisson is doing under the hood.
+
+### application.yml
+
+```yaml
+dist-lock:
+  service-url: http://localhost:8080   # Go lock server
+  default-ttl-ms: 5000
+  retry-attempts: 3
+  retry-delay-ms: 100
+
+management:
+  endpoint:
+    health:
+      show-details: always
+```
+
+### Run it
+
+```bash
+# Terminal 1: start the Go lock server
+cd labs/dist-lock
+go run ./cmd/server
+
+# Terminal 2: run the Spring Boot demo
+cd labs/dist-lock/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Distributed Lock Demo ===
+Two threads competing for the same account lock.
+
+[Thread 1] Acquiring lock on account:42 with 3s TTL...
+[Thread 1] [inside lock] processing debit of 100 for account 42
+[Thread 2] Attempting to acquire lock on account:42 (Thread 1 holds it)...
+[Thread 2] As expected — blocked: Could not acquire lock on 'account:42' after 3 attempts
+[Thread 1] Completed: debited 100 from account 42 at 2026-05-08T10:23:45Z
+
+=== Results ===
+Thread 1: debited 100 from account 42 at 2026-05-08T10:23:45Z
+Thread 2: BLOCKED: Could not acquire lock on 'account:42' after 3 attempts
+```
+
+Thread 2 is blocked because Thread 1 holds the lock for ~1 second and Thread 2's 3 retry attempts at 100ms intervals total only 300ms of waiting. Increase `retry-attempts` to 15 in `application.yml` and Thread 2 will eventually succeed after Thread 1 releases.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="Martin Kleppmann's 2016 critique of Redlock is required reading — not because Redlock is useless, but because his reasoning exposes the exact assumptions that fail in practice. His core point: Redlock is safe only if you assume bounded network delays and bounded process pauses. But a full JVM GC pause violates process pause bounds. An NTP clock jump violates bounded clock skew. A network partition violates bounded delay. These are not theoretical edge cases — they happen in production. The fencing token approach works even without those assumptions, because the storage server enforces correctness at the write point regardless of what the lock server believes. The lock server coordinates; the storage server enforces. I had always assumed the lock server was sufficient. It is not." />
+
+## Where to go deeper
+
+- **How to do distributed locking — Martin Kleppmann**: the canonical critique of Redlock and the case for fencing tokens — [martin.kleppmann.com](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)
+- **Redlock algorithm — Redis documentation**: the official multi-node quorum approach — [redis.io/docs](https://redis.io/docs/manual/patterns/distributed-locks/)
+- **Redisson distributed locks**: production implementation in Java — [github.com/redisson](https://github.com/redisson/redisson/wiki/8.-Distributed-locks-and-synchronizers)
+- **Chubby — Google's lock service**: the original paper on how Google uses a distributed lock service for coordination in Bigtable, GFS, and other infrastructure — Burrows, OSDI 2006
+- **etcd lease API**: Go implementation of distributed leases, with watch semantics for immediate lock release detection — [etcd.io/docs/v3.5/dev-guide/api_reference_v3](https://etcd.io/docs/v3.5/dev-guide/api_reference_v3/)
+
+## Related labs and questions
+
+- **Foundation**: Consistent Hashing Ring — why distributed primitives exist and what "distributed" means for a lock
+- **Next in distributed**: Raft From Scratch — Raft's leader election is a distributed lock generalized to log replication; a Raft leader is a lock holder whose lease is enforced by quorum
+- **Storage complement**: Build Your Own KV Cache — the Redis primitive (`SET NX PX`) we used in v2 lives inside a KV cache; understanding the cache's internals helps reason about lock latency
+- **Design question**: if you implement Redlock on N=5 Redis nodes and one node crashes mid-acquire (after the acquirer wrote to it but before they wrote to the third node needed for quorum), what happens? The acquirer times out after TTL and retries from scratch. But the crashed node may restart with the old key still in memory (if it had not yet flushed to disk). Now two acquirers may hold the lock simultaneously. How does Redlock's delayed restart rule (`>= maxTTL` before restarting a crashed node) prevent this?

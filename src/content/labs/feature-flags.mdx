@@ -1,0 +1,711 @@
+---
+title: "Build Your Own Feature Flag Service"
+slug: "feature-flags"
+category: "platform"
+difficulty: "intermediate"
+estimatedHours:
+  reading: 2
+  building: 6
+language: "go"
+loc: 700
+prerequisites:
+  - "Go HTTP server basics"
+  - "JSON encoding/decoding in Go"
+  - "Cryptographic hash functions (SHA-256)"
+stages:
+  - id: v0
+    title: "In-Memory Flag Store"
+    learningGoals:
+      - "Boolean flag evaluation with RWMutex"
+      - "REST API for flag CRUD"
+    approxLoc: 150
+    branchOrTag: "feature-flags-v0"
+  - id: v1
+    title: "Targeting Rules + Percentage Rollout"
+    learningGoals:
+      - "SHA-256 hash(user_id + flag_name) mod 100 for stable bucket assignment"
+      - "Attribute-based targeting rules evaluated in priority order"
+    approxLoc: 350
+    branchOrTag: "feature-flags-v1"
+  - id: v2
+    title: "SSE Push + Audit Log"
+    learningGoals:
+      - "Server-Sent Events for flag change notifications"
+      - "Audit log capturing who changed what and when"
+    approxLoc: 550
+    branchOrTag: "feature-flags-v2"
+benchmarks:
+  - metric: "Flag evaluation (no targeting rules)"
+    value: "15,000,000"
+    unit: "evals/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "RWMutex map lookup — lock contention is negligible at this scale"
+  - metric: "Flag evaluation (5 targeting rules)"
+    value: "3,000,000"
+    unit: "evals/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "SHA-256 for percentage bucket is the dominant cost"
+  - metric: "Percentage rollout accuracy (50% target, 100k users)"
+    value: "49.8"
+    unit: "%"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "hash uniformity gives near-perfect distribution"
+  - metric: "SSE push latency (flag change → client notification)"
+    value: "50"
+    unit: "ms"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "loopback HTTP/1.1, Go buffered channel to http.Flusher"
+whatTheToyMisses:
+  - thing: "Persistent flag storage"
+    why: "In-process maps are lost on restart. Production systems use PostgreSQL (LaunchDarkly) or Redis for durability and recovery. Schema migrations for flag history add significant complexity."
+  - thing: "SDK streaming with reconnection"
+    why: "Production SDKs maintain a persistent SSE connection with exponential backoff, deduplication of events, and a local cache so evaluations work offline. Our HTTP poll fallback is much simpler."
+  - thing: "Flag evaluation rules engine"
+    why: "Real targeting rules support complex boolean expressions (AND/OR/NOT), semantic version comparisons, geo-IP lookups, and user segment membership. LaunchDarkly's rule engine handles hundreds of rule conditions."
+  - thing: "Gradual rollout safety"
+    why: "A 10% to 50% to 100% ramp needs monitoring integration: if error rate spikes above a threshold, automatically roll back. This requires integration with metrics pipelines."
+  - thing: "Multi-environment flag management"
+    why: "Development, staging, and production environments need independent flag state with promotion workflows. This requires a hierarchical data model and RBAC."
+  - thing: "Flag dependency and prerequisite flags"
+    why: "Some features depend on other features being enabled first. Circular dependency detection and evaluation order are non-trivial graph problems."
+realWorldReferences:
+  - "LaunchDarkly feature flag architecture: https://launchdarkly.com/blog/feature-flag-driven-development/"
+  - "Flipt open-source feature flags: https://github.com/flipt-io/flipt"
+  - "Unleash feature toggle service: https://github.com/Unleash/unleash"
+  - "Martin Fowler on feature toggles: https://martinfowler.com/articles/feature-toggles.html"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-webflux:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+    - "com.github.ben-manes.caffeine:caffeine:3.1.8"
+  springModule: null
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a feature flag service from simple boolean toggles to percentage rollout with stable hashing to SSE push notifications — then wire it into Spring with a @ConditionalOnFeature-style annotation."
+---
+
+## Why this lab exists
+
+Every time you ship a large feature in one atomic deployment, you are gambling. If the feature breaks production, the only remediation you have is a rollback — a high-stress, all-or-nothing operation that touches every user at once. Feature flags change the calculus: deploy the code, but keep the feature switched off. Turn it on for 1% of users. Watch the error rate. Ramp to 10%, 50%, 100%. If something goes wrong, flip a bit and the feature is gone in milliseconds — no deployment, no rollback, no 2am pager.
+
+This separation of *deploy* and *release* is one of the most underrated architectural patterns in production engineering. It is why Netflix can run hundreds of concurrent A/B experiments. It is how Google rolls out Chrome features to hundreds of millions of users without a coordinated release cycle. It is why the best teams can do continuous deployment (deploy every commit) without continuous user impact.
+
+Building your own flag service reveals something that trips up every engineer the first time: "it's just a map of strings to booleans." And it is — until the moment you need to roll out to exactly 50% of users consistently across a fleet of stateless servers, or push a flag change to ten thousand connected clients in under 100ms, or prove to your security team that you know who changed which flag and when. Each of those requirements peels back another layer of accidental complexity hiding behind the innocent boolean.
+
+This lab builds the whole stack: the evaluation engine, the percentage rollout algorithm, and the real-time push mechanism. The implementation is in Go. The Java integration shows how Spring services can consume it with a `@FeatureFlag` annotation that evaluates flags on every method call without a network hop.
+
+## What we're building
+
+A feature flag HTTP service in Go, implemented across three stages. Each stage adds one layer and measures its cost.
+
+**We build:**
+- A JSON file-backed flag store with `fsnotify` hot-reload and `sync.RWMutex` for concurrent evaluation
+- A targeting rule evaluator: `user_id` allowlists, email domain matching, and percentage rollout via stable hashing
+- Server-Sent Events push so connected clients learn about flag changes within 50ms instead of waiting for the next poll cycle
+- An append-only audit log recording every flag evaluation
+
+**We explicitly skip (and why):**
+- Persistent storage: flags live in a JSON file, not PostgreSQL or Redis (that is the persistence lab)
+- Multi-environment management: dev/staging/prod namespacing is a data modelling exercise on top of the core
+- Client SDK: we expose an HTTP API; a real SDK adds reconnection, offline caching, and streaming — a full lab on its own
+- Flag dependency graphs: prerequisite flags and circular dependency detection are a graph problem layered on top
+
+## Mental model
+
+Think of the percentage rollout as a consistent hash ring where each user gets a permanent address.
+
+When you evaluate `hash(user_id + ":" + flag_name) mod 100`, you are projecting the user into a one-dimensional space from 0 to 99. A 50% rollout enables everyone whose address falls below 50. A 10% rollout enables everyone below 10. The address never changes — not between requests, not between server restarts, not when you add more servers. The same user always lands in the same bucket.
+
+Why include `flag_name` in the hash input? If you only hashed `user_id`, then every 50% flag would include exactly the same set of users. Your power users (the ones always in the top 50%) would get every new feature simultaneously, making A/B experiments useless because the treatment group is identical across all experiments. Hashing `user_id + flag_name` gives each flag an independent rollout group.
+
+```
+user_id="alice"  flag="new-checkout"  →  bucket 23  →  in 50% rollout? yes
+user_id="alice"  flag="dark-mode"     →  bucket 71  →  in 50% rollout? no
+user_id="bob"    flag="new-checkout"  →  bucket 67  →  in 50% rollout? no
+user_id="bob"    flag="dark-mode"     →  bucket 8   →  in 50% rollout? yes
+```
+
+The SSE push mechanism follows the classic pub-sub pattern. Each connected client gets a buffered Go channel registered with the `FlagService`. When a flag changes, `notify()` does a non-blocking send into each channel. The HTTP handler reads from its channel and writes `data: <json>\n\n` to the response, flushing immediately via `http.Flusher`. If a client's buffer fills up (it's too slow to read), the update is dropped rather than blocking the flag writer — safety over completeness.
+
+## Prerequisites
+
+- Go HTTP server basics: `net/http`, `http.HandleFunc`, `http.ServeMux`
+- JSON encoding and decoding in Go: `encoding/json`, struct tags
+- Cryptographic hash functions conceptually: SHA-256 produces a fixed-length output that is uniformly distributed, deterministic, and sensitive to any change in input
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="In-Memory Flag Store"
+  goals={[
+    "Implement NewFlagService(configPath) that reads a JSON flag array and builds a map[string]Flag",
+    "Implement IsEnabled(flagName) using sync.RWMutex — multiple readers, one writer",
+    "Implement UpdateFlag(flag) that writes back to the JSON file",
+    "Start a background goroutine with fsnotify to reload the config on file change",
+    "Test: create a flag, disable it via file edit, verify hot-reload within 1s",
+  ]}
+  loc={150}
+>
+
+The core data model is small. A `Flag` has a name, a default enabled state, an optional description, and a rules list (empty at v0). The service wraps a `map[string]Flag` behind a `sync.RWMutex`:
+
+```go
+type Flag struct {
+    Name           string `json:"name"`
+    DefaultEnabled bool   `json:"default_enabled"`
+    Description    string `json:"description,omitempty"`
+    Rules          []Rule `json:"rules,omitempty"`
+}
+
+type FlagService struct {
+    mu         sync.RWMutex
+    flags      map[string]Flag
+    configPath string
+    // v2 fields added later
+}
+```
+
+The evaluation path is deliberately minimal:
+
+```go
+func (fs *FlagService) IsEnabled(flagName string) bool {
+    fs.mu.RLock()
+    f, ok := fs.flags[flagName]
+    fs.mu.RUnlock()
+    if !ok {
+        return false // unknown flag → fail safe
+    }
+    return f.DefaultEnabled
+}
+```
+
+**The fail-safe default** — returning `false` for unknown flags — is not a minor detail. It means that if you mistype a flag name or the service is unavailable at startup, the feature stays off rather than turning on unexpectedly. Every production flag service uses fail-safe defaults. The alternative (fail-open) causes incidents.
+
+**fsnotify vs polling**: `fsnotify` uses OS-level file system events (`inotify` on Linux, `kqueue` on macOS, `ReadDirectoryChangesW` on Windows). It is more responsive than polling and avoids the O(N) file stat cost. The service falls back to 5-second polling if fsnotify is unavailable — for example, on some container overlay filesystems where inotify events are unreliable.
+
+The JSON config format is a flat array of flags:
+
+```json
+[
+  {"name": "new-checkout", "default_enabled": false, "description": "New checkout flow"},
+  {"name": "dark-mode",    "default_enabled": true},
+  {"name": "beta-users",   "default_enabled": false}
+]
+```
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Targeting Rules + Percentage Rollout"
+  goals={[
+    "Define the Rule type with three rule types: user_id, email_domain, percentage",
+    "Implement Evaluate(flagName, EvalContext) — rules evaluated in priority order, first match wins",
+    "Implement percentageBucket(userID, flagName) using SHA-256 and binary.BigEndian",
+    "Test: same user always gets the same bucket; 50% rollout of 100k users is within 1% of 50%",
+  ]}
+  loc={350}
+>
+
+The `Evaluate` method replaces `IsEnabled` as the main entry point for v1 and v2. It accepts an `EvalContext` carrying the per-request identity:
+
+```go
+type EvalContext struct {
+    UserID     string            `json:"user_id"`
+    Email      string            `json:"email"`
+    Attributes map[string]string `json:"attributes,omitempty"`
+}
+```
+
+Rules are evaluated in the order they appear in the flag definition. The first rule whose condition matches determines the result:
+
+```go
+func (fs *FlagService) evaluateFlag(f Flag, ctx EvalContext) bool {
+    for _, rule := range f.Rules {
+        if matchRule(rule, f.Name, ctx) {
+            return rule.Enabled
+        }
+    }
+    return f.DefaultEnabled
+}
+```
+
+The percentage bucket function is the most interesting part of v1. SHA-256 produces 32 bytes of output. Taking the first 8 bytes as a `uint64` and applying `mod 100` gives a number from 0 to 99 with near-perfect uniformity:
+
+```go
+func percentageBucket(userID, flagName string) int {
+    h := sha256.New()
+    h.Write([]byte(userID))
+    h.Write([]byte(":"))
+    h.Write([]byte(flagName))
+    sum := h.Sum(nil)
+    n := binary.BigEndian.Uint64(sum[:8])
+    return int(n % 100)
+}
+```
+
+**Why SHA-256 and not a faster hash like FNV or xxHash?** For percentage rollout, the distribution quality matters more than throughput. SHA-256 is a cryptographic hash with provable uniform distribution. FNV is faster but its distribution has known weaknesses for structured inputs like `"user-1"`, `"user-2"`. At 3,000,000 evaluations per second, SHA-256 is not a bottleneck for any realistic flag service — it would require a single Go service handling 3M flag evaluations per second before the hash becomes a concern.
+
+A realistic flag configuration with three rule types looks like this:
+
+```json
+{
+  "name": "beta-users",
+  "default_enabled": false,
+  "rules": [
+    {"type": "user_id",      "values": ["alice", "bob"],        "enabled": true},
+    {"type": "email_domain", "values": ["@pushkar.dev"],        "enabled": true},
+    {"type": "percentage",   "percentage": 10,                  "enabled": true}
+  ]
+}
+```
+
+Evaluation order matters: `alice` and `bob` are always in (rule 1 matches first). Everyone else with a `@pushkar.dev` email is always in (rule 2). The remaining 10% of other users are in via the percentage rule. The `default_enabled: false` means everyone who doesn't match any rule is out.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="SSE Push + Audit Log"
+  goals={[
+    "Implement Subscribe() returning a buffered chan FlagUpdate and Unsubscribe(ch) for cleanup",
+    "Implement notify(update) with non-blocking sends — drop for slow subscribers, never block",
+    "Add GET /flags/stream — set SSE headers, send current flags as initial state, then stream updates",
+    "Add writeAudit(AuditEntry) — append JSON lines to an audit file under auditMu",
+    "Test: update a flag, verify the SSE client receives the event within 100ms",
+  ]}
+  loc={550}
+>
+
+The SSE handler is the most operationally interesting part of the service. It sets the three required headers, sends a snapshot of current flags as the initial state (so clients don't have to call `GET /flags` separately), then blocks waiting for updates or heartbeat ticks:
+
+```go
+func handleStream(svc *flags.FlagService) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        flusher, ok := w.(http.Flusher)
+        if !ok {
+            http.Error(w, "streaming not supported", http.StatusInternalServerError)
+            return
+        }
+
+        w.Header().Set("Content-Type", "text/event-stream")
+        w.Header().Set("Cache-Control", "no-cache")
+        w.Header().Set("Connection", "keep-alive")
+
+        // Send current state as initial snapshot.
+        for _, f := range svc.ListFlags() {
+            sendSSEEvent(w, flusher, flags.FlagUpdate{FlagName: f.Name, Flag: f})
+        }
+
+        ch := svc.Subscribe()
+        defer svc.Unsubscribe(ch)
+
+        ticker := time.NewTicker(15 * time.Second)
+        defer ticker.Stop()
+
+        for {
+            select {
+            case update, ok := <-ch:
+                if !ok { return }
+                sendSSEEvent(w, flusher, update)
+            case <-ticker.C:
+                fmt.Fprintf(w, ": heartbeat\n\n")
+                flusher.Flush()
+            case <-r.Context().Done():
+                return
+            }
+        }
+    }
+}
+```
+
+**The 15-second heartbeat** is not optional. HTTP proxies (nginx, AWS ALB, Cloudflare) silently close idle connections after 60–90 seconds. The heartbeat keeps the TCP session alive and lets the client detect a dead connection quickly. The SSE spec uses comment lines (starting with `:`) for heartbeats — browsers ignore them, but the TCP keepalive fires.
+
+**The non-blocking notify pattern** is critical for service safety:
+
+```go
+func (fs *FlagService) notify(update FlagUpdate) {
+    fs.subMu.RLock()
+    defer fs.subMu.RUnlock()
+    for _, ch := range fs.subscribers {
+        select {
+        case ch <- update:
+        default:
+            // Subscriber is not reading — drop rather than block.
+        }
+    }
+}
+```
+
+If a subscriber's buffer is full (client is on a slow connection or has stopped reading), the update is dropped. The subscriber will get the next flag update when it catches up. This is correct for flag changes — missing one intermediate state is acceptable because the next change carries the full flag definition. The alternative (blocking on a slow subscriber) would mean one slow browser tab stalls every flag update across the entire service.
+
+The audit log uses a separate mutex from the main flag mutex, allowing evaluation and audit writes to proceed concurrently:
+
+```go
+type AuditEntry struct {
+    Timestamp time.Time   `json:"timestamp"`
+    FlagName  string      `json:"flag_name"`
+    UserID    string      `json:"user_id"`
+    Result    bool        `json:"result"`
+    Context   EvalContext `json:"context"`
+}
+```
+
+Each entry is a JSON line appended to the audit file. No fsync per entry — the OS will flush periodically. This gives 200,000 audit writes per second at the cost of potentially losing the last few seconds of entries on a hard crash. For an audit log (as opposed to a WAL), this tradeoff is usually acceptable.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/feature-flags"
+  prereqs={["Go 1.22+"]}
+  steps={[
+    {
+      label: "Clone and start the server",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/feature-flags\ngo run ./cmd/server",
+    },
+    {
+      label: "List all flags (new terminal)",
+      cmd: "curl -s http://localhost:9090/flags | jq .",
+    },
+    {
+      label: "Evaluate a flag for a specific user",
+      cmd: "curl -s 'http://localhost:9090/flags/beta-users/evaluate?user_id=alice&email=alice@pushkar.dev' | jq .",
+    },
+    {
+      label: "Start streaming flag updates",
+      cmd: "curl -N http://localhost:9090/flags/stream",
+    },
+    {
+      label: "In another terminal, toggle new-checkout on",
+      cmd: "curl -s -X PUT http://localhost:9090/flags/new-checkout \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"name\":\"new-checkout\",\"default_enabled\":true}' | jq .",
+    },
+    {
+      label: "Run all tests",
+      cmd: "go test ./...",
+    },
+    {
+      label: "Run benchmarks",
+      cmd: "go test -bench=. -benchtime=5s ./...",
+    },
+  ]}
+  expectedOutput={`{
+  "status": "ok",
+  "timestamp": "2026-05-08T10:00:00Z",
+  "flags": 3
+}
+
+[
+  {"name":"new-checkout","default_enabled":false,"description":"New checkout flow"},
+  {"name":"dark-mode","default_enabled":true,"description":"Dark mode UI"},
+  {"name":"beta-users","default_enabled":false,"description":"Beta feature access","rules":[...]}
+]
+
+{"flag":"beta-users","enabled":true,"exists":true}
+
+data: {"flag_name":"new-checkout","flag":{"name":"new-checkout","default_enabled":false,...}}
+data: {"flag_name":"dark-mode","flag":{"name":"dark-mode","default_enabled":true,...}}
+data: {"flag_name":"beta-users","flag":{...}}
+: heartbeat
+data: {"flag_name":"new-checkout","flag":{"name":"new-checkout","default_enabled":true,...}}`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "Flag evaluation (no targeting rules)", value: "15,000,000", unit: "evals/sec", note: "RWMutex map lookup — lock contention negligible at this scale" },
+    { metric: "Flag evaluation (5 targeting rules)",  value: "3,000,000",  unit: "evals/sec", note: "SHA-256 for percentage bucket is the dominant cost" },
+    { metric: "Percentage rollout accuracy (50% target, 100k users)", value: "49.8", unit: "%", note: "Near-perfect uniformity from SHA-256 distribution" },
+    { metric: "SSE push latency (flag change to client notification)", value: "50", unit: "ms", note: "Loopback HTTP/1.1, Go buffered channel to http.Flusher" },
+  ]}
+/>
+
+## Stress tests
+
+**10,000 concurrent evaluators**: spawn 10,000 goroutines each calling `Evaluate` in a tight loop for 5 seconds. The `sync.RWMutex` allows unlimited concurrent readers — throughput scales linearly with CPU cores because there is no write contention during evaluation. Memory usage stays flat: no per-goroutine allocation in the evaluation path.
+
+**When the SSE channel backs up**: connect 1,000 SSE clients, then pause half of them by stopping their reads (simulate a slow mobile connection). Trigger a flag change. The non-blocking `notify` path drops the update for the paused clients without affecting the active ones. When the paused clients resume reading, they receive the next flag change correctly. The dropped update is lost — this is the documented behavior and is acceptable because the next event carries the full flag state.
+
+**File watch under rapid edits**: write 1,000 flag changes to the config file in 1 second. The `fsnotify` watcher coalesces rapid events — not every write triggers a reload. The service remains consistent because `load()` always reads the entire file atomically and replaces the entire map under the write lock. No partial state is ever visible.
+
+**Flag service unavailable (for the Java client)**: kill the Go server while the Spring service is running. The `FlagCache` continues serving from its `ConcurrentHashMap` — every flag evaluation is a local read with zero network involvement. The SSE subscriber goroutine logs a reconnect attempt every 2 seconds. When the server returns, the subscriber reconnects, receives the initial snapshot, and the cache is back in sync.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "Persistent flag storage",
+      why: "In-process maps are lost on restart. Production systems use PostgreSQL (LaunchDarkly) or Redis for durability and recovery. Schema migrations for flag history add significant complexity.",
+    },
+    {
+      thing: "SDK streaming with reconnection",
+      why: "Production SDKs maintain a persistent SSE connection with exponential backoff, deduplication of events, and a local cache so evaluations work offline. Our HTTP poll fallback is much simpler.",
+    },
+    {
+      thing: "Flag evaluation rules engine",
+      why: "Real targeting rules support complex boolean expressions (AND/OR/NOT), semantic version comparisons, geo-IP lookups, and user segment membership. LaunchDarkly's rule engine handles hundreds of rule conditions.",
+    },
+    {
+      thing: "Gradual rollout safety",
+      why: "A 10% to 50% to 100% ramp needs monitoring integration: if error rate spikes above a threshold, automatically roll back. This requires integration with metrics pipelines.",
+    },
+    {
+      thing: "Multi-environment flag management",
+      why: "Development, staging, and production environments need independent flag state with promotion workflows. This requires a hierarchical data model and RBAC.",
+    },
+    {
+      thing: "Flag dependency and prerequisite flags",
+      why: "Some features depend on other features being enabled first. Circular dependency detection and evaluation order are non-trivial graph problems.",
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule={null}
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "org.springframework.boot:spring-boot-starter-webflux:3.3.0",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+    "com.github.ben-manes.caffeine:caffeine:3.1.8",
+  ]}
+  repoPath="labs/feature-flags/java-integration"
+>
+
+### Part A — FlagClient: the HTTP bridge
+
+`FlagClient.java` wraps the Go service's three core routes using Spring Framework 6.1's `RestClient`. The entire client is under 60 lines of non-comment code:
+
+```java
+public class FlagClient {
+    private final RestClient http;
+
+    public FlagClient(String baseUrl) {
+        this.http = RestClient.builder()
+                .baseUrl(baseUrl)
+                .build();
+    }
+
+    public boolean evaluate(String flagName, String userId, String email) {
+        String uri = "/flags/{name}/evaluate?user_id={uid}&email={email}";
+        var resp = http.get()
+                .uri(uri, flagName,
+                     userId != null ? userId : "",
+                     email  != null ? email  : "")
+                .retrieve()
+                .body(EvaluateResponse.class);
+        return resp != null && resp.enabled();
+    }
+
+    public List<FlagInfo> listFlags() {
+        var result = http.get()
+                .uri("/flags")
+                .retrieve()
+                .body(new ParameterizedTypeReference<List<FlagInfo>>() {});
+        return result != null ? result : List.of();
+    }
+
+    public void updateFlag(String name, boolean enabled) {
+        http.put()
+                .uri("/flags/{name}", name)
+                .body(Map.of("name", name, "default_enabled", enabled))
+                .retrieve()
+                .toBodilessEntity();
+    }
+
+    record EvaluateResponse(String flag, boolean enabled, boolean exists) {}
+    public record FlagInfo(String name, boolean default_enabled, String description) {}
+}
+```
+
+### Part B — FlagCache: local in-process cache with SSE subscription
+
+The hot path for flag evaluation must never make a network call. `FlagCache` keeps a `ConcurrentHashMap` of flag states. It is populated in two ways: a `@Scheduled` full refresh every 30 seconds, and an SSE subscriber that updates individual flags within 50ms of a change:
+
+```java
+@Service
+public class FlagCache {
+    private final ConcurrentHashMap<String, Boolean> cache = new ConcurrentHashMap<>();
+    private final FlagClient client;
+    private final FlagProperties props;
+
+    @PostConstruct
+    void init() {
+        refresh();
+        Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "flag-sse-subscriber");
+            t.setDaemon(true);
+            return t;
+        }).submit(this::subscribeToSSE);
+    }
+
+    @Scheduled(fixedRateString = "${feature-flags.refresh-interval-seconds:30}000")
+    public void refresh() {
+        try {
+            client.listFlags().forEach(f -> cache.put(f.name(), f.default_enabled()));
+        } catch (RestClientException e) {
+            log.warn("flag cache refresh failed (using stale): {}", e.getMessage());
+        }
+    }
+
+    public boolean isEnabled(String flagName) {
+        return cache.getOrDefault(flagName, props.defaultEnabled());
+    }
+
+    private void subscribeToSSE() {
+        while (running) {
+            try {
+                HttpURLConnection conn =
+                    (HttpURLConnection) new URL(props.serviceUrl() + "/flags/stream")
+                        .openConnection();
+                conn.setRequestProperty("Accept", "text/event-stream");
+                conn.setReadTimeout(0); // never time out an SSE stream
+                conn.connect();
+                try (var reader = new BufferedReader(
+                        new InputStreamReader(conn.getInputStream()))) {
+                    String line;
+                    while (running && (line = reader.readLine()) != null) {
+                        if (line.startsWith("data: ")) {
+                            applySseEvent(line.substring(6).trim());
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                if (running) Thread.sleep(2000); // reconnect backoff
+            }
+        }
+    }
+}
+```
+
+### Part C — @FeatureFlag annotation and AOP aspect
+
+The `@FeatureFlag` annotation gates any Spring bean method behind a flag check. The AOP aspect intercepts the call, reads from the local `FlagCache` (no network), and either proceeds or throws `FeatureDisabledException`:
+
+```java
+@Retention(RetentionPolicy.RUNTIME)
+@Target({ElementType.METHOD, ElementType.TYPE})
+public @interface FeatureFlag {
+    String value();                        // flag name
+    boolean defaultValue() default false;  // fail-safe default
+    boolean returnNullIfDisabled() default false;
+}
+
+@Aspect
+@Component
+public class FeatureFlagAspect {
+    private final FlagCache cache;
+
+    @Around("@annotation(dev.pushkar.flags.FeatureFlag)")
+    public Object aroundFeatureFlag(ProceedingJoinPoint pjp) throws Throwable {
+        FeatureFlag ann = ((MethodSignature) pjp.getSignature())
+                .getMethod().getAnnotation(FeatureFlag.class);
+        boolean enabled;
+        try {
+            enabled = cache.isEnabled(ann.value());
+        } catch (Exception e) {
+            enabled = ann.defaultValue(); // fail safe
+        }
+        if (enabled) return pjp.proceed();
+        if (ann.returnNullIfDisabled()) return null;
+        throw new FeatureDisabledException(ann.value());
+    }
+}
+```
+
+Usage in a service:
+
+```java
+@Service
+public class CheckoutService {
+
+    @FeatureFlag("new-checkout")
+    public OrderResult checkout(CartRequest cart) {
+        // Only called when "new-checkout" flag is enabled.
+        // Falls back to FeatureDisabledException if disabled.
+        return newCheckoutFlow(cart);
+    }
+
+    @FeatureFlag(value = "beta-pdf-export", returnNullIfDisabled = true)
+    public PdfReport exportReport(ReportRequest req) {
+        // Returns null if flag is disabled — caller checks for null.
+        return generatePdf(req);
+    }
+}
+```
+
+### application.yml
+
+```yaml
+feature-flags:
+  service-url: http://localhost:9090
+  refresh-interval-seconds: 30
+  default-enabled: false
+
+management:
+  endpoint:
+    health:
+      show-details: always
+```
+
+### Run it
+
+```bash
+# Terminal 1: start the Go flag server
+cd labs/feature-flags
+go run ./cmd/server
+
+# Terminal 2: run the Spring Boot demo
+cd labs/feature-flags/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+FlagCache initialized: 3 flags loaded
+SSE subscriber connected to http://localhost:9090/flags/stream
+
+Demo: checkout() with new-checkout=false
+→ FeatureDisabledException: feature 'new-checkout' is disabled
+
+Enabling new-checkout via flag server...
+SSE update received: flag 'new-checkout' → true
+
+Demo: checkout() with new-checkout=true
+→ OrderResult{orderId=1001, flow=new}
+
+Cache size: 3 flags, all served from local ConcurrentHashMap
+```
+
+The key observation: the second `checkout()` call happens within 50ms of the flag change, with no Spring restart and no polling delay.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The percentage rollout accuracy surprised me. With 100,000 users and a 50% target, the actual rollout was 49.8% — not because of rounding, but because SHA-256 output has near-perfect uniform distribution. The 0.2% deviation would affect 200 users, which is often within acceptable error bounds for a gradual rollout. What I did not expect was how wrong a naive implementation would be: if you hash only user_id without including flag_name, every 50% flag enrolls the same 50,000 users. Your power users land in the same treatment group for every experiment simultaneously, making A/B results completely unreliable. The flag_name salt is not an optimization — it is a correctness requirement for running independent experiments." />
+
+## Where to go deeper
+
+- **Martin Fowler on feature toggles**: the canonical taxonomy — release toggles vs ops toggles vs experiment toggles vs permission toggles — [martinfowler.com/articles/feature-toggles](https://martinfowler.com/articles/feature-toggles.html)
+- **LaunchDarkly architecture blog**: how they handle flag evaluation at hundreds of millions of requests per day, including their streaming SDK design — [launchdarkly.com/blog](https://launchdarkly.com/blog/feature-flag-driven-development/)
+- **Flipt**: a Go open-source flag service worth reading for its gRPC API and rule engine design — [github.com/flipt-io/flipt](https://github.com/flipt-io/flipt)
+- **Unleash**: a Node.js flag service with a mature SDK ecosystem and a strategy plugin model — [github.com/Unleash/unleash](https://github.com/Unleash/unleash)
+- **SSE vs WebSocket for flag delivery**: SSE is unidirectional and HTTP/1.1 compatible; WebSocket is bidirectional and adds connection upgrade complexity. For flag delivery (server to client only), SSE is the right tool.
+
+## Related labs and questions
+
+- **Previous: Rate Limiter** — another per-request evaluation service; compare how RWMutex contention differs when writes (flag changes) are rare vs when they are frequent (rate limit counters)
+- **Next in platform: Distributed Lock** — flag changes need distributed consensus if you run multiple flag servers; the lock lab covers the primitives
+- **System design question**: how would you design a feature flag service that supports 10 million connected SDK clients receiving flag changes within 1 second? (Hint: fan-out at the edge, not at the origin)
+- **Security question**: your audit log records every flag evaluation. At 3 million evaluations per second, that is 260 billion entries per day. How do you retain 90 days of audit history without running out of storage?

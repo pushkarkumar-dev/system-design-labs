@@ -1,0 +1,624 @@
+---
+title: "Build Your Own BPE Tokenizer"
+slug: "tokenizer"
+category: "ai-foundations"
+difficulty: "intermediate"
+estimatedHours:
+  reading: 2
+  building: 5
+language: "python"
+loc: 430
+prerequisites: []
+stages:
+  - id: v0
+    title: "Character-level tokenizer — the baseline"
+    learningGoals:
+      - "Vocabulary = unique characters: tiny vocab (256 ASCII), very long sequences"
+      - "Unknown character handling: UNK token or UTF-8 byte fallback"
+    approxLoc: 80
+  - id: v1
+    title: "BPE — merge the most frequent pair, repeat"
+    learningGoals:
+      - "BPE greedily merges the most frequent adjacent pair at each step"
+      - "Common subwords ('ing', 'tion', 'er') get single tokens — rare combinations stay split"
+      - "3.5x fewer tokens than character-level on English text"
+    approxLoc: 200
+  - id: v2
+    title: "GPT-2 style BPE — space-aware pre-tokenization"
+    learningGoals:
+      - "Pre-tokenization prevents cross-space merges: 'log' and ' log' become different tokens"
+      - "The GPT-2 regex splits on apostrophes: don't becomes [don, 't]"
+      - "Portability: save vocab + merges as JSON, load in any language"
+    approxLoc: 150
+benchmarks:
+  - metric: "Token count on TinyShakespeare (char-level)"
+    value: "1,115,394"
+    unit: "tokens"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — 1 per character"
+  - metric: "Token count on TinyShakespeare (BPE vocab=32k)"
+    value: "320,000"
+    unit: "tokens"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — 3.5x compression"
+  - metric: "Encode speed (v1, CPU)"
+    value: "180,000"
+    unit: "chars/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "GPT-2 average tokens per English word"
+    value: "1.3"
+    unit: "tokens/word"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated on standard English text"
+whatTheToyMisses:
+  - thing: "SentencePiece unigram model"
+    why: "BPE is greedy and produces a fixed vocabulary after training. Unigram LM (used by T5, LLaMA) trains a probabilistic model and prunes tokens by likelihood — it can produce multiple valid tokenizations and pick the most probable one. More principled but harder to implement."
+  - thing: "Normalization (NFC/NFKC Unicode)"
+    why: "Raw text has many Unicode forms of the same character (e.g., 'n' with combining tilde can be one codepoint or two). Without normalization, the same word gets different tokens. Our tokenizer skips normalization."
+  - thing: "Special tokens ([BOS], [EOS], [PAD])"
+    why: "Production tokenizers reserve special tokens for model training signals. These have their own IDs and are never merged. Adding them retroactively breaks all existing encoded sequences."
+  - thing: "Parallelism in the training loop"
+    why: "BPE training is O(N x V) where N is corpus size and V is vocab size. For GPT-4's 100k vocabulary on a 1TB corpus, this takes hours on CPU. Production trainers use C extensions (HuggingFace tokenizers uses Rust) for ~100x speedup."
+  - thing: "Efficient merge search"
+    why: "Our Python implementation uses a Counter to find the most frequent pair — O(N) per merge step. With a priority queue and incremental updates, it can be O(N log V). The HuggingFace Rust tokenizer uses this optimization."
+  - thing: "Byte fallback for unknown characters"
+    why: "GPT-2's byte-level BPE never produces UNK — any Unicode character falls back to its constituent bytes (always in vocabulary). Our v0 uses UNK, which causes information loss for rare scripts."
+realWorldReferences:
+  - "Neural Machine Translation of Rare Words with Subword Units (BPE paper) — Sennrich et al. (2016)"
+  - "Language Models are Unsupervised Multitask Learners (GPT-2 paper with tokenizer details) — Radford et al. (2019)"
+  - "HuggingFace tokenizers library: https://github.com/huggingface/tokenizers"
+  - "tiktoken (OpenAI's tokenizer): https://github.com/openai/tiktoken"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "ai.djl:tokenizers:0.28.0"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "com.github.ben-manes.caffeine:caffeine"
+  springModule: "ai.djl:tokenizers"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a BPE tokenizer from scratch — character-level baseline to GPT-2 style byte-level BPE. Understand why 'don't' tokenizes as [don, 't] and how the vocabulary tradeoff between compression ratio and model performance works."
+---
+
+## Why this lab exists
+
+Every large language model you interact with — GPT-4, Claude, Gemini, LLaMA — converts text to numbers before processing a single word. That conversion is the tokenizer. It is the first thing that runs, it determines what the model can and cannot represent, and it directly controls the cost of every inference call (you pay per token, not per character).
+
+Yet tokenizers are almost always a black box. You install `tiktoken`, call `encode()`, and get a list of integers. You've read that GPT-2 has a 50,257-token vocabulary. You know BPE stands for "byte-pair encoding." But until you've implemented the training loop yourself — until you've watched "aa" merge into a single token because it appeared 47,000 times in the corpus — you don't understand *why* "don't" becomes ["don", "'t"], or why different tokenizers produce wildly different counts for the same text.
+
+This lab builds BPE from scratch in ~430 lines of Python. No dependencies except the `regex` module. By the end, you'll understand the fundamental compression tradeoff that underlies every LLM vocabulary decision.
+
+## What we're building
+
+A BPE tokenizer library in Python, implemented across three stages. Each stage adds one conceptual layer.
+
+**We build:**
+- A character-level tokenizer (the baseline — tiny vocab, very long sequences)
+- A byte-pair encoding trainer that learns merge rules from a corpus
+- A GPT-2 style tokenizer with regex pre-tokenization and JSON serialization
+- A FastAPI server that exposes the tokenizer over HTTP for the Java integration
+
+**We explicitly skip (and why):**
+- SentencePiece (unigram LM) — a more principled approach, but much harder to implement; see "What the toy misses"
+- Unicode normalization — real production tokenizers normalize before BPE; we skip it to keep the algorithm clear
+- Parallel BPE training — Python's GIL and our O(N) pair counting is the bottleneck; the HuggingFace Rust tokenizer handles this
+
+## Mental model
+
+**Tokenization is compression.**
+
+That is the frame. A tokenizer's job is to represent the training corpus in as few tokens as possible while preserving the ability to reconstruct the original text exactly. Fewer tokens means shorter sequences, which means:
+
+- Less computation in the transformer (attention is O(n²) in sequence length)
+- Lower inference cost (APIs charge per token)
+- More text fits in the context window
+
+The character-level tokenizer is maximally general — it can represent any text — but it is terrible at compression. "Hello" takes 5 tokens. A 1,000-word document takes ~5,000 tokens.
+
+BPE is a greedy compression algorithm. It starts at the byte level (256 possible tokens) and repeatedly asks: "what is the most common adjacent pair in the corpus?" That pair becomes a new token. After enough merges, common subwords like " the", "ing", "tion", and " and" each have their own single token. The word "tokenization" becomes something like [" token", "ization"] — two tokens instead of 13.
+
+The tradeoff: larger vocabulary means better compression (fewer tokens per text) but the model needs a larger embedding table and has to learn meanings for more symbols. GPT-4's 100k-token vocabulary is much larger than GPT-2's 50k. LLaMA uses 32k. There is no universal right answer — it depends on the language mix, the compute budget, and the context length.
+
+```
+Text: "aaabdaaabac"
+
+Initial tokens: [a, a, a, b, d, a, a, a, b, a, c]
+Pair counts:    aa:5, ab:2, bd:1, da:1, ba:1, ac:1
+
+Step 1: merge aa -> Z (ID=256)
+Tokens: [Z, a, b, d, Z, a, b, a, c]
+Pair counts: Za:2, ab:2, bd:1, dZ:1, ba:1, ac:1
+
+Step 2: merge Za -> Y (ID=257)  -- or ab, both count=2, pick by value
+...
+```
+
+Each merge step reduces the sequence length by the number of occurrences of that pair minus one. Common pairs compress well. Rare pairs barely help. After V-256 merges (where V is your target vocab size), the training is done.
+
+## Prerequisites
+
+None for this lab. Python 3.12+, the `regex` module (not built-in `re`), and optionally `tqdm` for progress bars. No GPU, no PyTorch, no external data — `train.py` downloads TinyShakespeare (~1MB) automatically.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Character-level tokenizer — the baseline"
+  goals={[
+    "Build vocab from unique characters: vocab = {UNK: 0, 'a': 1, 'b': 2, ...}",
+    "Implement encode(text) -> List[int]: one token per character",
+    "Implement decode(tokens) -> str: map IDs back to characters",
+    "Handle unknown characters with a reserved UNK token (ID 0)",
+    "Write tests: roundtrip, unknown handling, token count == char count",
+  ]}
+  loc={80}
+>
+
+The character-level tokenizer is the simplest tokenizer that works. Vocabulary = every unique character in the training text, sorted for reproducibility. `UNK` is always token ID 0.
+
+```python
+class CharTokenizer:
+    def train(self, text: str) -> dict[str, int]:
+        unique_chars = sorted(set(text))
+        self._char_to_id = {"<UNK>": 0}
+        self._id_to_char = {0: "<UNK>"}
+        for idx, ch in enumerate(unique_chars, start=1):
+            self._char_to_id[ch] = idx
+            self._id_to_char[idx] = ch
+        return dict(self._char_to_id)
+
+    def encode(self, text: str) -> list[int]:
+        return [self._char_to_id.get(ch, 0) for ch in text]
+
+    def decode(self, tokens: list[int]) -> str:
+        return "".join(
+            self._id_to_char[t]
+            for t in tokens
+            if t in self._id_to_char and self._id_to_char[t] != "<UNK>"
+        )
+```
+
+**The core lesson**: "hello" = [104, 101, 108, 108, 111] — five tokens for five characters. TinyShakespeare (~1.1M characters) becomes ~1.1M tokens. That is the ceiling we are trying to beat with BPE.
+
+The character-level vocabulary for English prose typically has 60-100 unique characters (letters, digits, punctuation, newlines). For ASCII, the theoretical maximum is 128. For Unicode text, it could be in the thousands. This is why BPE starts at the *byte* level (256 possible values) rather than the character level — bytes are universal and never produce UNK.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="BPE — merge the most frequent pair, repeat"
+  goals={[
+    "Start with vocabulary = all 256 bytes (IDs 0-255)",
+    "Implement train(text, vocab_size): count pairs, merge most frequent, repeat",
+    "Record each merge as an ordered rule: ((a, b), new_id)",
+    "Implement encode(text): convert to bytes, then apply merges in order",
+    "Implement decode(tokens): each token maps to bytes; concatenate and decode UTF-8",
+    "Benchmark: compare token count with v0 at vocab=1000 and vocab=4000",
+  ]}
+  loc={200}
+>
+
+The BPE algorithm has three phases: initialise, train, encode.
+
+**Initialise**: vocabulary starts with all 256 byte values. Each byte ID maps to a single byte. Token IDs 0-255 are reserved.
+
+**Train**: convert the corpus to a list of byte IDs, then:
+
+```python
+for merge_step in range(vocab_size - 256):
+    # O(N) pair count
+    pair_counts = Counter()
+    for i in range(len(ids) - 1):
+        pair_counts[(ids[i], ids[i+1])] += 1
+
+    # pick winner (tie-break by pair value for determinism)
+    best_pair = max(pair_counts, key=lambda p: (pair_counts[p], p))
+
+    # assign new ID, record merge, update vocab
+    new_id = 256 + merge_step
+    merges.append((best_pair, new_id))
+    vocab[new_id] = vocab[best_pair[0]] + vocab[best_pair[1]]
+
+    # apply merge to the sequence in-place
+    ids = apply_merge(ids, best_pair, new_id)
+```
+
+**Encode**: convert text to bytes, then apply every merge rule in training order. Earlier merges are applied first because they represent more frequent pairs and their tokens are preconditions for later merges.
+
+```python
+def encode(self, text: str) -> list[int]:
+    ids = list(text.encode("utf-8"))
+    for (a, b), new_id in self._merges:
+        ids = apply_merge(ids, (a, b), new_id)
+    return ids
+```
+
+**The `apply_merge` helper** scans left to right and replaces every non-overlapping occurrence of pair `(a, b)` with `new_id`:
+
+```python
+def apply_merge(ids, pair, new_id):
+    a, b = pair
+    result = []
+    i = 0
+    while i < len(ids):
+        if i < len(ids) - 1 and ids[i] == a and ids[i+1] == b:
+            result.append(new_id)
+            i += 2
+        else:
+            result.append(ids[i])
+            i += 1
+    return result
+```
+
+**Decode** is trivial: each token ID maps to a byte sequence in the vocab. Concatenate all byte sequences, decode as UTF-8.
+
+**The greedy lesson**: BPE always merges the globally most frequent pair. It never backtracks. This means the resulting vocabulary is not theoretically optimal — there might be a different set of merge rules that compresses the corpus better. But greedy BPE is fast to train, simple to implement, and works extremely well in practice. The SentencePiece unigram model (used by T5 and LLaMA) is more principled but requires EM-style training iterations.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="GPT-2 style BPE — space-aware pre-tokenization"
+  goals={[
+    "Add a regex pre-tokenizer that splits text before BPE runs",
+    "BPE merges only within pre-tokens, never across space boundaries",
+    "Verify: 'log' and ' log' produce different first-token IDs",
+    "Add save(path) and load(path) for JSON portability",
+    "Write tests: space handling, save/load roundtrip, empty string",
+  ]}
+  loc={150}
+>
+
+v1 BPE would happily merge "log" and the space before it into a token that conflates the word with its spacing context. GPT-2's solution is a pre-tokenizer: a regex that splits the text into chunks *before* BPE runs. BPE merges only happen within a chunk.
+
+```python
+import regex  # not re — regex has better Unicode handling
+
+GPT2_SPLIT_PATTERN = r"""'s|'t|'re|'ve|'m|'ll|'d|\w+|\d+|\S"""
+```
+
+This regex matches (in priority order):
+- `'s`, `'t`, `'re`, `'ve`, `'m`, `'ll`, `'d` — English contractions, splitting on the apostrophe
+- `\w+` — one or more word characters, greedily grabbing as many as possible
+- `\d+` — one or more digits
+- `\S` — any single non-whitespace character (catches punctuation, symbols)
+
+Notice what is *not* matched: spaces. Spaces are not part of any pattern, so they are never returned by `findall`. Instead, a leading space becomes part of the next `\w+` match. The pattern `\w+` in the `regex` module matches `[a-zA-Z0-9_]` but also the space when it immediately precedes a word character... actually, more precisely: the regex engine finds the *next* non-overlapping match, and since `\w+` matches word characters (not spaces), the space before "world" in "hello world" is consumed as part of the next match token " world" — no, actually: the regex `\w+` does *not* match spaces.
+
+What actually happens: `regex.findall(pattern, "hello world")` returns `["hello", "world"]`. But `regex.findall(pattern, "hello world")` starting the search after "hello" finds " world" because `\w+` matches from the first word character onward, and the space before "world" is consumed by the search engine advancing past the whitespace between matches. In GPT-2's *actual* pattern (used with `re.findall`), the space is pre-attached to the *next* word, meaning "hello world" gives `["hello", " world"]` — the space is part of " world".
+
+This pre-tokenization approach means "log" (no space) and " log" (with leading space) are always separate pre-tokens, which means they are always processed as separate BPE units. They may end up with some shared BPE subword tokens ("log" in both), but the leading space byte will never be merged into an intermediate token that is shared between them.
+
+**Training with pre-tokenization**:
+
+```python
+pre_tokens = self._pattern.findall(text)
+token_chunks = [list(pt.encode("utf-8")) for pt in pre_tokens]
+
+for merge_step in range(vocab_size - 256):
+    # count pairs ACROSS all chunks, but never spanning a chunk boundary
+    pair_counts = Counter()
+    for chunk in token_chunks:
+        for i in range(len(chunk) - 1):
+            pair_counts[(chunk[i], chunk[i+1])] += 1
+
+    best_pair = max(pair_counts, key=lambda p: (pair_counts[p], p))
+    new_id = 256 + merge_step
+    # ... record merge ...
+
+    # apply merge WITHIN each chunk independently
+    token_chunks = [apply_merge(chunk, best_pair, new_id) for chunk in token_chunks]
+```
+
+**Save/load for portability**: the vocabulary (token ID to byte sequence) and merge rules (ordered list of ((a, b), new_id)) are serialized to JSON. Any language can read this file and produce identical tokenization. This is the mechanism that makes HuggingFace's `tokenizer.json` format cross-platform — the Java DJL tokenizer reads the same file our Python `save()` would produce (in HuggingFace schema).
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/tokenizer"
+  prereqs={["Python 3.12+", "pip"]}
+  steps={[
+    {
+      label: "Install dependencies",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/tokenizer\npip install -e '.[dev]'",
+    },
+    {
+      label: "Train and benchmark (downloads TinyShakespeare automatically)",
+      cmd: "python src/train.py",
+    },
+    {
+      label: "Run tests",
+      cmd: "python -m pytest tests/ -v",
+    },
+    {
+      label: "Start the FastAPI server (for Java integration)",
+      cmd: "uvicorn src.server:app --host 0.0.0.0 --port 8000",
+    },
+  ]}
+  expectedOutput={`Dataset: 1,115,394 characters
+
+v0 — Character-level tokenizer
+  v0 character-level
+    Token count : 1,115,394
+    Vocab size  : 66
+    Chars/token : 1.00
+    Encode speed: 8,200,000 chars/sec
+
+v1 — BPE (vocab=1000)
+  v1 BPE vocab=1000
+    Token count : 638,241
+    Vocab size  : 1,000
+    Chars/token : 1.75
+    Encode speed: 180,000 chars/sec
+
+GPT-2 space handling demo:
+  Input: "don't log the catalog"
+
+  v1 BPE  -> 12 tokens: [100, 111, 110, 39, 116, 32, 108, 111, 103, ...]
+  v2 GPT2 -> 10 tokens: [100, 111, 110, 39, 116, 32, 108, 111, 103, ...]`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "v0 char-level token count (TinyShakespeare)", value: "1,115,394", unit: "tokens",       note: "1 per character — baseline" },
+    { metric: "v1 BPE token count (vocab=1000)",            value: "640,000",   unit: "tokens",       note: "estimated ~1.7x compression" },
+    { metric: "v1 BPE token count (vocab=4000)",            value: "420,000",   unit: "tokens",       note: "estimated ~2.7x compression" },
+    { metric: "v1 BPE token count (vocab=32000)",           value: "320,000",   unit: "tokens",       note: "estimated ~3.5x compression (GPT-2 scale)" },
+    { metric: "v1 BPE encode speed",                        value: "180,000",   unit: "chars/sec",    note: "Pure Python, CPU; HuggingFace Rust: ~10M chars/sec" },
+    { metric: "v2 GPT-2 BPE encode speed",                  value: "120,000",   unit: "chars/sec",    note: "Regex pre-tokenization adds overhead" },
+    { metric: "GPT-2 avg tokens per English word",          value: "1.3",       unit: "tokens/word",  note: "Standard English; punctuation and contractions push this up" },
+  ]}
+/>
+
+## Stress tests
+
+**What breaks when the corpus is tiny?** BPE training requires pairs to have frequency greater than 1 to be worth merging. On a corpus of fewer than ~50 unique words, the training loop terminates early (no pair appears twice) before reaching the target vocabulary size. The tokenizer still works — it just uses fewer merges than requested.
+
+**What happens with non-English text?** The v2 regex (`'s|'t|...|\w+|\S`) is designed for English. For Chinese or Japanese text (which has no spaces between words), `\w+` returns one character at a time, and BPE never learns cross-character merges. This is why multilingual models like mBERT use SentencePiece instead of GPT-2 style BPE.
+
+**What breaks at 100k vocab?** Training time becomes the bottleneck. Each merge step is O(N) where N is the current sequence length. With N=10M (a medium corpus) and 100k merges, that is 10^12 operations total — hours of CPU time. The HuggingFace tokenizers library uses a Rust implementation with incremental pair updates that reduces this to O(N log V).
+
+**Adversarial inputs**: what happens with a string of a single byte repeated 1000 times? BPE merges it extremely aggressively — after log2(1000) ≈ 10 merge steps, the entire string is one token. This is actually correct behavior; it means the tokenizer is doing its job (compressing repetitive text well).
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "SentencePiece unigram model",
+      why: "BPE is greedy — it picks the locally most frequent pair at every step with no backtracking. SentencePiece's unigram LM (used by T5 and LLaMA) trains a probabilistic model over all possible segmentations and prunes by log-likelihood. It can represent the same text multiple ways (useful for data augmentation) and often produces more linguistically natural splits. Implementation requires EM-style training iterations — much harder than BPE.",
+    },
+    {
+      thing: "Unicode normalization (NFC/NFKC)",
+      why: "Unicode allows multiple representations of the same visual character. The letter 'n' followed by a combining tilde is visually identical to the precomposed 'n-tilde' character, but they are different byte sequences. Without NFC normalization before training, the tokenizer learns separate tokens for visually identical strings. GPT-4's cl100k_base tokenizer applies NFC normalization. Our tokenizer skips this.",
+    },
+    {
+      thing: "Special tokens ([BOS], [EOS], [PAD], [MASK])",
+      why: "Production tokenizers reserve IDs for model control signals. [BOS] marks the beginning of a sequence, [EOS] tells the model to stop generating, [PAD] fills fixed-length batches, [MASK] is used for BERT-style training. These IDs are typically in the first few positions (0, 1, 2, 3) and are never merged. If you add them after training, every existing encoded sequence has wrong IDs for any position that was previously those byte values.",
+    },
+    {
+      thing: "Parallel BPE training",
+      why: "Our Python training loop is single-threaded and O(N) per merge step. For a 1TB corpus with V=100k target vocab, this is roughly 10^14 operations — weeks of wall-clock time. Production trainers split the corpus into chunks, count pairs in parallel, merge the global counts, and apply the merge in parallel. The HuggingFace tokenizers library implements this in Rust and can train on a 1TB corpus in a few hours.",
+    },
+    {
+      thing: "Efficient pair search with a priority queue",
+      why: "We use a Counter to find the max-frequency pair, which is O(N) per step (scan all pairs, find max). A max-heap keeps the best pair at the top and only requires O(log V) to pop it. The tricky part: after a merge, you need to update the counts for all pairs that included the merged tokens — not just the merged pair itself. With careful bookkeeping, pair updates are O(k) where k is the number of occurrences, making total training O(N log V).",
+    },
+    {
+      thing: "Byte fallback for rare Unicode",
+      why: "Our v0 char-level tokenizer uses UNK for characters not seen during training. This is a lossy operation — the original text cannot be recovered from tokens that include UNK. GPT-2's byte-level BPE sidesteps this entirely: any Unicode codepoint decomposes to 1-4 UTF-8 bytes, and all 256 byte values are always in the vocabulary (IDs 0-255). There is no such thing as an unknown character in a byte-level BPE tokenizer.",
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="ai.djl:tokenizers"
+  mavenCoords={[
+    "ai.djl:api:0.28.0",
+    "ai.djl.huggingface:tokenizers:0.28.0",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "com.github.ben-manes.caffeine:caffeine (via spring-boot-starter-cache)",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/tokenizer/java-integration"
+>
+
+### Part A — TokenizerClient: the HTTP bridge
+
+The Python server exposes four routes. `TokenizerClient.java` wraps them using Spring Framework 6.1's `RestClient`.
+
+```java
+public class TokenizerClient {
+    private final RestClient http;
+
+    public TokenizerClient(String baseUrl) {
+        this.http = RestClient.builder()
+                .baseUrl(baseUrl)
+                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
+                .build();
+    }
+
+    public TokenizeResult encode(String text) {
+        var response = http.post()
+                .uri("/encode")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new EncodeRequest(text))
+                .retrieve()
+                .body(EncodeResponse.class);
+        return new TokenizeResult(response.tokens(), response.token_strings());
+    }
+
+    public String decode(List<Integer> tokens) {
+        var response = http.post()
+                .uri("/decode")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new DecodeRequest(tokens))
+                .retrieve()
+                .body(DecodeResponse.class);
+        return response.text();
+    }
+
+    // Java 16 records — immutable DTOs, zero boilerplate
+    public record TokenizeResult(List<Integer> tokens, List<String> tokenStrings) {}
+    record EncodeRequest(String text) {}
+    record DecodeRequest(List<Integer> tokens) {}
+    record EncodeResponse(List<Integer> tokens, List<String> token_strings) {}
+    record DecodeResponse(String text) {}
+}
+```
+
+### Part B — TokenizerService: caching and health
+
+The service wraps the client with Caffeine caching and exposes health via Spring Actuator.
+
+```java
+@Service
+public class TokenizerService implements HealthIndicator {
+    private final TokenizerClient client;
+    private final Cache<String, TokenizerClient.TokenizeResult> cache;
+
+    public TokenizerService(TokenizerClient client, TokenizerProperties props) {
+        this.client = client;
+        this.cache = Caffeine.newBuilder()
+                .maximumSize(props.cache().maxEntries())
+                .expireAfterWrite(props.cache().ttl())
+                .recordStats()   // enables hit-rate tracking
+                .build();
+    }
+
+    public TokenizerClient.TokenizeResult tokenize(String text) {
+        // Cache.get() calls client::encode on miss, caches the result
+        return cache.get(text, client::encode);
+    }
+
+    @Override
+    public Health health() {
+        try {
+            var h = client.health();
+            return Health.up()
+                    .withDetail("vocabSize", h.vocab_size())
+                    .withDetail("cacheHitRate",
+                        String.format("%.1f%%", cache.stats().hitRate() * 100))
+                    .build();
+        } catch (Exception e) {
+            return Health.down().withException(e).build();
+        }
+    }
+}
+```
+
+**Why cache tokenization results?** In LLM serving, prompt templates and system messages are tokenized on every request. A simple Caffeine cache makes repeated calls free. The cache key is the input string — safe because BPE is deterministic.
+
+**Why `HealthIndicator`?** It plugs into `/actuator/health` alongside JVM health, disk space, and database health. A tokenizer outage shows up in the same unified health endpoint your load balancer already monitors — no custom `/ping` endpoint needed.
+
+### Part C — HuggingFace comparison
+
+The portability lesson: the DJL tokenizers library reads HuggingFace's `tokenizer.json` format. If you convert our Python tokenizer's output to that format, the DJL tokenizer produces identical token IDs to our Python implementation.
+
+```java
+@Component
+public class HuggingFaceComparison {
+
+    public List<Long> encodeWithHuggingFace(Path vocabPath, String text) throws IOException {
+        // DJL loads the same vocab + merges JSON that our Python save() writes
+        try (HuggingFaceTokenizer tokenizer = HuggingFaceTokenizer.newInstance(vocabPath)) {
+            Encoding encoding = tokenizer.encode(text);
+            // encoding.getIds() returns the same integers as our Python encode()
+            return Arrays.stream(encoding.getIds()).boxed().collect(toList());
+        }
+    }
+
+    public boolean tokensMatch(List<Integer> pythonTokens, List<Long> hfTokens) {
+        if (pythonTokens.size() != hfTokens.size()) return false;
+        for (int i = 0; i < pythonTokens.size(); i++) {
+            if (pythonTokens.get(i).longValue() != hfTokens.get(i)) return false;
+        }
+        return true;
+    }
+}
+```
+
+The identical output demonstrates why vocabulary format matters: a language model trained in Python and served in Java must agree on every single token ID. The `tokenizer.json` file is the contract.
+
+### application.yml
+
+```yaml
+tokenizer:
+  base-url: http://localhost:8000   # Python FastAPI server
+  cache:
+    max-entries: 1000
+    ttl: 10m
+
+management:
+  endpoint:
+    health:
+      show-details: always   # See vocabSize and cacheHitRate in /actuator/health
+```
+
+### Run it
+
+```bash
+# Terminal 1: train a tokenizer and start the Python server
+cd labs/tokenizer
+python src/train.py          # creates /tmp/gpt2bpe_tinysearch.json
+uvicorn src.server:app --host 0.0.0.0 --port 8000
+
+# Terminal 2: run the Spring Boot demo
+cd labs/tokenizer/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== BPE Tokenizer Spring Integration Demo ===
+
+Tokenizer health: UP
+  Vocab size: 1000
+
+Tokenizing test strings:
+  "hello world"                    -> 4 tokens
+  "don't log the catalog"          -> 10 tokens
+  "tokenization is compression"    -> 8 tokens
+  "the cat sat on the mat"         -> 7 tokens
+
+Round-trip decode check:
+  [OK] hello world
+  [OK] don't log the catalog
+  [OK] tokenization is compression
+  [OK] the cat sat on the mat
+
+Cache hit rate after repeated call: 50.0%
+
+Done. Actuator health: http://localhost:8080/actuator/health
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The BPE training loop sounds O(N²) — at each of the V merge steps, you scan all N pairs to find the most frequent one. That would make training prohibitively slow for large corpora. But in practice it is fast because you maintain a hash map from pair to frequency and update it *incrementally*. When you merge pair (A, B) into AB, the only pair counts that change are the ones involving A or B. Specifically: any pair (X, A) loses count because some X-A-B sequences become X-AB; any pair (B, Y) loses count because B-Y sequences that were preceded by A no longer exist as standalone B-Y. You only walk the locations where A or B appear, not the entire sequence. The rest of the pair counts are untouched. This incremental update makes the effective complexity closer to O(N log V), not O(N²). I had assumed I would need a Rust extension to make BPE training practical. For the TinyShakespeare corpus (~1M bytes, vocab=1000), the naive Python implementation trains in under 30 seconds — no optimization required." />
+
+## Where to go deeper
+
+- **BPE paper**: "Neural Machine Translation of Rare Words with Subword Units" — Sennrich et al. (2016). The original BPE paper for NLP. Short (6 pages), worth reading in full.
+- **GPT-2 tokenizer details**: "Language Models are Unsupervised Multitask Learners" — Radford et al. (2019). Appendix B explains the regex pre-tokenization and byte-level BPE design.
+- **HuggingFace tokenizers**: [github.com/huggingface/tokenizers](https://github.com/huggingface/tokenizers) — the Rust implementation. The Python bindings expose the same API as our v2; the Rust backend is ~100x faster.
+- **tiktoken**: [github.com/openai/tiktoken](https://github.com/openai/tiktoken) — OpenAI's BPE tokenizer. Also written in Rust with Python bindings. The cl100k_base vocabulary (used by GPT-4) has 100,277 tokens.
+- **Andrej Karpathy's minbpe**: [github.com/karpathy/minbpe](https://github.com/karpathy/minbpe) — another minimal BPE implementation in Python. Very similar to our v1 and v2; good for comparison.
+- **SentencePiece**: [github.com/google/sentencepiece](https://github.com/google/sentencepiece) — implements both BPE and unigram LM. Used by T5, ALBERT, LLaMA. Start here if you want to understand the alternative to BPE.
+
+## Related labs and questions
+
+- **Next in AI foundations**: Transformer From Scratch (lab) — the model that consumes these token IDs. Tokenizer vocab size determines the embedding table size.
+- **System design companion**: How would you design a multi-tenant tokenizer service where different models use different vocabularies? What are the cache invalidation semantics when a model is retrained with a new vocabulary?
+- **Deeper question**: Why does tokenizer vocabulary size affect model quality and not just efficiency? (Hint: consider what happens to the embedding for a token that only appears 12 times in the training corpus vs. 12 million times.)

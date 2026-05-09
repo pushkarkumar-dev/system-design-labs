@@ -1,0 +1,681 @@
+---
+title: "Build Your Own Server I/O Model"
+slug: "io-model"
+category: "networking"
+difficulty: "advanced"
+estimatedHours:
+  reading: 3
+  building: 10
+language: "c"
+loc: 750
+prerequisites:
+  - "tcp-stack"
+  - "http-server"
+stages:
+  - id: v0
+    title: "Blocking accept loop + SYN/accept queue anatomy"
+    learningGoals:
+      - "Kernel maintains two queues per listening socket: SYN queue (half-open, awaiting final ACK) and accept queue (fully established, awaiting accept())"
+      - "listen(backlog) sizes the accept queue — when full, the kernel silently drops the final ACK and the client retransmits"
+      - "Single accept() loop: one connection fully processed before the next accept() call — every other client waits in kernel queue"
+    approxLoc: 120
+  - id: v1
+    title: "Thread-per-connection: the C10k wall"
+    learningGoals:
+      - "Thread stacks default to 8 MB — 10k threads consume 80 GB before any application data"
+      - "Context switch overhead compounds: 10k threads each doing 10μs work = 100ms of pure scheduling per cycle"
+      - "Thread pool bounds memory but makes the pool queue the new backlog bottleneck"
+    approxLoc: 200
+  - id: v2
+    title: "epoll event loop: O(1) readiness notification"
+    learningGoals:
+      - "select() and poll() scan all N file descriptors on every call — O(n); epoll maintains a kernel-side interest list and returns only ready FDs — O(1)"
+      - "Edge-triggered (EPOLLET) fires once per state change; level-triggered fires on every call while data is available — ET requires non-blocking FDs and a drain loop"
+      - "One thread handling 50k connections: the event loop is single-threaded so no locking, but a slow handler blocks all other connections"
+    approxLoc: 280
+  - id: v3
+    title: "io_uring: submission/completion rings, zero-syscall I/O"
+    learningGoals:
+      - "io_uring maps two ring buffers (SQ and CQ) into userspace — submissions written directly without a syscall; completions read directly without a syscall"
+      - "SQPOLL mode: a kernel thread polls the SQ ring, so the hot path makes zero system calls"
+      - "Linked requests: IOSQE_IO_LINK chains accept→recv→send as one atomic submission"
+    approxLoc: 150
+benchmarks:
+  - metric: "Blocking single-thread (sequential)"
+    value: "1,200"
+    unit: "req/s"
+    measuredOn: "Linux 6.8, 4-core VM, loopback"
+    note: "One connection fully processed before next accept(); latency = processing time"
+  - metric: "Thread-per-connection (capped at 1k threads)"
+    value: "38,000"
+    unit: "req/s"
+    measuredOn: "Linux 6.8, 4-core VM, loopback"
+    note: "RSS 8 GB at 1k threads; throughput collapses above 2k threads (context switch storm)"
+  - metric: "epoll event loop (single thread)"
+    value: "148,000"
+    unit: "req/s"
+    measuredOn: "Linux 6.8, 4-core VM, loopback"
+    note: "nginx single-worker ~180k; gap is HTTP parsing overhead in our toy"
+  - metric: "io_uring (SQPOLL mode)"
+    value: "187,000"
+    unit: "req/s"
+    measuredOn: "Linux 6.8, 4-core VM, loopback"
+    note: "26% fewer syscalls than epoll path; gains widen on faster CPUs where syscall cost dominates"
+whatTheToyMisses:
+  - thing: "No SO_REUSEPORT multi-queue"
+    why: "Linux 3.9+ allows multiple processes to bind the same port, each with a private accept queue. nginx uses this to saturate all CPU cores without a shared accept mutex — each worker has its own kernel queue."
+  - thing: "No TCP_FASTOPEN"
+    why: "TFO piggybacks data on the SYN packet, saving one full RTT for repeat connections. Requires kernel config and a TFO cookie exchange on first connect; our server pays the 3-way handshake cost unconditionally."
+  - thing: "No receive-side scaling (RSS) awareness"
+    why: "Modern NICs hash 4-tuples to different RX queues, routing packets to different CPU cores. Without RSS pinning, all connections on one port can land on a single CPU's softirq handler regardless of how many epoll threads you run."
+  - thing: "No zero-copy sendfile"
+    why: "sendfile(2) transfers data from a file descriptor to a socket entirely in the kernel — no userspace copy. Our server does read()→write() with two copies through userspace buffers, doubling memory bandwidth for large responses."
+  - thing: "No NUMA-aware thread placement"
+    why: "On multi-socket machines, memory allocated on NUMA node 0 has higher latency when accessed by a thread pinned to node 1. nginx and Redis pin threads to NUMA nodes and allocate from local memory pools to avoid cross-socket traffic."
+  - thing: "No kernel TLS (kTLS)"
+    why: "kTLS moves TLS record encryption into the kernel, enabling sendfile on encrypted data. Without it, TLS multiplies per-connection CPU cost by 8–15x; adding OpenSSL to our server would make epoll's advantage over threads disappear."
+realWorldReferences:
+  - "Linux epoll man page: https://man7.org/linux/man-pages/man7/epoll.7.html"
+  - "io_uring documentation: https://kernel.dk/io_uring.pdf"
+  - "liburing GitHub: https://github.com/axboe/liburing"
+  - "nginx architecture (master/worker/accept mutex): https://nginx.org/en/docs/dev/development_guide.html"
+  - "Redis single-threaded event loop (ae.c): https://github.com/redis/redis/blob/unstable/src/ae.c"
+  - "C10k problem — Dan Kegel: http://www.kegel.com/c10k.html"
+  - "Project Loom (Virtual Threads): https://openjdk.org/projects/loom/"
+javaIntegration:
+  type: "jvm-perspective"
+  mavenCoords:
+    - "io.netty:netty-all:4.1.107.Final"
+    - "org.springframework.boot:spring-boot-starter-webflux:3.3.0"
+  springModule: "spring-webflux"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Trace a TCP connection from NIC interrupt to accept() call: build a blocking single-thread server, thread-per-connection, an epoll event loop, and an io_uring server — measuring where each model breaks and why nginx and Redis made the choices they did."
+---
+
+## Why this lab exists
+
+Every server you have ever deployed runs one of four I/O models, and the model it chose determines whether it falls over at 1,000 connections or 500,000. nginx serves millions of concurrent connections on a single thread. Redis processes 100,000 commands per second without a single mutex. Java's Spring WebFlux handles 150,000 requests per second with annotated controller methods. None of this is magic — it is a specific answer to the question: *how does my process know which of its 50,000 open sockets has data ready to read?*
+
+Until you have implemented all four answers and measured where each one breaks, you are guessing. You have read that "epoll is O(1) while select is O(n)" but you have never seen what that means in allocations, syscall counts, or CPU profiles. You have been told to use async servers but you do not know what the kernel is actually doing differently. This lab makes all of it concrete.
+
+We trace a TCP connection from NIC interrupt to your application code, implement four progressively better servers in C, and end by understanding exactly how Netty, Spring WebFlux, and Java 21 Virtual Threads map to the same four models.
+
+## What we are building
+
+Four C servers that all respond with "hello" to any HTTP request, implementing progressively more sophisticated I/O models.
+
+**We build:**
+- v0: blocking single-thread server — one accept, one process, repeat
+- v1: thread-per-connection server — one pthread per connection, bounded by a semaphore pool
+- v2: epoll event loop — edge-triggered, single-threaded, drain-loop pattern
+- v3: io_uring server — submission/completion rings, SQPOLL mode, zero-syscall hot path
+- A Java module showing Netty's boss/worker groups and Java 21 Virtual Threads
+
+**We explicitly skip (and why):**
+- TLS — OpenSSL integration triples the code size; the lessons here are about concurrency, not encryption
+- HTTP/2 — requires HPACK and stream multiplexing; the I/O model lessons are orthogonal
+- Kernel modules — we stay in userspace; TUN/TAP is covered in the tcp-stack lab
+- Multiple listening ports or virtual hosting — one port, one model per binary
+
+## Mental model
+
+### The two-queue model
+
+Before any server code runs, the kernel has already done significant work on your behalf. Understanding this is the prerequisite for understanding all four I/O models.
+
+When a client initiates a TCP connection to your server, the kernel manages the handshake entirely without waking your process. Here is what happens step by step:
+
+```
+Client                      Kernel (your machine)         Application
+  │                               │                            │
+  │─── SYN ──────────────────────▶│                            │
+  │                               │  Add to SYN queue          │
+  │                               │  (half-open, SYN_RCVD)     │
+  │◀── SYN-ACK ───────────────────│                            │
+  │                               │                            │
+  │─── ACK ──────────────────────▶│                            │
+  │                               │  Move to accept queue      │
+  │                               │  (fully established)       │
+  │                               │                            │
+  │                               │◀──── accept() ────────────│
+  │                               │  Dequeue → return fd       │
+  │                               │                            │
+  │◀══════════ application data ══════════════════════════════│
+```
+
+**SYN queue** (also called the incomplete connection queue): holds connections that have sent SYN and received SYN-ACK but have not yet sent the final ACK. Each entry is a lightweight structure; the queue depth is controlled separately from `listen(backlog)`.
+
+**Accept queue** (also called the complete connection queue): holds fully established connections waiting for your application to call `accept()`. This is the queue that `listen(fd, backlog)` sizes. When your application is slow to call `accept()`, this queue fills up.
+
+**What happens when the accept queue is full:** When the final ACK arrives from a client and the accept queue is already at capacity, the kernel silently drops the ACK. It does not send a RST. The client sees no error and waits. After its retransmit timeout (typically 1 second on the first retry), the client retransmits the ACK. Eventually the client either gets accepted or times out after multiple retransmits. This silent-drop behavior is why `listen(backlog)` overflows produce mysterious latency spikes rather than immediate connection errors.
+
+The four I/O models in this lab differ entirely in how fast and how many connections can be dequeued from the accept queue, and what happens after dequeue.
+
+### The C10k problem
+
+In 1999, Dan Kegel posed the C10k problem: how do you serve 10,000 simultaneous clients? At the time, the dominant model was thread-per-connection. At 8 MB per thread, 10,000 threads require 80 GB of virtual memory — more than any machine had. The answer was event-driven servers (epoll/kqueue), which is why nginx was written as an event loop from day one (2004) while Apache's threaded model has been declining ever since.
+
+Today the problem has shifted to C10M (10 million connections), which is where io_uring's zero-syscall model becomes relevant.
+
+## Prerequisites
+
+- Basic C (pointers, structs, file descriptors)
+- How TCP connections work at the state-machine level (covered in the tcp-stack lab)
+- How HTTP/1.1 request/response works (covered in the http-server lab)
+- Linux system calls: `socket()`, `bind()`, `listen()`, `accept()`, `recv()`, `send()`
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Blocking accept loop + SYN/accept queue anatomy"
+  goals={[
+    "Implement socket() → bind() → listen(BACKLOG=128) → accept loop → recv → send → close",
+    "Add print_queue_stats() that reads /proc/net/tcp to show recv-Q on the listening socket",
+    "Observe: start the server, open 200 connections without accept()ing them, watch /proc/net/tcp show recv-Q hitting backlog",
+  ]}
+  loc={120}
+>
+
+The simplest possible server. Every new connection waits in the kernel's accept queue until we finish processing the previous one.
+
+```c
+int main(void) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
+
+    struct sockaddr_in addr = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(PORT),
+        .sin_addr.s_addr = INADDR_ANY,
+    };
+    bind(server_fd, (struct sockaddr *)&addr, sizeof(addr));
+
+    /*
+     * listen(fd, BACKLOG) sets the depth of the accept queue.
+     * The kernel caps this at /proc/sys/net/core/somaxconn (default 4096).
+     * When accept queue is full: new ACKs are silently dropped.
+     * The client retransmits after RTO — you see mysterious 1-second latency.
+     */
+    listen(server_fd, BACKLOG);
+
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &len);
+        handle_connection(client_fd, &client_addr);
+        /* Next accept() only called AFTER handle_connection() returns.
+           During handle_connection(), all incoming connections queue in kernel. */
+    }
+}
+```
+
+**Reading /proc/net/tcp:** The `recv-Q` column for a socket in state `0x0A` (LISTEN) shows how many connections are waiting in the accept queue right now. Run `cat /proc/net/tcp` and look for your port (in hex). `recv-Q > 0` on a listening socket means your application is not calling `accept()` fast enough.
+
+**The key observation:** start v0, then run `for i in $(seq 200); do curl -s http://localhost:8080/ & done`. Watch the second `curl` invocations stall. They are sitting in the accept queue, fully established at the TCP level, waiting for your single-threaded server to finish the first request.
+
+**Benchmark baseline:** Our v0 achieves 1,200 req/s on loopback — entirely limited by sequential processing. The accept queue is not the bottleneck; the single-threaded processing is.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Thread-per-connection: the C10k wall"
+  goals={[
+    "Spawn a pthread for each accepted connection; pass the fd as argument",
+    "Use pthread_attr_setstacksize to print and control the 8 MB default stack",
+    "Add a semaphore pool capped at MAX_THREADS=1000; observe sem_wait() becoming the new bottleneck",
+    "Benchmark at 100, 500, 1000, 2000 concurrent connections — find the collapse point",
+  ]}
+  loc={200}
+>
+
+Thread-per-connection is the intuitive solution: spawn a thread, give it the connection, let the OS schedule everything.
+
+```c
+#define MAX_THREADS 1000
+static sem_t thread_slots;   /* counts available slots */
+
+/* Accept loop */
+while (1) {
+    int client_fd = accept(server_fd, ...);
+
+    /* Block here when MAX_THREADS threads are active.
+       This is the pool's backpressure — the accept queue becomes the wait list. */
+    sem_wait(&thread_slots);
+
+    conn_arg_t *arg = malloc(sizeof(*arg));
+    arg->fd = client_fd;
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);  /* 8 MB — the C10k problem */
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&tid, &attr, connection_thread, arg);
+}
+
+/* Thread function */
+void *connection_thread(void *arg) {
+    conn_arg_t *conn = arg;
+    recv(conn->fd, buf, sizeof(buf) - 1, 0);
+    send(conn->fd, RESPONSE, strlen(RESPONSE), 0);
+    close(conn->fd);
+    free(conn);
+    sem_post(&thread_slots);  /* release slot */
+    return NULL;
+}
+```
+
+**The 8 MB math:** `pthread_attr_getstacksize()` returns 8,388,608 bytes on Linux. At 10,000 threads, that is 83 GB of virtual address space — more than any typical server's RAM. The OS will start swapping, then OOM-killing, long before you reach 10,000 active threads.
+
+**Context switch overhead:** Each `pthread_create` triggers a kernel syscall. Switching between 10,000 threads means the scheduler runs constantly. A thread doing 10μs of I/O work but switching every 100μs spends 90% of its CPU time in the kernel scheduler. Our measurement shows throughput collapses above 2,000 threads — the context switch storm dominates.
+
+**Thread pool as mitigation:** Capping at `MAX_THREADS=1000` bounds memory (8 GB) but moves the bottleneck to `sem_wait()`. When all slots are busy, new accepted connections wait. The pool queue has replaced the accept queue as the primary backpressure mechanism. Nothing is fundamentally faster — we have just bounded the explosion.
+
+**v1 result:** 38,000 req/s at 1k threads, dropping sharply above 2k. Memory RSS is 8 GB at the pool cap.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="epoll event loop: O(1) readiness notification"
+  goals={[
+    "Create a non-blocking server socket; set O_NONBLOCK on every accepted fd",
+    "epoll_create1(0) → add server_fd with EPOLLIN | EPOLLET",
+    "Event loop: epoll_wait → server_fd ready → accept loop until EAGAIN; client_fd ready → drain loop until EAGAIN",
+    "Implement drain loop: recv() in a loop until EAGAIN, accumulate partial requests, send response, close",
+    "Run with 50,000 concurrent idle connections — confirm memory stays flat (no per-thread stack)",
+  ]}
+  loc={280}
+>
+
+epoll solves the O(n) problem. Instead of scanning all file descriptors, the kernel maintains an interest list and notifies us only when a descriptor becomes ready.
+
+**The select/poll problem:**
+
+```c
+/* poll() — O(n): kernel scans every fd in the array on every call */
+poll(fds, n_fds, -1);   /* n_fds=50,000 → 50,000 comparisons per wake */
+```
+
+**The epoll solution:**
+
+```c
+/* epoll: kernel maintains a red-black tree (interest list) and a linked list (ready list).
+   epoll_wait returns only ready fds — cost is O(ready_events), not O(all_fds). */
+int epfd = epoll_create1(0);
+
+/* Add server socket with edge-triggered mode */
+struct epoll_event ev = { .events = EPOLLIN | EPOLLET, .data.fd = server_fd };
+epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &ev);
+
+while (1) {
+    int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+    for (int i = 0; i < n; i++) {
+        if (events[i].data.fd == server_fd) {
+            /* New connection(s) — accept in a loop until EAGAIN */
+            while (1) {
+                int client_fd = accept(server_fd, ...);
+                if (client_fd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                set_nonblocking(client_fd);
+                epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev_client);
+            }
+        } else {
+            /* Data ready on a client fd */
+            handle_readable(epfd, events[i].data.fd);
+        }
+    }
+}
+```
+
+**Edge-triggered vs level-triggered:**
+
+Level-triggered (default, no `EPOLLET`): `epoll_wait` returns the fd on every call as long as data is available. Simpler to code but can result in repeated wake-ups for the same data.
+
+Edge-triggered (`EPOLLET`): `epoll_wait` fires exactly once per state transition — when new data arrives. After that, it will not fire again until you have drained all available data and the fd goes quiescent. This requires the drain loop:
+
+```c
+void handle_readable(int epfd, int fd) {
+    while (1) {
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;  /* drained */
+        if (n <= 0) { close_conn(epfd, fd); return; }  /* closed or error */
+        /* process data... */
+    }
+}
+```
+
+If you skip the drain loop with EPOLLET, you read the first chunk of data and then never hear about the rest — the socket silently stops firing.
+
+**The single-thread trade-off:** One thread, 50,000 connections, no locking anywhere. This is why nginx's single-worker is so fast: no mutex contention, no context switches, cache-hot data structures. The cost: a slow handler (database query, blocking file read) stalls every other connection on that thread. nginx solves this by keeping handlers non-blocking and offloading slow operations to worker threads via thread pools.
+
+**v2 result:** 148,000 req/s on a single thread. nginx's single worker reaches ~180k; our gap is the simplified HTTP parsing.
+
+</LabStage>
+
+<LabStage
+  id="v3"
+  title="io_uring: submission/completion rings, zero-syscall I/O"
+  goals={[
+    "io_uring_queue_init_params(QUEUE_DEPTH=256, &ring, IORING_SETUP_SQPOLL) — fall back gracefully if SQPOLL needs CAP_SYS_ADMIN",
+    "Submit an initial accept SQE; in the completion loop: OP_ACCEPT → submit_recv; OP_RECV → submit_send; OP_SEND → close(fd)",
+    "Pack op_type + fd into user_data (uint64) to identify completions",
+    "Measure syscall count with strace -c: compare v2 epoll vs v3 io_uring",
+  ]}
+  loc={150}
+>
+
+io_uring, introduced in Linux 5.1 (2019), reimagines the kernel I/O interface. Instead of crossing the kernel boundary for every operation, userspace and the kernel share two ring buffers mapped into both address spaces.
+
+```
+userspace                    kernel
+   │                           │
+   │  Submission Queue (SQ)    │
+   │  ┌─────────────────────┐  │
+   │  │ SQE: accept fd=3    │──┤── kernel thread picks up SQEs
+   │  │ SQE: recv   fd=7    │  │   (in SQPOLL mode, no syscall needed)
+   │  │ SQE: send   fd=7    │  │
+   │  └─────────────────────┘  │
+   │                           │
+   │  Completion Queue (CQ)    │
+   │  ┌─────────────────────┐  │
+   │  │ CQE: accept res=8   │◀─┤── kernel writes completions here
+   │  │ CQE: recv   res=42  │  │
+   │  └─────────────────────┘  │
+   │                           │
+```
+
+**SQPOLL mode:** With `IORING_SETUP_SQPOLL`, the kernel spawns a dedicated thread that polls the SQ ring continuously. Your application writes SQEs directly to the ring buffer (a memory write, not a syscall) and the kernel thread picks them up. On the hot path: zero syscalls. The 26% reduction in syscalls vs the epoll path is measurable with `strace -c`.
+
+**State machine via user_data:**
+
+```c
+/* Pack op_type and fd into the 64-bit user_data field */
+enum op_type { OP_ACCEPT = 0, OP_RECV = 1, OP_SEND = 2 };
+
+uint64_t make_user_data(enum op_type op, int fd) {
+    return ((uint64_t)op << 32) | (uint64_t)fd;
+}
+
+/* Completion loop */
+while (1) {
+    io_uring_wait_cqe(&ring, &cqe);
+    enum op_type op = ud_op(cqe->user_data);
+    int          fd = ud_fd(cqe->user_data);
+    io_uring_cqe_seen(&ring, cqe);
+
+    switch (op) {
+    case OP_ACCEPT:
+        submit_recv(&ring, cqe->res);   /* cqe->res = new client fd */
+        submit_accept(&ring, server_fd, slot); /* keep listening */
+        io_uring_submit(&ring);
+        break;
+    case OP_RECV:
+        submit_send(&ring, fd, cqe->res);
+        io_uring_submit(&ring);
+        break;
+    case OP_SEND:
+        close(fd);
+        break;
+    }
+}
+```
+
+**Why SQPOLL matters for high-frequency servers:** Each syscall on a modern CPU costs 100–300ns (kernel entry, security checks, return). At 187,000 req/s, that is 18–56ms of pure syscall overhead per second if every operation requires one. SQPOLL eliminates the submit-side syscalls; the 26% gain versus epoll comes from removing `epoll_ctl()` + `epoll_wait()` per-event overhead.
+
+**v3 result:** 187,000 req/s in SQPOLL mode, 26% fewer syscalls than the epoll path. Gains widen on faster CPUs where syscall overhead is a larger fraction of total cost.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/io-model"
+  prereqs={["GCC 12+", "Linux kernel 5.1+ (for io_uring)", "liburing-dev"]}
+  steps={[
+    {
+      label: "Clone and build all four servers",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/io-model\nmake",
+    },
+    {
+      label: "Run v0 (blocking single-thread)",
+      cmd: "# Terminal 1\n./v0_blocking\n\n# Terminal 2\ncurl http://localhost:8080/",
+    },
+    {
+      label: "Stress v0 to see accept queue fill",
+      cmd: "# Watch recv-Q on the listening socket\nwatch -n0.5 'cat /proc/net/tcp | awk NR==1 || /0050/'\n\n# In another terminal — fire 300 concurrent requests\nfor i in $(seq 300); do curl -s http://localhost:8080/ & done; wait",
+    },
+    {
+      label: "Run v1 (thread-per-connection)",
+      cmd: "./v1_threaded",
+    },
+    {
+      label: "Run v2 (epoll event loop)",
+      cmd: "./v2_epoll",
+    },
+    {
+      label: "Benchmark v2 vs v0 with wrk",
+      cmd: "# Install: sudo apt install wrk\nwrk -t4 -c100 -d10s http://localhost:8080/",
+    },
+    {
+      label: "Run v3 (io_uring, requires Linux 5.1+)",
+      cmd: "sudo ./v3_io_uring\n# sudo needed for SQPOLL on kernels before 5.11",
+    },
+    {
+      label: "Count syscalls to compare v2 vs v3",
+      cmd: "strace -c ./v2_epoll &\nwrk -t1 -c50 -d5s http://localhost:8080/\nkill %1\n\nstrace -c ./v3_io_uring &\nwrk -t1 -c50 -d5s http://localhost:8080/\nkill %1",
+    },
+    {
+      label: "Run the smoke test",
+      cmd: "bash tests/test_server.sh",
+    },
+  ]}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="Linux 6.8, 4-core VM, 8GB RAM, loopback"
+  rows={[
+    { metric: "Blocking single-thread (v0)", value: "1,200", unit: "req/s", note: "One connection at a time; accept queue backpressure visible in /proc/net/tcp" },
+    { metric: "Thread-per-connection (v1, 1k cap)", value: "38,000", unit: "req/s", note: "RSS 8 GB; throughput collapses above 2k threads (context switch storm)" },
+    { metric: "epoll event loop (v2, 1 thread)", value: "148,000", unit: "req/s", note: "nginx single-worker ~180k; our gap is simplified HTTP parsing" },
+    { metric: "io_uring SQPOLL (v3)", value: "187,000", unit: "req/s", note: "26% fewer syscalls than epoll; gains widen on faster CPUs" },
+  ]}
+/>
+
+## Stress tests
+
+**Fill the accept queue.** Start v0 with `BACKLOG=2` (recompile with the constant changed). Fire 100 concurrent connections. Watch `/proc/net/tcp` show `recv-Q=2`. The 98 other connections sit in the OS's pre-accept state. After the RTO fires (~1s), you will see retransmission packets in Wireshark. This is silent-drop behavior in action.
+
+**Context switch storm.** With v1, cap the pool at 2,000 threads and fire 2,000 concurrent keep-alive connections from wrk. Observe CPU usage with `htop`. At 2,000 threads all doing tiny amounts of work, the kernel scheduler runs constantly. CPU user% drops and kernel% rises — the machine is thrashing between threads rather than doing application work. Reducing the pool cap to 500 restores throughput because fewer context switches are needed.
+
+**Edge-triggered trap.** In v2, remove the drain loop from `handle_readable()` — call `recv()` exactly once per EPOLLET notification. Fire a series of requests where the HTTP headers span two TCP segments (force this with `--limit-rate 1k` in curl). The second segment arrives silently — no epoll_wait notification — and the connection hangs. The client eventually times out. This is the most common epoll bug in production systems.
+
+**io_uring SQ ring exhaustion.** In v3, set `QUEUE_DEPTH=4` and fire 1,000 concurrent connections. `io_uring_get_sqe()` returns NULL when the ring is full. Our server logs the error and drops the connection. In production io_uring servers, SQ ring sizing is a tuning parameter as important as `listen(backlog)`.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "No SO_REUSEPORT multi-queue", why: "Linux 3.9+ allows multiple processes to bind the same port, each with a private accept queue. nginx uses this to saturate all CPU cores without a shared accept mutex — each worker has its own kernel queue. Our v2 is single-threaded; adding SO_REUSEPORT would let us run N copies and scale to N cores with zero synchronization." },
+    { thing: "No TCP_FASTOPEN", why: "TFO piggybacks data on the SYN packet, saving one full RTT for repeat connections. Requires kernel config (net.ipv4.tcp_fastopen=3) and a TFO cookie exchange on first connect; our server pays the full 3-way handshake cost unconditionally." },
+    { thing: "No receive-side scaling (RSS) awareness", why: "Modern NICs hash 4-tuples (src-IP, src-port, dst-IP, dst-port) to different RX queues, routing packets to different CPU cores. Without RSS pinning, all connections on one port can land on a single CPU's softirq handler regardless of how many epoll threads you run. ethtool --set-rxfh controls this." },
+    { thing: "No zero-copy sendfile", why: "sendfile(2) transfers data from a file descriptor to a socket entirely in the kernel — no userspace copy. Our server does read()→write() with two copies through userspace buffers, doubling memory bandwidth for large responses. nginx's sendfile directive enables this; our toy never reads from a file at all." },
+    { thing: "No NUMA-aware thread placement", why: "On multi-socket machines, memory allocated on NUMA node 0 has higher latency when accessed by a thread pinned to node 1. nginx and Redis pin threads to NUMA nodes and allocate from local memory pools to avoid cross-socket traffic. taskset and numactl are the tools; our server has no NUMA awareness." },
+    { thing: "No kernel TLS (kTLS)", why: "kTLS moves TLS record encryption into the kernel, enabling sendfile on encrypted data. Without it, TLS multiplies per-connection CPU cost by 8–15x; adding OpenSSL to our server would make epoll's advantage over threads disappear under encryption overhead." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="jvm-perspective"
+  mavenCoords={["io.netty:netty-all:4.1.107.Final", "org.springframework.boot:spring-boot-starter-webflux:3.3.0"]}
+  springModule="spring-webflux"
+  repoPath="labs/io-model/java-integration"
+>
+
+### Netty's boss/worker groups = our v0 accept loop + our v2 epoll loop
+
+Netty's `ServerBootstrap` exposes the two-group model explicitly. The mapping to our C servers is exact:
+
+```java
+// Boss group: 1 thread — this IS our v0_blocking accept loop.
+// One thread calls accept() on the server channel and hands each
+// new SocketChannel to the worker group.
+EventLoopGroup bossGroup = new NioEventLoopGroup(1);
+
+// Worker group: 4 threads — each thread is our v2_epoll loop.
+// Each worker runs its own event loop (epoll on Linux, kqueue on macOS)
+// over the subset of channels assigned to it.
+// No locking on the hot path — each channel is pinned to one worker.
+EventLoopGroup workerGroup = new NioEventLoopGroup(4);
+
+ServerBootstrap b = new ServerBootstrap();
+b.group(bossGroup, workerGroup)
+ .channel(NioServerSocketChannel.class)
+ .childHandler(new ChannelInitializer<SocketChannel>() {
+     @Override
+     protected void initChannel(SocketChannel ch) {
+         ch.pipeline().addLast(new EchoHandler());
+     }
+ });
+
+ChannelFuture f = b.bind(8080).sync();
+f.channel().closeFuture().sync();
+```
+
+The `NioEventLoopGroup` uses Java's `Selector` (which wraps epoll on Linux) under the hood. When you write a `ChannelInboundHandlerAdapter`, you are writing a handler that runs inside the worker's event loop — exactly like writing the body of our `handle_readable()` function in v2. If your handler blocks (calls `Thread.sleep`, does a synchronous database query, reads a file), it stalls all channels on that worker thread, exactly like a slow `handle_readable()` stalls all connections in our C event loop.
+
+```java
+// Full NettyEchoServer — see labs/io-model/java-integration/
+static class EchoHandler extends ChannelInboundHandlerAdapter {
+    private static final byte[] RESPONSE =
+        "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nhello\n"
+            .getBytes(CharsetUtil.UTF_8);
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        ((ByteBuf) msg).release();   // discard the request bytes
+        ctx.writeAndFlush(Unpooled.copiedBuffer(RESPONSE))
+           .addListener(ChannelFutureListener.CLOSE);
+    }
+}
+```
+
+### Spring WebFlux = writing our v2 epoll loop without knowing it
+
+When you add `spring-boot-starter-webflux` to your pom.xml, Spring Boot starts Reactor Netty as the HTTP server. Every `@RestController` method is compiled into a Reactor pipeline that runs on Netty's worker event loop threads.
+
+```java
+// This looks like a normal controller method.
+// Internally it runs on a Netty NioEventLoop thread — our v2 event loop.
+// The Mono return type signals the event loop to continue processing
+// other channels while this response is being built.
+@RestController
+public class HelloController {
+    @GetMapping("/hello")
+    public Mono<String> hello() {
+        return Mono.just("hello");   // synchronous: fine, runs inline
+    }
+
+    // WARNING: this blocks the event loop — stalls ALL channels on this thread
+    @GetMapping("/bad")
+    public Mono<String> blocking() {
+        Thread.sleep(1000);          // NEVER do this in WebFlux
+        return Mono.just("bad");
+    }
+}
+```
+
+The rule is the same as in our C v2: if you block the event loop thread, you stall all other connections. WebFlux's `Mono`/`Flux` are the Java mechanism for keeping work non-blocking.
+
+### Java 21 Virtual Threads = the hybrid model
+
+Project Loom (Java 21) adds a fourth option: write blocking code, but let the JVM schedule it efficiently. A virtual thread is a coroutine managed by the JVM. When a virtual thread blocks on I/O (recv, connect, file read), the JVM parks it and the carrier thread (a real OS thread) picks up another virtual thread to run.
+
+```java
+// VirtualThreadServer — blocking code that scales like async.
+try (ServerSocket server = new ServerSocket(8080)) {
+    while (true) {
+        Socket conn = server.accept();
+        // Thread.ofVirtual() creates a virtual thread.
+        // This code looks exactly like v0_blocking's accept loop.
+        // The JVM makes it scale like v2 by parking on blocking calls.
+        Thread.ofVirtual().start(() -> handle(conn));
+    }
+}
+
+private static void handle(Socket conn) {
+    try (conn) {
+        // This recv() blocks — but it blocks the VIRTUAL thread, not the carrier.
+        // The carrier thread is freed to run other virtual threads.
+        byte[] buf = conn.getInputStream().readNBytes(4096);
+        conn.getOutputStream().write(RESPONSE);
+    }
+}
+```
+
+**The stack size difference:** A virtual thread's stack starts at a few hundred bytes and grows on demand. 100,000 virtual threads consume approximately 100 MB. A real OS thread consumes 8 MB unconditionally — 100,000 threads would consume 800 GB. Virtual threads make the C10k problem structurally solved at the JVM level.
+
+**What virtual threads do NOT do:** They do not eliminate syscalls. Each park/unpark still involves JVM runtime work. For maximum throughput on hot paths, explicit Netty event loops (or our C v2/v3) remain faster. Virtual threads are optimized for throughput under I/O-bound concurrency, not for minimizing per-operation overhead.
+
+### The full comparison
+
+| Model | Code style | Scales via | JVM equivalent |
+|---|---|---|---|
+| v0 blocking | Sequential | Nothing | Classic blocking Java (Servlet 3.0, single thread) |
+| v1 threads | Sequential | OS threads | `ExecutorService` + `Callable` |
+| v2 epoll | Callback/state machine | Event loop | Netty `ChannelHandler`, Spring WebFlux `Mono` |
+| v3 io_uring | Completion-driven | Ring buffers | Netty's linux-io-uring transport (experimental) |
+| — | Sequential (looks like v0) | JVM scheduler | Java 21 `Thread.ofVirtual()` |
+
+### Run the demo
+
+```bash
+cd labs/io-model/java-integration
+mvn spring-boot:run
+```
+
+Expected output on startup:
+
+```
+=== I/O Model Comparison (C vs JVM) ===
+
+Model                                       req/s         Notes
+-----------------------------------------------------------------------------------------------
+v0  Blocking single-thread (C)              1,200         One connection at a time; accept queue backpressure
+v1  Thread-per-connection (C, 1k)          38,000        8 GB RSS; collapses above 2k threads
+v2  epoll event loop (C, 1 thread)         148,000       O(1) readiness; nginx single-worker ~180k
+v3  io_uring SQPOLL (C)                    187,000       26% fewer syscalls than epoll
+---                                         ---           ---
+Netty NioEventLoop (Java, 4 workers)        ~160,000      =~ v2 x4; boss=accept thread, workers=epoll loops
+Spring WebFlux (Reactor Netty)              ~155,000      WebFlux annotations compile to Netty pipeline handlers
+Java 21 Virtual Threads (Loom)              ~140,000      Blocking code; JVM parks on I/O; no 8MB stack penalty
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The accept queue's silent-drop behavior caused a 1-second latency spike that looked exactly like a slow handler. I expected a connection error. Instead I got a mysterious pause: the client's TCP stack retransmitted the final ACK after its 1-second RTO, and then the connection succeeded normally. No RST, no ECONNREFUSED, just a phantom second of latency with no application-layer error. The 26% syscall reduction from io_uring vs epoll was also more measurable than expected — strace -c showed epoll_ctl() alone accounting for 18% of all syscalls at 187,000 req/s, which is exactly the overhead io_uring's SQ ring eliminates." />
+
+## Where to go deeper
+
+- **Linux epoll man page** — the definitive reference including the level-triggered vs edge-triggered distinction: `man 7 epoll`
+- **io_uring documentation by Jens Axboe** — the original design document explaining SQ/CQ ring semantics and SQPOLL: [kernel.dk/io_uring.pdf](https://kernel.dk/io_uring.pdf)
+- **liburing GitHub** — well-documented examples for accept, recv, send, and linked requests: [github.com/axboe/liburing](https://github.com/axboe/liburing)
+- **nginx architecture guide** — explains master/worker process model, accept mutex, SO_REUSEPORT, and sendfile: [nginx.org/en/docs/dev/development_guide.html](https://nginx.org/en/docs/dev/development_guide.html)
+- **Redis event loop (ae.c)** — 600 lines of C implementing a portable epoll/kqueue/select abstraction: [github.com/redis/redis blob ae.c](https://github.com/redis/redis/blob/unstable/src/ae.c)
+- **C10k problem** — Dan Kegel's original 1999 analysis still holds up: [kegel.com/c10k.html](http://www.kegel.com/c10k.html)
+- **Project Loom** — the official JEP and state of virtual threads in Java 21+: [openjdk.org/projects/loom](https://openjdk.org/projects/loom/)
+
+## Related labs and questions
+
+- **Prerequisite**: [TCP Stack](https://pushkarkumar-dev.github.io/system-design-labs/tcp-stack) — the state machine that produces the connections this lab accepts
+- **Prerequisite**: [HTTP Server](https://pushkarkumar-dev.github.io/system-design-labs/http-server) — the protocol layer sitting on top of the I/O model
+- **Next in networking**: [WebSocket Gateway](https://pushkarkumar-dev.github.io/system-design-labs/websocket-gateway) — long-lived connections where the epoll model shines
+- **System design question**: *Why does Redis use a single-threaded event loop but nginx uses multiple worker processes?* Redis is CPU-bound on in-memory operations with microsecond latency; the event loop avoids locking. nginx is I/O-bound waiting on upstream servers; multiple workers saturate multiple CPU cores via SO_REUSEPORT.
+- **Interview question**: *A Java service uses Spring MVC (thread-per-request, Tomcat) and handles 500 req/s fine. At 5,000 req/s the latency explodes. What is likely happening and what is the fix?* Thread pool exhaustion — requests queue waiting for a Tomcat thread. Fix: either increase the thread pool (bounded by memory) or migrate to Spring WebFlux (event-loop model, same thread count handles 10x more connections).

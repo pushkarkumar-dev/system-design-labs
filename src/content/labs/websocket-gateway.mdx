@@ -1,0 +1,622 @@
+---
+title: "Build Your Own WebSocket Pub/Sub Gateway"
+slug: "websocket-gateway"
+category: "messaging"
+difficulty: "advanced"
+estimatedHours:
+  reading: 3
+  building: 10
+language: "go"
+loc: 800
+prerequisites:
+  - "TCP socket programming in Go"
+  - "HTTP/1.1 upgrade mechanism"
+  - "Go goroutines and channels"
+stages:
+  - id: v0
+    title: "WebSocket Upgrade + Room Broadcast"
+    learningGoals:
+      - "SHA-1 accept key derivation — the exact RFC 6455 magic string"
+      - "Frame parsing: FIN, opcode, masking key XOR"
+    approxLoc: 220
+    branchOrTag: "websocket-gateway-v0"
+  - id: v1
+    title: "Presence + Backpressure"
+    learningGoals:
+      - "Per-client send buffer — slow clients get dropped, not the whole room"
+      - "readPump/writePump goroutine pair per connection"
+    approxLoc: 520
+    branchOrTag: "websocket-gateway-v1"
+  - id: v2
+    title: "Heartbeat + Reconnect Tokens"
+    learningGoals:
+      - "Ping/pong with timeout detects half-open connections"
+      - "Ring buffer + seqno enables at-most-once replay on reconnect"
+    approxLoc: 800
+    branchOrTag: "websocket-gateway-v2"
+benchmarks:
+  - metric: "Broadcast (100 connected clients, 1 room)"
+    value: "180,000"
+    unit: "msg/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — 100 buffered channel writes per message"
+  - metric: "WebSocket frame encode (text, no mask)"
+    value: "8,000,000"
+    unit: "frames/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — 2-byte header + payload copy"
+  - metric: "Handshake (SHA-1 + base64)"
+    value: "1,200,000"
+    unit: "handshakes/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — crypto/sha1 is fast"
+  - metric: "Peak concurrent connections"
+    value: "10,000"
+    unit: "connections"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — goroutine pair per connection, ~10KB stack each"
+whatTheToyMisses:
+  - thing: "Horizontal scaling with pub/sub backend"
+    why: "Our hub is single-process. 10 gateway instances each have their own Hub. Broadcasting across instances requires Redis Pub/Sub or a message bus — every gateway subscribes to the room channel and fans out locally."
+  - thing: "WebSocket compression (permessage-deflate)"
+    why: "RFC 7692 allows compressing WebSocket payloads using deflate. For JSON messages, this achieves 60-80% compression. Implementation requires per-connection deflate context management and handshake extension negotiation."
+  - thing: "Rate limiting per connection"
+    why: "A malicious client can flood the hub with messages at millions of frames/sec. Real gateways enforce a message rate limit per connection (e.g., 100 msg/sec) and disconnect violators."
+  - thing: "Authentication and authorization per room"
+    why: "Our gateway allows anyone to join any room. Production gateways validate a JWT on connection upgrade and check room membership in a separate auth service before allowing join."
+  - thing: "Binary protocol for gaming/trading"
+    why: "Text JSON frames are easy to debug but 3-5x larger than equivalent binary frames. Real-time games use binary protocols (MessagePack, FlatBuffers) to hit sub-millisecond message delivery."
+  - thing: "Sticky sessions and load balancing"
+    why: "WebSocket connections are long-lived. An L7 load balancer must route all frames from a connection to the same backend (sticky sessions). Without this, frames from the same connection arrive at different backends."
+realWorldReferences:
+  - "RFC 6455 — The WebSocket Protocol"
+  - "Soketi open-source Pusher alternative: https://docs.soketi.app/"
+  - "Phoenix Framework Channels (Elixir): https://hexdocs.pm/phoenix/channels.html"
+  - "Ably's architecture for 100k connections: https://ably.com/blog/achieving-exactly-once-message-delivery"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-websocket:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-webflux:3.3.0"
+  springModule: "spring-websocket"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a WebSocket gateway from raw protocol upgrade to presence and backpressure to reconnect tokens with message replay — understanding why 10,000 connections need exactly two goroutines each."
+---
+
+## Why this lab exists
+
+WebSocket is everywhere. Chat applications, collaborative editors, live dashboards, financial tickers, multiplayer games — any feature where the server needs to push data to clients without a poll loop ends up on WebSockets. But WebSocket is also a surprisingly deep protocol. The HTTP upgrade handshake hides a SHA-1 computation. Frames have a masking requirement that exists specifically to prevent cache-poisoning attacks on TLS-terminating proxies. The opcode table distinguishes text from binary, ping from pong, and close from data — for good reasons.
+
+Most Go developers reach for `gorilla/websocket` or `nhooyr.io/websocket` and never see this machinery. That's fine for production. But when you're designing a gateway that needs to handle 10,000 simultaneous connections, you need to understand the goroutine cost, the buffer sizing decisions, and why a "slow client" can cascade into a broadcast outage if you don't handle backpressure correctly.
+
+This lab builds the gateway layer that sits between browser clients and your backend services: the hub that manages rooms, the client that has exactly two goroutines (one for reading, one for writing), and the reconnect token system that lets clients resume where they left off after a brief disconnect. The architecture mirrors what Pusher, Ably, and Phoenix Channels actually do under the hood.
+
+## What we're building
+
+A WebSocket pub/sub gateway in Go, across three stages. Each stage adds one architectural layer and is measurably better than the previous on a stated metric.
+
+**We build:**
+- A from-scratch WebSocket handshake (SHA-1 accept key, 101 Switching Protocols)
+- A frame parser and encoder (FIN, opcodes, masking key XOR)
+- A room-based Hub that broadcasts messages to all room members
+- Per-client `sendBuf` channels for backpressure — slow clients get their messages dropped, not the whole room
+- Presence events on join/leave with a member snapshot
+- Ping/pong heartbeat with pong timeout to detect half-open connections
+- Reconnect tokens (HMAC-SHA256) with ring-buffer message replay
+
+**We explicitly skip (and why):**
+- TLS termination — that belongs in an nginx/Caddy reverse proxy in front of this
+- Multi-node pub/sub — that requires Redis or NATS (listed in "what the toy misses")
+- Subprotocols (Sec-WebSocket-Protocol) — binary framing variants like STOMP or MQTT-over-WS
+- WebSocket compression (permessage-deflate) — requires per-connection deflate state
+- Authentication middleware — shown in the Java integration section conceptually
+
+## Mental model
+
+### The protocol stack
+
+WebSocket is a thin layer on top of HTTP. The entire handshake happens in a single HTTP GET request. After the server responds with `101 Switching Protocols`, the TCP connection is "upgraded" — it stops speaking HTTP and starts speaking the WebSocket framing protocol. From that point, both sides send and receive frames.
+
+```
+Client:
+  GET /ws HTTP/1.1
+  Upgrade: websocket
+  Connection: Upgrade
+  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+  Sec-WebSocket-Version: 13
+
+Server:
+  HTTP/1.1 101 Switching Protocols
+  Upgrade: websocket
+  Connection: Upgrade
+  Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+The `Sec-WebSocket-Accept` value is not a cookie or a token. It is a proof-of-understanding: `base64(SHA-1(clientKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`. The magic GUID is hardcoded in RFC 6455. Its purpose is to prevent a non-WebSocket HTTP server from accidentally accepting a WebSocket connection by just echoing headers back.
+
+### The frame format
+
+After the handshake, both sides send frames. A frame looks like:
+
+```
+byte 0: FIN(1) RSV1(1) RSV2(1) RSV3(1) Opcode(4)
+byte 1: MASK(1) Payload-Len(7)
+[2 bytes if Payload-Len==126]
+[8 bytes if Payload-Len==127]
+[4 bytes masking key if MASK==1]
+[payload bytes]
+```
+
+FIN=1 means this is the last (and in practice, usually only) fragment of a message. Opcode distinguishes text (0x1), binary (0x2), close (0x8), ping (0x9), and pong (0xA). The MASK bit is mandatory for client-to-server frames — browsers always mask. Servers must never mask their frames.
+
+The masking algorithm is XOR with a 4-byte key:
+
+```
+payload[i] ^= maskKey[i % 4]
+```
+
+This is not encryption. It provides no confidentiality. The reason masking exists is to prevent a malicious web page from sending arbitrary bytes through a browser's WebSocket connection that might be interpreted as HTTP requests by a TLS-terminating proxy. By masking with a random key, the frame bytes are unpredictable and cannot be crafted to look like valid HTTP.
+
+### The two-goroutine model
+
+Every client connection spawns exactly two goroutines: `readPump` and `writePump`.
+
+`readPump` blocks on `io.ReadFull(conn, header)`, waiting for the next frame. When a frame arrives, it dispatches to the hub. It owns the read side of the TCP connection — no other goroutine reads.
+
+`writePump` blocks on `select` over a buffered channel (`sendBuf chan []byte`) and a ping ticker. When a message arrives on the channel, it writes the frame. No other goroutine writes to the connection.
+
+This goroutine-pair discipline is the key to correctness. `net.Conn` is not safe for concurrent reads or concurrent writes, but one reader and one writer at a time is fine. The channel is the synchronization boundary.
+
+### The room and hub
+
+A `Room` is a `map[string]*Client` protected by a `sync.RWMutex`. Broadcast acquires a read lock (many goroutines can broadcast simultaneously from different rooms), iterates over clients, and calls `Client.Send()` on each.
+
+`Client.Send()` is a non-blocking channel send: if `sendBuf` is full, the message is dropped for that client and `DroppedMessages` is incremented. This is the backpressure policy: a slow client does not slow down the broadcaster or other clients in the room.
+
+The `Hub` holds `map[string]*Room` and `map[string]*Client` (all connected clients) under a single `sync.RWMutex`. Most operations are reads (dispatch, broadcast) so contention is low.
+
+## Prerequisites
+
+You should know:
+- **Go goroutines and channels**: the two-goroutine pattern relies on channel semantics
+- **TCP and net.Conn**: `io.ReadFull`, write deadlines, hijacking
+- **HTTP/1.1**: enough to understand what `Upgrade: websocket` means
+- **Bitwise operations**: frame parsing uses bit masks and shifts
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="WebSocket Upgrade + Room Broadcast"
+  goals={[
+    "Implement AcceptKey: base64(SHA-1(clientKey + magicGUID))",
+    "Parse a WebSocket frame: FIN, opcode, MASK bit, variable-length payload",
+    "Implement Unmask(payload, key [4]byte) — same function masks and unmasks",
+    "Build a Hub with map[string]*Room; rooms have map[string]*Client",
+    "Client connects, sends join JSON, hub broadcasts all messages to the room",
+    "Write 6 tests: accept key computation, frame parse (text/binary/close/ping), mask decode, broadcast to 3 clients",
+  ]}
+  loc={220}
+>
+
+The WebSocket handshake is simpler than it looks. The entire server-side logic is:
+
+```go
+func AcceptKey(clientKey string) string {
+    h := sha1.New()
+    h.Write([]byte(clientKey))
+    h.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+    return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+```
+
+The RFC 6455 test vector: key `"dGhlIHNhbXBsZSBub25jZQ=="` must produce `"s3pPLMBiTxaQ9kYGzzhZRbK+xOo="`. Write that as your first test.
+
+Frame parsing is mechanical but error-prone. The most common mistake is forgetting that the `MASK` bit is in the same byte as the 7-bit payload length, and the actual masking key comes after the extended length fields (if any):
+
+```go
+masked := (header[1] & 0x80) != 0
+payloadLen := int64(header[1] & 0x7F)
+// Read extended length if payloadLen is 126 or 127...
+// Then read 4-byte masking key if masked...
+// Then read payload bytes...
+// Then unmask in place.
+```
+
+The broadcast path in v0 is a direct loop over the client map. No channels yet, no goroutine discipline. Writes happen inline in the same goroutine that received the frame. This works correctly for v0 because Go's `net.Conn` allows one writer at a time — since we only have one goroutine per connection at this stage.
+
+**The test to write for broadcast**: create 3 clients manually (no real TCP, use `net.Pipe()` for bidirectional connections), join them to the same room, write one frame from the hub, read back from all three connections and verify the payload matches. This is the canonical broadcast test.
+
+**The key lesson**: the accept key computation is the entirety of the WebSocket "security" model at the handshake layer. It is not a cryptographic proof of identity — it is a proof that the server read the RFC. Real security (authentication, authorization) is applied at the HTTP layer before the upgrade, or in the first WebSocket message.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Presence + Backpressure"
+  goals={[
+    "Add sendBuf chan []byte (capacity 256) to each Client",
+    "Implement readPump and writePump goroutines — one goroutine owns reads, one owns writes",
+    "Broadcast via Client.Send(): non-blocking send to sendBuf, drop + increment DroppedMessages if full",
+    "Presence: on join/leave, broadcast a presence event with current member list",
+    "Connection limit: return HTTP 429 if Hub.maxConns is exceeded",
+    "Add atomic HubStats: TotalConnected, TotalMessages, DroppedMessages, ActiveRooms",
+    "Write 5 tests: presence events, backpressure drops slow clients, stats increment, concurrent 100-client broadcast",
+  ]}
+  loc={520}
+>
+
+The readPump/writePump pattern is the Go idiom for concurrent WebSocket connections. Each client has exactly two goroutines:
+
+```go
+func (c *Client) readPump() {
+    defer func() {
+        c.hub.Unregister(c)
+        c.conn.Close()
+    }()
+    for {
+        frame, err := ReadFrame(c.conn)
+        if err != nil { return }
+        switch frame.Opcode {
+        case OpcodeText, OpcodeBinary:
+            c.hub.Dispatch(c, frame.Payload)
+        case OpcodeClose:
+            _ = WriteFrame(c.conn, OpcodeClose, CloseFrame(1000, ""))
+            return
+        case OpcodePing:
+            _ = WriteFrame(c.conn, OpcodePong, frame.Payload)
+        }
+    }
+}
+
+func (c *Client) writePump() {
+    for msg := range c.sendBuf {
+        if err := WriteFrame(c.conn, OpcodeText, msg); err != nil {
+            return
+        }
+    }
+}
+```
+
+The backpressure policy is deliberately aggressive:
+
+```go
+func (c *Client) Send(msg []byte) {
+    select {
+    case c.sendBuf <- msg:
+    default:
+        atomic.AddInt64(&c.hub.stats.DroppedMessages, 1)
+    }
+}
+```
+
+This is a deliberate design choice: the hub's broadcast loop must never block. If it blocked on one slow client's buffer, all other clients in the room would stall too. Dropping for the slow client is the correct tradeoff. The alternative — removing the slow client from the room — is also valid and some production gateways do this.
+
+Presence events are the first place where "what do we send and to whom?" becomes interesting. When alice joins a room, we broadcast to all room members (including alice herself):
+
+```go
+{"event":"presence","room":"lobby","user":"alice","action":"joined","members":["alice","bob"]}
+```
+
+The member list is a snapshot taken under the room's read lock. It can be slightly stale (if another join happens concurrently) but is consistent for any single join event. This is the same tradeoff Phoenix Channels makes.
+
+The connection limit is enforced in `Hub.Register()`:
+
+```go
+if h.maxConns > 0 && len(h.clients) >= h.maxConns {
+    return fmt.Errorf("connection limit %d reached", h.maxConns)
+}
+```
+
+The HTTP handler returns 503 when this happens — before the WebSocket upgrade completes. Clients see an HTTP error, not a WebSocket close frame.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Heartbeat + Reconnect Tokens"
+  goals={[
+    "Ping/pong heartbeat in writePump: send ping every 30s, close connection if pong not received within 10s",
+    "Issue a reconnect token (HMAC-SHA256 over base64-encoded JSON claims) when client disconnects cleanly",
+    "Ring buffer (capacity 100) per room storing the last 100 messages with sequence numbers",
+    "On reconnect with ?token=..., verify HMAC, replay messages since client's last-seen seqno",
+    "Write 5 tests: ping timeout disconnects client, reconnect token replay, ring buffer wraps at 100, seqno ordering, expired token rejected",
+  ]}
+  loc={800}
+>
+
+### Heartbeat: detecting half-open connections
+
+TCP connections can appear alive at the socket level while the remote peer is unreachable (network partition, process kill, machine crash). The OS TCP keepalive mechanism eventually detects this (after 2+ hours by default) — far too slow for a WebSocket gateway.
+
+The WebSocket ping/pong mechanism detects half-open connections at the application layer:
+
+```go
+case <-pingTicker.C:
+    if err := c.writeFrameDirect(OpcodePing, nil); err != nil {
+        return
+    }
+    timer := time.NewTimer(pongTimeout)
+    select {
+    case <-c.pongReceived:
+        timer.Stop()
+    case <-timer.C:
+        // Pong timeout: connection is half-open. Close it.
+        return
+    }
+```
+
+The `pongReceived` channel is a `chan struct{}` with capacity 1. When `readPump` sees an `OpcodePong` frame, it non-blocking-sends to `pongReceived`. The `writePump` blocks on the timer waiting for the signal. If the pong arrives within 10 seconds, the timer is stopped and the connection stays open. If not, `writePump` returns, closing the connection.
+
+### Reconnect tokens: resuming after disconnect
+
+Mobile clients and flaky networks disconnect frequently. Without reconnect support, every disconnect means re-loading the UI state from scratch. With reconnect tokens, a client can re-subscribe and receive the messages it missed during the outage.
+
+The token structure is simple: base64-encoded JSON claims, signed with HMAC-SHA256:
+
+```go
+type TokenClaims struct {
+    UserID  string    `json:"uid"`
+    RoomID  string    `json:"rid"`
+    Expiry  time.Time `json:"exp"`
+    LastSeq uint64    `json:"seq"`
+}
+// token = base64(claims) + "." + base64(HMAC-SHA256(base64(claims)))
+```
+
+On reconnect, the client sends `?token=...` in the query string. The gateway verifies the HMAC (rejecting any tampering) and checks the expiry. If valid, it replays all messages from the ring buffer with `seqno > claims.LastSeq`.
+
+### The ring buffer: bounded message history
+
+Each room keeps a fixed-size ring buffer of the last 100 messages. The ring buffer is a circular array of `Message` structs (`SeqNo uint64`, `Payload []byte`):
+
+```go
+type RingBuffer struct {
+    buf  []Message
+    size int
+    head int    // index of the oldest slot
+    count int   // number of valid entries
+    nextSeq atomic.Uint64
+}
+
+func (rb *RingBuffer) Append(payload []byte) uint64 {
+    seqno := rb.nextSeq.Add(1)
+    pos := (rb.head + rb.count) % rb.size
+    if rb.count == rb.size {
+        // Overwrite oldest entry, advance head
+        rb.buf[rb.head] = Message{SeqNo: seqno, Payload: payload}
+        rb.head = (rb.head + 1) % rb.size
+    } else {
+        rb.buf[pos] = Message{SeqNo: seqno, Payload: payload}
+        rb.count++
+    }
+    return seqno
+}
+```
+
+`Since(afterSeq)` iterates from `head` to `head+count`, returning all entries with `SeqNo > afterSeq`. If the client was disconnected for long enough that its `lastSeq` predates the oldest retained message, it gets the full buffer — a best-effort replay, not exactly-once.
+
+Exactly-once delivery would require persistent storage and client ACK tracking. That is listed in "what the toy misses".
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/websocket-gateway"
+  prereqs={["Go 1.23+", "wscat or websocat (optional, for manual testing)"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/websocket-gateway\ngo build ./...",
+    },
+    {
+      label: "Run all tests",
+      cmd: "go test ./pkg/ws/ -v",
+    },
+    {
+      label: "Start the gateway (listens on :8080, max 10k connections)",
+      cmd: "go run ./cmd/server --port 8080 --max-conns 10000",
+    },
+    {
+      label: "Connect a client and join a room (requires wscat: npm i -g wscat)",
+      cmd: "wscat -c 'ws://localhost:8080/ws?user=alice'\n# After connecting, send:\n{\"action\":\"join\",\"room\":\"lobby\"}\n{\"action\":\"message\",\"content\":\"hello from alice\"}",
+    },
+    {
+      label: "Connect a second client in the same room",
+      cmd: "wscat -c 'ws://localhost:8080/ws?user=bob'\n# After connecting:\n{\"action\":\"join\",\"room\":\"lobby\"}",
+    },
+    {
+      label: "Check hub stats",
+      cmd: "curl -s http://localhost:8080/stats | python3 -m json.tool",
+    },
+  ]}
+  expectedOutput={`# After alice joins:
+{\"event\":\"presence\",\"room\":\"lobby\",\"user\":\"alice\",\"action\":\"joined\",\"members\":[\"alice\"]}
+
+# When bob joins (alice sees):
+{\"event\":\"presence\",\"room\":\"lobby\",\"user\":\"bob\",\"action\":\"joined\",\"members\":[\"alice\",\"bob\"]}
+
+# When alice sends a message (both clients see):
+{\"event\":\"message\",\"room\":\"lobby\",\"user\":\"alice\",\"content\":\"hello from alice\",\"seqno\":1}
+
+# Stats endpoint:
+{
+  \"activeRooms\": 1,
+  \"currentConnections\": 2,
+  \"totalConnected\": 2,
+  \"totalMessages\": 1,
+  \"droppedMessages\": 0
+}`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM (estimated — run go test -bench=. for real numbers)"
+  rows={[
+    { metric: "Broadcast (100 clients, 1 room)",     value: "180,000",   unit: "msg/sec",      note: "100 non-blocking channel writes per broadcast. Bottleneck is channel scheduler." },
+    { metric: "Frame encode (text, no mask)",         value: "8,000,000", unit: "frames/sec",   note: "2-byte header + memcopy of payload. CPU-bound above 64KB payload." },
+    { metric: "Handshake (SHA-1 + base64)",           value: "1,200,000", unit: "handshakes/sec", note: "crypto/sha1 on 60 bytes. Never the bottleneck in practice." },
+    { metric: "Peak concurrent connections",          value: "10,000",    unit: "connections",  note: "20k goroutines at 8KB stack = 160MB. Plus 256-slot send buffers = ~25MB. Total ~185MB." },
+  ]}
+/>
+
+## Stress tests
+
+**Slow client cascade**: connect 100 clients to a room. Make one client not drain its `sendBuf` (simulate a stalled network). Send 1000 messages. The stalled client should accumulate drops (visible in `DroppedMessages`) while the other 99 clients receive all 1000 messages. Without the non-blocking send, the stalled client would freeze the entire broadcast loop.
+
+**10k connection test**: connect 10,000 clients using goroutines (each simulates a client with `net.Dial` to the gateway). Join all to "stress-room". Broadcast 100 messages. Verify `DroppedMessages` stays low and the process stays under 512 MB RSS. The 20,000 goroutines (2 per connection) each start with an 8 KB stack; Go grows stacks lazily so idle goroutines stay small.
+
+**Ping/pong timeout**: connect a client using `net.Dial` directly. Complete the WebSocket handshake manually. Then stop reading from the connection (simulate a half-open TCP connection). After `pingInterval` (30s) + `pongTimeout` (10s), the gateway should close the connection and `ConnectedCount` should drop by 1.
+
+**Reconnect replay**: connect a client, join "replay-room", receive 50 messages (seqno 1-50), save the last seqno. Disconnect. While disconnected, send 30 more messages to the room (seqno 51-80). Reconnect with `?token=...` using a token that has `lastSeq=50`. Verify that the first messages received after reconnect start at seqno 51.
+
+**Ring buffer wrap**: append 150 messages to a ring buffer of size 100. Call `Since(0)`. Verify exactly 100 messages are returned (the oldest 50 were overwritten). Call `Since(100)`. Verify 50 messages are returned (seqno 101-150).
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "Horizontal scaling with pub/sub backend",
+      why: "Our hub is single-process. 10 gateway instances each have their own Hub. Broadcasting across instances requires Redis Pub/Sub or a message bus — every gateway subscribes to the room channel and fans out locally. Without this, clients on different instances in the same room don't see each other's messages.",
+    },
+    {
+      thing: "WebSocket compression (permessage-deflate)",
+      why: "RFC 7692 allows compressing WebSocket payloads using deflate. For JSON messages this achieves 60-80% compression. Implementation requires per-connection deflate context management, careful handling of the sliding window, and extension negotiation in the handshake headers.",
+    },
+    {
+      thing: "Rate limiting per connection",
+      why: "A malicious client can flood the hub with millions of frames per second. Real gateways enforce a message rate limit per connection (e.g., 100 msg/sec with a token bucket) and disconnect violators. Without this, one rogue client can saturate the hub's Dispatch goroutine and starve legitimate clients.",
+    },
+    {
+      thing: "Authentication and authorization per room",
+      why: "Our gateway allows anyone to join any room by name. Production gateways validate a JWT on connection upgrade (checking expiry, signature, and allowed rooms) and reject the upgrade before any WebSocket frames are exchanged. Room-level ACLs require a separate auth service call on every join.",
+    },
+    {
+      thing: "Binary protocol for gaming/trading",
+      why: "Text JSON frames are easy to debug but 3-5x larger than equivalent binary frames. Real-time games use binary protocols (MessagePack, FlatBuffers) with fixed-size headers to hit sub-millisecond message delivery. Our gateway only parses the action field; a production gateway would need a protocol negotiation handshake.",
+    },
+    {
+      thing: "Sticky sessions and load balancing",
+      why: "WebSocket connections are long-lived — hours or days. An L7 load balancer must route all frames from a single connection to the same backend instance (sticky sessions, typically via a cookie or connection ID). Without stickiness, frames from the same logical connection arrive at different backends and the room state becomes inconsistent.",
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-websocket"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-websocket:3.3.0",
+    "org.springframework.boot:spring-boot-starter-webflux:3.3.0",
+  ]}
+  repoPath="labs/websocket-gateway/java-integration"
+>
+
+### The Spring WebSocket client lesson
+
+Spring's `StandardWebSocketClient` (backed by the JDK 11+ built-in WebSocket client) performs the same RFC 6455 handshake our Go server implements. This is the value of understanding the protocol: when you see `StandardWebSocketClient.execute(handler, url)`, you know it is doing `GET /ws`, computing the accept key, and switching protocols — exactly the same bytes our `DoHandshake()` function processes.
+
+The contrast with WebSocket on the server side is instructive. Spring Boot's `@EnableWebSocket` and `WebSocketHandler` are server-side abstractions. Our Go gateway is the server; the Spring application is the client. In production, you might have Spring microservices subscribing to gateway rooms for internal event streams, while browser clients connect directly.
+
+### Part A — WsGatewayClient: the Spring WebSocket handler
+
+`WsGatewayClient` extends `TextWebSocketHandler` — Spring's callback interface for text-frame WebSocket sessions. The handler model is event-driven: Spring calls `afterConnectionEstablished`, `handleTextMessage`, and `afterConnectionClosed` from an internal I/O thread.
+
+```java
+public class WsGatewayClient extends TextWebSocketHandler {
+
+    private WebSocketSession session;
+    private final CountDownLatch connected = new CountDownLatch(1);
+    private final List<String> received = new CopyOnWriteArrayList<>();
+
+    public void connect() throws Exception {
+        new StandardWebSocketClient()
+            .execute(this, gatewayUrl + "?user=" + userID);
+        connected.await(5, TimeUnit.SECONDS);
+    }
+
+    public void joinRoom(String room) throws IOException {
+        session.sendMessage(new TextMessage(
+            "{\"action\":\"join\",\"room\":\"" + room + "\"}"));
+    }
+
+    @Override
+    public void afterConnectionEstablished(WebSocketSession s) {
+        this.session = s;
+        connected.countDown();  // unblock connect()
+    }
+
+    @Override
+    protected void handleTextMessage(WebSocketSession s, TextMessage msg) {
+        received.add(msg.getPayload());
+    }
+}
+```
+
+The `CountDownLatch` pattern is the standard way to synchronize a connect-and-wait in Java. `execute()` is non-blocking — it returns immediately and calls `afterConnectionEstablished` from a separate thread. The latch makes the calling thread block until connected (or timeout).
+
+### Part B — The two threading models compared
+
+Our Go gateway uses goroutines (green threads, 8 KB initial stack). Spring's WebSocket client uses Java threads (OS threads, 512 KB default stack on the JVM).
+
+For a client connecting to 5 rooms, the goroutine cost is negligible: 10 goroutines × 8 KB = 80 KB. A Java application doing the same with blocking I/O would use 10 threads × 512 KB = 5 MB. At 10,000 connections (see the WhatSurprisedMe section), this difference is the reason the gateway is written in Go, not Java.
+
+Spring WebFlux's reactive WebSocket client (`WebSocketClient` from `spring-webflux`) is the Java answer to this: it uses a small fixed thread pool (typically 2× CPU cores) with non-blocking I/O, similar to Go's netpoller. For a gateway that only receives events (not a high-connection server), the distinction rarely matters. Use `StandardWebSocketClient` (blocking, simpler code) unless you need thousands of simultaneous Spring-side WebSocket connections.
+
+### Part C — Running the demo
+
+```bash
+# Terminal 1: start the Go gateway
+cd labs/websocket-gateway
+go run ./cmd/server --port 8080
+
+# Terminal 2: run the Spring Boot demo
+cd labs/websocket-gateway/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== WebSocket Gateway Spring Integration Demo ===
+Connected 5 clients to ws://localhost:8080/ws
+All 5 clients joined room 'test-room'
+client-0 broadcast 100 messages
+Waiting for delivery...
+client-0 received: 102 messages (100 own + 2 presence events)
+client-1 received: 101 messages
+client-2 received: 101 messages
+client-3 received: 101 messages
+client-4 received: 101 messages
+All clients received at least 100 messages. Test PASSED.
+All connections closed.
+```
+
+Each client receives slightly more than 100 messages because presence events (join notifications) are also delivered as messages on the same WebSocket connection. This is by design — presence and chat use the same transport.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The two-goroutine-per-connection model surprised me. At 10,000 connections, we have 20,000 goroutines. Each Go goroutine starts with an 8 KB stack, so 20,000 goroutines use 160 MB of stack space minimum — before any message buffers. The per-client sendBuf channel (capacity 256, each message ~100 bytes) adds 25 MB more. Total: ~185 MB for 10,000 idle connections. The same setup in a thread-per-connection model (e.g., Java threads at 512 KB each) would require 10 GB just for stacks — 54x more. This is not an argument that Java cannot do 10k WebSocket connections — Spring WebFlux with a reactive WebSocket client uses a small thread pool and non-blocking I/O, just like Go's netpoller. But the goroutine model makes the code dramatically simpler: two linear functions (readPump, writePump) with no callbacks, no CompletableFutures, no reactive chains. The simplicity is the argument, not the raw memory number." />
+
+## Where to go deeper
+
+- **RFC 6455** — The WebSocket Protocol: surprisingly readable at 71 pages. Section 5 (framing) and Section 7 (closing handshake) are the essential reads
+- **RFC 7692** — WebSocket per-message compression: explains the permessage-deflate extension negotiation and the per-message vs. per-context deflate tradeoff
+- **gorilla/websocket** — the de facto Go WebSocket library: read its source to see how it implements the same frame parser, and why it adds a `Upgrader` type for the handshake
+- **Phoenix Channels** (Elixir): the most elegant pub/sub gateway design in any language, using GenServer processes (equivalent to goroutines) per connection: https://hexdocs.pm/phoenix/channels.html
+- **Soketi** — open-source Pusher-compatible WebSocket server: shows how to add Redis pub/sub for horizontal scaling, which is the key gap our toy gateway has
+
+## Related labs and questions
+
+- **Previous in messaging**: Kafka-lite (lab #11) — both Kafka and WebSocket gateways solve the fan-out problem; Kafka persists the log, our gateway keeps at most 100 messages in a ring buffer
+- **Networking companion**: HTTP Server (lab #14) — the WebSocket upgrade is built on HTTP/1.1; understanding `Connection: Upgrade` and hijacking requires knowing how HTTP servers work
+- **Distributed companion**: Raft (lab #18) — if you want the hub to survive a process restart, you need distributed consensus for room state and message ordering
+- **Questions to think about**: Why does WebSocket mandate client-to-server masking but not server-to-client masking? What would happen if you removed the `sendBuf` backpressure and used a blocking write instead? Why does the heartbeat timer live in `writePump` instead of a separate goroutine? What is the minimum change needed to make the hub work across multiple processes?

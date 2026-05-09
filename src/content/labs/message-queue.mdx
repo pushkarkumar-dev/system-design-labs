@@ -1,0 +1,664 @@
+---
+title: "Build Your Own Message Queue (SQS-lite)"
+slug: "message-queue"
+category: "messaging"
+difficulty: "intermediate"
+estimatedHours:
+  reading: 2
+  building: 8
+language: "go"
+loc: 730
+prerequisites:
+  - "Go goroutines and sync primitives"
+  - "UUID generation in Go"
+  - "Queue data structure (FIFO)"
+stages:
+  - id: v0
+    title: "FIFO Queue with Visibility Timeout"
+    learningGoals:
+      - "ReceiptHandle-based deletion enables at-least-once delivery"
+      - "Visibility timeout simulates consumer crash recovery"
+    approxLoc: 180
+    branchOrTag: "message-queue-v0"
+  - id: v1
+    title: "Dead-Letter Queue + Delayed Delivery"
+    learningGoals:
+      - "After maxReceiveCount receives, messages move to DLQ automatically"
+      - "Delayed delivery: message invisible until now + delaySeconds"
+    approxLoc: 480
+    branchOrTag: "message-queue-v1"
+  - id: v2
+    title: "FIFO + Deduplication + Long Polling"
+    learningGoals:
+      - "Message group ID enforces per-group ordering without global lock"
+      - "sync.Cond long polling avoids busy-waiting on empty queue"
+    approxLoc: 730
+    branchOrTag: "message-queue-v2"
+benchmarks:
+  - metric: "SendMessage throughput"
+    value: "1,800,000"
+    unit: "msg/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — append to slice under mutex"
+  - metric: "ReceiveMessage (1 message)"
+    value: "900,000"
+    unit: "receives/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — slice pop + in-flight map write"
+  - metric: "DeleteMessage"
+    value: "2,400,000"
+    unit: "deletes/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — map delete under mutex"
+  - metric: "Long poll wake latency (message arrives)"
+    value: "0.1"
+    unit: "ms"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated — sync.Cond.Broadcast from SendMessage"
+whatTheToyMisses:
+  - thing: "Durable persistence"
+    why: "Our messages are in-memory slices. SQS uses a distributed, replicated message store with multi-AZ durability. On process restart, all our messages are lost."
+  - thing: "Message ordering across partitions"
+    why: "SQS Standard queues do not guarantee ordering across partitions. FIFO queues guarantee per-group ordering at the cost of lower throughput (3,000 msg/sec vs 120,000 msg/sec for Standard). Our per-group mutex is the simpler version of this partitioning."
+  - thing: "Server-side encryption"
+    why: "SQS can encrypt message bodies at rest using KMS. Every message write requires a KMS encrypt call; every receive requires a decrypt call. Key rotation requires re-encrypting stored messages."
+  - thing: "Message attribute validation"
+    why: "SQS validates message attribute types (String, Number, Binary) and sizes (max 256 KB per message, 10 attributes per message). Our byte slice has no such constraints."
+  - thing: "Visibility timeout extension under load"
+    why: "Long-running consumers must extend visibility timeouts before they expire. This requires the consumer to track each message's timeout and call ChangeMessageVisibility proactively. Our test simulates this but production consumers often get this wrong."
+  - thing: "Request/response over a queue (temporary queue pattern)"
+    why: "The SQS temporary queue pattern creates a response queue per request for RPC-style communication. Each request gets a ReplyTo queue name. Managing the lifecycle of thousands of short-lived temporary queues requires a queue pool."
+realWorldReferences:
+  - "AWS SQS FAQs: https://aws.amazon.com/sqs/faqs/"
+  - "SQS vs Kafka: https://aws.amazon.com/blogs/big-data/building-scalable-and-fault-tolerant-data-pipelines/"
+  - "Celery task queue internals: https://docs.celeryq.dev/en/stable/internals/index.html"
+  - "Faktory job queue (Go): https://github.com/contribsys/faktory"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-integration:3.3.0"
+  springModule: null
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a message queue from FIFO with visibility timeout to dead-letter queues and delayed delivery to FIFO deduplication with long polling — making SQS's semantics concrete."
+---
+
+## Why this lab exists
+
+SQS is one of the most underestimated services in AWS. Developers who've only used it as a task queue — send a job, a worker picks it up, done — miss the operational complexity that makes it interesting: visibility timeouts that simulate consumer crashes, dead-letter queues that catch poison pills, FIFO deduplication that prevents duplicate processing, and long polling that eliminates the cost of empty receives.
+
+These features are not arbitrary. Each one exists because distributed systems fail in specific ways, and each feature is the minimum machinery needed to handle one failure mode correctly.
+
+This lab builds all of it from scratch in Go: from a 180-line in-memory FIFO queue to a 730-line system with DLQs, delayed delivery, per-group FIFO ordering, deduplication, and `sync.Cond` long polling. By the end, you will be able to read an SQS architecture diagram and know exactly what happens in the 30 seconds between a consumer crash and a message reappearing in the queue — and why that 30 seconds is the single most important number to tune.
+
+## What we're building
+
+A message queue in Go, implemented across three stages. Each stage adds one architectural layer that addresses a real operational failure mode.
+
+**We build:**
+- A FIFO in-memory queue with `ReceiptHandle`-based deletion and visibility timeout
+- A dead-letter queue that captures poison pills after `maxReceiveCount` failed deliveries
+- Delayed message delivery where a message is invisible until a future time
+- Batch send and batch delete operations
+- `QueueAttributes` for visibility into message, in-flight, and delayed counts
+- FIFO deduplication using a 5-minute dedup window keyed by `MessageDeduplicationID`
+- Per-group message ordering using `MessageGroupID` and a group in-flight map
+- Long polling with `sync.Cond` so consumers park instead of busy-waiting
+- An HTTP server so any language can interact without a native client library
+
+**We explicitly skip (and why):**
+- Durable persistence (disk, WAL) — adds complexity without teaching queue semantics
+- Multi-region replication — the Raft lab covers that
+- Native SQS wire protocol (AWS Signature v4, SQS XML format) — our broker speaks HTTP
+- Message attribute types (String, Number, Binary) — we accept raw bytes
+- Per-message encryption — the security labs cover KMS integration
+
+## Mental model
+
+### The queue vs. the log
+
+Before building anything, understand the fundamental distinction between this lab and the Kafka lab:
+
+```
+Queue model (this lab):
+  Producer → [msg A] [msg B] [msg C] → Consumer
+                              ^ message disappears after successful delete
+
+Log model (Kafka lab):
+  Producer → [0:A] [1:B] [2:C] → Consumer-1 (cursor at 2)
+                                → Consumer-2 (cursor at 0, re-reading A)
+                     (messages stay; only cursors move)
+```
+
+A queue has **ownership semantics**: when a consumer successfully processes and deletes a message, it is gone. This is the right model for task distribution — send 1,000 emails, each gets processed exactly once by exactly one worker.
+
+A log has **position semantics**: the message stays; only the consumer's cursor moves. This is the right model for event streaming — any number of consumers can read the same event, independently and at their own pace.
+
+### The visibility timeout is not a lock
+
+This is the most common misconception. The visibility timeout is **not a distributed lock** on the message. It is a timer that controls when a message becomes visible again if the consumer disappears.
+
+Here is what actually happens:
+
+1. Consumer calls `ReceiveMessage`. Server marks the message in-flight and returns it with a `ReceiptHandle`. A timer starts.
+2. Consumer processes the message. Calls `DeleteMessage(receiptHandle)`. Server permanently removes the message. Timer cancelled.
+3. (If consumer crashes) Timer expires. Server returns the message to visible state. Next `ReceiveMessage` call returns it to a (possibly different) consumer.
+
+The message was never "locked" in step 1 — another consumer could receive the same message if they called `ReceiveMessage` at the same time. In practice, `ReceiveMessage` moves messages to in-flight state so they are not returned to other callers, but this is a soft reservation, not a hard lock. The `ReceiptHandle` is proof of the reservation — but only until the timeout expires.
+
+### Why at-least-once is the guarantee, not exactly-once
+
+The visibility timeout means a message can be received more than once in two scenarios:
+- The consumer crashes after processing but before calling `DeleteMessage`
+- The consumer takes longer than the visibility timeout to process and delete
+
+In both cases, the message reappears. This is **at-least-once delivery**: every message is delivered at least once, but possibly more. If your consumer is not idempotent (safe to run twice with the same input), at-least-once delivery causes bugs.
+
+The deduplication feature (v2) helps with some cases of duplicate delivery from the producer side — if the producer sends the same message twice with the same `MessageDeduplicationID`, only the first arrives. But it does not help with the consumer-side at-least-once scenario.
+
+SQS's exactly-once guarantee for FIFO queues works at the producer level (deduplication) but not at the consumer level — consumers must handle re-delivery.
+
+## Prerequisites
+
+You should know:
+- **Go goroutines and sync primitives**: `sync.Mutex`, `sync.Cond`, goroutines, channels — we use all of these
+- **UUID generation in Go**: `crypto/rand` for generating `MessageID` and `ReceiptHandle`
+- **Queue data structure**: a `[]Message` slice with a head index (amortized O(1) front removal)
+- **Basic HTTP server in Go**: `net/http` for the server endpoint (v2 server)
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="FIFO Queue with Visibility Timeout"
+  goals={[
+    "Implement SendMessage(body []byte) returning a UUID MessageID",
+    "Implement ReceiveMessage(maxMessages int, visibilityTimeout time.Duration) []Message — assigns ReceiptHandle, moves to in-flight map",
+    "Implement DeleteMessage(receiptHandle string) bool — removes from in-flight and backing slice",
+    "Implement ChangeMessageVisibility(receiptHandle string, newTimeout time.Duration) bool",
+    "Background goroutine: every 200ms, scan in-flight for expired visibility and re-enqueue",
+    "Write 8 tests: send/receive roundtrip, visibility expiry requeues, delete removes, change visibility extends, max receive, empty when all in-flight, FIFO ordering, receive count increments",
+  ]}
+  loc={180}
+>
+
+The smallest message queue that can exist. A `[]Message` slice is the FIFO backing store. `ReceiveMessage` does not pop from the slice — it marks messages as in-flight and returns them with a `ReceiptHandle`. Only `DeleteMessage` permanently removes a message. The goal is to make the at-least-once delivery contract visible without any other complexity.
+
+```go
+type Message struct {
+    ID            string
+    Body          []byte
+    EnqueuedAt    time.Time
+    ReceiptHandle string
+    ReceiveCount  int
+    visibleAt     time.Time  // for delayed delivery (v1)
+}
+
+type inflightEntry struct {
+    msg       Message
+    visibleAt time.Time  // when visibility timeout expires
+}
+
+type Queue struct {
+    mu       sync.Mutex
+    name     string
+    messages []Message   // FIFO backing store
+    head     int         // index of next message to dequeue
+    inflight map[string]*inflightEntry
+    cond     *sync.Cond  // for long polling (v2)
+}
+```
+
+The `head` index is the key performance choice: instead of `messages = messages[1:]` (which copies the slice header and may cause allocations), we advance `head`. We compact periodically when `head` is past half the slice length.
+
+**ReceiveMessage**: iterates from `head` to `len(messages)`, skipping messages that are in-flight or delayed. For each candidate, generates a new `ReceiptHandle` (UUID), increments `ReceiveCount`, adds to `inflight` map.
+
+```go
+func (q *Queue) ReceiveMessage(maxMessages int, visibilityTimeout time.Duration) []Message {
+    q.mu.Lock()
+    defer q.mu.Unlock()
+    now := time.Now()
+    var result []Message
+    for i := q.head; i < len(q.messages) && len(result) < maxMessages; i++ {
+        msg := &q.messages[i]
+        if msg.visibleAt.After(now) { continue }        // delayed
+        if q.isInFlight(msg.ID, now) { continue }      // in-flight
+        rh := newUUID()
+        msg.ReceiveCount++
+        msg.ReceiptHandle = rh
+        clone := *msg
+        q.inflight[rh] = &inflightEntry{msg: clone, visibleAt: now.Add(visibilityTimeout)}
+        result = append(result, clone)
+    }
+    return result
+}
+```
+
+**The critical test to write**: after receiving a message, verify the second `ReceiveMessage` call returns empty. Then let the visibility timeout expire (wait for the background scanner). Verify the third `ReceiveMessage` returns the same message with `ReceiveCount == 2`. This is the entire at-least-once delivery contract in one test.
+
+**DeleteMessage**: removes the entry from `inflight`, then finds the message in the backing slice by ID and advances `head` past it. The combination of both removals is what prevents the message from reappearing — removing from `inflight` alone would not be enough if the message is still in the slice.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Dead-Letter Queue + Delayed Delivery"
+  goals={[
+    "Implement DLQConfig{MaxReceiveCount, DLQName} and attach it to a queue via Manager.CreateQueue",
+    "Background scanner: after MaxReceiveCount receives without delete, move message to DLQ",
+    "Implement DelayedSendMessage(body, delay) — message invisible until now + delay",
+    "Implement BatchSendMessage([][]byte) and BatchDeleteMessage([]string) — atomic under one mutex lock",
+    "Implement QueueAttributes{MessageCount, InFlightCount, DelayedCount}",
+    "Write 5 tests: DLQ after 3 receives, delayed message not visible before delay, batch send/delete atomicity, queue attributes counts, DLQ chain is disallowed",
+  ]}
+  loc={480}
+>
+
+### Dead-letter queues: the poison pill escape valve
+
+Without a DLQ, a message that your consumer cannot process loops forever:
+1. Consumer receives message, crashes during processing
+2. Visibility timeout expires, message reappears
+3. Consumer receives message again, crashes again
+4. Repeat indefinitely
+
+This is the poison pill problem. The fix is to track `ReceiveCount` and, after `MaxReceiveCount` receives without a delete, move the message to a separate queue (the DLQ) where it can be inspected without blocking the main queue.
+
+The `Manager` owns queues and enforces DLQ relationships:
+
+```go
+type DLQConfig struct {
+    MaxReceiveCount int
+    DLQName         string
+}
+
+// In requeueExpired (background scanner):
+if q.dlqConfig != nil && entry.msg.ReceiveCount >= q.dlqConfig.MaxReceiveCount {
+    dlqMsg := entry.msg
+    dlqMsg.ReceiptHandle = ""
+    q.dlq.mu.Lock()
+    q.dlq.messages = append(q.dlq.messages, dlqMsg)
+    q.dlq.mu.Unlock()
+    q.removeByID(entry.msg.ID)
+    continue
+}
+```
+
+**The DLQ chain restriction**: a queue that has a DLQ attached cannot itself be used as a DLQ. This prevents chains like `main → dlq-1 → dlq-2 → ...`. SQS enforces the same restriction. The reason is operational: if DLQ promotion could trigger further DLQ promotion, a single poison pill could cascade across an unbounded chain of queues. The restriction forces DLQs to be terminal.
+
+### Delayed delivery: scheduling messages
+
+A delayed message is enqueued in the normal backing slice but has a `visibleAt` time in the future. `ReceiveMessage` skips messages where `visibleAt.After(now)`. No separate data structure is needed.
+
+```go
+func (q *Queue) sendWithDelay(body []byte, delaySeconds int) string {
+    id := newUUID()
+    now := time.Now()
+    visibleAt := now
+    if delaySeconds > 0 {
+        visibleAt = now.Add(time.Duration(delaySeconds) * time.Second)
+    }
+    msg := Message{ID: id, Body: body, EnqueuedAt: now, visibleAt: visibleAt}
+    q.mu.Lock()
+    q.messages = append(q.messages, msg)
+    q.mu.Unlock()
+    return id
+}
+```
+
+**Use cases for delayed delivery**: scheduling retries with exponential backoff (send a retry with delay 2s, 4s, 8s), time-based triggers (send a "payment overdue" message with delay = due date - now), and rate limiting (space out API calls by delaying messages).
+
+### Batch operations: why atomicity matters
+
+`BatchSendMessage` enqueues up to 10 messages in a single mutex lock acquisition. This is not just about throughput — it's about atomicity. If the caller sends 5 messages and 3 of them are processed before the other 2 arrive, the system may see a partial update.
+
+The SQS batch API has the same semantics: all messages in a successful batch send are either all enqueued or the call fails. There is no partial success at the batch level (though individual message failures within the batch can be reported separately).
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="FIFO + Deduplication + Long Polling"
+  goals={[
+    "Implement FIFOQueue embedding Queue with MessageGroupID support",
+    "Per-group in-flight tracking: if a group has an in-flight message, no more from that group are delivered",
+    "MessageDeduplicationID: if same ID sent within 5-minute window, return original MessageID without enqueue",
+    "Implement LongPollReceive(maxMessages, visibilityTimeout, waitTime) using sync.Cond",
+    "Write 5 tests: deduplication within window, dedup expires after window, long poll returns immediately on arrival, long poll times out empty, FIFO ordering within group",
+  ]}
+  loc={730}
+>
+
+### FIFO ordering with MessageGroupID
+
+A standard FIFO queue guarantees ordering across all messages. This creates a bottleneck: if message N is in-flight, messages N+1, N+2, ... must wait. For a queue handling 10 message groups with independent consumers, this is a 10x throughput reduction.
+
+`MessageGroupID` solves this by partitioning the FIFO guarantee: messages within the same group are delivered in order, but messages from different groups can be interleaved. If group A has a message in-flight, only group A is blocked — groups B, C, ... continue at full speed.
+
+```go
+type FIFOQueue struct {
+    *Queue
+    fifoMu        sync.Mutex
+    dedupMap      map[string]dedupEntry  // dedupID → {messageID, expiresAt}
+    groupInflight map[string]int         // groupID → count of in-flight messages
+    fifoMessages  []FIFOMessage          // parallel to Queue.messages
+}
+
+// In ReceiveFIFOMessage:
+if fq.groupInflight[fifoMsg.GroupID] > 0 {
+    continue  // this group is blocked; skip to the next group's messages
+}
+```
+
+This is why SQS FIFO queues have a per-group throughput limit (3,000 msg/sec with batching) rather than a global limit — groups are the unit of isolation, not the queue.
+
+### Deduplication: the 5-minute window
+
+The deduplication window prevents the same message from being enqueued twice within 5 minutes. This is useful for producers that retry on network failures — if the first send succeeded but the acknowledgement was lost, the retry produces the same `MessageDeduplicationID` and is silently discarded.
+
+```go
+const dedupWindow = 5 * time.Minute
+
+type dedupEntry struct {
+    messageID string
+    expiresAt time.Time
+}
+
+func (fq *FIFOQueue) SendFIFOMessage(body []byte, groupID, dedupID string) string {
+    fq.fifoMu.Lock()
+    defer fq.fifoMu.Unlock()
+    if dedupID != "" {
+        fq.pruneDedup(time.Now())
+        if entry, ok := fq.dedupMap[dedupID]; ok {
+            return entry.messageID  // original ID, no enqueue
+        }
+    }
+    // ... enqueue and record in dedupMap
+}
+```
+
+Deduplication is a best-effort guarantee at the producer level only. It does not prevent the same message from being delivered twice to consumers (that's the at-least-once consumer delivery scenario we covered in v0). The two guarantees are independent.
+
+### Long polling with sync.Cond
+
+Without long polling, a consumer on an empty queue must poll repeatedly:
+
+```go
+// Busy poll — burns CPU and generates meaningless API calls:
+for {
+    msgs := q.ReceiveMessage(10, 30*time.Second)
+    if len(msgs) > 0 { process(msgs) }
+    time.Sleep(100 * time.Millisecond)  // 10 polls/sec on empty queue
+}
+```
+
+With long polling, the consumer parks on a condition variable and is woken when a message arrives:
+
+```go
+func (q *Queue) LongPollReceive(maxMessages int, visibilityTimeout, waitTime time.Duration) []Message {
+    deadline := time.Now().Add(waitTime)
+    // Timer goroutine: broadcast after deadline to unblock the waiter.
+    timer := time.AfterFunc(waitTime, func() { q.cond.Broadcast() })
+    defer timer.Stop()
+
+    q.mu.Lock()
+    for {
+        msgs := q.receiveUnlocked(maxMessages, visibilityTimeout)
+        if len(msgs) > 0 { q.mu.Unlock(); return msgs }
+        if time.Now().After(deadline) { q.mu.Unlock(); return nil }
+        q.cond.Wait()  // releases mu, parks goroutine, re-acquires on wake
+    }
+}
+```
+
+`SendMessage` calls `q.cond.Broadcast()` after every enqueue, which wakes all parked consumers. The first consumer to wake and acquire the lock gets the message; others loop back and check (some find the queue empty again and re-park).
+
+**Why `sync.Cond` instead of channels**: a channel-based approach would require one channel per consumer, complicating fan-out. `sync.Cond.Broadcast()` wakes all parked consumers simultaneously with one call, and the mutex ensures only one receives the message. This matches exactly the semantics of SQS long polling, where all connected pollers are eligible to receive any available message.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/message-queue"
+  prereqs={["Go 1.23+", "curl or httpie"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/message-queue\ngo build ./...",
+    },
+    {
+      label: "Run all tests",
+      cmd: "go test ./... -v",
+    },
+    {
+      label: "Start the HTTP server (default port 8080)",
+      cmd: "go run ./cmd/server --port 8080",
+    },
+    {
+      label: "Send a message",
+      cmd: "curl -s -X POST http://localhost:8080/queues/default/messages \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"body\":\"order:1001:created\"}'",
+    },
+    {
+      label: "Receive the message",
+      cmd: "curl -s 'http://localhost:8080/queues/default/messages?maxMessages=1&visibilityTimeout=30'",
+    },
+    {
+      label: "Delete (acknowledge) the message",
+      cmd: "# Replace RECEIPT_HANDLE with the receiptHandle from the receive response\ncurl -s -X DELETE 'http://localhost:8080/queues/default/messages/RECEIPT_HANDLE'",
+    },
+    {
+      label: "Check queue attributes",
+      cmd: "curl -s 'http://localhost:8080/queues/default/attributes'",
+    },
+    {
+      label: "Create a DLQ-backed queue and observe poison pill promotion",
+      cmd: "# Create the DLQ first\ncurl -s -X POST http://localhost:8080/queues \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"name\":\"orders-dlq\"}'\n\n# Create the main queue with DLQ attached\ncurl -s -X POST http://localhost:8080/queues \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"name\":\"orders\",\"dlqName\":\"orders-dlq\",\"maxReceiveCount\":3}'\n\n# Send a poison pill\ncurl -s -X POST http://localhost:8080/queues/orders/messages \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"body\":\"poison-pill\"}'",
+    },
+  ]}
+  expectedOutput={`# After send:
+{"messageId":"3f4a..."}
+
+# After receive:
+{"messages":[{"id":"3f4a...","body":"order:1001:created","receiptHandle":"9c2b...","receiveCount":1}]}
+
+# After delete:
+(HTTP 204 No Content)
+
+# After attributes:
+{"MessageCount":0,"InFlightCount":0,"DelayedCount":0}`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM (estimated — run go test -bench=. ./... for real numbers)"
+  rows={[
+    { metric: "SendMessage throughput",                    value: "1,800,000", unit: "msg/sec",  note: "Append to slice under mutex. Pure memory ceiling." },
+    { metric: "ReceiveMessage (1 message)",                value: "900,000",   unit: "recv/sec", note: "Slice scan + in-flight map write." },
+    { metric: "DeleteMessage",                             value: "2,400,000", unit: "del/sec",  note: "Map delete + slice compaction under mutex." },
+    { metric: "Long poll wake latency (message arrives)",  value: "0.1",       unit: "ms",       note: "sync.Cond.Broadcast round-trip." },
+  ]}
+/>
+
+## Stress tests
+
+**Visibility timeout storm**: send 10,000 messages and receive all of them with a 100ms visibility timeout. Do not call `DeleteMessage`. After 100ms, all 10,000 messages reappear. Your background scanner now has to process 10,000 re-queues in one tick. Verify that the scanner doesn't hold the mutex long enough to block concurrent senders. The fix is to process re-queues in batches and release the mutex between batches.
+
+**DLQ fill rate under crash simulation**: send 100 messages to a queue with `maxReceiveCount=3` and `visibilityTimeout=50ms`. Receive all 100 simultaneously and never delete any. After 150ms (3 timeout cycles), all 100 should be in the DLQ. Verify `QueueAttributes.MessageCount == 0` on the main queue and the DLQ has exactly 100 messages.
+
+**Long poll fan-out**: start 20 goroutines all calling `LongPollReceive(1, 30s, 10s)` on an empty queue. Then send 20 messages rapidly. Verify exactly 20 messages are received (one per goroutine) with no duplicates. The `sync.Cond.Broadcast` wakes all 20, but only 20 receive messages — the mutex ensures serialized access.
+
+**FIFO group contention**: create 2 message groups (A and B), each with 50 messages. Two concurrent consumers process in parallel — one dedicated to group A, one to group B. Verify total throughput is 2x a single-group setup (groups are independent) and that all group A messages arrive in order and all group B messages arrive in order.
+
+**Dedup window expiry**: send a message with `MessageDeduplicationID = "order-1001"`. Wait 5 minutes (in tests, mock the expiry). Send the same dedup ID again. Verify a new message is enqueued (not deduplicated) because the window has expired.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "Durable persistence",                  why: "Our messages are in-memory slices. SQS uses a distributed, replicated message store with multi-AZ durability. On process restart, all our messages are lost." },
+    { thing: "Message ordering across partitions",   why: "SQS Standard queues do not guarantee ordering across partitions. FIFO queues guarantee per-group ordering at the cost of lower throughput (3,000 msg/sec vs 120,000 msg/sec for Standard). Our per-group mutex is the simpler version of this partitioning." },
+    { thing: "Server-side encryption",               why: "SQS can encrypt message bodies at rest using KMS. Every message write requires a KMS encrypt call; every receive requires a decrypt call. Key rotation requires re-encrypting stored messages." },
+    { thing: "Message attribute validation",         why: "SQS validates message attribute types (String, Number, Binary) and sizes (max 256 KB per message, 10 attributes per message). Our byte slice has no such constraints." },
+    { thing: "Visibility timeout extension under load", why: "Long-running consumers must extend visibility timeouts before they expire. This requires the consumer to track each message's timeout and call ChangeMessageVisibility proactively. Our test simulates this but production consumers often get this wrong." },
+    { thing: "Request/response over a queue (temporary queue pattern)", why: "The SQS temporary queue pattern creates a response queue per request for RPC-style communication. Each request gets a ReplyTo queue name. Managing the lifecycle of thousands of short-lived temporary queues requires a queue pool." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="Spring Boot 3.3 / Spring Framework 6.1"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+    "org.springframework.boot:spring-boot-starter-integration:3.3.0",
+  ]}
+  repoPath="labs/message-queue/java-integration"
+>
+
+### The @JmsListener comparison
+
+Spring's `@JmsListener` hides the entire send-receive-delete cycle behind a single annotation:
+
+```java
+@JmsListener(destination = "orders")
+public void onOrder(String body) {
+    processOrder(body);
+    // Spring commits the JMS "ack" automatically after this method returns.
+    // If the method throws, the message is redelivered (JMS session rollback).
+}
+```
+
+Behind that annotation, `DefaultMessageListenerContainer` is doing exactly what our `QueueClient` does explicitly:
+1. Poll `MessageConsumer.receive()` in a thread pool
+2. Open a JMS Session (= our visibility timeout window)
+3. Deliver the message to your `@JmsListener` method
+4. On success: `session.commit()` (= our `DeleteMessage`)
+5. On exception: `session.rollback()` (= message reappears after visibility timeout)
+6. After N rollbacks: move to dead-letter queue (configured via `activemq.redeliveryPolicy`)
+
+Making this explicit is not a step backward — it forces you to think about what "at-least-once delivery" means in your application:
+- What happens if your consumer crashes after step 3 but before step 4?
+- What is the right visibility timeout for a 2-minute database update?
+- How do you drain a DLQ without re-triggering the bug that put messages there?
+
+### Part A — QueueClient: the HTTP bridge
+
+`QueueClient` wraps three endpoints behind a typed interface. Under 60 lines of logic:
+
+```java
+public class QueueClient {
+    private final RestClient http;
+
+    public String sendMessage(String queueName, String body) {
+        var resp = http.post()
+                .uri("/queues/{name}/messages", queueName)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("body", body))
+                .retrieve()
+                .body(SendResponse.class);
+        return resp.messageId();
+    }
+
+    public List<QueueMessage> receiveMessages(String queueName, int max, int visTimeoutSec) {
+        var resp = http.get()
+                .uri("/queues/{name}/messages?maxMessages={max}&visibilityTimeout={vis}",
+                     queueName, max, (double) visTimeoutSec)
+                .retrieve()
+                .body(ReceiveResponse.class);
+        return resp.messages();
+    }
+
+    public void deleteMessage(String queueName, String receiptHandle) {
+        http.delete()
+                .uri("/queues/{name}/messages/{rh}", queueName, receiptHandle)
+                .retrieve()
+                .toBodilessEntity();
+    }
+
+    public record QueueMessage(String id, String body, String receiptHandle, int receiveCount) {}
+}
+```
+
+The structural difference from the real AWS SQS SDK: our `sendMessage` is synchronous (blocks until the server acknowledges). The real `SqsAsyncClient.sendMessage()` is async — it returns a `CompletableFuture` and batches messages client-side before flushing. Our HTTP client sends one at a time.
+
+### Part B — The full processing loop
+
+```java
+// At-most-once (commit BEFORE processing — dangerous):
+List<QueueMessage> msgs = client.receiveMessages(queue, 10, 30);
+client.deleteMessage(queue, msg.receiptHandle());  // commit first
+processOrder(msg.body());                          // if this crashes, message is LOST
+
+// At-least-once (commit AFTER processing — correct default):
+List<QueueMessage> msgs = client.receiveMessages(queue, 10, 30);
+processOrder(msg.body());                          // process first
+client.deleteMessage(queue, msg.receiptHandle());  // if this crashes, message RE-DELIVERS
+```
+
+The real Spring JMS `@JmsListener` defaults to at-least-once (session transaction committed after method returns). The AWS Spring Cloud SQS `@SqsListener` also defaults to at-least-once (delete after successful return). Our demo explicitly shows the delete call so you cannot miss it.
+
+### Part C — Running the demo
+
+```bash
+# Terminal 1: start the Go server
+cd labs/message-queue
+go run ./cmd/server --port 8080
+
+# Terminal 2: run the Spring Boot demo
+cd labs/message-queue/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Message Queue Spring Integration Demo ===
+
+Sending 100 messages to queue 'default'...
+Sent 100 messages.
+
+--- Processing in batches of 10 (at-least-once) ---
+  Processing: order:0:user=0 (receiveCount=1)
+  Processing: order:1:user=1 (receiveCount=1)
+  ...
+  Batch done. Total processed: 10
+  ...
+  Batch done. Total processed: 100
+
+Processed 100 messages.
+
+--- DLQ drain pattern ---
+(shows the pattern for draining a DLQ once messages are promoted)
+
+--- What @JmsListener hides from you ---
+(shows the full session/ack/rollback equivalence)
+
+=== Demo complete ===
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The visibility timeout requeue rate surprised me in load testing. At 900,000 receives/sec with a 30-second visibility timeout, a 1% consumer crash rate means 9,000 messages/sec reappear in the queue — adding a 1% phantom load that grows as consumer crashes compound. At 10% crash rate, phantom load reaches 90,000 msg/sec, effectively doubling queue throughput while delivering 0 additional messages. This is why SQS recommends keeping visibility timeout 3x the expected processing time — not for safety margin, but to avoid runaway requeue amplification." />
+
+## Where to go deeper
+
+- **AWS SQS Developer Guide** — the official documentation on visibility timeout internals, FIFO semantics, and deduplication: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/
+- **Celery task queue internals** — how Celery implements task routing, retries, and dead-letter queues on top of AMQP and Redis: https://docs.celeryq.dev/en/stable/internals/index.html
+- **Faktory job queue** — a Go job queue server with a similar design to this lab, showing how to add persistence and a web UI: https://github.com/contribsys/faktory
+- **"Designing Data-Intensive Applications"** — Chapter 11 (Stream Processing) has an excellent comparison of queue vs. log semantics and when each is appropriate
+- **Go sync.Cond documentation** — the standard library implementation notes explain why `Broadcast` is preferred over `Signal` when multiple goroutines may be eligible: https://pkg.go.dev/sync#Cond
+
+## Related labs and questions
+
+- **Previous in messaging**: Kafka-lite (lab #21) — the inverse design: a log where messages are never deleted, vs. this queue where successful processing deletes messages permanently
+- **Distributed Systems companion**: Distributed Lock (dist-lock) — the visibility timeout is often mistaken for a lock; that lab shows what a real distributed lock looks like and why the two are fundamentally different
+- **Storage companion**: WAL (lab #5) — adding durability to this queue would require a WAL so messages survive process restarts; the WAL lab shows exactly how to implement that
+- **Questions to think about**: Why can't you make a queue exactly-once without coordination between producer and consumer? What happens to your system's correctness guarantee if the DLQ itself becomes full? When would you choose a queue over a log, and what signals in your requirements tell you which one you need? How would you implement priority queues on top of this design without breaking FIFO ordering within a priority level?

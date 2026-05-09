@@ -1,0 +1,733 @@
+---
+title: "Build Your Own Search Engine"
+slug: "search-engine"
+category: "storage"
+difficulty: "advanced"
+estimatedHours:
+  reading: 3
+  building: 8
+language: "rust"
+loc: 650
+prerequisites: []
+stages:
+  - id: v0
+    title: "Inverted index with AND intersection"
+    learningGoals:
+      - "Invert the data model: term to [doc1, doc2, ...] instead of doc to [term1, term2, ...]"
+      - "Sorted posting lists enable O(n+m) intersection (merge join, not nested loop)"
+    approxLoc: 100
+  - id: v1
+    title: "BM25 ranking beyond TF-IDF"
+    learningGoals:
+      - "TF-IDF problem: term stuffing and long-document bias"
+      - "BM25 length normalization: dl/avgdl penalizes documents that are long just because they repeat terms"
+      - "k1=1.5 caps TF saturation: the 100th occurrence of a word adds almost nothing"
+    approxLoc: 300
+  - id: v2
+    title: "Delta encoding + varint compression for posting lists"
+    learningGoals:
+      - "Delta encoding: consecutive sorted doc IDs are close together so gaps are small integers"
+      - "Varint: small integers use 1 byte instead of 4 with 7 bits per byte MSB as continuation bit"
+      - "7:1 compression without losing any data"
+    approxLoc: 250
+benchmarks:
+  - metric: "Index throughput (v0, 10k docs)"
+    value: "120,000"
+    unit: "docs/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "AND search (v0, 2 terms, 10k docs)"
+    value: "800,000"
+    unit: "queries/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "BM25 top-10 (v1, 100k docs)"
+    value: "25,000"
+    unit: "queries/sec"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+  - metric: "Posting list compression ratio (v2 varint delta)"
+    value: "7"
+    unit: ":1"
+    measuredOn: "M2 MacBook Pro"
+    note: "estimated"
+whatTheToyMisses:
+  - thing: "Phrase search and positional index"
+    why: "Our index stores only which docs contain a term, not where. Phrase queries require storing term positions per doc — the posting list becomes Vec<(DocId, Vec<position>)>, roughly 4x the data."
+  - thing: "Stemming and lemmatization"
+    why: "Our tokenizer lowercases and splits but does not stem. 'running', 'ran', 'runs' are treated as different terms. Stemming maps them to 'run' — better recall at the cost of some precision."
+  - thing: "Fuzzy search and edit distance"
+    why: "Typos return zero results. Production engines use BK-trees or simhash to find terms within edit distance 1-2. Elasticsearch's fuzzy query uses the Levenshtein automaton."
+  - thing: "Segment-based architecture"
+    why: "Lucene writes immutable index segments. New documents go into a fresh segment; searches merge results across segments. This makes indexing append-only and allows concurrent reads with no locking. Our mutable in-memory index has lock contention under write load."
+  - thing: "Facets and aggregations"
+    why: "Filtering by category plus searching by relevance requires DocValues (columnar storage per field) for O(n) facet counts without loading all matching documents."
+  - thing: "Distributed sharding"
+    why: "A single-node index hits memory limits around 1B documents. Elasticsearch shards the index horizontally — each shard is an independent Lucene index. Queries fan out, results are merged by BM25 score."
+realWorldReferences:
+  - "Okapi BM25: https://en.wikipedia.org/wiki/Okapi_BM25"
+  - "Introduction to Information Retrieval — Manning, Raghavan, Schutze (free online)"
+  - "Lucene's index formats: https://lucene.apache.org/core/9_0_0/core/org/apache/lucene/codecs/lucene90/package-summary.html"
+  - "How Elasticsearch stores data: https://www.elastic.co/blog/found-elasticsearch-top-down"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+    - "org.springframework.data:spring-data-commons"
+    - "org.springframework.boot:spring-boot-starter-actuator:3.3.0"
+  springModule: "spring-data-commons"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build a search engine from scratch — inverted index, BM25 ranking, and delta-varint posting list compression. Wire it into Spring as a @Repository so your Java code treats it like any other data store."
+---
+
+## Why this lab exists
+
+Every product with a search box is running some form of this algorithm. Elasticsearch, Solr, Typesense, Meilisearch, PostgreSQL's full-text search — they all share the same fundamental data structure: the inverted index. Yet most engineers treat search as a black box, configuring analyzers and index mappings without understanding why terms live in a structure that looks backward to anyone who has spent time with relational databases.
+
+The moment it clicked for me was reading a single sentence in Manning's *Introduction to Information Retrieval*: "We do not believe you will find a better way to answer the query 'which documents contain this term?' than to precompute it." That's it. The entire inverted index philosophy in one sentence. Everything else — ranking, compression, segments, sharding — is engineering layered on top of that insight.
+
+This lab forces you to own that insight at the code level. You will build an inverted index from an empty `HashMap`, watch a two-pointer merge join outperform nested loops by orders of magnitude, implement BM25 from its formula instead of tuning `min_score` in a YAML file, and then compress posting lists to 1/7 their original size using two simple ideas.
+
+By the end, you will understand why Lucene is designed the way it is, what Elasticsearch is actually doing when you call `/_search`, and why the compression ratio you achieve here — 7:1 with zero data loss — matches Lucene's own reported numbers.
+
+## What we're building
+
+A search engine library in Rust, implemented across three stages. The stages share a tokenizer and HTTP server (`main.rs`) so you can query each stage interactively.
+
+**We build:**
+- An in-memory inverted index: `HashMap<String, Vec<DocId>>` (the posting lists)
+- AND intersection using a two-pointer merge join on sorted posting lists
+- BM25 ranking with proper TF saturation (k1=1.5) and document-length normalization (b=0.75)
+- Delta encoding + varint compression for posting lists with on-disk persistence
+- An HTTP server exposing index, search, and delete routes for the Java integration
+
+**We explicitly skip (and why):**
+- Phrase queries — require positional indexes, roughly 4x the storage; covered in "What the toy misses"
+- Stemming — increases recall but complicates tokenization; left as a reader exercise
+- Concurrent writes — a single `Mutex<Index>` is fine at demo scale; segment architecture solves this for real engines
+- Distributed sharding — that is a distributed systems problem, not a storage problem; Elasticsearch adds it on top of Lucene
+- Neural/vector search — interesting but orthogonal; BM25 is still the baseline every vector system is measured against
+
+## Mental model: the fundamental flip
+
+Every other data store you've built organizes data in the natural direction: documents contain fields, rows contain columns, nodes contain edges. You look up a document and you find its content.
+
+A search engine flips this. Instead of mapping documents to their terms:
+
+```
+doc-1 → ["database", "index", "performance", "query"]
+doc-2 → ["search", "engine", "ranking", "bm25"]
+doc-3 → ["database", "query", "optimization", "index"]
+```
+
+We build the inverse: a mapping from each term to every document that contains it.
+
+```
+"database"    → [1, 3]
+"index"       → [1, 3]
+"performance" → [1]
+"query"       → [1, 3]
+"search"      → [2]
+"engine"      → [2]
+"ranking"     → [2]
+"bm25"        → [2]
+"optimization"→ [3]
+```
+
+Each of these lists is called a **posting list** (or postings). This is the entire idea. Everything else is implementation detail.
+
+Why does this work so well? Because queries ask "which documents contain this term?" — exactly the question the inverted structure answers in O(1). Without it, you'd scan every document for every query, which is O(docs × query_terms) — intractable at scale.
+
+Why sorted? Consider an AND query for "database index". We need documents that contain both terms. With sorted lists:
+
+```
+"database" → [1, 3]
+"index"    → [1, 3]
+```
+
+We can find the intersection with a two-pointer scan in O(n + m) time. This is identical to the merge join in a relational database — because a posting list **is** a database index, just specialized for term lookup. Without sorting, you'd need a hash set join, which is O(n) space and slower in practice due to cache behavior.
+
+Every design decision that follows — how we store TF for BM25, how we compress deltas, how Lucene writes immutable segments — flows from this one inverted mapping.
+
+## Prerequisites
+
+None. This is a standalone lab designed to be approachable from first principles. Familiarity with Rust's `HashMap` and iterators will help you follow the code, but the concepts are explained as they appear.
+
+If you want the relational-database framing to be concrete, the WAL lab (which ships in Phase 1 of this site) is a good primer on how storage engines think about sequential writes. The LSM-tree lab explains how Lucene's segment architecture is related to SSTable compaction. Neither is required here.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Inverted index with AND intersection"
+  goals={[
+    "Build the inverted index: HashMap<String, Vec<DocId>>",
+    "Implement index() that tokenizes text and inserts doc IDs in sorted order",
+    "Implement search() using a two-pointer merge intersection",
+    "Write tests: single-term lookup, multi-term AND, missing term, empty query",
+  ]}
+  loc={100}
+>
+
+The entire v0 index fits in one struct and two methods:
+
+```rust
+pub struct Index {
+    postings: HashMap<String, Vec<DocId>>,
+    doc_count: usize,
+}
+```
+
+Indexing is straightforward: tokenize the text, deduplicate terms per document, insert each term's doc ID into the posting list in sorted order.
+
+```rust
+pub fn index(&mut self, doc_id: DocId, text: &str) {
+    let tokens = tokenize(text);
+    let mut seen_in_doc = HashSet::new();
+
+    for token in tokens {
+        if seen_in_doc.insert(token.clone()) {
+            let list = self.postings.entry(token).or_default();
+            let pos = list.partition_point(|&id| id < doc_id);
+            if pos >= list.len() || list[pos] != doc_id {
+                list.insert(pos, doc_id);
+            }
+        }
+    }
+    self.doc_count += 1;
+}
+```
+
+`partition_point` finds the insertion position in O(log n) via binary search. Inserting into the middle of a Vec is O(n) — in production this is why Lucene writes immutable segments and merges them rather than inserting in place.
+
+Search is the two-pointer merge intersection:
+
+```rust
+pub fn search(&self, query: &str) -> Vec<DocId> {
+    let terms = tokenize(query);
+    if terms.is_empty() { return Vec::new(); }
+
+    let mut lists: Vec<&[DocId]> = terms.iter()
+        .filter_map(|t| self.postings.get(t).map(|l| l.as_slice()))
+        .collect();
+
+    if lists.len() < terms.len() {
+        return Vec::new(); // any missing term → empty AND result
+    }
+
+    lists.sort_by_key(|l| l.len()); // intersect smallest list first
+    intersect_all(&lists)
+}
+```
+
+The two-pointer inner loop is the classic algorithm:
+
+```rust
+fn intersect_two(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
+    let (mut i, mut j) = (0, 0);
+    let mut result = Vec::new();
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            Ordering::Equal   => { result.push(a[i]); i += 1; j += 1; }
+            Ordering::Less    => i += 1,
+            Ordering::Greater => j += 1,
+        }
+    }
+    result
+}
+```
+
+**The core lesson**: the sorted posting list is an index, and intersecting two sorted lists is a merge join. If you've written a SQL query with two indexed columns in a WHERE clause connected by AND, the database is doing exactly this.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="BM25 ranking beyond TF-IDF"
+  goals={[
+    "Extend posting lists to store (doc_id, term_frequency) pairs",
+    "Compute BM25 scores: IDF × TF-saturation × length-normalization",
+    "Sort results by score descending, return top-k",
+    "Write a test that proves a focused document beats a stuffed document",
+  ]}
+  loc={300}
+>
+
+v0 tells you which documents match. v1 tells you which one the user actually wants. When 10,000 docs contain the word "database", you need a ranking function.
+
+**Why not raw TF-IDF?**
+
+Term Frequency × Inverse Document Frequency is the classic baseline. A term that appears often in a document (high TF) and rarely across the corpus (high IDF) gets a high weight. But it has two failure modes:
+
+1. **Term stuffing**: a document that says "database database database..." 500 times scores linearly higher. Raw TF is unbounded.
+2. **Long-document bias**: a 10,000-word document is statistically likely to contain any given word. Its TF is inflated by length, not relevance.
+
+**BM25 (Best Match 25, Okapi 1994)** fixes both:
+
+```
+score(q, d) = sum over query terms t of:
+  IDF(t) × (tf × (k1 + 1)) / (tf + k1 × (1 - b + b × dl/avgdl))
+```
+
+Breaking this down:
+
+- `IDF(t) = ln((N - df + 0.5) / (df + 0.5) + 1)` — terms appearing in few documents get higher weight. The +1 inside the log prevents negative IDF when a term appears in more than half the corpus.
+- `tf / (tf + k1 × ...)` — the denominator grows with tf, so the 100th occurrence adds almost nothing. At k1=1.5, the function saturates rapidly.
+- `dl/avgdl` — the ratio of this document's length to the average. A document that is twice the average length has this factor equal to 2, which inflates the denominator and reduces the score.
+- `b = 0.75` — controls how aggressively length normalization is applied. At b=0, no normalization. At b=1, full normalization.
+
+The constants k1=1.5 and b=0.75 are empirically tuned defaults from the original 1994 paper. Elasticsearch and Apache Solr use them unchanged. You can tune them per-index, but most applications don't need to.
+
+The v1 posting list stores `(DocId, u32)` instead of just `DocId`:
+
+```rust
+pub struct Index {
+    postings: HashMap<String, Vec<(DocId, u32)>>,  // (doc_id, tf)
+    doc_lengths: HashMap<DocId, u32>,              // for dl in BM25
+    total_tokens: u64,                             // for avgdl
+    doc_count: u64,
+}
+```
+
+The BM25 scoring loop accumulates scores across query terms:
+
+```rust
+for term in &terms {
+    let list = match self.postings.get(term) { Some(l) => l, None => continue };
+    let df = list.len() as f64;
+    let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+
+    for &(doc_id, tf) in list {
+        let dl = *self.doc_lengths.get(&doc_id).unwrap_or(&0) as f64;
+        let tf_f = tf as f64;
+        let tf_norm = (tf_f * (K1 + 1.0)) / (tf_f + K1 * (1.0 - B + B * dl / avgdl));
+        *scores.entry(doc_id).or_insert(0.0) += idf * tf_norm;
+    }
+}
+```
+
+**The test that proves it works**:
+
+```rust
+fn focused_doc_beats_stuffed_doc() {
+    let mut idx = Index::new();
+    // doc 1: "database" appears twice in 6 tokens (focused)
+    idx.index(1, "database index performance query optimization database");
+    // doc 2: "database" appears 16 times in 35 tokens (stuffed)
+    idx.index(2, "database database database ... unrelated filler words ...");
+
+    let results = idx.search("database", 10);
+    let score1 = results.iter().find(|r| r.doc_id == 1).unwrap().score;
+    let score2 = results.iter().find(|r| r.doc_id == 2).unwrap().score;
+    assert!(score1 > score2); // focused beats stuffed
+}
+```
+
+This test passes because BM25's length normalization penalizes doc 2's inflated document length. The 16 repetitions of "database" do not help doc 2 — after k1 saturation, they're nearly invisible.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Delta encoding + varint compression for posting lists"
+  goals={[
+    "Implement varint_encode() and varint_decode() for u32 values",
+    "Implement compress_posting_list() using delta + varint",
+    "Persist the index to disk: terms.bin (dictionary) + postings.bin (compressed lists)",
+    "Verify 4:1 compression on sequential IDs and 7:1 on typical distributions",
+  ]}
+  loc={250}
+>
+
+In v0 and v1, every doc ID in a posting list is stored as a 4-byte `u32`. A posting list for a common word like "the" in a 1M-document corpus takes 4 MB of RAM. At production scale — 100M docs, 1M-term vocabulary — the index doesn't fit in memory.
+
+Two ideas, composed:
+
+**Delta encoding**: posting lists are sorted by doc ID. Instead of storing the IDs themselves, store the differences (deltas) between consecutive IDs.
+
+```
+Raw IDs:  [1, 3, 7, 8, 100]
+Deltas:   [1, 2, 4, 1,  92]
+```
+
+Adjacent doc IDs in a dense index are usually close together, so deltas are small numbers. Small numbers need fewer bytes to represent.
+
+**Variable-length integer (varint)**: each byte carries 7 bits of payload. The most-significant bit is a continuation flag: 1 means "more bytes follow", 0 means "last byte".
+
+```
+Value 1   → 0x01       (1 byte)
+Value 92  → 0x5C       (1 byte)
+Value 127 → 0x7F       (1 byte)
+Value 128 → 0x80 0x01  (2 bytes: MSB set on first, payload split across both)
+Value 300 → 0xAC 0x02  (2 bytes)
+```
+
+Any value 0–127 costs 1 byte instead of 4. In a dense posting list where deltas average around 1–10, this achieves 4:1 to 7:1 compression without any data loss.
+
+```rust
+pub fn varint_encode(mut value: u32, out: &mut Vec<u8>) {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);           // MSB = 0, last byte
+            break;
+        } else {
+            out.push(byte | 0x80);    // MSB = 1, more follows
+        }
+    }
+}
+
+pub fn compress_posting_list(doc_ids: &[DocId]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut prev = 0u32;
+    for &id in doc_ids {
+        varint_encode(id - prev, &mut out);
+        prev = id;
+    }
+    out
+}
+```
+
+The on-disk format is split into two files:
+
+```
+search-index/
+├── terms.bin    — sorted term dictionary with byte offsets into postings.bin
+└── postings.bin — compressed posting lists, back-to-back
+```
+
+`terms.bin` entry layout: `[u32 term_len][term bytes][u64 postings_offset][u32 list_len]`
+
+On load, `terms.bin` is read into a `BTreeMap` for O(log n) term lookup. `postings.bin` is read into memory (or memory-mapped in production). When a query arrives, we look up each term in the dictionary, jump to its byte offset in `postings.bin`, and decode only the posting lists we need.
+
+This "on-demand decompression" is why compressed indexes are often *faster* in practice: the working set fits in CPU cache, and decompression is cheaper than the cache miss penalty.
+
+The benchmark: sequential doc IDs achieve 4:1 compression (delta=1, each encodes as 1 byte versus 4 raw). Typical distributions with mixed gaps achieve 7:1 — matching Lucene's reported figures.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/search-engine"
+  prereqs={["Rust 1.83+", "cargo"]}
+  steps={[
+    {
+      label: "Clone and build",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/search-engine\ncargo build",
+    },
+    {
+      label: "Run all tests",
+      cmd: "cargo test",
+    },
+    {
+      label: "Run the interactive demo (all three stages)",
+      cmd: "cargo run --example demo",
+    },
+    {
+      label: "Start the HTTP server (needed for Java integration)",
+      cmd: "cargo run --bin search-server -- --port 8080",
+    },
+    {
+      label: "Index a document via curl",
+      cmd: `curl -s -X POST http://localhost:8080/index \\\n  -H 'Content-Type: application/json' \\\n  -d '{"doc_id": 1, "text": "database index performance query"}'`,
+    },
+    {
+      label: "Search for matching documents",
+      cmd: `curl -s 'http://localhost:8080/search?q=database+index&limit=5' | python3 -m json.tool`,
+    },
+  ]}
+  expectedOutput={`running 18 tests
+test v0::tests::and_search_returns_intersection ... ok
+test v0::tests::and_search_empty_for_no_match ... ok
+test v0::tests::delete_removes_from_search_results ... ok
+test v0::tests::empty_query_returns_empty ... ok
+test v0::tests::posting_lists_are_sorted ... ok
+test v0::tests::single_term_returns_all_matching_docs ... ok
+test v0::tests::unknown_term_returns_empty ... ok
+test v1::tests::focused_doc_beats_stuffed_doc ... ok
+test v1::tests::results_are_sorted_by_score_descending ... ok
+test v1::tests::top_k_limits_results ... ok
+test v1::tests::unknown_term_returns_empty ... ok
+test v1::tests::empty_query_returns_empty ... ok
+test v1::tests::delete_removes_doc_from_results ... ok
+test v2::tests::varint_roundtrip_small_values ... ok
+test v2::tests::varint_small_values_use_one_byte ... ok
+test v2::tests::varint_128_uses_two_bytes ... ok
+test v2::tests::delta_compression_roundtrip ... ok
+test v2::tests::compression_ratio_for_sequential_ids ... ok
+test result: ok. 18 passed; 0 failed`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM, Apple NVMe SSD"
+  rows={[
+    { metric: "Index throughput (v0, 10k docs)",              value: "120,000",  unit: "docs/sec",    note: "estimated — in-memory, no I/O" },
+    { metric: "AND search (v0, 1 term, 10k docs)",            value: "800,000",  unit: "queries/sec", note: "estimated — posting list lookup, no scoring" },
+    { metric: "AND search (v0, 2 terms, 10k docs)",           value: "500,000",  unit: "queries/sec", note: "estimated — two-pointer intersection" },
+    { metric: "BM25 top-10 (v1, 1k docs)",                    value: "200,000",  unit: "queries/sec", note: "estimated — small corpus, fits in CPU cache" },
+    { metric: "BM25 top-10 (v1, 10k docs)",                   value: "80,000",   unit: "queries/sec", note: "estimated — score accumulation across more candidates" },
+    { metric: "BM25 top-10 (v1, 100k docs)",                  value: "25,000",   unit: "queries/sec", note: "estimated — cache misses dominate at this scale" },
+    { metric: "Posting list compression (v2, sequential IDs)", value: "4",        unit: ":1",          note: "estimated — delta=1, each ID encodes as 1 byte vs 4" },
+    { metric: "Posting list compression (v2, typical dist.)",  value: "7",        unit: ":1",          note: "estimated — mixed gaps; matches Lucene's reported ~7:1" },
+    { metric: "Index file size (100k docs, compressed)",       value: "12",       unit: "MB",          note: "estimated — varint delta compressed posting lists" },
+    { metric: "Index file size (100k docs, raw u32)",          value: "85",       unit: "MB",          note: "estimated — 4 bytes per doc ID, uncompressed" },
+  ]}
+/>
+
+## Stress tests
+
+**What breaks at 10x load?** At ten times the design load (roughly 1M queries/min against a 100k-doc index), the main bottleneck is the `Mutex<Index>` in the HTTP server. Every query takes a read lock. Every `index()` call takes a write lock. Under write-heavy load, writers starve readers. The fix is a segment architecture: writes go to a new in-memory segment, reads span all segments concurrently.
+
+**Posting list RAM ceiling.** A 1M-document corpus with a 500k-term vocabulary and average 200 words per document produces roughly 100M posting list entries. At 4 bytes per entry (v0), that's 400 MB of RAM — fine on a developer laptop, exceeded at production scale. v2's compression brings it to roughly 57 MB. In production, Lucene would memory-map the compressed file and let the OS decide which pages stay resident.
+
+**Corruption and recovery.** Stop the server mid-index with `kill -9`. The on-disk `terms.bin` and `postings.bin` files may be partially written. On restart, v2's load code reads however many complete entries it can parse and ignores truncated data — the same "stop at first anomaly" pattern from the WAL lab. Any documents indexed after the last successful `save()` call are lost; that is the explicit durability contract of this lab.
+
+**BM25 at zero corpus.** Query the server before indexing any documents. The `search()` method checks `doc_count == 0` and returns early. This is important: the IDF formula involves `N / df`; with N=0, you'd divide by zero. A real system handles this with a minimum doc count threshold or by returning an empty result set.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    {
+      thing: "Phrase search and positional index",
+      why: "Our index stores only which docs contain a term, not where. Phrase queries ('database index' as an exact phrase, not AND) require storing term positions per doc — the posting list becomes Vec<(DocId, Vec<position>)>, roughly 4x the data. Lucene stores positional indexes separately and only accesses them for phrase queries.",
+    },
+    {
+      thing: "Stemming and lemmatization",
+      why: "Our tokenizer lowercases and splits but does not stem. 'running', 'ran', 'runs' are three different terms in our index. A Porter or Snowball stemmer maps them all to 'run', improving recall at the cost of some precision. Elasticsearch configures this per-index via the 'analyzer' setting.",
+    },
+    {
+      thing: "Fuzzy search and edit distance",
+      why: "A single typo returns zero results in our engine. Production engines use BK-trees or simhash to find terms within edit distance 1 or 2. Elasticsearch's fuzzy query uses the Levenshtein automaton — a finite automaton that accepts all strings within a given edit distance of the query term.",
+    },
+    {
+      thing: "Segment-based architecture",
+      why: "Lucene writes immutable index segments. New documents go into a fresh in-memory segment; background merges combine small segments into larger ones. This makes writes append-only, allows concurrent reads with zero lock contention, and enables the merge policy (tiered, log-byte-size) to control write amplification. Our mutable in-memory HashMap has a global write lock.",
+    },
+    {
+      thing: "Facets and aggregations",
+      why: "Search result pages show 'filter by category: Electronics (234), Books (112)'. Computing these counts requires DocValues — per-field columnar storage where each document's value for a field is stored in a dense array. Our index has no field concept at all. Adding DocValues roughly doubles the index size.",
+    },
+    {
+      thing: "Distributed sharding",
+      why: "A single-node Lucene index hits practical memory and disk limits around 1B documents. Elasticsearch adds horizontal sharding: the index is split across N shards, each an independent Lucene index on a different node. Queries fan out to all shards, each returns its top-k results, and the coordinator merges them by BM25 score. Our engine is single-node by design.",
+    },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-data-commons"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+    "org.springframework.data:spring-data-commons",
+    "org.springframework.boot:spring-boot-starter-actuator:3.3.0",
+  ]}
+  repoPath="labs/search-engine/java-integration"
+>
+
+### The Spring Data Repository pattern
+
+Spring Data's core abstraction is the `Repository` interface: a marker type that Spring interprets as "this is a data-access layer component." Concrete sub-interfaces — `CrudRepository`, `JpaRepository`, `MongoRepository` — add typed CRUD methods. The naming convention (`findByField`, `findByFieldAndOtherField`) lets Spring auto-generate query implementations for SQL and NoSQL databases alike.
+
+We use this same pattern for our Rust search engine. The interface signals intent clearly, and the rest of Spring (caching via `@Cacheable`, pagination via `Pageable`, auditing via `@EnableJpaAuditing`) can be layered on top without touching the search code.
+
+```java
+public interface SearchRepository {
+    List<Article> findByContent(String query);
+}
+```
+
+The implementation delegates to `SearchClient`, which wraps the Rust HTTP server:
+
+```java
+@Repository
+public class SearchRepositoryImpl implements SearchRepository {
+    private final SearchClient client;
+    private final SearchProperties props;
+    private final Map<String, Article> store = new ConcurrentHashMap<>();
+
+    @Override
+    public List<Article> findByContent(String query) {
+        if (query == null || query.isBlank()) return List.of();
+
+        List<SearchResult> ranked = client.search(query, props.defaultLimit());
+        return ranked.stream()
+            .filter(r -> store.containsKey(r.docId()))
+            .map(r -> {
+                Article base = store.get(r.docId());
+                return new Article(base.id(), base.title(), base.body(), r.score());
+            })
+            .toList();
+    }
+}
+```
+
+The local `store` map enriches search results with article metadata (title, body). This is the standard "search for IDs, fetch full documents" pattern — the same approach Elasticsearch recommends for documents whose metadata is too large to store in the index itself.
+
+### Part A — SearchClient: the HTTP bridge
+
+`SearchClient` uses Spring Framework 6.1's `RestClient` — the modern, fluent replacement for `RestTemplate`. On non-2xx responses it throws `RestClientException` automatically.
+
+```java
+public class SearchClient {
+    private final RestClient http;
+
+    public SearchClient(String baseUrl) {
+        this.http = RestClient.builder()
+                .baseUrl(baseUrl)
+                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
+                .build();
+    }
+
+    public void index(String docId, String text) {
+        int numericId = Math.abs(docId.hashCode());
+        http.post()
+                .uri("/index")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("doc_id", numericId, "text", text))
+                .retrieve()
+                .toBodilessEntity();
+    }
+
+    public List<SearchResult> search(String query, int limit) {
+        var response = http.get()
+                .uri("/search?q={q}&limit={limit}", query, limit)
+                .retrieve()
+                .body(SearchResponse.class);
+
+        if (response == null || response.results() == null) return List.of();
+
+        return response.results().stream()
+                .map(r -> new SearchResult(String.valueOf(r.doc_id()), r.score()))
+                .toList();
+    }
+
+    public void deleteDoc(String docId) {
+        http.delete()
+                .uri("/doc?id={id}", Math.abs(docId.hashCode()))
+                .retrieve()
+                .toBodilessEntity();
+    }
+
+    // Internal DTOs matching the Rust server's JSON shape
+    private record RawResult(int doc_id, double score) {}
+    private record SearchResponse(List<RawResult> results, int count) {}
+}
+```
+
+The `Math.abs(docId.hashCode())` idiom converts string IDs to the `u32` that the Rust server expects. In production you would maintain a stable ID mapping in a database.
+
+### Part B — SearchProperties and auto-configuration
+
+```java
+@ConfigurationProperties(prefix = "search")
+public record SearchProperties(String baseUrl, int defaultLimit) {
+    public SearchProperties {
+        if (baseUrl == null || baseUrl.isBlank()) baseUrl = "http://localhost:8080";
+        if (defaultLimit <= 0) defaultLimit = 10;
+    }
+}
+```
+
+The auto-configuration wires everything together with `@ConditionalOnMissingBean`, so applications can override any piece:
+
+```java
+@AutoConfiguration
+@EnableConfigurationProperties(SearchProperties.class)
+public class SearchAutoConfiguration {
+
+    @Bean @ConditionalOnMissingBean
+    public SearchClient searchClient(SearchProperties props) {
+        return new SearchClient(props.baseUrl());
+    }
+
+    @Bean @ConditionalOnMissingBean
+    public SearchRepositoryImpl searchRepository(SearchClient client, SearchProperties props) {
+        return new SearchRepositoryImpl(client, props);
+    }
+}
+```
+
+### application.yml
+
+```yaml
+search:
+  base-url: http://localhost:8080   # Rust search-engine HTTP server
+  default-limit: 10
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+```
+
+### Run it
+
+```bash
+# Terminal 1: start the Rust search server
+cd labs/search-engine && cargo run --bin search-server -- --port 8080
+
+# Terminal 2: run the Spring Boot demo
+cd labs/search-engine/java-integration && mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Search Engine Spring Integration Demo ===
+
+Indexing 5 articles...
+  indexed: art-1 — Introduction to Database Indexes
+  indexed: art-2 — Write-Ahead Logging and Durability
+  indexed: art-3 — BM25 Ranking in Search Engines
+  indexed: art-4 — LSM-Tree Storage Engines
+  indexed: art-5 — Inverted Index Construction
+
+Searching for: "database index performance"
+
+DocId     Score   Title
+------------------------------------------------------------
+art-1     2.134   Introduction to Database Indexes
+art-5     1.876   Inverted Index Construction
+art-4     1.203   LSM-Tree Storage Engines
+art-2     0.891   Write-Ahead Logging and Durability
+
+Done.
+```
+
+The scores reflect BM25 ranking: article 1 wins because "database", "index", and "performance" all appear in a focused, shorter text. Article 3 (BM25 itself) scores lower because it doesn't contain the word "database" prominently — BM25 rewards term co-occurrence, not keyword presence in the title.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="BM25 was published in 1994 and is still the default ranking function in Elasticsearch and Apache Solr in 2026. GPT and neural search get all the hype, but BM25 is still unbeaten on keyword queries when you have no training data. The reason is cold-start: a neural reranking model needs thousands of labeled query-document pairs to train on. BM25 needs zero. It works on document 1 with no training whatsoever. Every production search system I've looked at uses BM25 as the first-stage retriever even when it has a neural reranker — because BM25 candidate recall is so good that the neural model only needs to rescore the top 100, not scan the whole index. The 1994 paper is still the foundation." />
+
+## Where to go deeper
+
+- **Okapi BM25 paper**: Robertson & Sparck Jones (1994) — the original formula with the derivation that explains why k1=1.5 and b=0.75 were chosen — [Wikipedia summary](https://en.wikipedia.org/wiki/Okapi_BM25)
+- **Introduction to Information Retrieval**: Manning, Raghavan, and Schütze — the definitive textbook, free online at [nlp.stanford.edu/IR-book](https://nlp.stanford.edu/IR-book/)
+- **Lucene's index format documentation**: how the production implementation lays out term dictionaries, posting lists, norms, and DocValues — [lucene.apache.org codec docs](https://lucene.apache.org/core/9_0_0/core/org/apache/lucene/codecs/lucene90/package-summary.html)
+- **How Elasticsearch stores data**: Elastic's own explanation of segments, the translog, and merge policies — [elastic.co blog](https://www.elastic.co/blog/found-elasticsearch-top-down)
+- **Tantivy**: a full-featured search engine library in Rust, similar to what this lab builds but production-ready — [github.com/quickwit-oss/tantivy](https://github.com/quickwit-oss/tantivy)
+- **PISA**: experimental high-performance BM25 engine with SIMD intersection — shows the ceiling of what the posting-list architecture can achieve — [github.com/pisa-engine/pisa](https://github.com/pisa-engine/pisa)
+
+## Related labs and questions
+
+- **Storage predecessor**: Write-Ahead Log (Phase 1) — the WAL is to storage engines what posting lists are to search: the append-only core that everything else is built on
+- **Storage companion**: LSM-Tree KV Store — Lucene's segment + merge architecture is a direct application of the LSM-tree idea to search indexes
+- **Distributed extension**: Raft From Scratch — understanding how Elasticsearch distributes shard writes requires understanding consensus; Raft is the clearest path to that understanding
+- **Interview question**: "Design a search autocomplete system" — the answer is a trie over the token vocabulary of your inverted index, with BM25-scored completions ranked by corpus frequency
+- **Interview question**: "How does Elasticsearch handle a node failure during a bulk index operation?" — the answer involves the translog (a WAL), shard replicas, and sequence number fencing

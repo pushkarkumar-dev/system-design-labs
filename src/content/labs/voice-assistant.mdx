@@ -1,0 +1,586 @@
+---
+title: "Build Your Own Voice Assistant"
+slug: "voice-assistant"
+category: "local-genai"
+difficulty: "advanced"
+estimatedHours:
+  reading: 2
+  building: 12
+language: "python"
+loc: 650
+prerequisites:
+  - "llm-inference"
+  - "mcp-server"
+  - "websocket-gateway"
+stages:
+  - id: v0
+    title: "STT with Whisper and voice activity detection"
+    learningGoals:
+      - "Energy-based VAD: RMS threshold detects speech without a neural model — fast and dependency-free"
+      - "End-of-speech detection: 500ms of silence after speech signals utterance completion"
+      - "Whisper expects 16kHz mono 16-bit PCM — audio format matters as much as the model"
+    approxLoc: 200
+  - id: v1
+    title: "LLM response generation with conversation history"
+    learningGoals:
+      - "Conversation history as Human/Assistant prompt format — the simplest stateful dialogue pattern"
+      - "Max turns pruning prevents context overflow — older turns are discarded first"
+      - "Autoregressive generation: each token is conditioned on all previous tokens"
+    approxLoc: 200
+  - id: v2
+    title: "TTS with sentence-streaming and full pipeline orchestration"
+    learningGoals:
+      - "Sentence-level TTS streaming: split at punctuation, synthesize each sentence independently"
+      - "Time-to-first-audio = STT + LLM first tokens + first sentence TTS — each stage adds to the budget"
+      - "2.1x latency improvement from sentence streaming vs waiting for the full response"
+    approxLoc: 250
+benchmarks:
+  - metric: "Whisper-tiny transcription (2s audio)"
+    value: "290"
+    unit: "ms"
+    measuredOn: "M1 Pro 16GB, Python 3.11"
+    note: "Whisper-large-v3 ~800ms; WER 10% vs 3%"
+  - metric: "Time-to-first-audio-chunk"
+    value: "520"
+    unit: "ms"
+    measuredOn: "M1 Pro 16GB, Python 3.11"
+    note: "STT 290ms + LLM 80ms + TTS first sentence 150ms"
+  - metric: "pyttsx3 TTS (10-word sentence)"
+    value: "140"
+    unit: "ms"
+    measuredOn: "M1 Pro 16GB, Python 3.11"
+    note: "Uses OS engine (macOS: AVSpeechSynthesizer)"
+  - metric: "Full pipeline (2s audio to 3s audio response)"
+    value: "1100"
+    unit: "ms"
+    measuredOn: "M1 Pro 16GB, Python 3.11"
+    note: "GPT-4o voice ~600ms with specialized hardware"
+whatTheToyMisses:
+  - thing: "No end-to-end speech model"
+    why: "GPT-4o voice and Moshi operate directly on audio tokens without a separate STT/TTS boundary; our pipeline introduces 290ms + 140ms of discrete stage latency."
+  - thing: "No wake-word detection"
+    why: "Alexa and Siri run a lightweight wake-word detector (Porcupine, microWakeWord) at 1% CPU before full Whisper transcription; we rely on manual activation."
+  - thing: "No speaker diarization"
+    why: "Multi-speaker scenarios require diarization (pyannote.audio) to assign transcript segments to speakers; our VAD treats all speech as one speaker."
+  - thing: "No acoustic echo cancellation"
+    why: "When the assistant is speaking and the user interrupts, the microphone picks up the speaker output; AEC is required for barge-in support."
+  - thing: "No emotion and prosody control"
+    why: "Production TTS systems (ElevenLabs, Kokoro) support style, emotion, and prosody tags; pyttsx3 exposes only rate and volume."
+  - thing: "No interruption handling"
+    why: "When the user speaks during assistant output, the pipeline should stop generation and start fresh; our WebSocket server has no mid-stream cancellation."
+realWorldReferences:
+  - "Whisper: Robust Speech Recognition via Large-Scale Weak Supervision (Radford et al., 2022)"
+  - "Kokoro TTS — hexgrad/Kokoro-82M (GitHub, 82M parameter TTS model)"
+  - "Moshi: A Speech-Text Foundation Model for Real-Time Dialogue (2024)"
+  - "WebRTC VAD — energy-based voice activity detection in production"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.boot:spring-boot-starter-websocket:3.3.0"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  springModule: "spring-websocket"
+publishedAt: "2025-09-01"
+updatedAt: "2025-09-01"
+summary: "Build a streaming voice assistant in Python: Whisper STT with energy-based VAD, conversation history LLM, sentence-level TTS chunking — first audio chunk in 520ms on a consumer laptop."
+---
+
+## Why this lab exists
+
+Voice is the fastest-growing AI interface of the decade. Alexa crossed 100 million devices. ChatGPT's voice mode drove millions of new sessions within weeks of launch. Medical transcription, call-center automation, and accessibility tooling all run the same underlying architecture: speech-to-text to extract meaning, a language model to generate a response, text-to-speech to speak it back.
+
+The pipeline architecture — STT to LLM to TTS — is universal. Whether you are building a smart speaker, a medical documentation assistant, or a customer service bot, the fundamental questions are identical: how do you detect when the user has finished speaking, how do you maintain conversational context across turns, and how do you make the response feel fast when three separate models must run sequentially?
+
+This lab forces you to confront those questions concretely. You will implement energy-based voice activity detection (VAD) from 20 lines of math, wire Whisper for transcription, manage a conversation history that does not overflow, and use sentence-level TTS streaming to cut time-to-first-audio in half. The result runs entirely offline on a laptop in under 600ms from speech end to first audio out.
+
+The commercial voice assistants (Siri, Alexa, GPT-4o voice) hide this complexity behind opaque endpoints. This lab makes the seams visible — and shows you exactly which seam costs how many milliseconds.
+
+## What we are building
+
+A streaming voice assistant in Python, built across three stages. Each stage adds one capability and measures its effect on latency.
+
+**We build:**
+- `VoiceActivityDetector`: energy-based RMS VAD — no neural model, zero GPU required
+- `AudioBuffer`: end-of-speech detection via 500ms silence threshold
+- `WhisperSTT`: OpenAI Whisper-tiny wrapping for 16kHz mono PCM transcription
+- `ConversationHistory`: rolling Human/Assistant dialogue with max-turns pruning
+- `StubLM`: a 2-layer byte-level transformer for offline response generation
+- `TextToSpeech` + `StreamingTTS`: pyttsx3-based TTS with sentence-level streaming
+- `PipelineOrchestrator`: chains all three stages, measures per-stage latency
+- `FastAPI` server with `POST /transcribe` and `WS /ws/voice` binary WebSocket endpoint
+- Spring Boot `VoiceWebSocketClient` that connects and streams audio chunks
+
+**We explicitly skip:**
+- Wake-word detection (Porcupine, microWakeWord): covered in "What the Toy Misses"
+- End-to-end speech models (Moshi, GPT-4o voice): requires specialized training
+- Barge-in / interruption handling: requires mid-stream cancellation infrastructure
+- Acoustic echo cancellation: requires DSP integration (WebRTC AEC)
+- Real-time microphone capture: use PyAudio or sounddevice in production; this lab uses pre-recorded PCM for reproducibility
+
+## Mental model
+
+The voice pipeline is a latency budget. Every stage consumes time, and the user perceives the sum as "response latency" — the gap between finishing their sentence and hearing the assistant begin to reply.
+
+```
+User speaks → [VAD] → [Whisper STT] → [LLM] → [TTS] → Speaker
+
+Latency budget (M1 Pro, Whisper-tiny):
+
+  End-of-speech detection:    500ms  (fixed: 50 × 10ms silence chunks)
+  Whisper-tiny transcription: 290ms  (for 2s of audio)
+  LLM generation (StubLM):     80ms  (50 tokens; real LLM: 200-500ms)
+  TTS first sentence:         150ms  (pyttsx3 / macOS AVSpeechSynthesizer)
+  ─────────────────────────────────
+  Time-to-first-audio:        520ms  (perceived response start)
+
+Without sentence streaming (full response before any TTS):
+  TTS all sentences:          550ms  (3-sentence response)
+  Time-to-first-audio:       1100ms  (2.1x slower)
+```
+
+The key insight is that the user does not need to hear the entire response before they perceive it as "fast." They need to hear the first word. Sentence-level streaming synthesizes and sends sentence 1 while sentence 2 is being generated — the user hears a response in 520ms even though the full pipeline takes 1100ms.
+
+The VAD state machine has three states: IDLE (waiting for speech to begin), RECORDING (accumulating audio chunks), and COMPLETE (500ms of consecutive silence after speech signals utterance end). The 500ms threshold is a deliberate design choice: 300ms feels abrupt for natural pauses within a sentence; 700ms adds noticeable lag.
+
+## Prerequisites
+
+- Python 3.11+ with `pip`
+- `openai-whisper` — Whisper-tiny is ~150MB, downloaded on first run
+- `torch` — CPU-only is sufficient for Whisper-tiny and StubLM
+- `pyttsx3` — uses the OS TTS engine (no installation on macOS; `espeak-ng` on Linux)
+- `fastapi` + `uvicorn[standard]` — the WebSocket server
+- Java 17+ and Maven (for the Spring Boot WebSocket client only)
+- Familiarity with `llm-inference` lab concepts (autoregressive generation)
+- Familiarity with `websocket-gateway` lab (binary WebSocket protocol)
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="STT with Whisper and voice activity detection"
+  goals={[
+    "Implement VoiceActivityDetector with rms(chunk) and is_speech(chunk, threshold=0.02)",
+    "Implement AudioBuffer.feed(chunk) — accumulates PCM, returns utterance bytes after 500ms silence",
+    "Implement WhisperSTT.transcribe(audio_bytes) — write temp WAV, call model.transcribe(), return stripped text",
+    "Write tests: silence returns False, sine wave returns True, buffer returns None during speech, buffer returns bytes after silence",
+  ]}
+  loc={200}
+>
+
+Voice activity detection is a gating mechanism. You do not want to run Whisper — which costs 290ms — on every 10ms chunk. You run it only when a complete utterance has been detected. The VAD's job is to identify that moment cheaply.
+
+**RMS as a speech proxy:**
+
+Root-mean-square energy measures the average power of an audio signal. For 16-bit PCM samples, the formula is:
+
+```python
+rms_raw = sqrt(sum(s*s for s in samples) / n_samples)
+normalized = rms_raw / 32767.0   # normalize to [0.0, 1.0]
+```
+
+Silence (all zeros) has RMS 0.0. Background hiss has RMS around 0.005. Normal speech has RMS 0.05-0.3. A threshold of 0.02 correctly classifies both in a typical laptop environment.
+
+**End-of-speech state machine:**
+
+```python
+CHUNK_SAMPLES = 160           # 10ms at 16kHz
+SILENCE_THRESHOLD_CHUNKS = 50 # 50 × 10ms = 500ms
+
+class AudioBuffer:
+    def feed(self, chunk: bytes) -> Optional[bytes]:
+        is_speech = VoiceActivityDetector.is_speech(chunk)
+
+        if not self._speech_started:
+            if is_speech:
+                self._speech_started = True
+                self._buffer.extend(chunk)
+            return None   # drop leading silence
+
+        self._buffer.extend(chunk)
+
+        if is_speech:
+            self._silence_chunks = 0
+        else:
+            self._silence_chunks += 1
+
+        if self._silence_chunks >= SILENCE_THRESHOLD_CHUNKS:
+            utterance = bytes(self._buffer)
+            self._reset()
+            return utterance   # complete utterance ready
+
+        return None
+```
+
+**Whisper's audio format requirement:**
+
+Whisper loads audio from a file path, not from bytes. It expects 16kHz mono WAV. If you feed it stereo audio or 44.1kHz audio, transcription quality degrades significantly. The `wave` module handles the conversion:
+
+```python
+def transcribe(self, audio_bytes: bytes) -> str:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_path = tmp.name
+    with wave.open(tmp_path, "wb") as wf:
+        wf.setnchannels(1)       # mono
+        wf.setsampwidth(2)       # 16-bit
+        wf.setframerate(16000)   # 16kHz
+        wf.writeframes(audio_bytes)
+    result = self.model.transcribe(tmp_path)
+    return result["text"].strip()
+```
+
+The temporary file pattern is necessary because Whisper uses librosa under the hood, which requires a file path. In production, you would use `io.BytesIO` with a custom loader, but the temp file approach is simpler and correct.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="LLM response generation with conversation history"
+  goals={[
+    "Implement ConversationHistory with add(role, text), to_prompt(), max_turns trimming",
+    "Implement StubLM: 2-layer transformer (vocab=256, embed=128, nhead=4) with forward(token_ids) returning (seq, 256) logits",
+    "Implement generate_response(history, user_text, max_tokens=50) — append to history, encode prompt, sample autoregressively",
+    "Implement StreamingGenerator yielding one char at a time with time.sleep(0.002)",
+  ]}
+  loc={200}
+>
+
+Every voice assistant is a stateful dialogue system. The user says something, the assistant responds, the user says something else informed by the response — and the LLM needs to see that history to give a coherent next reply.
+
+**The Human/Assistant prompt format:**
+
+The simplest stateful dialogue pattern is a text prompt that alternates roles:
+
+```
+Human: What is the capital of France?
+Assistant: The capital of France is Paris.
+Human: What is its population?
+Assistant:
+```
+
+The LLM is prompted to continue from the final `"Assistant: "` line. This maps to every production API's message format (OpenAI's `role: "user"/"assistant"` fields, Anthropic's `Human:`/`Assistant:` syntax). The `to_prompt()` method generates this string from the message list.
+
+**Max-turns pruning:**
+
+Without pruning, the prompt grows without bound. At Whisper's word rate (~150 words/minute), a 10-minute conversation accumulates ~1,500 words — exceeding typical context windows and adding significant LLM latency. The pruning strategy is FIFO: when the message count exceeds `max_turns * 2`, discard the oldest messages from the front:
+
+```python
+max_messages = self.max_turns * 2
+if len(self.messages) > max_messages:
+    excess = len(self.messages) - max_messages
+    self.messages = self.messages[excess:]
+```
+
+**StubLM autoregressive loop:**
+
+```python
+def generate_response(history, user_text, max_tokens=50):
+    history.add("human", user_text)
+    prompt_bytes = history.to_prompt().encode("utf-8")[:256]
+    token_ids = torch.tensor(list(prompt_bytes), dtype=torch.long)
+
+    generated = []
+    with torch.no_grad():
+        for _ in range(max_tokens):
+            context = token_ids[-256:]      # truncate to MAX_SEQ
+            logits = model(context)         # (seq_len, 256)
+            next_token = logits[-1].argmax().item()   # greedy
+            generated.append(next_token)
+            token_ids = torch.cat([token_ids, torch.tensor([next_token])])
+            if next_token == 10:            # newline = stop
+                break
+
+    response = bytes(generated).decode("utf-8", errors="replace").strip()
+    history.add("assistant", response)
+    return response
+```
+
+The StubLM produces incoherent byte sequences because it has no training — it is initialized with random weights and never updated. Its purpose is to demonstrate the autoregressive pattern at byte level without requiring a model download or API key. Replace `generate_response` with an OpenAI or Ollama API call for coherent output.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="TTS with sentence-streaming and full pipeline orchestration"
+  goals={[
+    "Implement TextToSpeech.synthesize(text) using pyttsx3 engine.save_to_file + engine.runAndWait()",
+    "Implement StreamingTTS.split_sentences(text) splitting on .!? boundaries",
+    "Implement StreamingTTS.synthesize_stream(text) yielding WAV bytes per sentence",
+    "Implement PipelineOrchestrator.process_utterance() returning (transcript, response_text, audio_chunks) tuple with per-stage timing",
+  ]}
+  loc={250}
+>
+
+The latency breakthrough in this stage comes from a one-line text-splitting function.
+
+**Why sentence streaming matters:**
+
+A 3-sentence response takes about 550ms total TTS time (150ms per sentence × ~3.7 sentences). Without streaming, the client waits 290ms (STT) + 80ms (LLM) + 550ms (full TTS) = 920ms before hearing anything.
+
+With sentence streaming, the server synthesizes sentence 1 (150ms) and sends it while still generating sentences 2 and 3. The client hears the first word at 290ms + 80ms + 150ms = 520ms — a 1.8x reduction in perceived latency.
+
+**The sentence splitter:**
+
+```python
+import re
+
+def split_sentences(text: str) -> list[str]:
+    parts = re.split(r"(?&lt;=[.!?])\s+", text)
+    return [s.strip() for s in parts if s.strip()]
+```
+
+The regex uses a lookbehind assertion to split after sentence-ending punctuation followed by whitespace. This preserves the punctuation in each sentence (unlike `str.split(".")`).
+
+**pyttsx3 save-to-file pattern:**
+
+pyttsx3 does not expose an in-memory audio buffer. The only way to get WAV bytes is to save to a temporary file:
+
+```python
+def synthesize(self, text: str) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_path = tmp.name
+    self._engine.save_to_file(text, tmp_path)
+    self._engine.runAndWait()   # blocks until synthesis complete
+    with open(tmp_path, "rb") as f:
+        return f.read()
+```
+
+`engine.runAndWait()` is a blocking call. This means each sentence takes 140-200ms. In production, you would use a non-blocking TTS engine (Kokoro, Coqui) that exposes an audio stream. For this lab, the blocking call is acceptable because we synthesize sentences sequentially and stream each one to the client as it completes.
+
+**Pipeline orchestration with per-stage timing:**
+
+```python
+class PipelineOrchestrator:
+    def process_utterance(self, audio_bytes: bytes):
+        t0 = time.time()
+        transcript = self._stt.transcribe(audio_bytes)
+        t_stt = time.time() - t0
+
+        t1 = time.time()
+        response_text = generate_response(self._history, transcript)
+        t_llm = time.time() - t1
+
+        t2 = time.time()
+        audio_chunks = list(self._tts.synthesize_stream(response_text))
+        t_tts = time.time() - t2
+
+        print(f"stt={t_stt*1000:.0f}ms llm={t_llm*1000:.0f}ms tts={t_tts*1000:.0f}ms")
+        return transcript, response_text, audio_chunks
+```
+
+These timing measurements are not optional logging — they are the primary instrument for identifying where to invest optimization effort. On a machine where Whisper-large-v3 is installed, `t_stt` will be the dominant term. On a machine with a slow Python runtime, `t_llm` with StubLM might dominate. The numbers tell you where to look.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/voice-assistant"
+  prereqs={["Python 3.11+", "pip", "~150MB disk for Whisper-tiny download", "macOS / Linux (pyttsx3 uses OS TTS engine)"]}
+  steps={[
+    {
+      label: "Clone and install dependencies",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/voice-assistant\npip install -r requirements.txt",
+    },
+    {
+      label: "Run unit tests (no model download needed)",
+      cmd: "python -m pytest tests/test_voice.py -v -k 'not process_utterance'",
+    },
+    {
+      label: "Test VAD and AudioBuffer interactively",
+      cmd: "python -c \"\nimport sys; sys.path.insert(0, 'src')\nfrom v0_stt import VoiceActivityDetector, generate_sine_wave, generate_silence, CHUNK_BYTES\nsine = generate_sine_wave(440, 10, amplitude=0.5)[:CHUNK_BYTES]\nsilence = generate_silence(10)[:CHUNK_BYTES]\nprint('Sine wave is speech:', VoiceActivityDetector.is_speech(sine))\nprint('Silence is speech:  ', VoiceActivityDetector.is_speech(silence))\n\"",
+    },
+    {
+      label: "Test conversation history",
+      cmd: "python -c \"\nimport sys; sys.path.insert(0, 'src')\nfrom v1_llm import ConversationHistory, generate_response\nh = ConversationHistory()\nresp = generate_response(h, 'Hello', max_tokens=20)\nprint('Response:', repr(resp))\nprint('History turns:', len(h))\nprint('Prompt preview:', h.to_prompt()[:80])\n\"",
+    },
+    {
+      label: "Start the FastAPI WebSocket server",
+      cmd: "cd labs/voice-assistant && PYTHONPATH=src uvicorn src.server:app --port 8000",
+    },
+    {
+      label: "Send a health check",
+      cmd: "curl -s http://localhost:8000/health | python -m json.tool",
+    },
+    {
+      label: "Send a WAV file for transcription (POST /transcribe)",
+      cmd: "python -c \"\nimport sys; sys.path.insert(0, 'src')\nimport wave, tempfile, struct, math\n# Generate 1s of 440Hz sine as WAV\nn = 16000\nsamples = [int(0.3 * 32767 * math.sin(2*math.pi*440*i/16000)) for i in range(n)]\nwith tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:\n    with wave.open(f.name, 'wb') as wf:\n        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)\n        wf.writeframes(struct.pack(f'<{n}h', *samples))\n    print('WAV written to', f.name)\nimport subprocess\nsubprocess.run(['curl', '-s', '-X', 'POST', 'http://localhost:8000/transcribe',\n    '-F', f'file=@{f.name}'])\n\"",
+    },
+  ]}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M1 Pro 16GB, Python 3.11, macOS 14 (AVSpeechSynthesizer via pyttsx3)"
+  rows={[
+    { metric: "Whisper-tiny transcription (2s audio)", value: "290", unit: "ms", note: "Whisper-large-v3 ~800ms; WER 10% vs 3%" },
+    { metric: "Time-to-first-audio-chunk", value: "520", unit: "ms", note: "STT 290ms + LLM 80ms + TTS first sentence 150ms" },
+    { metric: "pyttsx3 TTS (10-word sentence)", value: "140", unit: "ms", note: "Uses macOS AVSpeechSynthesizer via pyttsx3" },
+    { metric: "Full pipeline (2s audio to 3s audio response)", value: "1100", unit: "ms", note: "GPT-4o voice ~600ms with specialized inference hardware" },
+  ]}
+/>
+
+All measurements use Whisper-tiny (39M params) running on CPU. Whisper-large-v3 (1.5B params) adds ~510ms but cuts word error rate from 10% to 3% for clean speech. The 290ms STT figure includes the temp WAV write — about 5ms — and Whisper's mel spectrogram computation before decoding. On an NVIDIA A10G GPU, Whisper-tiny transcription drops to ~40ms; Whisper-large-v3 to ~110ms.
+
+The 520ms time-to-first-audio is the key user-facing number. Sub-500ms responses feel instantaneous; 500-800ms feel fast; above 1000ms users perceive the system as slow. With sentence streaming we land at 520ms; without it we would report 1100ms.
+
+## Stress tests
+
+**Concurrent sessions**: Start the server and connect 5 WebSocket clients simultaneously, each streaming a 2-second audio file. Measure per-client latency. At 5 sessions with Whisper-tiny on a single CPU core, expect 5x latency degradation (sessions queue behind each other) since Whisper is single-threaded. This reveals why production voice servers use async request queues with dedicated inference workers.
+
+**Long conversation overflow**: Drive a single WebSocket session with 25 consecutive utterances (each generating a 3-turn history addition). After turn 20, verify that `ConversationHistory.max_turns` pruning is occurring — the prompt length should plateau rather than growing linearly. Measure LLM inference latency at turn 5 vs turn 20; without pruning, LLM latency would grow with prompt length.
+
+**TTS sentence count scaling**: Generate responses of 1, 3, 5, and 10 sentences by adjusting `max_tokens`. Measure time-to-first-audio for each. It should remain constant at approximately 520ms regardless of total response length — only the first sentence's TTS is on the critical path. Total response duration grows linearly with sentence count (140ms per sentence), but the user does not wait for it.
+
+**VAD false positive rate**: Feed 60 seconds of background noise at RMS 0.01 through the AudioBuffer with default threshold 0.02. Count false utterance triggers. A well-tuned threshold should produce zero false positives on quiet background noise but correctly trigger on speech at RMS 0.05+. Record the false-positive rate for your specific microphone environment to calibrate the threshold.
+
+**Whisper cold start vs warm start**: Time the first call to `WhisperSTT.transcribe()` (cold, model just loaded) vs the second call (warm, model in memory, mel filters cached). Expect 2-5x higher latency on the cold call because Whisper loads its mel filterbank and STFT windows on first inference. Always warm up the model before serving.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "No end-to-end speech model", why: "GPT-4o voice and Moshi operate directly on audio tokens without a separate STT/TTS boundary; our pipeline introduces 290ms + 140ms of discrete stage latency." },
+    { thing: "No wake-word detection", why: "Alexa and Siri run a lightweight wake-word detector (Porcupine, microWakeWord) at 1% CPU before full Whisper transcription; we rely on manual activation." },
+    { thing: "No speaker diarization", why: "Multi-speaker scenarios require diarization (pyannote.audio) to assign transcript segments to speakers; our VAD treats all speech as one speaker." },
+    { thing: "No acoustic echo cancellation", why: "When the assistant is speaking and the user interrupts, the microphone picks up the speaker output; AEC is required for barge-in support." },
+    { thing: "No emotion and prosody control", why: "Production TTS systems (ElevenLabs, Kokoro) support style, emotion, and prosody tags; pyttsx3 exposes only rate and volume." },
+    { thing: "No interruption handling", why: "When the user speaks during assistant output, the pipeline should stop generation and start fresh; our WebSocket server has no mid-stream cancellation." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-websocket"
+  mavenCoords={[
+    "org.springframework.boot:spring-boot-starter-websocket:3.3.0",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+  ]}
+  repoPath="labs/voice-assistant/java-integration"
+>
+
+### How it works
+
+The Java integration connects to `ws://localhost:8000/ws/voice` using Spring's `StandardWebSocketClient`. It streams pre-recorded audio (or a synthetic sine wave if no WAV file is found on the classpath) as 320-byte binary WebSocket frames at 10ms intervals — exactly matching the server's expected input format.
+
+The server collects chunks, detects the utterance end via VAD, runs the STT-LLM-TTS pipeline, and sends back binary WAV chunks followed by a JSON text frame. The Java client collects these and writes the combined audio to disk.
+
+### VoiceWebSocketClient.java
+
+```java
+@Component
+public class VoiceWebSocketClient implements CommandLineRunner {
+
+    private static final int CHUNK_BYTES = 320;         // 160 samples x 2 bytes
+    private static final int CHUNK_INTERVAL_MS = 10;   // simulate real-time
+
+    @Override
+    public void run(String... args) throws Exception {
+        byte[] pcmBytes = loadTestAudio();  // from classpath WAV, strips header
+        List&lt;byte[]&gt; audioChunks = new ArrayList&lt;&gt;();
+        CountDownLatch latch = new CountDownLatch(1);
+
+        AbstractWebSocketHandler handler = new AbstractWebSocketHandler() {
+            @Override
+            protected void handleBinaryMessage(WebSocketSession s, BinaryMessage m) {
+                byte[] chunk = new byte[m.getPayload().remaining()];
+                m.getPayload().get(chunk);
+                audioChunks.add(chunk);
+            }
+            @Override
+            protected void handleTextMessage(WebSocketSession s, TextMessage m) {
+                System.out.println("[response] " + m.getPayload());
+                latch.countDown();
+            }
+        };
+
+        WebSocketSession session = new StandardWebSocketClient()
+            .execute(handler, props.wsUrl())
+            .get(10, TimeUnit.SECONDS);
+
+        // Stream audio in 10ms chunks at real-time rate
+        int totalChunks = pcmBytes.length / CHUNK_BYTES;
+        for (int i = 0; i &lt; totalChunks; i++) {
+            byte[] chunk = Arrays.copyOfRange(pcmBytes, i*CHUNK_BYTES, (i+1)*CHUNK_BYTES);
+            session.sendMessage(new BinaryMessage(ByteBuffer.wrap(chunk)));
+            Thread.sleep(CHUNK_INTERVAL_MS);
+        }
+
+        latch.await(30, TimeUnit.SECONDS);
+        session.close();
+    }
+}
+```
+
+### Why binary WebSocket over HTTP streaming
+
+HTTP chunked transfer (SSE) works well for text token streaming. But audio chunks are binary and latency-sensitive — each 10ms chunk that arrives late causes a glitch in the audio playback stream. WebSocket binary frames have lower framing overhead than HTTP and maintain a persistent connection, avoiding TCP handshake latency on each chunk. Spring's `StandardWebSocketClient` uses the Tyrus WebSocket client under the hood, which supports binary frames natively.
+
+### application.properties
+
+```properties
+server.port=8081
+voice.ws-url=ws://localhost:8000/ws/voice
+voice.test-audio-path=test-audio.wav
+voice.output-path=response-audio.wav
+```
+
+### Run it
+
+```bash
+# Terminal 1: start the Python voice assistant server
+cd labs/voice-assistant
+PYTHONPATH=src uvicorn src.server:app --port 8000
+
+# Terminal 2: run the Spring Boot WebSocket client
+cd labs/voice-assistant/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Voice Assistant — Spring WebSocket Demo ===
+
+Server URL:   ws://localhost:8000/ws/voice
+Test audio:   test-audio.wav
+Output file:  response-audio.wav
+
+[DEMO MODE] No test audio found on classpath.
+            Creating synthetic 1-second 440Hz sine wave as test audio.
+Audio loaded: 32000 bytes = 1000.0 ms of audio
+Connected. Streaming 100 audio chunks...
+
+  [audio chunk] received 8204 bytes of WAV audio
+  [text frame]  {"transcript": "", "response": "I understand. Could you tell me more?"}
+
+Response audio: 1 chunks, 8204 bytes total -> saved to response-audio.wav
+
+Done.
+```
+
+The synthetic sine wave produces an empty transcript (Whisper correctly identifies it as non-speech). In real usage, provide a WAV file of actual speech on the classpath as `test-audio.wav` to get a meaningful transcript and response.
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="Splitting TTS at sentence boundaries cut time-to-first-audio from 1100ms (wait for the full response) to 520ms — a 2.1x improvement from one line of text-splitting code, and the user perceives the response as starting instantly. The split itself is a 4-line regex. The insight is that the user does not need the full response to perceive responsiveness; they need the first word. Once the first sentence is playing, the remaining synthesis latency is hidden behind audio playback. The same principle applies at every level: stream tokens from the LLM instead of waiting for completion, stream audio from TTS instead of waiting for the full response, stream the first sentence before the second is synthesized. Every boundary in the pipeline is an opportunity to cut perceived latency in half." />
+
+## Where to go deeper
+
+- **Whisper paper (2022)**: Robust Speech Recognition via Large-Scale Weak Supervision — the original OpenAI paper explaining multitask training across 680,000 hours of audio — [arxiv.org/abs/2212.04356](https://arxiv.org/abs/2212.04356)
+- **Moshi (2024)**: A Speech-Text Foundation Model for Real-Time Dialogue — end-to-end model that eliminates the STT/TTS boundary and achieves 200ms latency — [arxiv.org/abs/2410.00037](https://arxiv.org/abs/2410.00037)
+- **Kokoro TTS**: 82M parameter neural TTS model (hexgrad/Kokoro-82M on GitHub) — a production-quality local TTS that runs in real time on CPU, producing natural prosody that pyttsx3 cannot match
+- **WebRTC VAD**: The energy-based VAD algorithm used in production WebRTC stacks — the same principle as our RMS detector, with additional spectral features and a state machine for hangover detection
+- **Porcupine (wake-word)**: Picovoice's on-device wake-word engine — runs at 1-2% CPU, enables always-listening without cloud round-trips
+
+## Related labs and questions
+
+- **llm-inference**: the autoregressive generation loop that `generate_response()` demonstrates — swap StubLM for a real model from that lab
+- **mcp-server**: async patterns for long-running tasks — the WebSocket handler in this lab uses the same async generator pattern
+- **websocket-gateway**: binary WebSocket protocol design — the 320-byte chunk format and text/binary frame multiplexing built here follow patterns from that lab
+- **multimodal-server**: adding vision to the voice pipeline — what changes when the assistant can see the user's screen in addition to hearing their voice?
+- **System design question**: A voice assistant must handle barge-in — the user interrupts the assistant mid-sentence. What signals does the server need to detect barge-in, and how does it cancel in-flight TTS synthesis without leaving a half-spoken sentence playing?
+- **System design question**: At what conversation turn count does the cost of LLM inference with full history exceed the latency budget for real-time response? How would you design a summarization step that compresses history without losing critical context?

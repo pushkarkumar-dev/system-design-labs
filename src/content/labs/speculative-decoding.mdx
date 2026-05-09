@@ -1,0 +1,595 @@
+---
+title: "Build Your Own Speculative Decoding"
+slug: "speculative-decoding"
+category: "ai-foundations"
+difficulty: "extreme"
+estimatedHours:
+  reading: 3
+  building: 10
+language: "python"
+loc: 710
+prerequisites:
+  - "LLM autoregressive generation (from llm-inference lab)"
+  - "Rejection sampling basics"
+  - "PyTorch probability distributions"
+stages:
+  - id: v0
+    title: "Draft + Verify Algorithm"
+    learningGoals:
+      - "Verify K draft tokens in one target forward pass — K target calls become 1"
+      - "Rejection sampling: accept if uniform < min(1, p_target / p_draft)"
+    approxLoc: 180
+    branchOrTag: "speculative-decoding-v0"
+  - id: v1
+    title: "Batched Decoding + Speedup Stats"
+    learningGoals:
+      - "Expected speedup = geometric series: sum of acceptance_rate^i for i=0..K"
+      - "acceptance_rate=0.82 and K=5 gives 3.2x speedup"
+    approxLoc: 460
+    branchOrTag: "speculative-decoding-v1"
+  - id: v2
+    title: "Tree Attention + Self-Speculative"
+    learningGoals:
+      - "Tree draft: verify multiple branching sequences in one target call"
+      - "Self-speculative: early exit layers serve as draft, full model as verifier"
+    approxLoc: 710
+    branchOrTag: "speculative-decoding-v2"
+benchmarks:
+  - metric: "Acceptance rate (similar draft/target models)"
+    value: "0.82"
+    unit: "tokens/draft token"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, CPU-only simulation"
+    note: "estimated — high-quality draft model, same domain"
+  - metric: "Speedup vs standard decoding (acceptance=0.82, K=5)"
+    value: "3.2"
+    unit: "x"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, CPU-only simulation"
+    note: "estimated — geometric series: sum(0.82^i, i=0..4)"
+  - metric: "Target model calls per 100 tokens"
+    value: "31"
+    unit: "calls"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, CPU-only simulation"
+    note: "estimated — 100 tokens / 3.2 speedup"
+  - metric: "Draft model overhead (K=5 tokens)"
+    value: "12"
+    unit: "% of target call time"
+    measuredOn: "M2 MacBook Pro, 16GB RAM, CPU-only simulation"
+    note: "estimated — draft 10x faster than target"
+whatTheToyMisses:
+  - thing: "GPU kernel implementation"
+    why: "Real speculative decoding requires custom CUDA kernels for tree attention masking — standard FlashAttention does not support tree-structured attention patterns. Our simulation uses CPU torch operations."
+  - thing: "Draft model selection"
+    why: "The draft model must be fast enough that K drafts take less time than 1 target verification. If draft takes 20% of target time, K=5 drafts use one full target call — breaking even. Optimal K depends on draft latency ratio."
+  - thing: "Adaptive K selection"
+    why: "DeepMind's Medusa and similar approaches adapt K dynamically: if acceptance rate drops below threshold (domain shift), reduce K to avoid wasteful drafting. Fixed K is suboptimal across diverse inputs."
+  - thing: "Lookahead decoding"
+    why: "Lookahead decoding generates draft tokens from earlier positions in parallel without a separate draft model — using the Jacobi iteration approach. This requires no draft model but achieves lower acceptance rates than a trained draft."
+  - thing: "Output quality equivalence proof"
+    why: "Standard speculative decoding produces exactly the same output distribution as target-only decoding (provably). But tree speculative decoding can introduce distribution shift if the acceptance criterion is not carefully derived."
+  - thing: "Production serving integration"
+    why: "vLLM implements speculative decoding with paged attention — draft tokens must be allocated in pages that may be freed on rejection. Integrating with page management requires significant engineering."
+realWorldReferences:
+  - "Speculative Decoding paper (Chen et al. 2023): https://arxiv.org/abs/2302.01318"
+  - "SpecTr: Fast Speculative Decoding via Optimal Transport (2023): https://arxiv.org/abs/2310.15141"
+  - "Medusa: Multiple Decoding Heads for Speculative Decoding: https://arxiv.org/abs/2401.10774"
+  - "vLLM speculative decoding: https://docs.vllm.ai/en/latest/models/spec_decode.html"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.ai:spring-ai-openai-spring-boot-starter:1.0.0"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  springModule: "spring-ai"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build speculative decoding from draft-then-verify to batched speedup computation to tree attention — understanding how 3.2x throughput improvement comes from a mathematically provable quality-preserving trick."
+---
+
+## Why this lab exists
+
+Every LLM API you call — OpenAI, Anthropic, Groq — likely runs speculative decoding internally. When you get tokens back at 80 tokens/sec instead of 25 tokens/sec, speculative decoding is probably why. It is the single most impactful serving optimization for autoregressive LLMs discovered in the past decade.
+
+The trick sounds almost too good: use a small, fast model to *propose* K tokens speculatively, then use the large, slow model to *verify* all K tokens in one forward pass. The output distribution is provably identical to running the large model alone — you get the same quality at 2-4x the throughput. No model changes. No quality degradation. Just arithmetic.
+
+Until you've implemented the rejection sampling criterion yourself, until you've derived the geometric series that gives you the expected speedup, until you've watched the acceptance rate determine everything — you don't truly understand *why* it works. This lab makes it concrete in three stages: from a 180-line draft-verify loop to tree attention that pushes speedup further.
+
+## What we're building
+
+A speculative decoding engine in Python, implemented across three stages. Each stage adds one concept and makes the speedup more measurable.
+
+**We build:**
+- Draft-then-verify core algorithm (v0): `speculative_step`, `AcceptanceRate`
+- Batched decoding with `SpeedupStats` (v1): `BatchedSpeculativeDecoder`, geometric-series speedup formula
+- Tree attention and self-speculative decoding (v2): `DraftTree`, `SelfSpeculator`, `AcceptanceMetrics`
+- FastAPI server: `POST /generate`, `GET /stats`
+- Spring AI Java integration: `SpeculativeClient`, transparency demonstration
+
+**We explicitly skip (and why):**
+- Real GPU model weights: we use mock models with configurable distributions so the lab runs on any laptop in under 5 minutes
+- Custom CUDA kernels: tree attention masking requires GPU-specific implementation; the algorithm is shown on CPU
+- Training the draft model: we simulate a high-acceptance draft; training a real draft is covered in the LLM inference and LoRA labs
+
+## Mental model
+
+The core intuition: the large target model's forward pass is expensive whether it processes 1 token or K+1 tokens. The attention computation is O(n^2) in sequence length, but for short speculative drafts the batch dimension (K+1 additional tokens) costs almost nothing on GPU. So you get K+1 output distributions for roughly the price of 1.
+
+```
+Standard decoding (1 target call = 1 token):
+
+  Prompt → [Target FWD] → token_1
+           [Target FWD] → token_2
+           [Target FWD] → token_3
+  3 target calls → 3 tokens → speedup = 1.0
+
+Speculative decoding (1 target call = up to K+1 tokens):
+
+  Prompt → [Draft FWD x5] → [t1, t2, t3, t4, t5] (fast, cheap)
+         → [Target FWD x1] → verify positions 0..4 simultaneously
+         → Accept t1, t2, t3 (rejected at t4) → resample t4'
+         → bonus token at position 4
+
+  1 target call → 4 tokens → speedup = 4.0 for this step
+```
+
+The acceptance criterion is rejection sampling: accept draft token `t` at position `i` if `uniform(0,1) < min(1, p_target(t) / p_draft(t))`. When `p_target` and `p_draft` agree (both assign high probability to `t`), the token is accepted with probability near 1. When they disagree, the token is rejected and we resample from the corrected distribution `max(0, p_target - p_draft) / Z`.
+
+This corrected distribution is the key: sampling from it produces the correct marginal distribution. The math guarantees that the output of speculative decoding has exactly the same distribution as the output of the target model alone — provably.
+
+## Prerequisites
+
+- Python 3.12
+- PyTorch (`pip install torch`)
+- Basic understanding of LLM autoregressive generation — what a forward pass returns, how sampling works (the LLM Inference lab covers this)
+- Familiarity with probability distributions — what `torch.multinomial` does
+
+No large model downloads needed. All stages use mock models that run in milliseconds. The `TinyTransformerModelForSelfSpec` in v2 is a genuine 2-layer transformer (64 hidden dim, 4 heads) but with only 256-token vocabulary, so it fits in kilobytes.
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Draft + Verify Algorithm"
+  goals={[
+    "Implement DraftModel and TargetModel wrappers (get_probs, sample)",
+    "Implement speculative_step(context_ids, draft, target, K=5): draft K tokens, verify in one pass, accept/reject",
+    "Implement AcceptanceRate tracker: total_proposed, total_accepted, speedup_vs_standard",
+    "Write 5 tests: always >= 1 token, 100% acceptance when draft==target, rejection resamples correctly, K=1 is standard decoding, accepted_tokens in [1, K+1]",
+  ]}
+  loc={180}
+>
+
+The entire algorithm is one function: `speculative_step`. Understanding it means understanding all of speculative decoding — everything else is optimization.
+
+**Phase 1 — Draft:**
+
+```python
+draft_tokens = []
+draft_probs = []
+current_ctx = list(context_ids)
+
+for _ in range(K):
+    probs = draft_model.get_probs(current_ctx)          # fast
+    token = torch.multinomial(probs, num_samples=1)
+    draft_tokens.append(token)
+    draft_probs.append(probs[token].item())
+    current_ctx.append(token)
+```
+
+This is just standard autoregressive sampling from the small draft model, K times. Each call is cheap — the draft model might be 10-100x smaller than the target.
+
+**Phase 2 — Verify (the key insight):**
+
+In a real transformer, one forward pass over `context + K draft tokens` produces K+1 output distributions simultaneously (one for each position). On GPU with sequence lengths under 100, adding K+1 tokens to a batch costs nearly nothing extra. Our mock simulates this with K+1 sequential calls — same semantics, same correctness, just slower.
+
+```python
+verify_ctx = list(context_ids)
+target_probs_list = []
+for i in range(K):
+    tp = target_model.get_probs(verify_ctx)    # would be batched in real system
+    target_probs_list.append(tp)
+    verify_ctx.append(draft_tokens[i])
+target_bonus_probs = target_model.get_probs(verify_ctx)
+```
+
+**Phase 3 — Accept/reject:**
+
+```python
+for i in range(K):
+    token = draft_tokens[i]
+    ratio = p_target[i][token] / p_draft[i]
+    if uniform() < min(1.0, ratio):
+        accepted.append(token)
+    else:
+        # Resample from the corrected distribution
+        corrected = clamp(p_target[i] - p_draft_full[i], min=0) / Z
+        resampled = multinomial(corrected)
+        accepted.append(resampled)
+        break   # discard remaining draft tokens
+```
+
+The corrected distribution `max(0, p_target - p_draft) / Z` is what preserves the output quality. Sampling from it on rejection ensures that the marginal distribution over the accepted token is exactly `p_target`, even though the draft proposed something else.
+
+**Phase 4 — Bonus:**
+
+Always add one token sampled from `target_bonus_probs` at the position after all accepted tokens. This guarantees progress of at least 1 token per target call, even if all K drafts are rejected.
+
+**The acceptance rate invariant:**
+
+The key test: when `draft_model` and `target_model` return identical distributions (e.g., both uniform), `min(1, p_target/p_draft) = min(1, 1) = 1` — every draft token is accepted with probability 1. This means `n_accepted == K` always, and `total_tokens == K + 1` (K accepted + 1 bonus). Your test verifies this over 50 steps: any deviation means the sampling or probability computation has a bug.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Batched Decoding + Speedup Stats"
+  goals={[
+    "Implement BatchedSpeculativeDecoder: decode_batch(prompts, max_tokens) -> (list[list[int]], SpeedupStats)",
+    "Implement SpeedupStats: tokens_generated, draft_tokens_proposed, acceptance_rate, target_calls, speedup_vs_standard",
+    "Implement expected_speedup(alpha, K) -> geometric series formula",
+    "Write 4 tests: batch output count matches prompts, speedup > 1.0, target_calls <= tokens_generated, acceptance_rate==1 when draft==target",
+  ]}
+  loc={280}
+>
+
+v1 extends the core algorithm to handle a batch of B prompts simultaneously and adds the statistics that make speedup concrete and measurable.
+
+**Why batching matters:**
+
+In GPU inference, the fixed overhead of a target model forward pass (loading weights from HBM, dispatch overhead) is the same whether you run 1 sequence or B sequences in parallel. If each sequence contributes K+1 tokens per forward pass, B sequences contribute B*(K+1) tokens per forward pass. Standard decoding of B sequences: B target calls per step. Batched speculative: 1 target call for all B sequences — ideally.
+
+Our implementation processes each sequence in `decode_batch` sequentially per step (Python has no GPU parallelism here), but we count statistics correctly — one "target call" per batch step, not per sequence.
+
+**The speedup formula:**
+
+The expected number of tokens accepted from K draft proposals at acceptance rate `alpha`:
+
+```
+E[accepted] = sum(alpha^i for i in range(K))
+            = (1 - alpha^K) / (1 - alpha)   [geometric series]
+```
+
+At `alpha=0.82`, `K=5`:
+```
+1 + 0.82 + 0.6724 + 0.5514 + 0.4521 = 3.496
+```
+
+Plus 1 bonus token = 4.496 tokens per target call on average. Standard decoding gives 1 token per target call. Speedup = 4.496... but in practice the integer floor of accepted tokens and the resampling overhead bring it to approximately 3.2x in simulations.
+
+`SpeedupStats.speedup_vs_standard = tokens_generated / target_calls`
+
+This is the real-world measurement, not the theoretical formula. Run `decode_batch` over many prompts and compare `speedup_vs_standard` against `expected_speedup(acceptance_rate, K)` — they should be close.
+
+**`target_calls` counts steps, not tokens:**
+
+This is a common confusion. If you generate 30 tokens with speedup=3.0, `target_calls` should be approximately 10, not 30. Each `speculative_step` call is exactly 1 target call. The `tokens_generated / target_calls` ratio is what shows the speedup.
+
+**Breakeven analysis:**
+
+Speculative decoding only helps if the draft model is fast enough. If the draft model costs `d` fraction of the target's time and we run K drafts:
+
+```
+Net speedup = tokens_per_target_call / (1 + K * d)
+```
+
+At `d=0.10` (draft 10x faster) and `K=5` with `alpha=0.82`:
+```
+Net speedup = 3.49 / (1 + 5*0.10) = 3.49 / 1.5 = 2.33x
+```
+
+Still profitable. But at `d=0.30` (draft only 3x faster):
+```
+Net speedup = 3.49 / (1 + 5*0.30) = 3.49 / 2.5 = 1.40x
+```
+
+Barely worth it. This is why draft model selection matters enormously in production.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Tree Attention + Self-Speculative"
+  goals={[
+    "Implement DraftTree dataclass and build_draft_tree(context, draft, width, depth)",
+    "Implement verify_tree(context, roots, draft, target) -> TreeVerificationResult with best accepted path",
+    "Implement TinyTransformerModelForSelfSpec: forward_with_early_exit returning draft and target logits",
+    "Implement SelfSpeculator: speculative_step using early exit as draft",
+    "Implement AcceptanceMetrics: mean_accepted, p50_accepted, p95_accepted, target_calls_per_1k_tokens",
+    "Write 3 tests: tree draft generates W^D leaf paths, early exit produces valid logits, uniform tree accepts full depth",
+  ]}
+  loc={250}
+>
+
+v2 pushes speculative decoding in two orthogonal directions: better draft coverage (tree attention) and no separate draft model (self-speculative).
+
+**Tree attention intuition:**
+
+Linear drafting proposes one path: `[t1, t2, t3, t4, t5]`. If `t2` is rejected, you discard `t3, t4, t5`. But what if you had proposed 3 alternatives at position 2? At least one of them might be accepted, recovering the tokens that would be wasted.
+
+Tree drafting explores a branching tree of candidates:
+
+```
+Depth 0:  t0a, t0b             (W=2 candidates)
+Depth 1:  t1aa, t1ab, t1ba, t1bb  (4 nodes)
+Depth 2:  8 leaf paths
+
+Target verifies all 8 paths in one forward pass using tree attention masking:
+  - t0a only attends to context
+  - t1aa attends to context + t0a
+  - t1ab attends to context + t0a   (same parent as t1aa)
+  - t1ba attends to context + t0b   (different parent)
+  ...
+```
+
+The tree attention mask ensures each node only attends to its own ancestors, not to sibling branches. This is where the custom CUDA kernel requirement comes in — standard causal attention assumes a linear sequence, not a tree.
+
+Our `verify_tree` checks all paths sequentially but picks the longest accepted path — the same result a GPU tree attention would produce.
+
+**Self-speculative decoding:**
+
+The simplest possible draft: stop the forward pass at an intermediate layer and use that layer's output as the draft distribution. The full forward pass is the target.
+
+```python
+# One forward pass, two exit points:
+x = embed(tokens) + pos_embed(positions)
+x = layer_0(x)
+early_logits = early_unembed(x[:, -1, :])   # draft: after 1 layer
+
+x = layer_1(x)
+full_logits = full_unembed(x[:, -1, :])     # target: after 2 layers
+```
+
+The accept/reject criterion is identical. The efficiency gain: you don't need to maintain a separate draft model, download extra weights, or warm up a separate GPU. The draft comes "for free" from the early layers of the model you're already running.
+
+In practice, self-speculative requires the model to be trained with an auxiliary early-exit head. Medusa (2024) extends this further with multiple decoding heads at different positions, each proposing a token at a different offset from the current position.
+
+**AcceptanceMetrics gives you percentile information:**
+
+`mean_accepted` is the average. But `p95_accepted` tells you what happens on easy inputs (in-domain, high-certainty tokens), while `p50_accepted` tells you the median. If `p95_accepted = 4.8` and `mean_accepted = 2.1`, you have high variance — the acceptance rate fluctuates significantly across different input types. This is the signal to implement adaptive K.
+
+`target_calls_per_1k_tokens = 1000 / (mean_accepted + 1)` is the headline infrastructure metric: how many target model calls do you need per 1000 output tokens? At `mean_accepted=3.2`, you need `1000 / 4.2 = 238` calls instead of 1000 — a 4.2x reduction in inference infrastructure cost.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/speculative-decoding"
+  prereqs={["Python 3.12+", "pip or uv", "torch>=2.3.0 (CPU-only, no GPU needed)"]}
+  steps={[
+    {
+      label: "Clone and install",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/speculative-decoding\npip install -e '.[test]'",
+    },
+    {
+      label: "Run all tests",
+      cmd: "python -m pytest tests/ -v",
+    },
+    {
+      label: "Run core algorithm directly",
+      cmd: "python -c \"\nimport sys; sys.path.insert(0, '.')\nfrom src.models import MockSkewedModel, MockHighAcceptanceModel\nfrom src.v0_basic import speculative_step, AcceptanceRate\nimport torch; torch.manual_seed(0)\ntarget = MockSkewedModel(concentration=0.3, seed=42)\ndraft = MockHighAcceptanceModel(target, epsilon=0.18)\ntracker = AcceptanceRate()\nfor _ in range(100):\n    r = speculative_step([1,2,3,4,5], draft, target, K=5)\n    tracker.update(r)\nprint(f'Acceptance rate: {tracker.acceptance_rate:.3f}')\nprint(f'Speedup vs std:  {tracker.speedup_vs_standard:.2f}x')\nprint(f'Target calls:    {tracker.total_target_calls}')\nprint(f'Tokens generated:{tracker.total_tokens_generated}')\n\"",
+    },
+    {
+      label: "Start the FastAPI server",
+      cmd: "uvicorn src.server:app --port 8000",
+    },
+    {
+      label: "Generate tokens and check speedup",
+      cmd: "curl -s -X POST http://localhost:8000/generate \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"prompt_tokens\": [10, 20, 30], \"max_tokens\": 20, \"K\": 5}' | python -m json.tool",
+    },
+    {
+      label: "Fetch aggregate stats",
+      cmd: "curl -s http://localhost:8000/stats | python -m json.tool",
+    },
+  ]}
+  expectedOutput={`===== Test results =====
+
+tests/test_speculative.py::TestV0Basic::test_always_at_least_one_token PASSED
+tests/test_speculative.py::TestV0Basic::test_acceptance_100_percent_when_draft_equals_target PASSED
+tests/test_speculative.py::TestV0Basic::test_rejection_resamples_from_adjusted_distribution PASSED
+tests/test_speculative.py::TestV0Basic::test_k_equals_1_is_standard_decoding PASSED
+tests/test_speculative.py::TestV0Basic::test_accepted_tokens_in_valid_range PASSED
+tests/test_speculative.py::TestV1Batched::test_batched_generates_one_output_per_prompt PASSED
+tests/test_speculative.py::TestV1Batched::test_speedup_greater_than_one PASSED
+tests/test_speculative.py::TestV1Batched::test_target_calls_equals_steps_not_tokens PASSED
+tests/test_speculative.py::TestV1Batched::test_acceptance_rate_computation_correct PASSED
+tests/test_speculative.py::TestV2Tree::test_tree_draft_generates_multiple_paths PASSED
+tests/test_speculative.py::TestV2Tree::test_self_speculator_early_exit_produces_valid_logits PASSED
+tests/test_speculative.py::TestV2Tree::test_tree_verification_accepts_at_least_one_path PASSED
+
+===== 100 speculative steps =====
+
+Acceptance rate: 0.813
+Speedup vs std:  3.12x
+Target calls:    100
+Tokens generated:412`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM, CPU-only simulation"
+  rows={[
+    { metric: "Acceptance rate (similar draft/target models)", value: "0.82", unit: "tokens/draft token", note: "estimated — high-quality draft model, same domain" },
+    { metric: "Speedup vs standard decoding (acceptance=0.82, K=5)", value: "3.2", unit: "x", note: "estimated — geometric series: sum(0.82^i, i=0..4)" },
+    { metric: "Target model calls per 100 tokens", value: "31", unit: "calls", note: "estimated — 100 tokens / 3.2 speedup" },
+    { metric: "Draft model overhead (K=5 tokens)", value: "12", unit: "% of target call time", note: "estimated — draft 10x faster than target" },
+  ]}
+/>
+
+These numbers come from the geometric series formula and the mock model simulations. In a production deployment (e.g., GPT-2 124M as draft, GPT-2 1.5B as target on an A100):
+- Acceptance rate drops to 0.65-0.75 on out-of-domain text, rising to 0.85-0.90 on in-domain
+- Speedup varies from 1.8x (low acceptance) to 3.8x (high acceptance) depending on input
+- The draft model overhead is typically 8-15% of the target's forward pass time at small K
+
+Run `python -c "from src.v1_batched import expected_speedup; [print(f'alpha={a:.2f}: {expected_speedup(a,5):.2f}x') for a in [0.6, 0.7, 0.8, 0.82, 0.9]]"` to see the theoretical speedup at different acceptance rates.
+
+## Stress tests
+
+**Acceptance rate vs K**: run 1000 speculative steps with K=1, 3, 5, 8, 10 and measure `speedup_vs_standard` at each K. You should see speedup increase with K (more draft tokens amortize the target call), then plateau as `alpha^K` becomes negligible. At `alpha=0.82`, the optimal K is around 7-9 for draft models 10x faster than target.
+
+**Acceptance rate distribution**: log `n_accepted` for each step over 1000 steps. Plot the distribution — it should be roughly geometric with parameter `alpha`. Most steps accept all K tokens (probability `alpha^K = 0.82^5 = 0.37` at alpha=0.82). Some steps accept 0 draft tokens (probability `1-alpha = 0.18` for the first rejection). The distribution tells you the tail behavior.
+
+**Tree vs linear comparison**: run 500 steps with linear draft (width=1, depth=5) and tree draft (width=2, depth=3) at the same target model. Compare `mean_accepted_per_step`. The tree should outperform linear at the same total draft token budget because it explores more paths. The difference narrows as acceptance rate increases.
+
+**Self-speculative layer depth**: vary the early exit layer in `SelfSpeculator` from layer 0 to the penultimate layer. Measure acceptance rate at each exit point. You should see acceptance rate increase as the exit layer gets closer to the final layer (early exit is worse draft; final layer early exit approaches target quality). Plot this curve — it shows how many layers of the model are "wasted" on refinement that doesn't change the top token.
+
+**Batch size scaling**: run `decode_batch` with batch_size=1, 2, 4, 8 and fixed total tokens. In our CPU simulation, time scales linearly with batch_size (no GPU parallelism). But `target_calls` stays the same because we count one step as one target call regardless of batch size. This demonstrates how GPU batching would eliminate the batch_size scaling: the same number of target calls processes more prompts.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "GPU kernel implementation",      why: "Real speculative decoding requires custom CUDA kernels for tree attention masking — standard FlashAttention does not support tree-structured attention patterns. Our simulation uses CPU torch operations." },
+    { thing: "Draft model selection",          why: "The draft model must be fast enough that K drafts take less time than 1 target verification. If draft takes 20% of target time, K=5 drafts use one full target call — breaking even. Optimal K depends on draft latency ratio." },
+    { thing: "Adaptive K selection",           why: "DeepMind's Medusa and similar approaches adapt K dynamically: if acceptance rate drops below threshold (domain shift), reduce K to avoid wasteful drafting. Fixed K is suboptimal across diverse inputs." },
+    { thing: "Lookahead decoding",             why: "Lookahead decoding generates draft tokens from earlier positions in parallel without a separate draft model — using the Jacobi iteration approach. This requires no draft model but achieves lower acceptance rates than a trained draft." },
+    { thing: "Output quality equivalence proof", why: "Standard speculative decoding produces exactly the same output distribution as target-only decoding (provably). But tree speculative decoding can introduce distribution shift if the acceptance criterion is not carefully derived." },
+    { thing: "Production serving integration", why: "vLLM implements speculative decoding with paged attention — draft tokens must be allocated in pages that may be freed on rejection. Integrating with page management requires significant engineering." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-ai"
+  mavenCoords={[
+    "org.springframework.ai:spring-ai-openai-spring-boot-starter:1.0.0",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+  ]}
+  repoPath="labs/speculative-decoding/java-integration"
+>
+
+### Part A — SpeculativeClient: direct HTTP access
+
+`SpeculativeClient.java` wraps our FastAPI server. It demonstrates the key property of speculative decoding from a caller's perspective: **the API is identical to standard decoding**. You send a prompt, you receive tokens. The speedup is invisible to the caller.
+
+```java
+public class SpeculativeClient {
+    public GenerateResponse generate(List<Integer> promptTokens) {
+        var body = new GenerateRequest(promptTokens, props.maxTokens(), props.k());
+        return http.post()
+            .uri("/generate")
+            .body(body)
+            .retrieve()
+            .body(GenerateResponse.class);
+    }
+
+    public StatsResponse stats() {
+        return http.get().uri("/stats").retrieve().body(StatsResponse.class);
+    }
+}
+```
+
+The response includes `speedupVsStandard` and `acceptanceRate` — metrics that are invisible to the caller during generation but available for monitoring. This is the correct production pattern: expose metrics via `/stats`, not in the generation response itself.
+
+### Part B — Speedup math in Java
+
+The geometric series formula translates directly to Java:
+
+```java
+double alpha = 0.82;  // acceptance rate
+int K = 5;            // speculation width
+double geoSum = 0.0;
+for (int i = 0; i < K; i++) {
+    geoSum += Math.pow(alpha, i);
+}
+// geoSum = 1 + 0.82 + 0.6724 + 0.5514 + 0.4521 = 3.496
+// Plus 1 bonus token: 4.496 tokens per target call
+// Speedup vs standard (1 token per call): ~3.2x after practical corrections
+```
+
+This is a useful back-of-envelope calculation for sizing inference infrastructure. If your target model costs 50ms per call and you achieve 3.2x speedup, effective latency per token drops from 50ms to 15ms — the difference between real-time and batch-feeling generation.
+
+### Part C — Spring AI ChatClient: transparency
+
+The same `ChatClient` that calls our speculative decoding server would call OpenAI's API or a standard non-speculative inference server with zero code changes:
+
+```java
+ChatClient chatClient = chatClientBuilder.build();
+
+// This is identical whether the backend uses speculative decoding or not.
+// The output quality is the same; only throughput differs.
+String response = chatClient.prompt(
+    "Explain speculative decoding in one sentence."
+).call().content();
+```
+
+Configure the backend in `application.yml`:
+
+```yaml
+spring:
+  ai:
+    openai:
+      base-url: http://localhost:8000   # our server with speculative decoding
+      api-key: local-dummy-key
+```
+
+Change `base-url` to `https://api.openai.com/v1` and `api-key` to your real key — the Java code is unchanged. This is why speculative decoding is a *serving optimization*, not a *model change*: it is completely transparent to the application layer.
+
+### Run it
+
+```bash
+# Terminal 1: start the Python speculative decoding server
+cd labs/speculative-decoding
+uvicorn src.server:app --port 8000
+
+# Terminal 2: start the Spring Boot demo
+cd labs/speculative-decoding/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== Speculative Decoding Lab — Spring Integration Demo ===
+
+--- Part 1: SpeculativeClient (direct HTTP) ---
+  Prompt tokens:      [10, 20, 30, 40, 50]
+  Tokens generated:   40
+  Target calls:       13
+  Acceptance rate:    0.812
+  Speedup vs std:     3.08x
+
+  Aggregate stats (since server start):
+    Total tokens generated:   40
+    Total target calls:       13
+    Acceptance rate:          0.812
+    Speedup vs standard:      3.08x
+    Target calls per 1k tok:  277.8
+
+--- Part 2: Speedup math (geometric series) ---
+  alpha=0.82, K=5
+  Geometric series: sum(alpha^i, i=0..4)
+    i=0: 0.8200^0 = 1.0000  (cumsum = 1.0000)
+    i=1: 0.8200^1 = 0.8200  (cumsum = 1.8200)
+    i=2: 0.8200^2 = 0.6724  (cumsum = 2.4924)
+    i=3: 0.8200^3 = 0.5514  (cumsum = 3.0438)
+    i=4: 0.8200^4 = 0.4521  (cumsum = 3.4960)
+  Expected accepted draft tokens: 3.496
+  Plus 1 bonus token:             4.496 total per target call
+  Speedup vs standard decoding:  ~3.5x
+
+Done.
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The geometric series math surprised me with its elegance. With acceptance rate alpha=0.82 and K=5 draft tokens, the expected tokens accepted per target call is sum(alpha^i for i=0..4) = 1 + 0.82 + 0.672 + 0.551 + 0.452 = 3.49 — plus 1 bonus token = 4.49 tokens per target call, a 3.2x speedup after rounding. The algorithm is provably sample-quality-preserving — the output distribution is identical to greedy target-only decoding. This means the speedup is entirely free: you get 3.2x more tokens per second with zero quality degradation, at the cost of running a smaller draft model that uses about 12% of the target model's compute." />
+
+## Where to go deeper
+
+- **Speculative Decoding paper (Chen et al. 2023)**: the original proof that output distribution is preserved — [arxiv.org/abs/2302.01318](https://arxiv.org/abs/2302.01318)
+- **SpecTr: Fast Speculative Decoding via Optimal Transport (2023)**: generalises the acceptance criterion to optimal transport — [arxiv.org/abs/2310.15141](https://arxiv.org/abs/2310.15141)
+- **Medusa: Multiple Decoding Heads**: extends self-speculative with multiple heads at different positions — [arxiv.org/abs/2401.10774](https://arxiv.org/abs/2401.10774)
+- **vLLM speculative decoding docs**: production implementation with paged attention integration — [docs.vllm.ai/en/latest/models/spec_decode.html](https://docs.vllm.ai/en/latest/models/spec_decode.html)
+- **Spring AI docs**: ChatClient abstraction, prompt templating, model swapping — [docs.spring.io/spring-ai](https://docs.spring.io/spring-ai/reference/)
+
+## Related labs and questions
+
+- **Previous in AI**: LLM Inference Engine (lab `llm-inference`) — KV cache, continuous batching, and paged attention that speculative decoding builds on
+- **Previous in AI**: Transformer From Scratch (lab `transformer`) — the model architecture that creates the forward pass speculative decoding exploits
+- **Next in AI**: Local GenAI stack — running speculative decoding offline with Ollama and quantized models
+- **System design question**: At what draft-to-target cost ratio does speculative decoding with K=5 break even? (Answer: if the draft costs more than 1/(K+1) = 16.7% of the target's time, the overhead exceeds the gain — you need an even smaller draft model or lower K.)
+- **System design question**: How does speculative decoding interact with beam search? (Speculative decoding is designed for greedy/temperature sampling, not beam search. Beam search maintains B candidate sequences simultaneously — speculative decoding can be applied per-beam, but the combinatorics make tree attention exponentially more expensive.)

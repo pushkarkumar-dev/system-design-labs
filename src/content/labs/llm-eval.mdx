@@ -1,0 +1,658 @@
+---
+title: "Build Your Own LLM Evaluation Harness"
+slug: "llm-eval"
+category: "ai-foundations"
+difficulty: "advanced"
+estimatedHours:
+  reading: 3
+  building: 10
+language: "python"
+loc: 780
+prerequisites:
+  - "Python statistics (mean, sampling with replacement)"
+  - "LLM prompting basics"
+  - "Log probability concept"
+stages:
+  - id: v0
+    title: "Few-Shot Eval with Exact Match"
+    learningGoals:
+      - "Few-shot prompt: n examples prepended before the test question"
+      - "Exact match: normalize both strings before comparison"
+    approxLoc: 200
+    branchOrTag: "llm-eval-v0"
+  - id: v1
+    title: "Log-Likelihood Scoring"
+    learningGoals:
+      - "Log-likelihood avoids format sensitivity: score choices, don't generate"
+      - "Contextual calibration subtracts prior bias between choice tokens"
+    approxLoc: 500
+    branchOrTag: "llm-eval-v1"
+  - id: v2
+    title: "Contamination Detection + Bootstrap CI"
+    learningGoals:
+      - "13-gram fingerprinting detects evaluation examples in training data"
+      - "Bootstrap CI width plus-or-minus 10pp at n=100, plus-or-minus 3pp at n=1000"
+    approxLoc: 780
+    branchOrTag: "llm-eval-v2"
+benchmarks:
+  - metric: "Few-shot prompt build (5-shot, 200 token example)"
+    value: "850,000"
+    unit: "prompts/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — string concatenation"
+  - metric: "Bootstrap CI (1000 resamples, 100 examples)"
+    value: "12,000"
+    unit: "CIs/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — numpy random.choice + mean"
+  - metric: "13-gram contamination check (1MB training shard)"
+    value: "180,000"
+    unit: "checks/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — set intersection on 13-grams"
+  - metric: "Paired bootstrap test (1000 resamples)"
+    value: "8,500"
+    unit: "tests/sec"
+    measuredOn: "M2 MacBook Pro, 16GB RAM"
+    note: "estimated — numpy resample + comparison"
+whatTheToyMisses:
+  - thing: "Open-ended generation metrics (ROUGE, BLEU, BERTScore)"
+    why: "Exact match fails for open-ended tasks — a correct paraphrase scores 0. ROUGE measures n-gram overlap; BERTScore computes contextual embedding similarity. Both require additional models and careful interpretation."
+  - thing: "Model-graded evaluation"
+    why: "GPT-4 as a judge evaluates model outputs for helpfulness, safety, and factuality. This requires a grading prompt, handling judge inconsistency (run 3x and majority vote), and detecting self-preference bias."
+  - thing: "Human evaluation protocols"
+    why: "Automated metrics correlate poorly with human preference for open-ended tasks. Crowdsourcing human evals (via MTurk or Scale) requires inter-annotator agreement measurement (Cohen's kappa), outlier removal, and calibration."
+  - thing: "Dynamic benchmarks"
+    why: "Static benchmarks saturate as models improve. DynaBench collects adversarial examples that fool current models. Maintaining a live leaderboard requires continuous data collection and anti-contamination measures."
+  - thing: "Chain-of-thought evaluation"
+    why: "CoT prompting changes accuracy significantly. A fair eval must test both direct and CoT prompting, compare reliably, and measure whether the reasoning chain actually leads to the correct answer or just post-hoc rationalizes it."
+  - thing: "Evals as unit tests in CI"
+    why: "Production eval pipelines run on every model checkpoint. Regressions on safety evals block deployment. This requires fast evals (subset of full benchmark), statistical power to detect small regressions, and automated gates."
+realWorldReferences:
+  - "HELM benchmark (Holistic Evaluation of Language Models): https://crfm.stanford.edu/helm/"
+  - "lm-evaluation-harness (EleutherAI): https://github.com/EleutherAI/lm-evaluation-harness"
+  - "Measuring Massive Multitask Language Understanding (MMLU): https://arxiv.org/abs/2009.03300"
+  - "Contamination in LLM evals: https://arxiv.org/abs/2311.04850"
+javaIntegration:
+  type: "service-client"
+  mavenCoords:
+    - "org.springframework.ai:spring-ai-openai-spring-boot-starter:1.0.0"
+    - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  springModule: "spring-ai"
+publishedAt: "2026-05-08"
+updatedAt: "2026-05-08"
+summary: "Build an LLM evaluation harness from few-shot exact-match to log-likelihood scoring with calibration to contamination detection with bootstrap confidence intervals."
+---
+
+## Why this lab exists
+
+Every benchmark number you've seen on a leaderboard — GPT-4 at 87% on MMLU, Llama 3 at 79% on HellaSwag — comes from an evaluation harness running the same loop: build a prompt, call the model, compare the output to an answer key, aggregate accuracy. But there is a gap between "call the model and check the answer" and "produce a statistically valid, contamination-clean benchmark number."
+
+The gap matters. A naive harness penalizes a model for answering "The answer is A" when the expected output is just "A". A harness without contamination detection celebrates models that memorized the test set. A harness without confidence intervals publishes leaderboard rankings where half the differences are statistically insignificant.
+
+Until you've implemented the few-shot prompt format and watched exact-match fail on correct paraphrases, until you've scored choices by log-likelihood and seen format sensitivity disappear, until you've run bootstrap resampling on 100 examples and realized the CI is ±10 percentage points — you don't *know* why lm-evaluation-harness is 8,000 lines instead of 50.
+
+This lab builds an evaluation harness in three stages: from naive few-shot exact-match in ~200 lines to contamination-aware evaluation with bootstrap confidence intervals in ~780 lines. Each stage fixes one measured problem in the previous one.
+
+## What we're building
+
+An LLM evaluation harness in Python, across three stages. Each stage adds one capability and addresses one real problem in evaluation methodology.
+
+**We build:**
+- Few-shot evaluator (v0): prepend n examples, call model, compare with exact-match or multiple-choice extraction
+- Log-likelihood scoring (v1): score each choice as a continuation, eliminate format sensitivity, add contextual calibration
+- Contamination detection and bootstrap CI (v2): 13-gram fingerprinting, paired bootstrap significance test
+- FastAPI server: `POST /eval`, `GET /tasks`
+- Spring Boot Java integration: `EvalClient` calling our eval server
+
+**We explicitly skip (and why):**
+- Real LLM calls: the harness is model-agnostic via `model_fn: Callable[[str], str]`; integrating GPT-4 or Llama is configuration, not architecture
+- ROUGE/BERTScore: requires heavy dependencies and an embedding model; covered in "What the Toy Misses"
+- Human evaluation: requires crowdsourcing infrastructure; covered in "What the Toy Misses"
+- Full MMLU/HellaSwag datasets: 10-example lite versions illustrate the mechanics without requiring dataset downloads
+
+## Mental model
+
+An evaluation harness is a three-stage pipeline:
+
+```
+Benchmark dataset
+  |
+  v
+[Prompt builder]  ← few-shot examples + test question
+  |
+  v
+[Model]           ← Callable[[str], str]
+  |
+  v
+[Scorer]          ← extract answer, compare to gold label
+  |
+  v
+[Aggregator]      ← accuracy + confidence interval + contamination report
+```
+
+The naive version of this is 20 lines. The production version (lm-evaluation-harness) is 8,000 lines. The difference is in the details:
+
+**Format sensitivity** — a model that would correctly pick A if scoring log-likelihoods answers "The answer is: option A" in free generation. Exact-match comparison to "A" scores this as wrong. Log-likelihood scoring fixes this by never generating text: compute `log P(A | context)`, `log P(B | context)`, etc. and pick the highest.
+
+**Length bias** — a choice with more tokens has lower raw log probability (probabilities multiply; more terms means lower product). "All of the above" gets unfairly penalized vs "A". Normalized log-likelihood divides by token count to correct this.
+
+**Prior bias** — "A" appears more frequently in training data than "D". The model assigns higher prior probability to A-continuations. Contextual calibration subtracts `log P(choice | empty context)` from every score, removing this prior.
+
+**Statistical validity** — a single accuracy number from 100 examples has 95% CI of ±10pp. A model scoring 72% is indistinguishable from 62–82%. Bootstrap CI makes this explicit.
+
+**Contamination** — if the model saw `"What is the capital of France? Paris"` during training, it's measuring memorization, not generalization. 13-gram fingerprinting detects this before you publish numbers.
+
+## Prerequisites
+
+- Python 3.12
+- NumPy (`pip install numpy`) — for bootstrap CI
+- FastAPI + uvicorn (`pip install fastapi uvicorn`) — for the server
+- No LLM download required — the harness is model-agnostic; tests use mock functions
+
+## Stage-by-stage build
+
+<LabStage
+  id="v0"
+  title="Few-Shot Eval with Exact Match"
+  goals={[
+    "Implement Task dataclass: name, metric, examples list",
+    "Implement FewShotEvaluator.build_prompt(task, test_example, n_shot=5)",
+    "Implement FewShotEvaluator.evaluate(model_fn, task, n_shot=5) -> EvalResult",
+    "Implement _normalize_string() and _extract_multiple_choice()",
+    "Write 5 tests: prompt includes n examples, 0-shot works, exact match normalizes, multiple-choice extracts A-D, accuracy computed correctly",
+  ]}
+  loc={200}
+>
+
+The simplest possible evaluation loop. No log-likelihood, no calibration.
+
+**The few-shot prompt format:**
+
+For multiple-choice tasks (HellaSwag, MMLU):
+
+```
+Question: She poured water into the pot and placed it on the stove. She then
+A. turned on the burner and waited for the water to boil.
+B. placed the pot in the refrigerator.
+C. filled the pot with sand.
+D. put the pot on the floor.
+Answer: A
+
+Question: He laced up his running shoes and stepped outside. He then
+A. sat down on the couch.
+B. began jogging down the street.
+C. took off his shoes.
+D. cooked breakfast.
+Answer: B
+
+[n_shot demos above — the test example below]
+
+Question: The teacher wrote the problem on the blackboard. The students
+A. left the classroom.
+B. started talking loudly.
+C. took out their notebooks and began working.
+D. fell asleep.
+Answer:
+```
+
+The model must complete "Answer:" with a single letter. The n_shot demonstrations show the expected format.
+
+**Why n_shot matters:**
+
+Zero-shot (no demonstrations) fails on novel formats. The model doesn't know it's supposed to respond with just a letter. With 5 demonstrations, it sees the pattern: question, choices, "Answer: X". This alone often improves accuracy by 10-15pp without any model changes.
+
+**Exact match normalization:**
+
+For open-ended tasks (TriviaQA), the expected answer is `"Paris"` and the model might generate `"Paris."` or `"The capital is Paris"`. Normalization handles the punctuation case but not the paraphrase case. Lowercase + strip punctuation is the minimum; production harnesses also strip articles ("the", "a"), normalize whitespace, and handle number formatting.
+
+```python
+def _normalize_string(s: str) -> str:
+    s = s.strip().lower()
+    s = s.translate(str.maketrans("", "", string.punctuation))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+```
+
+**Multiple-choice extraction:**
+
+The model might generate any of: "A", "A.", "Answer: A", "The answer is A", "Option A is correct". The extractor tries patterns in priority order:
+
+```python
+# Pattern 1: starts with letter
+re.match(r"^([ABCD])[.):]?\s", completion)
+
+# Pattern 2: "Answer: A"
+re.search(r"[Aa]nswer[:\s]+([ABCD])", completion)
+
+# Pattern 3: "is A" / "is (A)"
+re.search(r"is\s+\(?([ABCD])\)?", completion)
+```
+
+If none match, return `""` — counted as wrong. This is where format sensitivity shows up: a model that would correctly identify the answer often generates a format the extractor misses. Log-likelihood scoring (v1) eliminates this entirely.
+
+**EvalResult:**
+
+```python
+@dataclass
+class EvalResult:
+    task_name: str
+    n_shot: int
+    accuracy: float
+    num_correct: int
+    num_total: int
+    examples_evaluated: list[ExampleResult]
+```
+
+The `examples_evaluated` list lets you drill into which examples the model got wrong — essential for debugging prompts and spotting systematic failure patterns.
+
+</LabStage>
+
+<LabStage
+  id="v1"
+  title="Log-Likelihood Scoring"
+  goals={[
+    "Implement score_logprob(model_fn_logprob, context, continuation) -> float",
+    "Implement score_normalized(model_fn_logprob, context, continuation) -> float",
+    "Implement ContextualCalibration with get_bias() and calibrated_score()",
+    "Implement LogprobEvaluator with scoring_mode: raw | normalized | calibrated",
+    "Implement EvalSuite.run(tasks, n_shot) -> SuiteResult with macro_average",
+    "Write 4 tests: logprob is negative float, normalized penalizes long choices, calibrated score shifts correctly, EvalSuite aggregates correctly",
+  ]}
+  loc={300}
+>
+
+Log-likelihood scoring eliminates format sensitivity by never generating text.
+
+**The core insight:**
+
+Instead of asking the model to generate "A", "B", "C", or "D", score each choice as a continuation of the context:
+
+```
+context  = "Question: What is the capital of France?\nA. London\nB. Paris\nC. Berlin\nD. Rome\nAnswer:"
+score(A) = log P("A. London" | context)
+score(B) = log P("B. Paris"  | context)
+score(C) = log P("C. Berlin" | context)
+score(D) = log P("D. Rome"   | context)
+pick = argmax(score(A), score(B), score(C), score(D))
+```
+
+The model never generates anything. It just assigns probabilities. A model that "knows" Paris is correct will assign higher probability to "B. Paris" as a continuation, regardless of how it would format a free-text response.
+
+**`model_fn_logprob` protocol:**
+
+```python
+ModelFnLogprob = Callable[[str, str], float]
+# Takes (context, continuation), returns log probability (always <= 0)
+```
+
+For a real LLM, this is typically:
+1. Tokenize context + continuation together
+2. Run a forward pass to get token log probabilities
+3. Sum log probs for only the continuation tokens
+
+Our implementation accepts any callable that satisfies this protocol — including mock functions for testing.
+
+**Normalized log-likelihood:**
+
+Raw log-likelihood biases toward shorter choices. "A" (1 token) has higher raw log-prob than "All of the above" (4 tokens) even if the model "prefers" the latter. Normalization divides by token count:
+
+```python
+def score_normalized(model_fn_logprob, context, continuation) -> float:
+    raw = score_logprob(model_fn_logprob, context, continuation)
+    token_count = max(1, len(continuation.split()))
+    return raw / token_count
+```
+
+We approximate token count by whitespace-split — sufficient for short choices. Real harnesses use the model's tokenizer (byte-pair encoding token counts differ from word counts).
+
+**Contextual calibration:**
+
+The model has prior biases. "A" appears more in training text than "D". Even before reading the question, the model assigns higher probability to "A" as a next token. This biases multiple-choice accuracy toward options labeled "A".
+
+Fix: compute `bias[choice] = log P(choice | "")` — the probability under empty context. Then:
+
+```python
+calibrated_score = log P(choice | context) - log P(choice | "")
+```
+
+After calibration, all choices start at equal expected score. Zhao et al. (2021) showed this improves accuracy by 5-15pp on some tasks, particularly when the answer distribution is uneven.
+
+**EvalSuite:**
+
+```python
+suite = EvalSuite(evaluator, model_fn_logprob)
+result = suite.run([hellaswag_lite, triviaqa_lite, mmlu_lite], n_shot=5)
+print(result.macro_average)    # 0.72
+print(result.per_task)         # {"HellaSwag-lite": 0.80, "TriviaQA-lite": 0.60, ...}
+```
+
+Macro-average weights all tasks equally regardless of example count. Real benchmarks (HELM) use both macro-average and size-weighted average.
+
+</LabStage>
+
+<LabStage
+  id="v2"
+  title="Contamination Detection + Bootstrap CI"
+  goals={[
+    "Implement ContaminationDetector with add_training_shard() and check_contamination() -> float",
+    "Implement bootstrap_ci(results, n_bootstrap=1000, confidence=0.95) -> BootstrapCI",
+    "Implement paired_bootstrap_test(results_A, results_B, n_bootstrap=1000) -> p_value",
+    "Implement EvalReport dataclass with task, accuracy, ci_95, contaminated_examples",
+    "Implement Harness that composes contamination filtering + evaluation + CI into one call",
+    "Write 4 tests: contamination flags exact example, CI in [0,1], CI width decreases with more examples, paired bootstrap p_value < 0.05 when A always wins",
+  ]}
+  loc={280}
+>
+
+Two critical correctness mechanisms: know what your model actually learned, and know whether your accuracy estimates are meaningful.
+
+**13-gram contamination detection:**
+
+The GPT-3 paper (Brown et al., 2020) used 13-gram overlap to check whether benchmark examples appeared in Common Crawl training data. 13 is a deliberate choice: long enough to be distinctive (a random 13-gram match is near-impossible), short enough to be practical (13-gram indexing over terabytes of text is feasible with sets).
+
+```python
+def _make_ngrams(text: str, n: int = 13) -> set[tuple[str, ...]]:
+    words = text.lower().split()
+    return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)}
+
+class ContaminationDetector:
+    def add_training_shard(self, texts: list[str]) -> None:
+        for text in texts:
+            self._training_ngrams.update(_make_ngrams(text))
+
+    def check_contamination(self, example_text: str) -> float:
+        example_ngrams = _make_ngrams(example_text)
+        found = example_ngrams.intersection(self._training_ngrams)
+        return len(found) / len(example_ngrams)
+```
+
+Threshold: examples with more than 10% of their 13-grams in training data are flagged. This is conservative — 10% contamination for a 200-token example means 20+ overlapping 13-grams, strong evidence the example was seen during training.
+
+**Bootstrap confidence intervals:**
+
+The bootstrap is conceptually simple: resample with replacement from your results, compute accuracy for each resample, use the 2.5th and 97.5th percentiles as CI bounds.
+
+```python
+def bootstrap_ci(results: list[bool], n_bootstrap=1000, confidence=0.95) -> BootstrapCI:
+    arr = np.array(results, dtype=float)
+    boot_means = np.zeros(n_bootstrap)
+    for i in range(n_bootstrap):
+        sample = rng.choice(arr, size=len(arr), replace=True)
+        boot_means[i] = sample.mean()
+    alpha = 1.0 - confidence
+    lower = np.percentile(boot_means, 100 * (alpha / 2))
+    upper = np.percentile(boot_means, 100 * (1 - alpha / 2))
+    return BootstrapCI(lower=lower, upper=upper, mean=arr.mean())
+```
+
+Width reference (at 95% confidence):
+- n=100: ~±10pp (upper - lower ≈ 0.20)
+- n=500: ~±4.5pp
+- n=1000: ~±3pp
+- n=14,000 (MMLU full): ~±0.8pp
+
+**Paired bootstrap test:**
+
+To test whether model A is significantly better than model B on the same examples:
+
+```python
+def paired_bootstrap_test(results_A, results_B, n_bootstrap=1000) -> float:
+    # Resample pairs (A_i, B_i) together
+    for _ in range(n_bootstrap):
+        idx = rng.choice(n, size=n, replace=True)
+        delta = arr_A[idx].mean() - arr_B[idx].mean()
+        if delta <= 0:
+            count_leq_zero += 1
+    return count_leq_zero / n_bootstrap  # p_value
+```
+
+If p_value is less than 0.05, model A is significantly better at the 95% level. With 100 examples, you need at least a 7pp difference to achieve p < 0.05.
+
+**EvalReport ties it together:**
+
+```python
+@dataclass
+class EvalReport:
+    task: str
+    n_shot: int
+    accuracy: float
+    ci_95: tuple[float, float]
+    contaminated_examples: int
+    total_examples: int
+```
+
+A responsible benchmark report always includes CI alongside accuracy and reports contaminated examples removed. The `Harness` class composes all three: filter contamination, run evaluation, compute CI, return report.
+
+</LabStage>
+
+## Run it yourself
+
+<RunIt
+  repoPath="labs/llm-eval"
+  prereqs={["Python 3.12+", "pip or uv"]}
+  steps={[
+    {
+      label: "Clone and install dependencies",
+      cmd: "git clone https://github.com/pushkarkumar-dev/system-design-labs\ncd system-design-labs/labs/llm-eval\npip install -e '.[test]'",
+    },
+    {
+      label: "Run all tests (no model download — all use mock functions)",
+      cmd: "python -m pytest tests/ -v",
+    },
+    {
+      label: "Try the few-shot evaluator on HellaSwag-lite with a mock model",
+      cmd: "python -c \"\nfrom src.tasks import HELLASWAG_LITE\nfrom src.v0_fewshot import FewShotEvaluator\nevaluator = FewShotEvaluator()\n# Mock model that always answers B\nresult = evaluator.evaluate(lambda p: 'B', HELLASWAG_LITE, n_shot=3)\nprint(f'Task: {result.task_name}')\nprint(f'Accuracy: {result.accuracy:.0%} ({result.num_correct}/{result.num_total})')\n\"",
+    },
+    {
+      label: "Try bootstrap CI",
+      cmd: "python -c \"\nimport numpy as np\nfrom src.v2_contamination import bootstrap_ci\nrng = np.random.default_rng(42)\nresults_100 = [i < 72 for i in range(100)]\nci = bootstrap_ci(results_100, rng=rng)\nprint(f'Accuracy: {ci.mean:.1%}')\nprint(f'95% CI: [{ci.lower:.1%}, {ci.upper:.1%}]')\nprint(f'CI width: +/-{(ci.upper - ci.lower)/2*100:.1f}pp')\n\"",
+    },
+    {
+      label: "Start the FastAPI server",
+      cmd: "uvicorn src.server:app --port 8000",
+    },
+    {
+      label: "List available tasks",
+      cmd: "curl -s http://localhost:8000/tasks | python -m json.tool",
+    },
+    {
+      label: "Run evaluation via HTTP",
+      cmd: "curl -s -X POST http://localhost:8000/eval \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"task_name\": \"hellaswag-lite\", \"n_shot\": 5, \"model\": \"mock-always-A\"}' | python -m json.tool",
+    },
+  ]}
+  expectedOutput={`===== Tests =====
+
+tests/test_eval.py::TestV0FewShot::test_fewshot_prompt_includes_n_examples PASSED
+tests/test_eval.py::TestV0FewShot::test_fewshot_zero_shot_has_no_demonstrations PASSED
+tests/test_eval.py::TestV0FewShot::test_exact_match_normalizes_correctly PASSED
+tests/test_eval.py::TestV0FewShot::test_multiple_choice_extracts_a_through_d PASSED
+tests/test_eval.py::TestV0FewShot::test_accuracy_computed_correctly PASSED
+tests/test_eval.py::TestV1Logprob::test_logprob_score_is_negative_float PASSED
+tests/test_eval.py::TestV1Logprob::test_normalized_score_penalizes_long_choices PASSED
+tests/test_eval.py::TestV1Logprob::test_calibrated_score_shifts_correctly PASSED
+tests/test_eval.py::TestV1Logprob::test_eval_suite_aggregates_correctly PASSED
+tests/test_eval.py::TestV2Contamination::test_contamination_detection_flags_exact_example PASSED
+tests/test_eval.py::TestV2Contamination::test_bootstrap_ci_is_within_0_1 PASSED
+tests/test_eval.py::TestV2Contamination::test_ci_width_decreases_with_more_examples PASSED
+tests/test_eval.py::TestV2Contamination::test_paired_bootstrap_p_value_low_when_a_always_wins PASSED
+
+===== Bootstrap CI example =====
+
+Accuracy: 72.0%
+95% CI: [62.0%, 81.0%]
+CI width: +/-9.5pp`}
+/>
+
+## Benchmarks
+
+<Benchmark
+  hardware="M2 MacBook Pro, 16GB RAM"
+  rows={[
+    { metric: "Few-shot prompt build (5-shot, 200 token example)", value: "850,000", unit: "prompts/sec", note: "estimated — string concatenation" },
+    { metric: "Bootstrap CI (1000 resamples, 100 examples)",        value: "12,000",  unit: "CIs/sec",     note: "estimated — numpy random.choice + mean" },
+    { metric: "13-gram contamination check (1MB training shard)",   value: "180,000", unit: "checks/sec",  note: "estimated — set intersection on 13-grams" },
+    { metric: "Paired bootstrap test (1000 resamples)",             value: "8,500",   unit: "tests/sec",   note: "estimated — numpy resample + comparison" },
+  ]}
+/>
+
+Numbers are estimates on M2 MacBook Pro. All operations are CPU-bound numpy + Python — no GPU needed. Prompt building is pure string concatenation; at 850,000 prompts/sec, the bottleneck in a real evaluation pipeline is always the model inference call, not prompt construction. The bootstrap CI is fast because numpy vectorizes the resampling; a pure-Python implementation would be 20-50x slower.
+
+## Stress tests
+
+**n_shot sensitivity**: run the same model on HellaSwag-lite with n_shot = 0, 1, 3, 5. Plot accuracy vs n_shot. You should see accuracy improve from 0-shot to 5-shot and then plateau. If accuracy drops with more demonstrations, your prompt builder is ordering examples in a way that confuses the model (most recent example should be closest to the test question).
+
+**CI convergence**: run `bootstrap_ci` with n_bootstrap = 100, 500, 1000, 5000. For each, compute 10 CI estimates on the same results and measure how much the CI bounds vary. At n_bootstrap=100, CI bounds vary by several percentage points across runs. At n_bootstrap=1000, they stabilize within 0.5pp. This is why 1000 resamples is the standard — further resampling has diminishing returns.
+
+**Contamination threshold sensitivity**: add a training shard that overlaps with exactly 5%, 10%, 15%, and 20% of an eval example's 13-grams. Verify that the 10% threshold correctly separates near-matches (expected noise) from true contamination (model has seen the example). Adjust the threshold and observe false positive rate.
+
+**Paired test power**: generate pairs of results where model A is better by 1pp, 3pp, 5pp, 7pp, and 10pp, all at n=100. Run `paired_bootstrap_test` for each. You should see p_value drop below 0.05 at approximately 7pp with n=100. At n=1000, the threshold drops to approximately 2pp. This is the empirical power curve for your harness.
+
+**Format sensitivity experiment**: implement a mock model that returns "The answer is A" instead of just "A". Run with v0 (exact-match extraction) and v1 (log-likelihood). The v0 harness incorrectly scores these as wrong when the correct answer is A; the v1 harness scores them correctly by not generating text at all.
+
+## What the toy misses
+
+<WhatTheToyMisses
+  items={[
+    { thing: "Open-ended generation metrics (ROUGE, BLEU, BERTScore)", why: "Exact match fails for open-ended tasks — a correct paraphrase scores 0. ROUGE measures n-gram overlap; BERTScore computes contextual embedding similarity. Both require additional models and careful interpretation." },
+    { thing: "Model-graded evaluation", why: "GPT-4 as a judge evaluates model outputs for helpfulness, safety, and factuality. This requires a grading prompt, handling judge inconsistency (run 3x and majority vote), and detecting self-preference bias." },
+    { thing: "Human evaluation protocols", why: "Automated metrics correlate poorly with human preference for open-ended tasks. Crowdsourcing human evals (via MTurk or Scale) requires inter-annotator agreement measurement (Cohen's kappa), outlier removal, and calibration." },
+    { thing: "Dynamic benchmarks", why: "Static benchmarks saturate as models improve. DynaBench collects adversarial examples that fool current models. Maintaining a live leaderboard requires continuous data collection and anti-contamination measures." },
+    { thing: "Chain-of-thought evaluation", why: "CoT prompting changes accuracy significantly. A fair eval must test both direct and CoT prompting, compare reliably, and measure whether the reasoning chain actually leads to the correct answer or just post-hoc rationalizes it." },
+    { thing: "Evals as unit tests in CI", why: "Production eval pipelines run on every model checkpoint. Regressions on safety evals block deployment. This requires fast evals (subset of full benchmark), statistical power to detect small regressions, and automated gates." },
+  ]}
+/>
+
+## Wiring it into a Java/Spring service
+
+<JavaIntegration
+  type="service-client"
+  springModule="spring-ai"
+  mavenCoords={[
+    "org.springframework.ai:spring-ai-openai-spring-boot-starter:1.0.0",
+    "org.springframework.boot:spring-boot-starter-web:3.3.0",
+  ]}
+  repoPath="labs/llm-eval/java-integration"
+>
+
+### Part A — EvalClient: calling our eval server
+
+`EvalClient.java` wraps our Python FastAPI server's `POST /eval` and `GET /tasks` endpoints using Spring Framework 6.1's `RestClient`. The entire client fits in under 60 lines.
+
+```java
+public class EvalClient {
+    private final RestClient http;
+
+    public EvalResponse evaluate(String taskName, int nShot, String model) {
+        var body = new EvalRequest(taskName, nShot, model);
+        return http.post()
+            .uri("/eval")
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(body)
+            .retrieve()
+            .body(EvalResponse.class);
+    }
+
+    public record EvalResponse(
+        String task, int nShot, double accuracy,
+        int numCorrect, int numTotal,
+        double ci95Lower, double ci95Upper, String model
+    ) {}
+}
+```
+
+The response includes accuracy and 95% CI bounds — the client can directly print "72.0% [62.0%, 81.0%]" without any local statistics computation.
+
+### Part B — EvalDemoApplication: the integration demo
+
+The demo application shows three things:
+
+1. **Health check** — skips gracefully if the Python server is not running
+2. **Task listing** — `GET /tasks` returns all built-in tasks with name, metric, and example count
+3. **CI interpretation** — prints a reference table of CI widths vs sample size
+
+```java
+var result = evalClient.evaluate("hellaswag-lite", 5, "mock-always-A");
+System.out.printf("Accuracy: %.1f%% [%.1f%%, %.1f%%]%n",
+    result.accuracy() * 100,
+    result.ci95Lower() * 100,
+    result.ci95Upper() * 100);
+System.out.printf("CI width: +/-%.1fpp%n",
+    (result.ci95Upper() - result.ci95Lower()) * 100 / 2);
+```
+
+### Part C — Connecting real LLMs with Spring AI
+
+For production evaluation pipelines, you would replace the `mock-always-A` model with a real LLM via Spring AI:
+
+```java
+ChatClient chatClient = chatClientBuilder.build();
+
+// Use Spring AI to call GPT-4 for model-graded eval
+String evaluation = chatClient.prompt(
+    "Is this answer correct? Question: " + question +
+    " Expected: " + expected + " Model answer: " + modelAnswer +
+    " Reply with only: CORRECT or WRONG"
+).call().content();
+```
+
+This is the "model-graded evaluation" pattern (see What the Toy Misses). Spring AI's `ChatClient` abstraction means the same Java code works whether you're calling GPT-4, Claude, or a local Ollama model — only `application.yml` changes.
+
+### Run it
+
+```bash
+# Terminal 1: start the Python eval server
+cd labs/llm-eval
+uvicorn src.server:app --port 8000
+
+# Terminal 2: start the Spring Boot demo
+cd labs/llm-eval/java-integration
+mvn spring-boot:run
+```
+
+Expected output:
+
+```
+=== LLM Evaluation Harness — Spring Integration Demo ===
+
+--- Available Tasks ---
+  hellaswag-lite        metric=multiple_choice  examples=10
+  triviaqa-lite         metric=exact_match      examples=10
+  mmlu-lite-math        metric=multiple_choice  examples=10
+
+--- Evaluating mock-always-A on hellaswag-lite (5-shot) ---
+  Task:         HellaSwag-lite
+  Model:        mock-always-A
+  n-shot:       5
+  Accuracy:     10.0% (1/10)
+  95% CI:       [0.0%, 28.6%]
+  CI width:     +/-14.3pp
+
+--- CI Width Reference ---
+  n=100  examples -> 95% CI width approximately +/-10pp
+  n=1000 examples -> 95% CI width approximately +/-3pp
+  n=14000 examples (MMLU) -> 95% CI width under +/-1pp
+Done.
+```
+
+</JavaIntegration>
+
+## What surprised me
+
+<WhatSurprisedMe insight="The confidence interval width surprised me. With 100 evaluation examples and 95% confidence, the bootstrap CI is plus-or-minus 10 percentage points. That means a model scoring 72% accuracy is statistically indistinguishable from one scoring 62-82%. The MMLU benchmark has 14,000 examples specifically to get CI width under 1pp. But most 'leaderboard' comparisons use 100-500 examples, making half the ranking differences statistically insignificant. The paired bootstrap test formalizes this: two models with 100 examples each need at least 7pp accuracy difference to achieve p less than 0.05 significance." />
+
+## Where to go deeper
+
+- **HELM benchmark**: holistic evaluation covering accuracy, calibration, efficiency, and fairness — [crfm.stanford.edu/helm](https://crfm.stanford.edu/helm/)
+- **lm-evaluation-harness (EleutherAI)**: the reference open-source harness — [github.com/EleutherAI/lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness)
+- **MMLU paper**: measuring multitask language understanding across 57 subjects — [arxiv.org/abs/2009.03300](https://arxiv.org/abs/2009.03300)
+- **Contamination in LLM evals (2023)**: systematic analysis of benchmark contamination in GPT-4 — [arxiv.org/abs/2311.04850](https://arxiv.org/abs/2311.04850)
+- **Calibration paper (Zhao et al., 2021)**: contextual calibration for few-shot learning — "Calibrate Before Use: Improving Few-Shot Performance of Language Models"
+
+## Related labs and questions
+
+- **Previous in AI**: Transformer From Scratch (lab `transformer`) — the model architecture being evaluated
+- **Previous in AI**: RAG System (lab `rag`) — RAG pipelines need eval harnesses to measure retrieval quality
+- **Next in AI**: LLM Inference Engine (lab `llm-inference`) — once you can evaluate, you can benchmark inference optimizations
+- **System design question**: How would you build a continuous evaluation system that runs on every model checkpoint in CI? What statistical test would you use to detect regressions, and what is the minimum regression size you can reliably detect with 500 eval examples per task? (Hint: the paired bootstrap test at n=500 detects ~4.5pp differences with 80% power.)
+- **System design question**: If a benchmark has 14,000 examples but 5% are contaminated, should you remove the contaminated examples or flag the entire benchmark? What is the expected accuracy inflation from 5% contamination assuming the model gets all contaminated examples correct?
