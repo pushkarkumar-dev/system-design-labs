@@ -97,7 +97,8 @@ anthropic:
   faas-runtime, kafka-lite, cicd-engine, websocket-gateway, crdt, dist-lock, distributed-cron,
   http-server, jwt-library, oauth-provider, logical-clocks. **Source of truth: `src/lib/interviews/labStatus.ts`**;
   test results and known bugs: `docs/ai-interviews/LAB-HEALTH.md`. Labs with failing tests (e.g. observability,
-  message-queue, container-orchestrator, cdn-edge, gossip, lora-finetune, agent-framework, tokenizer) are `partial`.
+  message-queue, container-orchestrator, gossip, lora-finetune, agent-framework) are `partial`; cdn-edge and
+  tokenizer were fixed on 2026-10-13 (see LAB-HEALTH).
 - **Partial**: llm-inference (KV cache real; paged attention is bookkeeping only; continuous batching runs
   sequential per-request forwards; no TTFT/TPOT or token streaming), speculative-decoding (math correct,
   mock models), model-quantizer (sizes + weight error measured; perplexity illustrative), multimodal-server

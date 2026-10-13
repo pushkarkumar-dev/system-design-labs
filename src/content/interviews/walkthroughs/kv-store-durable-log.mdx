@@ -13,13 +13,13 @@ status: published
 basedOn: [eng-119, infra-025, infra-026, infra-031, r2a-021, r2b-020, r2b-021]
 askedAt: [openai, baseten, databricks]
 labs:
-  - { lab: wal, role: proof, note: "A Rust write-ahead log in three built stages: in-memory, file-backed with CRC32 framing and fsync, and group commit. Its recovery stops at a torn record but does not cut the file there (see Common mistakes)." }
+  - { lab: wal, role: proof, note: "A Rust write-ahead log in three built stages: in-memory, file-backed with CRC32 framing and fsync, and group commit. Its recovery stops at a torn record and, since 2026-10-13, cuts the file there before the next append (see Common mistakes)." }
   - { lab: kafka-lite, role: proof, note: "A Go segmented log that fsyncs every 64 appends. It acknowledges a produce before that fsync, so it shows the durability window you accept when you do not wait." }
-  - { lab: kv-cache, role: background, note: "A Redis-style cache, not an LLM KV cache. Its v2 append-only file replays on start-up but never calls fsync." }
+  - { lab: kv-cache, role: background, note: "A Redis-style cache, not an LLM KV cache. Its v2 append-only file replays on start-up and, since 2026-10-13, fsyncs on a write once a second has passed and on shutdown, with no background thread." }
   - { lab: lsm-kv, role: background, note: "Where the log goes next: a memtable flushed to sorted files. Not audited for this guide." }
 gapLabs: []
 researchedAt: "2026-10-12"
-updatedAt: "2026-10-12"
+updatedAt: "2026-10-13"
 ---
 
 ## The prompt
@@ -976,16 +976,18 @@ and the drive can lie, and can say when the right answer is not to build this at
 ## Common mistakes
 
 - **Not truncating the torn tail before appending.** The next acknowledged write lands behind the garbage, where
-  the next recovery never reaches it. The wal lab's v1 `open()` has this shape: it recovers up to the first bad
-  record and reopens the file with `append(true)` without cutting it (read on 2026-10-12). The fix is two lines;
-  the test is "append after a torn tail, then recover again".
+  the next recovery never reaches it. The wal lab's v1 `open()` had this bug until 2026-10-13: it recovered up to
+  the first bad record and reopened the file with `append(true)` without cutting it. The fix truncates the file
+  to the end of the last valid record and fsyncs that (`set_len` + `sync_all`); the test is "append after a torn
+  tail, then recover again" (`append_after_torn_tail_is_recovered`).
 - **Logging a transaction as one record per key.** A crash between records leaves a half-applied transaction,
   like Alice at 70 and Bob still at 100.
 - **Acknowledging before fsync.** That is a valid design (kafka-lite does it on purpose), but then the answer has
   to state the loss window instead of claiming none.
-- **Calling an append-only file "everysec" without the fsync.** The kv-cache lab's v2 comment compares its
-  append-only file to Redis's `everysec`, but the code never calls fsync, while Redis runs fsync once a second on
-  a background thread ([Redis docs](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)).
+- **Calling an append-only file "everysec" without the fsync.** The kv-cache lab's v2 compared its append-only
+  file to Redis's `everysec` but never called fsync until 2026-10-13. It now fsyncs on a write once a second has
+  passed, and on shutdown. Redis runs that fsync once a second on a background thread, so a quiet stretch after a
+  burst is still synced ([Redis docs](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)).
 - **Delimiter-based serialization.** It breaks the first time a key contains the delimiter; length-prefix it.
 - **Forgetting the directory fsync after a rename or a new file.** The rename can be lost even though the file's
   bytes are safe ([fsync(2)](https://man.archlinux.org/man/fsync.2.en)).
@@ -995,11 +997,11 @@ and the drive can lie, and can say when the right answer is not to build this at
 
 ## Prove it with a lab
 
-<LabRef lab="wal" role="proof" note="Read v1 (framing, CRC32, recovery) and v2 (one fsync for N records). Then add the torn-tail truncation and the append-after-recovery test from this page; that is the most useful change you can make to it." />
+<LabRef lab="wal" role="proof" note="Read v1 (framing, CRC32, recovery with torn-tail truncation) and v2 (one fsync for N records). Then delete the set_len line in v1's recover_and_truncate and run append_after_torn_tail_is_recovered: the test fails, which is the bug this page warns about." />
 
 <LabRef lab="kafka-lite" role="proof" note="Its segment append fsyncs every 64 messages and returns the offset before that fsync. Change it to wait for the batch's fsync and measure what that costs." />
 
-<LabRef lab="kv-cache" role="background" note="A Redis-style store with an append-only file. Add a once-a-second background fsync so its comment becomes true." />
+<LabRef lab="kv-cache" role="background" note="A Redis-style store with an append-only file that fsyncs on a write once a second has passed. Add a background thread for that fsync, as Redis does, so a quiet stretch after a burst is synced too." />
 
 <LabRef lab="lsm-kv" role="background" note="Where a write-ahead log sits in a storage engine: in front of the memtable." />
 

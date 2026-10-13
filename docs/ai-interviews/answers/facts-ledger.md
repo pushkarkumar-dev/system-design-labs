@@ -481,7 +481,7 @@ Write these in dated passive voice ("run on 2026-10-11 on an Apple M1 Ultra"), n
 ### 4.7 Lab status (source of truth `src/lib/interviews/labStatus.ts`, tests run 2026-10-11)
 
 **Proof** (own tests pass; Rust labs vector-index and wal rely on CI, not re-run here): vector-index, rag,
-embedding-pipeline, llm-eval, mcp-server (17/17), transformer (10/10), rate-limiter\*, load-balancer, feature-flags,
+embedding-pipeline, llm-eval, mcp-server (18/18 since 2026-10-13), tokenizer (31/31 since 2026-10-13), cdn-edge (since 2026-10-13), transformer (10/10), rate-limiter\*, load-balancer, feature-flags,
 faas-runtime, kafka-lite, cicd-engine, websocket-gateway, wal, crdt, dist-lock, distributed-cron, http-server,
 jwt-library, oauth-provider, logical-clocks.
 \*rate-limiter caveat: "one concurrency test fails intermittently (about 5% to 37% of runs, depending on load)".
@@ -494,7 +494,7 @@ llm-eval caveat: the bundled server's model is a mock (`mock-always-A`).
 | observability | doesn't compile: `pkg/obs/span.go:55–56` type errors; `LogEntry` declared in both logger.go and span.go |
 | message-queue | `TestDelayedMessageNotVisibleBeforeDelay` panics (index out of range). The `int(delay.Seconds())` bug is at `pkg/queue/delay.go:27` |
 | container-orchestrator | `TestInformerCallsHandler` fails; suite times out after 2 min |
-| cdn-edge | `TestCoalescing_StaleIfError` and `TestTiered_L2HitPromotesToL1` fail. **`TestCoalescing_RequestCoalescing` passes**, so "run its request-coalescing test" is valid |
+| cdn-edge | **Fixed 2026-10-13** (see LAB-HEALTH): `TestCoalescing_StaleIfError` and `TestTiered_L2HitPromotesToL1` used to fail; a 5xx from the origin is now an error, and the tier test's off-by-one is fixed. To practise, undo the 5xx check in `coalesce.go` |
 | consistent-hashing | `TestVirtualNodes` fails. There is **no bounded-load code at all**; v3 (weighted + jump hash) isn't implemented |
 | gossip | demo doesn't build; `TestIncarnationNumberHandlesRevivedNode` fails |
 | service-discovery | `WatchReceivesExpiry`, `GracefulDegradationWhenAllExpired`, `CacheRefreshOnWatchEvent` fail |
@@ -506,7 +506,7 @@ llm-eval caveat: the bundled server's model is a mock (`mock-always-A`).
 | saga | module setup fails |
 | container-runtime | demo doesn't build (`cr.NewContainer`, `cr.CgroupConfig` undefined) |
 | lora-finetune | 2 of 13 fail. Its trainable-parameter figures conflict: bench says 2,359,296; LAB-HEALTH calls 1,179,648 a param count; the docstring's 1,179,648 is **bytes** (294,912 params × 4). **Quote neither**; work the LoRA formula (§3.15) by hand |
-| tokenizer | 3 of 19 fail |
+| tokenizer | **Fixed 2026-10-13**: 31 of 31 pass (v2 now uses GPT-2's split pattern). Its `bench-results.json` encode speed predates the fix |
 | agent-framework | 3 of 15 fail: 2 because the parser can't read the nested tool-call JSON its own prompt asks for (so **no tool call reaches the registry until the parser is fixed**, e.g. with `json.JSONDecoder.raw_decode`), 1 because the sandbox test's temp module isn't importable in the child process |
 
 **Partial, special:** llm-inference (KV cache real; paged attention is bookkeeping only; "continuous batching" runs
@@ -535,7 +535,9 @@ audited; io-model, which is Linux-only C and wasn't built).
 - websocket-gateway: ping 30 s, pong 10 s, send buffer 256, HMAC token 5 min, ring replay.
 - llm-inference: `asyncio.Event` callback per request; `PAGE_SIZE = 16`.
 - mcp-server: HTTP transport, bearer-token middleware and roots enforcement fixed 2026-10-11; one token for every
-  tool; **the roots check (`_path_outside_roots`) inspects only arguments named `path` or `directory`**.
+  tool. Since 2026-10-13 the roots check (`_path_outside_roots`) covers every argument the schema marks as a path
+  (`format: path` or `x-mcp-path`) and every argument with a common path name (`filename`, `file`, `dir`, `folder`
+  …); a path argument with another name and no schema mark (e.g. `target`) still escapes it.
 - agent-framework: memory keeps the last 5 turns, the default summarizer keeps 120 chars per turn; sandbox timeout
   10 s; the child inherits env, filesystem and network.
 - rag: v0 chunks are 512 approximate tokens with 50 overlap; RRF k = 60; server caps `top_k` at 20; **no ACL code**.

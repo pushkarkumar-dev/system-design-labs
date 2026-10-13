@@ -18,7 +18,7 @@ machine (Apple M1 Ultra, macOS). This matters because the guide links labs as "p
 | speculative-decoding | ✅ 14 passed | had never run before: line 1 of `v0_basic.py` read as an encoding declaration (fixed in Phase 0) |
 | model-quantizer | ✅ 14 passed | 1 test fixed in Phase 0 (wrong bound) |
 | embedding-pipeline | ✅ 21 passed | 3 tests fixed in Phase 0 |
-| mcp-server | ✅ 17 passed | HTTP transport fixed: every POST returned 422 (FastAPI couldn't resolve `Request`); bearer token now reaches the auth middleware; `tools/call` enforces declared roots. 2 new tests |
+| mcp-server | ✅ 18 passed (17 before the 2026-10-13 roots fix) | HTTP transport fixed: every POST returned 422 (FastAPI couldn't resolve `Request`); bearer token now reaches the auth middleware; `tools/call` enforces declared roots. 2 new tests |
 | transformer | ✅ 10 passed | |
 | voice-assistant | ✅ 22 passed, 2 skipped | |
 | rag, llm-eval | see the measurement agent's report (Phase M) | |
@@ -62,8 +62,9 @@ walkthroughs and guide pages reference them as "partly covers it", never as proo
 fixed, move it back to the proof list in `labStatus.ts` and the guide can cite it as proof again.
 
 ## Suggested follow-up (not done)
-1. Fix the 14 failing Go labs and 6 failing Python labs, starting with those the guide cites:
-   observability, message-queue, container-orchestrator, cdn-edge, gossip, lora-finetune,
-   agent-framework, tokenizer, rpc-framework, consistent-hashing, service-discovery.
+1. Fix the remaining failing Go and Python labs, starting with those the guide cites:
+   observability, message-queue, container-orchestrator, gossip, lora-finetune,
+   agent-framework, rpc-framework, consistent-hashing, service-discovery
+   (cdn-edge and tokenizer were fixed on 2026-10-13).
 2. Add Go and Python CI workflows (path-filtered like the Rust one) so this can't silently regress.
 3. Commit `go.sum` files.
