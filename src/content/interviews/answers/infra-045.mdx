@@ -1,0 +1,210 @@
+---
+question: infra-045
+family: gpu-job-queue
+status: published
+labs: [dist-lock, message-queue, container-orchestrator]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "It's a durable job queue where each job holds one GPU for a minute or more. The job table in the database is the
+> only truth; I return a job ID only after the row is saved. Workers borrow a job under a lease and renew it with
+> heartbeats. Every lease gets a new fence number, and a worker can save its result only if its fence is still
+> current, so a worker that froze can't overwrite the real result. GPUs are shared by GPU-seconds used, with a
+> weight for the paid tier, and retries are capped so a broken job can't loop forever."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The interviewer wants to know whether you can design a job queue where every step can fail, and make re-running a
+task safe.
+
+You have probably built a background job queue for emails or reports. Those jobs are short and cheap; if one runs
+twice, little is lost. A text-to-video queue has the same shape, but three things change:
+
+1. **Each job is long and expensive.** One task holds one GPU (a graphics processor rented for dollars an hour) for
+   90 seconds or more. A lost job is a user who got nothing; a duplicated job is paid for twice.
+2. **The GPUs are not all the same.** A new model version can work on one GPU type and crash on another.
+3. **The fleet is often nearly full**, so queues build quickly and users need honest wait estimates.
+
+The reported title is a text-to-video scheduler with one GPU per task and fair queueing. Only the title is
+candidate-reported; the rest is the write-up by PracHub (an interview-question aggregator) of the
+OpenAI-tagged question. It says failure handling is "the
+core of the discussion" and checks for a durable job store, fairness in weighted GPU time, leases, heartbeats,
+fencing tokens, bounded retries and throughput estimates <Cite id="s-725e58e60a" />. The follow-ups it lists (paid
+tier, a model failing on some GPU types, wait estimates) decide the round.
+
+## Clarify first
+
+Ask for numbers, because the page gives none. Say an assumption for each:
+
+- **Arrival rate and task duration?** "Assume 2 tasks a second, 90 seconds of GPU time on average, with a long
+  tail."
+- **Fleet size and GPU types?** "Assume 200 GPUs of two types."
+- **Fairness unit?** Per user, per organization, or per tier? What does "faster" mean for paid: a wait target, a
+  guaranteed share, or the right to interrupt free work?
+- **Can a task save progress partway and resume** (a **checkpoint**)? "Assume no; a crash restarts it from zero."
+- **Delivery?** Polling, a callback to the user's URL (a **webhook**), or both? Can users cancel?
+
+## Answer
+
+### Words you need first
+
+- **Lease**: a time-limited loan of a job to a worker: "worker W may run job J until time T".
+- **Heartbeat**: a small "still here" message the worker sends every few seconds to renew its lease. If heartbeats
+  stop and the lease's **TTL** (time to live) runs out, the job is given to another worker.
+- **Fencing token** (or fence): a number that goes up every time the job is leased. Only the holder of the current
+  number can save a result.
+- **GPU-seconds**: one GPU busy for one second. A 90-second task costs 90 GPU-seconds.
+
+### Size it first
+
+On average, the number of busy GPUs equals tasks per second times GPU-seconds per task (this is **Little's law**).
+With our assumptions that is **180 of 200 GPUs busy: 90% utilization**. That leaves little spare room. A
+10-minute burst at 5 tasks a second leaves about **1,667 tasks queued**, and with only about 0.22 spare tasks a
+second afterwards, the backlog takes **about 2 hours** to drain.
+
+"At 90% busy, a short burst becomes hours of waiting. So deciding at the door whether to accept a job, which is
+called **admission control**, and giving honest wait estimates are part of the design, not extras."
+
+### The system
+
+```
+Client ── POST /jobs (idempotency key) ──► API ── commits the row, THEN returns the ID
+                                              │
+                                              ▼
+                                   Jobs table (the only truth)
+                                              │
+                                              ▼
+                       Scheduler ── fair queues per tenant, grants lease + new fence
+                                              │
+                                              ▼
+                       GPU worker ── heartbeats, renders, writes outputs/<job>/attempt-<fence>/
+                                              │
+                                              ▼
+                       Commit ── "set succeeded WHERE fence = mine"
+```
+
+**Data model.** A jobs table is the source of truth: state, tier, model version, attempt, fence, lease owner and
+expiry, output reference. The scheduler's queues are a cache rebuilt from it, so a scheduler crash loses nothing.
+
+**Leases and fencing.** The scheduler grants a lease and increments the job's fence. The worker heartbeats (say
+every 10 seconds with a 30-second TTL, assumed), writes output to a path that includes its attempt number, and
+commits with a conditional update that succeeds only if the fence is still its own. A worker that paused past its
+lease finds its commit rejected. This is Kleppmann's fencing-token pattern
+([2016](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)).
+
+### Follow one job
+
+Maya (free tier) asks for a fox running through snow: 90 seconds of GPU time. Timings are illustrative.
+
+| Clock | What happens | Fence | What to say in the interview |
+|---|---|---|---|
+| 0 s | API commits the row and returns J-1042. | 0 | "No ID before the commit." |
+| 40 s | Leased to worker W1. | 1 | "Every lease grant bumps the fence." |
+| 70 s | W1 freezes (a stuck driver call). Heartbeats stop. | 1 | "Frozen and dead look the same from outside." |
+| 100 s | Lease expired; leased again to W2. | 2 | "The job re-runs under a new fence." |
+| 190 s | W2 commits "where fence = 2": one row changes. | 2 | "Only the current fence can finish the job." |
+| 200 s | W1 wakes and commits "where fence = 1": zero rows. | 2 | "The stale write is rejected; one video, not two." |
+
+The freeze cost about 30 seconds of work plus 30 seconds before anyone noticed. With no checkpoints, a crash at a
+random point of a 90-second task wastes **about 45 seconds plus up to 30 seconds of detection** on average.
+
+### Fairness
+
+Count fairness in **GPU-seconds, not tasks**: a 10-minute render should not count the same as a 10-second clip.
+Use **deficit round robin**: go around the tenants in turn, giving each a credit of GPU-seconds in proportion to
+its tier's weight, and let a tenant start a job when its credit covers the job. Add a cap on how many GPUs one
+tenant can hold, and no saving up credit while idle. Keep separate queues for long and short jobs, so short clips
+don't wait behind 10-minute renders.
+
+### Retries and the dead-letter state
+
+Cap attempts (say 3), back off with jitter (a random delay so retries don't line up), and retry on a different GPU.
+After the last attempt the job goes to a **dead-letter** state: a visible "failed, here's why", so a job that
+always fails can't loop forever.
+
+### The three follow-ups
+
+**Paid tier.** Three options, each with a cost. Higher weights give more share but no guarantee. Reserved capacity
+gives a floor but can sit idle. **Preempting** free tasks (stopping them to make room) gives the lowest wait but
+throws away their work. "I'd combine weights with a small reserved pool that free work can borrow and that I can
+take back."
+
+**A model failing on some GPU types.** Count failures per pair of (model_version, gpu_type). When one pair's failure
+rate crosses a threshold, open a **circuit breaker**: stop sending that model to that GPU type, route its jobs to
+other types, and alert. Next time, use a **canary**: roll each new version to a small share of traffic on each GPU
+type separately before widening.
+
+**Wait estimates.** GPU-seconds of work ahead of the job in its tier, divided by the GPU-seconds per second the tier
+is currently getting. Show it as a range, and measure how wrong it was.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Busy GPUs:** 2 tasks/s × 90 s = 180 busy; 180 ÷ 200 = ρ 0.9.
+- **Burst:** service rate 200 ÷ 90 = 2.22 tasks/s. A 10-minute burst at 5/s adds (5 − 2.22) × 600 ≈ 1,667 queued
+  tasks. Back at 2/s, the spare rate is 0.22/s, so 1,667 ÷ 0.22 ≈ 7,500 s, about 2 hours.
+
+<Formula
+  title="Cost of a crash without checkpoints"
+  expr="wasted GPU time ≈ elapsed share of the task + lease TTL"
+  vars={[
+    { sym: 'TTL', meaning: 'lease length' },
+  ]}
+  example="A crash at a random point of a 90 s task wastes about 45 s plus up to 30 s of detection"
+/>
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Text-to-video scheduler"
+  senior={["Durable store, leases, fencing on commit, bounded retries, fairness in GPU-seconds."]}
+  staff={["Derives backlog and drain time to drive admission control, and contains a bad model per GPU type with a breaker and canary."]}
+/>
+
+In plain words: a Senior answer makes the queue correct when workers crash. A Staff answer also uses the numbers
+to set policy (when to say no, what wait to promise) and has a plan for a model that breaks only on some hardware.
+
+## Small-team version
+
+A small team running image or video generation builds the same thing, smaller: a Postgres jobs table claimed with
+`SELECT … FOR UPDATE SKIP LOCKED` (several workers take different rows without waiting on each other), a fence
+column, a cap of 3 attempts, per-tenant concurrency limits, and GPUs billed per second until they would be busy
+enough to justify dedicated ones.
+
+Run this question's load through the family walkthrough's break-even formula (list prices fetched 2026-10-11):
+
+- 180 busy GPUs on RunPod serverless L40S at $1.75 an hour is about **$7,560 a day**, paid only for busy seconds.
+- 200 dedicated secure L40S at $1.09 an hour is about **$5,230 a day**, paid whether busy or not.
+
+Dedicated wins once the pool is busy more than about 62% of the time. At this question's 90%, dedicated is cheaper.
+At a small team's typical spiky load, it usually isn't. "I'd rent by the second until steady load keeps a dedicated
+pool more than about 62% busy."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Serverless: 180 × $1.75 × 24 ≈ $7,560 a day.
+- Dedicated: 200 × $1.09 × 24 ≈ $5,232 a day.
+- Break-even utilization: $1.09 ÷ $1.75 ≈ 62%.
+
+</details>
+
+The fence check and the "kill a worker mid-job" test are not optional at any size.
+
+## Pitfalls
+
+- **Leases without fencing.** A worker that paused past its lease can still overwrite the real result.
+- **Fairness by task count.** Users with long jobs take far more GPU than users with short ones.
+- **Retrying forever on the GPU type where the model crashes.** Every retry fails the same way and burns a GPU.
+- **Scheduler state that can't be rebuilt.** A scheduler crash then loses jobs that were only in its memory.
+
+## Go deeper
+
+- Family walkthrough: [Async GPU job system](/system-design-labs/interviews/walkthroughs/gpu-job-queue/), especially the fencing and fair-queueing deep dives.
+- Fleet-level placement and drain: [GPU cluster control plane](/system-design-labs/interviews/walkthroughs/gpu-cluster-control-plane/).
+- <LabRef lab="dist-lock" inline /> for fencing tokens, <LabRef lab="message-queue" inline /> for visibility timeouts, <LabRef lab="container-orchestrator" inline /> for placement.

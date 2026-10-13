@@ -1,0 +1,177 @@
+---
+question: infra-095
+family: infra-dsa-screens
+status: published
+labs: [embedding-pipeline]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Find the longest row, allocate one rectangle of that width, copy each row in, and fill the rest with a pad
+> value. I'll also return a mask that says which cells are real, because whatever reads this matrix has to skip
+> the padding. The output is n rows by the longest length, so one very long row makes every row pay. I'll write
+> the plain version first, then a vectorized one."
+>
+> The rest of this page explains each part of that answer.
+
+The task is simple: take a list of arrays of different lengths and produce a rectangular matrix. What makes it
+an infrastructure question is *why* anyone needs it.
+
+AI models read text as **tokens**: small pieces of text (roughly ¾ of a word each), each turned into a number.
+A sentence becomes a list of numbers, and different sentences have different lengths. GPUs (the chips AI models
+run on) are fast only when they process many sentences at once, as one rectangular block of numbers called a
+**tensor**. A group of sentences processed together is a **batch**. So a batch of uneven lists has to become a
+rectangle, and the short rows get filled with a filler value. That is **padding**.
+
+Padding is not free. The padded cells go through the model like real ones, so they cost compute. And the model
+must be told which cells are filler, or it will treat them as text. Those two points, cost and the mask, are
+what turn a five-line function into a good answer.
+
+(This was reported by an NVIDIA Senior candidate, who called the round "a straightforward implementation
+problem", said they "coded the padding logic directly", described the onsite coding as "more speed-driven" and
+said interviewers wanted code that was "well written, performance-aware" <Cite id="s-7dd221b925" />.) So: get
+it right fast, then show you know where the cost is and what the consumer of the matrix needs.
+
+### Words you need first
+
+- **Ragged:** a list of rows with different lengths.
+- **Mask:** a grid the same shape as the output, with 1 (or true) for real cells and 0 for padding.
+- **Right or left padding:** whether the filler goes after the real values or before them.
+- **Vectorized:** written as whole-array operations in a library such as NumPy, instead of a Python loop over
+  every cell.
+
+## Clarify first
+
+- **Fill value and side:** pad with 0 on the right? Text-generating models (called decoder-only models) are
+  often padded on the left for generation, so ask.
+- **Mask:** should you return which cells are real? Usually yes.
+- **Width:** the longest row, a fixed maximum (truncate longer rows), or rounded up to a multiple of 8?
+- **Types and library:** plain Python lists, or NumPy/PyTorch allowed?
+- **Edge cases:** an empty input, and empty rows.
+
+Say it like this: "Right padding with zeros and a mask, unless you need left padding for generation?"
+
+## Answer
+
+### The example to follow
+
+Three rows, with made-up token numbers: `[11, 12, 13]`, `[21]` and `[31, 32, 33, 34, 35]`. The longest row has 5
+values, so the output is 3 × 5.
+
+| Row | Right-padded | Mask | Left-padded | What to say in the interview |
+|---|---|---|---|---|
+| `[11, 12, 13]` | `[11, 12, 13, 0, 0]` | `[1, 1, 1, 0, 0]` | `[0, 0, 11, 12, 13]` | "Two cells of filler." |
+| `[21]` | `[21, 0, 0, 0, 0]` | `[1, 0, 0, 0, 0]` | `[0, 0, 0, 0, 21]` | "Four of five cells are wasted." |
+| `[31, …, 35]` | unchanged | `[1, 1, 1, 1, 1]` | unchanged | "The longest row sets the width for everyone." |
+
+Of 15 cells, 9 are real and 6 are padding, so **40%** of this batch is waste. (These outputs come from running
+the plain version below on 2026-10-12.)
+
+### The plain version first
+
+It states the meaning clearly, including left padding and the mask:
+
+```python
+def pad(rows, fill=0, side="right"):
+    width = max((len(r) for r in rows), default=0)
+    out, mask = [], []
+    for r in rows:
+        gap = [fill] * (width - len(r))
+        out.append(list(r) + gap if side == "right" else gap + list(r))
+        m = [1] * len(r) + [0] * len(gap)
+        mask.append(m if side == "right" else m[::-1])
+    return out, mask
+```
+
+`default=0` handles an empty input. For left padding the mask is reversed, so the real cells line up at the
+end.
+
+### Then the vectorized version
+
+This is what "performance-aware" means here: allocate once, build the mask by **broadcasting** (comparing a
+row of column numbers against a column of lengths, which NumPy expands into a full grid), and scatter the
+concatenated values into it.
+
+```python
+import numpy as np
+
+def pad_numpy(rows, fill=0):
+    lengths = np.fromiter((len(r) for r in rows), dtype=np.int64, count=len(rows))
+    width = int(lengths.max()) if len(rows) else 0
+    mask = np.arange(width) < lengths[:, None]          # (n, width) via broadcasting
+    out = np.full((len(rows), width), fill, dtype=np.int64)
+    if width:                                           # nothing to copy for [] or all-empty rows
+        out[mask] = np.concatenate([np.asarray(r, dtype=np.int64) for r in rows])
+    return out, mask
+```
+
+In the example, `np.arange(5)` is `[0, 1, 2, 3, 4]` and the lengths are `[3, 1, 5]`. Comparing them gives the
+mask in the table. Boolean-mask assignment fills in row-major order (row by row, left to right), which is why
+the concatenated values land in the right cells. Both versions passed the same tests (empty rows, left and
+right padding) when run on 2026-10-12.
+
+### The point to make about cost
+
+The output is n rows × the longest length, whatever you do. So one long row makes every row pay. Say it like
+this: "Memory is n times L. The thing to watch is one long row making every short row pay for it."
+
+At real batch sizes this gets large. Take an assumed batch of 31 texts of 46 tokens and one of 256: about **79%**
+of the padded batch is filler. The fix is to sort texts by length before forming batches, called
+**bucketing**, so each batch holds texts of similar length. A Staff-level answer also mentions a **packed**
+layout: no padding at all, just the values back to back plus a list of where each row starts.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Waste formula:** waste = 1 − Σ len_i ÷ (n × max len).
+- **Small example:** 1 − (3 + 1 + 5) ÷ (3 × 5) = 1 − 9 ÷ 15 = **40%**.
+- **Assumed batch:** 31 × 46 + 256 = 1,682 real tokens; 32 × 256 = 8,192 padded slots. 1 − 1,682 ÷ 8,192 ≈
+  **79%**. The padded batch does 8,192 ÷ 1,682 ≈ **4.9×** the needed work.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Ragged padding"
+  senior={["Correct plain and vectorized versions, a mask, left/right handled, edge cases tested."]}
+  staff={["Quantifies the padding waste, proposes length bucketing or a packed (unpadded) layout with offsets, and asks what consumes the matrix."]}
+/>
+
+## Small-team version
+
+This is real for a team that batch-**embeds** documents on its own hardware. An embedding is a list of numbers
+that represents a piece of text, used for search. Padding waste there is compute you pay for.
+
+What to do:
+
+- **Check your library before writing anything.** The sentence-transformers version in this site's lab
+  environment (6.1.0) sorts inputs by length inside `encode` before batching, verified by reading its source on
+  2026-10-12.
+- **Default to a hosted embedding API at small scale.** You pay per input token, and padding is the provider's
+  problem. Embedding 1M chunks of 500 tokens costs **about $10**.
+- **If you self-host, sort by length.** The 79% batch above does 4.9× the needed work: a backfill worth 10
+  GPU-hours sorted takes about 49 unsorted, **about $98 instead of $20**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Hosted:** 1M × 500 = 500M tokens at $0.02 per million tokens for text-embedding-3-small (list price on
+  [OpenAI's pricing page](https://developers.openai.com/api/docs/pricing), fetched 2026-10-11) = 500 × $0.02 = $10.
+- **Self-hosted:** 10 GPU-hours × 4.9 ≈ 49 GPU-hours. At an assumed $2 per GPU-hour, about $98 against $20.
+
+</details>
+
+## Pitfalls
+
+- **A Python loop over every cell when NumPy is allowed.** It is correct but misses the "performance-aware" bar.
+- **No mask.** Downstream code can't tell padding from data.
+- **Assuming right padding without asking.** Generation often wants left padding.
+- **Crashing on an empty list or empty rows.** `max()` of nothing raises unless you give a default.
+
+## Go deeper
+
+- Family walkthrough: [Short DSA screens with an infrastructure flavor](/system-design-labs/interviews/walkthroughs/infra-dsa-screens/), including the padding-waste formula in its small-team section.
+- Batching texts for an embedding model: <LabRef lab="embedding-pipeline" inline />.

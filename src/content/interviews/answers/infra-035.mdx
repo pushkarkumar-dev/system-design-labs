@@ -1,0 +1,155 @@
+---
+question: infra-035
+family: distributed-training
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "First I'd pin down the noise model, because the answer depends on it. Without noise, a ring all_gather takes
+> N − 1 rounds and is bandwidth-optimal, recursive doubling takes log₂ N rounds, and log₂ N is the lower bound.
+> With lost messages, a union bound tells me how many retries each hop needs; the naive bound multiplies that by
+> every hop, and I improve it by pipelining retries, cutting hops with recursive doubling, and adding error
+> correction. Because the values are floats, I don't need every bit exact: protect the sign and exponent, and treat
+> the goal as bounded error rather than perfect delivery."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see you implement a collective, reason about how many rounds it needs from first
+principles, and adapt when the model of the network changes.
+
+### What makes this different from a coding question you know
+
+Most coding rounds have a fixed spec. This one changes under you: first a clean network, then a noisy one, then a
+hint that the data is floating-point. The skill being tested is noticing that each change alters what "correct"
+means. For a backend engineer, the closest analogy is going from "deliver every message exactly once" to "the
+consumer only needs the value to within 0.1%". The second goal is much cheaper to meet.
+
+### Words you need first
+
+- **Collective**: an operation where N machines (here called **nodes**) each contribute data and each get a result.
+- **all_gather**: every node starts with one block of data and must end with all N blocks.
+- **Round**: one time step in which each node can send a message. Counting rounds is how this question measures
+  speed.
+- **Union bound**: the chance that at least one of many bad events happens is at most the sum of their individual
+  chances. It turns "everything succeeds" into simple arithmetic.
+
+An OpenAI research-engineer candidate reports the sequence: implement all_gather across nodes; for noisy channels
+"derive a worst-case formula for how many rounds you need"; improve it "since the naive bound is too slow"; then use
+the fact that the values are floats. They called it "graduate-level information theory" and were rejected
+(<Cite id="s-7fa103b073" />). The exact noise model isn't reported, so the first job is to pin it down.
+
+## Clarify first
+
+- **Round model?** "In one round, can each node send to one peer, or to all of them?"
+- **Noise model?** "Is a message lost or corrupted with probability p, in a way we can detect? Or is each value
+  received with some random noise added? I'll cover both."
+- **Guarantee?** "Must every node be correct with probability at least 1 − ε, or exactly correct?"
+- **Size?** "How many nodes N, and how big is each value?"
+
+## Answer
+
+### Implementation, no noise
+
+**Ring.** Arrange the nodes in a circle. Node i sends its block to node i + 1. In each of the next N − 1 rounds,
+every node forwards the block it just received. After N − 1 rounds, everyone has everything. Each node sends N − 1
+blocks in total, which is the least any method can send, so it is **bandwidth-optimal**.
+
+**Recursive doubling** (N a power of two). In round r, node i exchanges everything it has so far with node
+i XOR 2^r. The amount each node holds doubles every round, so it takes **log₂ N rounds**, with messages that double
+in size.
+
+**Lower bound.** If each node can send to only one peer per round, the number of nodes that know a given block can
+at most double each round. So at least ⌈log₂ N⌉ rounds are needed. Recursive doubling meets it.
+
+Say it like this: "The ring is optimal for bytes, recursive doubling is optimal for rounds. Which matters depends on
+whether we're limited by bandwidth or by latency."
+
+### Noisy channel: lost messages
+
+Assume each transmission fails independently with probability p, and the receiver can tell (a checksum), so the
+sender retries.
+
+Follow one example: **N = 64 nodes, p = 0.1, and we want everything to succeed with probability at least
+1 − 10⁻⁶**.
+
+1. The ring needs 64 × 63 = **4,032** successful transmissions.
+2. Each hop must succeed within r attempts. The chance one hop fails r times in a row is p^r. By the union bound,
+   all 4,032 succeed with the required probability if 4,032 × p^r is at most 10⁻⁶. That gives **r = 10 attempts
+   per hop**.
+3. The naive schedule waits for the worst case on every hop: 63 hops × 10 = **630 rounds**.
+
+That naive bound is slow because it assumes every hop hits its worst case. Three improvements:
+
+- **Pipeline the retries.** A node forwards each block as soon as it arrives instead of waiting for a fixed slot.
+  The total becomes about hops plus a few extra attempts, not hops × attempts.
+- **Use recursive doubling** to cut the hops from 63 to log₂ 64 = **6**.
+- **Add forward error correction**: each message carries extra redundant bits so it can be decoded even if part of
+  it is damaged. It succeeds in one round with high probability, trading bandwidth for rounds.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Rounds for all transmissions to succeed (union bound)"
+  expr="per-hop attempts r ≥ ln(T ÷ ε) ÷ ln(1 ÷ p)     total rounds ≈ hops × r"
+  vars={[
+    { sym: 'T', meaning: 'transmissions that must succeed (N(N − 1) for the ring)' },
+    { sym: 'ε', meaning: 'allowed failure probability' },
+    { sym: 'p', meaning: 'per-transmission failure probability' },
+  ]}
+  example="N = 64, p = 0.1, ε = 10⁻⁶: T = 4,032 → r ≥ ln(4.03 × 10⁹) ÷ ln 10 ≈ 9.6 → 10; naive ring ≈ 63 × 10 = 630 rounds"
+/>
+
+Derivation: require T × p^r ≤ ε, so p^r ≤ ε ÷ T, so r ≥ ln(T ÷ ε) ÷ ln(1 ÷ p).
+
+</details>
+
+### Using the fact that values are floats
+
+A floating-point number has a sign bit, exponent bits (the scale) and mantissa bits (the digits). Not every bit
+matters equally. An error in the lowest mantissa bits changes the value by a tiny relative amount. An error in the
+sign or exponent can change it by orders of magnitude.
+
+So **protect bits unequally**: strong error correction or retransmission for the sign, the exponent and the top
+mantissa bits; little or none for the low bits.
+
+Or **send fewer bits**. bf16, the 16-bit format used in training, keeps 8 significant bits, so its rounding error is
+at most 2⁻⁸, about 0.4%. Training often tolerates that.
+
+If the noise is **additive** (each received value is the true value plus random noise of standard deviation σ),
+averaging k independent copies shrinks the error to σ ÷ √k. To reach an error of δ, you need k = (σ ÷ δ)² rounds.
+That replaces an exact-delivery bound with an accuracy bound, which is what a consumer of floats actually needs.
+
+Say it like this: "For floats, the right guarantee is bounded error, not identical bits. That changes the bound from
+'how many retries until perfect' to 'how many samples until close enough'."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Noisy all_gather"
+  senior={["Implements ring and recursive doubling and derives the log₂ N lower bound and the union-bound retry count."]}
+  staff={["Pins down the noise model first and reframes the goal from exact bits to bounded error on floats."]}
+/>
+
+## Small-team version
+
+No small team implements collectives over noisy links. NVIDIA's collective library, NCCL, does this work. What
+transfers is the reasoning you use when a profiler shows a slow collective: rounds × latency, plus bytes ÷
+bandwidth. And the question of whether exact delivery is even what the consumer needs.
+
+## Pitfalls
+
+- **Starting to code before fixing the noise model.** The bound depends entirely on it.
+- **Multiplying hops by worst-case retries without pipelining.** It gives 630 rounds where far fewer are needed.
+- **Treating all float bits as equally important.** The sign and exponent matter far more than the low bits.
+- **Forgetting the ⌈log₂ N⌉ lower bound.** It tells you when to stop optimizing.
+
+## Go deeper
+
+- Family walkthrough: [Distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/), the ring all-reduce formula in its back-of-envelope.
+- Sharding and collective cost math: [Roofline and sharded matmul](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/).
+- Where gathered tensors feed a model: <LabRef lab="transformer" inline />.

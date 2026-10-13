@@ -1,0 +1,187 @@
+---
+question: r2a-006
+family: ai-assisted-system-design
+status: published
+labs: [btree-kv]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "First I need to pin down what 'closest' means: the players next to me by rank, or the scores nearest mine. They
+> give different lists. Then it's a sorted structure per game, keyed by score with a tie rule, where a new score
+> replaces the old one only if it's higher. The part that sets the load is friends, so I'll compare looking up
+> friends' scores on every game end against precomputing friend boards. I'll use the AI chat for breadth, if at
+> all, and keep the definition of 'closest' myself."
+>
+> The rest of this page explains each part of that answer.
+
+This is a classic design question: a leaderboard for a video game. Players play games, each player keeps one best
+score per game, players have friends, and when a game ends the app must "show the closest scores". The twist is
+that a chat window with an **AI assistant** sits next to you. It is a large language model (LLM), the same kind of
+tool as ChatGPT or Claude: you type a request, called a **prompt**, and it writes back.
+
+In this round the assistant is *offered*, not required. That matters. A normal design round tests how you think.
+With an assistant present, a complete-looking design is always one prompt away, so the interviewer learns about
+you only from what you define, decide and check yourself. For a leaderboard, the decisive thing to define is one
+word: "closest". The assistant will happily pick a meaning for you, and it may pick the wrong one.
+
+The question was reported from a Meta onsite in September 2026, one of two design rounds in a loop that also had
+two AI coding rounds and a behavioral round. The candidate says the interviewers "just gave you an AI chat window"
+and said you could use it to "unblock yourself as needed". They found little use for it in what they called
+"decades-old classic system design questions", and report that "some interviewers straight up say they don't
+recommend it" (<Cite id="s-6728fdb0b3" />). The same loop's second design round was a ride-share system, with no
+further detail.
+
+## Clarify first
+
+Ask the interviewer, not the assistant. Say it like this: "Before anything else, can I pin down what 'closest'
+means?"
+
+- **Closest by rank or by score?** "The players around your rank" and "the scores nearest yours" are different
+  queries. Ask, and show the difference with a tiny example (below).
+- **Global, friends, or both?** The prompt mentions friends, so assume both.
+- **Ties.** Assume higher score first, then a stable player-id order.
+- **One best score per player per game.** A new score replaces the old one only when it is higher.
+- **Scale, if not given.** Assume 20M players in the biggest game and 50M games finished a day, with a **peak
+  factor** (how much busier the busiest moment is than the average) of 5. That gives about **2,900 score
+  submissions a second** at peak.
+
+## Answer
+
+### One example board
+
+Keep one small board in your head for the whole answer (illustrative values):
+
+| Rank | Player | Best score |
+|---|---|---|
+| 1 | Ana | 50 |
+| 2 | Bo | 41 |
+| 3 | Cy | 40 |
+| 4 | Gus (just finished) | 30 |
+| 5 | Dee | 22 |
+| 6 | Eve | 21 |
+
+Gus finishes with 30 and wants to see two players near him.
+
+- **By rank**, one on each side: Cy (40) and Dee (22).
+- **By score**, the two nearest: Dee (22, 8 away) and Eve (21, 9 away). Cy is 10 away, so he drops out.
+
+Say it like this: "Same board, same player, different answers. That's why I asked."
+
+### The picture
+
+```
+Game client (game ends, score 30)
+   │  1. submit(game, player, score)
+   ▼
+Leaderboard API ── routes by game id
+   │  2. conditional update: only if higher than the player's best
+   ▼
+Game shard ── one sorted structure per game, in memory: (−score, player id)
+   │         replicated to read copies
+   ├──► 3a. "around me": find my position, read k on each side
+   ├──► 3b. "closest scores": jump to my score, walk up and down, merge by distance
+   └──► 3c. friends: look up each friend's best score and sort
+```
+
+**The leaderboard API** receives each finished game and sends it to the machine that owns that game. Games are
+split across machines by game id, so one game lives on one machine.
+
+**The game shard** keeps, for each game, entries sorted by `(−score, player id)`. The minus sign puts the highest
+score first; the player id breaks ties. All 20M best scores of the biggest game fit in about **2 GB** of memory,
+and any lookup takes about **24 steps**, because a sorted structure costs O(log n) per operation. Read copies serve
+the query traffic.
+
+**Submit** is a conditional update. If the new score is higher, remove the old entry and insert the new one. If you
+forget the removal, Gus appears twice after he improves from 30 to 35.
+
+**Around me** finds the player's position, then reads a window of k entries on each side.
+
+**Closest scores** jumps to the submitted score, then walks outward in both directions. At each step it takes
+whichever side is nearer, applies the tie rule, and skips the player himself.
+
+**Friends** fetches each friend's best score and sorts them on each request. More on its cost below.
+
+### The tricky part, checked by test
+
+The family walkthrough has a small prototype of "closest" that was checked against a **brute-force oracle**: a
+slow, obviously correct version (sort every entry by distance, take the first k) that the fast version must always
+agree with. It ran on 3,000 random boards with many ties and resubmits. Two plausible drafts failed it. One
+returned equal scores above the pivot in the wrong order. The other kept a player's old entry after an
+improvement, so the player appeared twice. Both drafts look correct when you read them. That is the point: say
+"I'd prove this against a brute-force version" rather than trusting a draft, yours or the assistant's.
+
+### Friends is the number that sets the load
+
+There are two ways to build "closest among my friends".
+
+- **Fan-out on read:** when a game ends, look up each friend's best score and sort. With an assumed 100 friends,
+  that is about **289,000 lookups a second** at peak.
+- **Fan-out on write:** when a player improves, write the new score into every friend's private board. That is about
+  **58,000 writes a second**, if an assumed 20% of games improve a best score. But the friend boards take about
+  **200 GB**.
+
+Say it like this: "Which wins depends on how often scores improve and how many friends people have. Can you tell me
+both?" Start with fan-out on read, because friend lists are small, and cap very large ones.
+
+### The expensive query
+
+Exact global rank for a player far down a huge board ("you are #4,512,901") means counting everyone above them.
+That is the costly query. Approximate it from counts per score bucket ("about 4.5 million players have more than
+your score"). Exact neighbours stay cheap.
+
+### How to use the assistant here
+
+Use it for breadth (a list of failure modes, a diagram draft) or not at all. Don't let it define "closest". If it
+proposes "take the rank and read k on each side", say what that returns (neighbours by rank) and what it misses
+(nearest by score needs a merge of both sides with a tie rule).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Every input is an assumption.
+
+- Submissions: 50M games a day ÷ 86,400 seconds = 578.7 a second; × peak factor 5 = **2,894 a second**.
+- Memory: 20M entries × an assumed 100 bytes each (with index overhead) = **2 GB**.
+- Depth: log₂(20M) ≈ **24** levels.
+- Fan-out on read: 2,894 × 100 friends ≈ **289K lookups a second**.
+- Fan-out on write: 2,894 × 0.2 × 100 ≈ **58K writes a second**.
+- Friend boards: 20M players × 100 friends × 100 bytes = **200 GB**.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Leaderboard with an AI window"
+  senior={["Defines closest by rank vs by score, handles ties and resubmits, and sizes the ordered store per game."]}
+  staff={["Finds the number that sizes the friends feature (fan-out on read vs write), names approximate rank for the long tail, and decides how much AI use the round rewards."]}
+/>
+
+## Small-team version
+
+Start in Postgres. An index on `(game_id, score)` answers "closest scores" with two short index scans: one at or
+above the score, one below it. Merge them in the application with your tie rule. The friends view is a query over a
+few hundred rows.
+
+The sizing, with the assumed numbers above: 20M rows at about 100 bytes each is about **2 GB** of table and index.
+That fits the database you already pay for. About 2,900 conditional updates a second at peak is a write rate to
+load-test on your own primary database before you rely on it.
+
+Buy nothing new yet. Add an in-memory sorted structure (for example a Redis sorted set) only when exact rank
+queries show up as slow. Measure first. Revisit when a second game reaches that size, or when rank queries
+dominate the load.
+
+## Pitfalls
+
+- **Answering "by rank" when the product meant "by score".** Or the reverse; the two return different players.
+- **A submit path that keeps duplicate entries.** A player who improves then appears twice.
+- **Ignoring friend fan-out.** It can be a hundred times the submission rate.
+- **A long AI detour in a round where it is optional.** Some interviewers reportedly don't recommend using it at all.
+
+## Go deeper
+
+- Family walkthrough: [System design with an AI assistant in the room](/system-design-labs/interviews/walkthroughs/ai-assisted-system-design/), especially "Deep dives" and its prototype.
+- An ordered index with a range scan: <LabRef lab="btree-kv" inline />.

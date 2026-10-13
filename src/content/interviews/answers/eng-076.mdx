@@ -1,0 +1,186 @@
+---
+question: eng-076
+family: llm-cost-latency
+status: published
+labs: [llm-inference, observability, rag]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'd diagnose before I optimise. First I'd split one slow request into stages with tracing: my own code,
+> retrieval, waiting for the model, the model reading the prompt, and the model writing the answer. Then I'd check
+> whether the delay is before the first word or after it, because those have different causes. Long prompts and
+> queueing make the first word slow; long answers make the whole thing slow. I'd look for model calls running one
+> after another and for hidden retries on rate limits. Only then would I pick batching or caching, aimed at the stage
+> that is actually slow."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants a method, not a list of tricks. Do you measure before you change things?
+
+Most of that method is ordinary backend debugging: trace the request, find the slow span, fix it. What is different
+with a **large language model (LLM)** is the shape of the model call itself. A database query is one block of time.
+A model call has two parts with different causes:
+
+1. **Reading the prompt.** The model first reads the whole input in one pass. This is called **prefill**. It gets
+   longer as the prompt gets longer.
+2. **Writing the answer.** The model then writes one **token** (a chunk of text, roughly ¾ of a word) at a time.
+   This is called **decode**. A 300-token answer needs 300 steps, so long answers take many seconds.
+
+So "the model is slow" can mean three quite different things: the prompt is too long, the answer is too long, or
+the request waited in a queue before the model even started. A good answer separates them.
+
+The question was reported in a first-hand account of an OpenAI forward-deployed engineer technical screen. The
+prompt was "Walk me through how you'd diagnose high latency in an LLM inference pipeline", and then "we discussed
+batching strategies and caching" (<Cite id="s-812dbc9385" />).
+
+## Clarify first
+
+- **Which latency is high?** "The wait for the first word, the full answer, or a workflow of several calls? I'll
+  assume the first word in a chat feature." The wait for the first word is the **time to first token (TTFT)**.
+- **Since when, and for whom?** "All users, one customer, or only long prompts? I'll assume a recent regression."
+- **Hosted API or our own model?** "I'll start with a provider's API, then cover running our own."
+- **What tracing exists?** "I'll assume a trace per request. If there isn't one, adding it is step one."
+
+## Answer
+
+### Picture the request
+
+```
+Client
+   │
+   ▼
+Your code ── build the prompt, retrieve documents, rerank, maybe call a database
+   │
+   ▼
+Queue ── wait for capacity (provider rate limit, or a full GPU)
+   │
+   ▼
+Prefill ── model reads the prompt            → first token (TTFT ends here)
+   │
+   ▼
+Decode ── one token at a time, each one taking the "time per output token"
+   │
+   ▼
+Client sees the full answer
+```
+
+The **time per output token (TPOT)** is how long each decode step takes. Total time is roughly: your code, plus
+queue, plus prefill, plus (output tokens − 1) × TPOT.
+
+### Follow one slow request
+
+Take a chat request that takes about 8.4 seconds end to end. Assume your own code takes 0.5 s, the queue 0.1 s,
+prefill 0.3 s, and the 300-token answer at 25 ms per token about 7.5 s. Walk the six checks in order:
+
+| Check | What you look at | In this example | What to say in the interview |
+|---|---|---|---|
+| **1. Model or everything else?** | The client's TTFT against the model span's TTFT | 0.5 s is our own code | "The gap between what the client sees and what the model reports is my code." |
+| **2. Serial calls** | Model calls per user action, and whether they run one after another | One call | "Three 1-second calls in a row take 3 seconds. I'd run independent ones in parallel or merge them." |
+| **3. First token or the rest?** | TTFT against total time | First token at 0.9 s; the other 7.5 s is decode | "The answer length is the problem here, not the prompt." |
+| **4. Prompt length** | TTFT plotted against input tokens | Prefill is only 0.3 s | "If TTFT climbed in a straight line with prompt length, I'd trim the prompt." |
+| **5. Queueing and retries** | TTFT against load; retries per request | 0.1 s | "If TTFT climbed with load but not with prompt length, I'd look for rate-limit retries." |
+| **6. Tails** | p95 per stage and per prompt length, then the request p95 from traces | — | "I never add stage p95s together." |
+
+The conclusion for this request: trimming the answer from 300 to 150 tokens saves about **3.75 s**. Halving
+prefill saves about **0.15 s**. Say: "Cut the answer before you touch the prompt. Here output length owns the time."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Where the time goes"
+  expr="total = t_app + t_queue + t_prefill + (output_tokens − 1) × TPOT"
+  vars={[
+    { sym: 't_app', meaning: 'everything before the model: build, retrieve, rerank' },
+    { sym: 'TPOT', meaning: 'time per output token' },
+  ]}
+  example="Assumed: t_app 0.5 s, queue 0.1 s, prefill 0.3 s, 300 tokens at 25 ms = 7.5 s. Total ≈ 8.4 s; trimming output to 150 tokens saves more than halving prefill."
+/>
+
+- Trimming 150 output tokens: 150 × 25 ms = 3.75 s saved.
+- Halving prefill: 0.3 s ÷ 2 = 0.15 s saved.
+
+</details>
+
+### The six checks, explained
+
+**1. Model or everything else.** Compare the TTFT the client sees with the model span's own TTFT. The gap is your
+own code: prompt building, retrieval, reranking, a synchronous database call. A **reranker** is a second model that
+re-scores retrieved documents before they go into the prompt, and it can be slow. The rag lab measured one scoring 20
+candidates at <LabNumber lab="rag" metric="Cross-encoder rerank, 20 candidates (CPU / MPS)" />. A stage like that can
+own the p95 on its own.
+
+**2. Serial calls.** Count model calls per user action. Three 1-second calls in series take 3 seconds. Run
+independent ones in parallel, or merge them into one.
+
+**3. First token versus the rest.** A slow first token with a normal TPOT points at long prompts, queueing, or a
+prompt cache that isn't being hit (explained under "Then batching and caching"). A normal first token with a long
+total time points at answer length. Cap the answer length with the `max_tokens` setting, ask for a shorter format, or
+stream.
+
+**4. Prompt length.** Plot TTFT against input tokens. A straight-line climb means prefill is the cost. Trim the
+retrieved context, shorten the history, and put content that never changes at the start of the prompt so it can be
+cached.
+
+**5. Queueing and retries.** TTFT that climbs with load but not with prompt length means requests are waiting for
+capacity. On a provider's API, that is often rate limiting: the provider returns HTTP 429 ("too many requests") and
+the client library quietly retries with backoff, so the wait looks like a slow model. On your own server, it means
+the GPU is full. Check retries per request.
+
+**6. Tails.** A **p95** is the time 95% of requests beat. Compare p95 per stage and per group of similar prompt
+lengths, then take the request-level p95 from traces. Never add stage p95s together; a prep guide notes those tails
+"can belong to different requests" (<Cite id="s-b6632d5df9" />).
+
+### Then batching and caching
+
+This is the reported follow-up. Say which stage each one helps.
+
+- **Batching** means running several requests through the model together. On a server you run, the model's weights
+  are read from GPU memory once per step for everyone in the batch, so throughput goes up and cost per token goes
+  down; each request's steps get slightly slower. On a hosted API, the batching lever is the **batch API**: you submit
+  work that nobody is waiting for and get answers within hours at 50% off.
+- **Caching** removes work. **Prompt caching** (or prefix caching) reuses the provider's work for a prompt start it
+  has seen recently, which cuts prefill time and input cost. An **exact-match cache** in your code skips repeated
+  identical calls entirely. An **embedding cache** skips repeated work on the retrieval side.
+
+Say: "Batching makes the GPU cheaper per token. Caching makes the work disappear. Neither helps if the slow stage is
+my own reranker."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Latency diagnosis"
+  senior={["Runs the stage breakdown, separates TTFT from decode, checks serial calls and retries, then picks a lever per stage."]}
+  staff={["Argues in tokens first (prompt and output length, fan-out, cache hits) before new infrastructure, and sets a p95 objective per feature with an owner."]}
+/>
+
+In plain words: a Senior answer finds the slow stage and picks the right fix. A Staff answer first asks whether the
+request is simply carrying too many tokens, and leaves behind a latency target per feature that someone owns.
+
+## Small-team version
+
+You are the one who gets paged. Add a span per stage and token counts per call to your client library before anything
+else; an agent can wire it in an hour.
+
+Most fixes at this scale are prompt length, answer caps, serial calls and provider retries, not GPUs. The example
+shows why: at an assumed 25 ms per output token, cutting 150 output tokens saves 3.75 s, while halving a 0.3 s
+prefill saves 0.15 s.
+
+Consider running your own model or paying for a dedicated endpoint only when traces show provider queueing you can't
+route around, and the volume justifies GPUs that are on all the time.
+
+## Pitfalls
+
+- **Proposing a faster GPU before measuring stages.** If your own code or the reranker owns the time, a faster GPU changes nothing.
+- **Summing per-stage p95s.** The slow tails of different stages usually belong to different requests.
+- **Missing hidden client retries on 429s.** Rate-limit retries look like a slow model unless you count them.
+- **Treating streaming as a fix for total latency.** Streaming makes the wait feel shorter; the full answer takes just as long.
+
+## Go deeper
+
+- Family walkthrough: [Make an LLM feature fast and affordable](/system-design-labs/interviews/walkthroughs/llm-cost-latency/#deep-dives), the diagnosis deep dive.
+- Labs: <LabRef lab="llm-inference" inline />, <LabRef lab="observability" inline />, <LabRef lab="rag" inline />.
+- Sibling: [Read a TTFT timeline](/system-design-labs/interviews/questions/infra-075/).

@@ -1,0 +1,198 @@
+---
+question: eng-087
+family: adapt-models
+status: published
+labs: [transformer, lora-finetune, llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "A transformer turns each word piece into a vector, then passes it through layers where each piece looks back
+> at earlier pieces and mixes in what's relevant. It writes one piece at a time, so it caches earlier pieces' keys
+> and values, and that cache is what fills GPU memory. Fine-tuning adjusts the model on our own examples; LoRA
+> does it with a small add-on instead of retraining everything. RLHF trains the model to please a learned judge
+> of human preferences, which risks flattery. And hallucination is fixed mostly by giving the model the facts and
+> letting it say 'I don't know', not by training."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+This is a depth round on the machinery under your applied decisions. The interviewer wants four short, correct
+explanations, each with one number and a link to what you would actually do.
+
+What makes it different from a backend depth round: you can't reason about a model by reading its code, because
+its behaviour lives in billions of learned numbers (its **weights**, or **parameters**). So you explain it the way
+you'd explain a database engine from the outside: what flows through it, where the memory goes, and what you can
+change cheaply. Use one public model as your running example, Llama-3.1-8B, an open model with about 8 billion
+parameters, so every number is checkable.
+
+The report is one Blind commenter (company tag Google) describing "an ML depth round probing transformers,
+fine-tuning, RLHF, and hallucination mitigation" in Staff loops; it is unverified and the year isn't shown
+<Cite id="s-fe60d2bf1f" />.
+
+## Clarify first
+
+- **"How deep do you want to go?"** Concepts, or derivations? Offer the concept and one formula, then let them steer.
+- **"Which part matters most for this role?"** Serving, adaptation or safety?
+- **"Your models, or general?"** Say you'll use Llama-3.1-8B as a public example.
+
+## Answer
+
+### Words you need first
+
+- **Token.** Models read and write text in pieces called tokens, roughly ¾ of a word each. Each token has an id.
+- **Vector.** A list of numbers. Llama-3.1-8B represents each token as 4,096 of them.
+- **bf16.** A 2-byte number format; most model weights and caches are stored in it.
+
+### Transformers
+
+A **transformer** is the design almost every large language model (**LLM**) uses. Follow one prompt, "refund for
+annual plan", through it:
+
+```
+Text "refund for annual plan"
+   │  1. split into tokens, each with an id
+   ▼
+Embedding table ── looks up one vector per token id
+   │  2. vectors go through 32 layers
+   ▼
+Each layer:
+   ├─ Attention ── each token looks back at earlier tokens
+   └─ Feed-forward ── each token's vector is transformed on its own
+   │  3. the last token's final vector
+   ▼
+Next-token scores ── pick the next token, append it, repeat
+```
+
+**The embedding table** is a lookup table with one learned vector per token in the vocabulary. Llama-3.1-8B's has
+128,256 entries × 4,096 numbers = **525 million parameters, about 1.05 GB** in bf16. This is not the same as a
+sentence-embedding model, which turns a whole passage into one vector for search.
+
+**Attention.** In each layer, every token makes three vectors: a **query** (what am I looking for?), a **key** (what
+do I contain?) and a **value** (what do I pass on?). A token compares its query with the keys of all earlier tokens.
+A function called **softmax** turns those match scores into weights that add up to 1, and the token takes the
+weighted mix of the earlier tokens' values. A **feed-forward** block then transforms each token's vector on its
+own. Each layer also adds its result back onto its input (a **residual connection**) and rescales the numbers
+(**normalization**), which keeps training stable.
+
+**The KV cache.** The model writes one token at a time, and each new token needs the keys and values of every
+earlier token in every layer. So they are saved in GPU memory instead of recomputed. That store is the **KV cache**.
+For Llama-3.1-8B it is **128 KiB per token**, so one 8,192-token request holds about **1.07 GB**.
+
+Say it like this: "The KV cache trades memory for speed. It's why long conversations limit how many users a GPU can
+serve."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Llama-3.1-8B uses **grouped-query attention** (GQA): its 32 query heads share 8 key/value heads, so it stores fewer
+keys and values than it has query heads.
+
+<Formula
+  title="KV cache per token"
+  expr="bytes = 2 × layers × n_kv_heads × head_dim × bytes_per_value"
+  vars={[
+    { sym: 'n_kv_heads', meaning: 'KV heads; 8 for Llama-3.1-8B under grouped-query attention' },
+    { sym: 'bytes_per_value', meaning: '2 for bf16' },
+  ]}
+  example="2 × 32 × 8 × 128 × 2 = 131,072 B (128 KiB) per token; 1.07 GB for an 8,192-token request"
+/>
+
+The "2" is one key and one value. Using the hidden size (`2 × layers × hidden × bytes`) instead of KV heads ignores
+the sharing and is 8× too high for Llama-3.1-70B.
+
+</details>
+
+### Fine-tuning
+
+**Fine-tuning** is training a model further on your own examples. **Supervised fine-tuning (SFT)** trains on pairs
+of an input and the ideal output, scoring the model only on the output tokens.
+
+**Full fine-tuning** updates every weight. **LoRA** (low-rank adaptation) freezes the weights and learns a small
+add-on for each adapted matrix: two thin matrices whose product, `ΔW = B·A`, is added to the original. `B` starts
+at zero, so training begins from the base model's behaviour. The LoRA paper reports that, compared with fine-tuning
+GPT-3 175B with the Adam optimizer, this cuts trainable parameters 10,000× and GPU memory 3×, with no added delay
+per request once the add-on is merged into the weights ([Hu et al., 2021](https://arxiv.org/abs/2106.09685)).
+**QLoRA** trains the add-on over a base model stored in 4-bit numbers, and reports a 65B fine-tune on one 48 GB GPU
+([Dettmers et al., 2023](https://arxiv.org/abs/2305.14314)).
+
+For Llama-3.1-8B, a rank-16 LoRA on the four attention matrices is about **13.6 million parameters, about 27.3 MB**.
+
+### RLHF
+
+**RLHF** (reinforcement learning from human feedback) is how chat models are trained to be helpful. InstructGPT's
+recipe has three steps: SFT on human-written demonstrations; a **reward model** (a second model that predicts which
+answer a human would prefer) trained on human rankings; then reinforcement learning to make the main model score
+well on that reward. Its 1.3B model's outputs were preferred to the 175B GPT-3's
+([Ouyang et al., 2022](https://arxiv.org/abs/2203.02155)). **DPO** (direct preference optimization) reaches the same
+goal with a simple classification loss and no generating answers during training
+([Rafailov et al., 2023](https://arxiv.org/abs/2305.18290)).
+
+The risk is that the model learns to please the reward, not the intent behind it. Per OpenAI's postmortem as quoted
+by Georgetown Law, an extra thumbs-up/down reward signal weakened the one "holding sycophancy in check" in the April
+2025 GPT-4o update, which was rolled back. (**Sycophancy** means telling users what they want to hear.)
+
+### Hallucination mitigation
+
+**Hallucination** is the model stating something false with confidence. It predicts likely text, and a fluent
+guess is likely text. The fixes: ground answers in retrieved documents, allow "I don't know", require quotes or
+citations and check them in code, measure how often answers are supported in the eval, and send low-confidence
+cases to a human.
+
+Fine-tuning on facts doesn't fix it and can make it worse. One study found that once a model learns fine-tuning
+examples with facts it didn't already know, they "linearly increase the model's tendency to hallucinate"
+([Gekhman et al., 2024](https://arxiv.org/abs/2405.05904)).
+
+Say it like this: "If you train a model on facts it didn't know, you also train it to answer confidently past what
+it knows."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Depth round"
+  senior={["Explains each piece correctly with one number, and uses the KV-heads formula rather than the hidden-size one."]}
+  staff={["Connects each mechanism to a decision: KV size to context limits and cost, LoRA to multi-tenant adapters, RLHF to the evals you'd add before shipping a tuned model."]}
+/>
+
+In plain words: a Senior answer is correct and concrete. A Staff answer also turns each mechanism into a decision
+about cost, capacity or safety.
+
+## Small-team version
+
+You will rarely train with RLHF. You will debug a self-hosted model's memory use, choose between a better prompt and
+an adapter, and answer "why did it make that up?". Know three things:
+
+- **The KV formula**, to size how many long requests fit on a GPU.
+- **LoRA's size**, about 27 MB per adapter at the 8B example, to reason about one adapter per customer.
+- **The hallucination checklist**, to turn a bad answer into a new test case.
+
+A worked sizing: one 80 GB GPU holding Llama-3.1-8B leaves room for about **54 full 8,192-token requests** at once.
+Fifty customer adapters add only about **1.4 GB**, which barely moves that. Rented, one H100 GPU costs about
+**$3,130 a month**. Compare that with a managed API at your volume before you self-host.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Assumptions labelled; prices from Lambda's single-GPU list price, fetched 2026-10-11.
+
+- **Memory left for the KV cache:** 80 GB − 16.06 GB of bf16 weights − an assumed 5 GB of overhead ≈ 58.9 GB.
+- **Requests:** 58.9 GB ÷ 1.074 GB per 8,192-token request ≈ 54.9, so **54** full requests.
+- **Adapters:** 50 × 27.3 MB ≈ **1.4 GB**.
+- **Cost:** $4.29 an hour × 730 hours ≈ **$3,130 a month**.
+
+</details>
+
+## Pitfalls
+
+- **The hidden-size KV formula.** `2 × layers × hidden × bytes` ignores shared KV heads; for Llama-3.1-70B it is 8×
+  too high.
+- **Saying LoRA "adds latency" or "trains a small model".** Once merged it adds no delay, and it trains a small
+  change to a big model.
+- **Describing RLHF without its failure mode.** The model optimizes what you reward, including flattery.
+- **Promising fine-tuning will stop hallucinations.** Training on new facts can make it worse.
+
+## Go deeper
+
+- Family walkthrough: [Prompting, RAG or fine-tuning](/system-design-labs/interviews/walkthroughs/adapt-models/), "Core concepts" and "Common follow-ups in depth".
+- Attention in code: <LabRef lab="transformer" inline />. LoRA: <LabRef lab="lora-finetune" inline />. A real KV cache: <LabRef lab="llm-inference" inline />.

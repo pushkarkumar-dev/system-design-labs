@@ -1,0 +1,192 @@
+---
+question: infra-030
+family: concurrent-io-workers
+status: published
+labs: [io-model]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll ask the server for the file size and whether it supports range requests. Then I'll split the file
+> into fixed-size pieces, download them in parallel, and write each piece straight to its own position in a
+> preallocated file, so no two threads fight over a file cursor. A piece that fails is retried on its own.
+> At the end I hash the whole file and compare it with the expected hash, and only a file that matches gets
+> its real name. If you can publish a hash per piece, I'd use that, so a bad piece can be re-fetched alone."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you can split one large transfer into independent pieces, run them
+concurrently, put the bytes back in the right places, survive partial failures, and prove the result is
+correct.
+
+Most concurrency questions are about many small jobs. This one is about one big job made into many small
+ones. That changes what can go wrong. Every piece can look fine on its own (right status, right length) and
+the file can still be wrong: a flipped byte, a piece from an older version of the file, or a server that
+quietly ignored your request for a piece and sent the whole thing. So the question is half concurrency and
+half **integrity**: proving the bytes on disk are the bytes the publisher meant.
+
+The PracHub title is "Parallelize chunked file download and verify integrity", from a Baseten technical
+screen. The page gives only the title (<Cite id="s-fa7d3ae628" />), so the details below are the natural
+scope, not a reported spec. Confidence is low.
+
+## Clarify first
+
+- **Does the server support range requests?** Check for `Accept-Ranges: bytes` on a `HEAD` request.
+- **What is the integrity reference?** A whole-file hash, a hash per chunk, or only the size?
+- **Can the file change during the download?** Is there an ETag?
+- **Should the download resume after a crash?**
+- **What is the bottleneck?** One connection's speed (a long round trip, or a per-connection cap on the
+  server), or the link itself?
+
+## Answer
+
+### Words you need first
+
+- **Range request**: an HTTP request with a header like `Range: bytes=0-8388607`, asking for only those bytes.
+  A server that honors it answers **206 Partial Content**, with a `Content-Range` header saying which bytes it
+  sent.
+- **ETag**: a version id the server gives a file. Sending it back as `If-Range: <etag>` means "send me this
+  range only if the file hasn't changed; otherwise send the whole new file". MDN says If-Range turns a stale
+  range request into a full 200 response
+  ([MDN](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Range_requests), read 2026-10-12).
+- **`pwrite`**: write bytes at a given offset in a file without moving the file's shared position, so several
+  threads can write different parts at once with no lock.
+- **SHA-256**: a fingerprint of a file's bytes. Two different files practically never share one.
+
+### The download as a picture
+
+```
+HEAD request ── Content-Length, Accept-Ranges: bytes, ETag (no range support → one plain stream)
+   │
+   ▼
+Plan ranges ── e.g. 8 MiB each; the last one is shorter
+   │
+   ▼
+Create dest.part, ftruncate to the full size
+   │
+   ▼
+Thread pool ── each worker: GET with Range and If-Range
+   │            check 206 + exact Content-Range + length → pwrite at offset a
+   │            on error: retry this range only, with jittered backoff
+   ▼
+fsync, then SHA-256 the whole file
+   │
+   ▼
+Match → os.replace(dest.part, dest)      Mismatch → delete and fail (or re-fetch)
+```
+
+**The `HEAD` request** gets the size, the ETag and whether ranges work. If they don't, fall back to one
+ordinary download.
+
+**Planning ranges** is plain arithmetic: fixed-size pieces, with a shorter last one.
+
+**Preallocating** with `ftruncate` sets the file's size up front, so every worker can write to its own offset
+immediately.
+
+**Each worker** sends `Range: bytes=a-b` and `If-Range: <etag>`, checks for a 206 with exactly the right
+`Content-Range` and length, and writes with `os.pwrite(fd, data, a)`. A **200** to a range request means the
+server ignored the range or the file changed, so stop and restart rather than writing a whole file at offset
+`a`.
+
+**Retries** are per range, with **jittered backoff** (a random, growing wait) and a cap on attempts.
+
+**Verification** calls `fsync` (force the bytes to disk), hashes the whole file in blocks, compares, and only
+then renames it with `os.replace`. The rename is atomic, so the real name never points at an unverified file.
+
+Say it like this: "Nothing gets the final name until its hash matches."
+
+### Follow one download through it
+
+The family walkthrough ran this on 2026-10-12 against a local test server serving 64 MiB plus 12,345 bytes in
+8 MiB ranges. The server was set to misbehave twice.
+
+| Event | What the code did | What to say in the interview |
+|---|---|---|
+| One range gets a 503 once | Retried that range silently; it succeeded | "Server errors are retried per range." |
+| Another range comes back once with one byte flipped | Passed every per-range check: 206, right range, right length | "Status and length aren't integrity." |
+| Final SHA-256 | Didn't match; the file was discarded | "Only the whole-file hash caught it." |
+| Second attempt | Succeeded in 0.15 s | "With one whole-file hash I can't tell which range was bad, so I re-fetch all of it." |
+
+### Better integrity
+
+Publish a **manifest**: a small file listing the hash of each chunk. Verify each range as it arrives,
+re-fetch just the bad one, and record finished ranges on disk, so a crash resumes from where it stopped
+instead of starting over.
+
+### When parallel ranges help at all
+
+Splitting a download only helps when one connection can't fill the link. A TCP connection can have only a
+limited amount of unacknowledged data in flight (its **window**), and it waits one **round-trip time** (RTT)
+for acknowledgments. So one connection's speed is capped at about window ÷ RTT. Far-away servers (long RTT)
+and servers that cap each connection are where parallel ranges pay off.
+
+<Formula
+  title="When parallel ranges help"
+  expr="one-connection throughput ≤ window ÷ RTT"
+  vars={[
+    { sym: 'window', meaning: 'bytes a TCP connection can have unacknowledged' },
+    { sym: 'RTT', meaning: 'round-trip time to the server' },
+  ]}
+  example="An assumed 4 MiB window at 50 ms RTT: 4,194,304 ÷ 0.05 ≈ 84 MB/s per connection, so filling a 10 Gbit/s (1.25 GB/s) link needs about 15 connections"
+/>
+
+On the local test link, parallel ranges made no difference worth measuring: the 64 MiB download took 0.15 s. Say
+it like this: "I'd measure one connection first. If it already fills the link, parallel ranges only add load."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **One connection:** 4,194,304 bytes ÷ 0.05 s ≈ 83.9 MB/s ≈ **84 MB/s** (assumed window and RTT).
+- **Connections to fill 10 Gbit/s:** 1.25 GB/s ÷ 0.084 GB/s ≈ 14.9, so about **15**.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Chunked download"
+  senior={["Range requests into a preallocated file with pwrite, per-range retries, a final hash check and an atomic rename."]}
+  staff={["Asks for per-chunk hashes and ETags up front, makes the download resumable, and explains when parallel connections help (window ÷ RTT) and when they only add load."]}
+/>
+
+In plain words: a Senior answer downloads correctly and refuses a bad file. A Staff answer also makes a bad
+piece cheap to fix, survives a crash, and knows when parallelism is pointless.
+
+## Small-team version
+
+You meet this when pulling model weights or datasets. The actions:
+
+- **Use the model hub's own download client first**, and check in its docs whether it downloads in parallel
+  and what it verifies.
+- **If you write it yourself**, keep a manifest of chunk hashes, resume from it, and never let an unverified
+  file take the final name.
+- **Put the download cache on a local disk**, so a restart doesn't download everything again.
+
+The arithmetic says when parallel ranges matter. An 8-billion-parameter model stored in bf16 (2 bytes per
+number) is about 16 GB of weights. At a full 10 Gbit/s link that takes about **13 s**. At an assumed 250 MB/s
+for a single connection it takes about **64 s**. Default: the hub client, with its cache on a local disk.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Weights:** 8 × 10⁹ parameters × 2 bytes = **16 GB**.
+- **Full link:** 16 GB ÷ 1.25 GB/s = 12.8 s ≈ **13 s**.
+- **One connection (assumed 250 MB/s):** 16 GB ÷ 0.25 GB/s = **64 s**.
+
+</details>
+
+## Pitfalls
+
+- **Trusting status and length checks as integrity.** The flipped byte passed both; only a hash catches it.
+- **Accepting a 200 to a range request.** Writing the whole body at a range's offset corrupts the file.
+- **Seeking and writing from several threads on one shared file offset.** Threads move each other's cursor;
+  use `pwrite` instead.
+- **Renaming before verification.** A corrupt file then looks complete, and the next run trusts it.
+
+## Go deeper
+
+- Family walkthrough: [Concurrent I/O workers](/system-design-labs/interviews/walkthroughs/concurrent-io-workers/), "Parallel chunked download".
+- Large-scale weight distribution: [Move big bytes fast](/system-design-labs/interviews/walkthroughs/move-big-bytes/).
+- Sockets and I/O models: <LabRef lab="io-model" inline />.

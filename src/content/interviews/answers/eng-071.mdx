@@ -1,0 +1,185 @@
+---
+question: eng-071
+family: batcher-to-fleet
+status: published
+labs: [embedding-pipeline, llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "If every batch takes 100 ms, one GPU serves the batch size divided by 0.1 seconds: 320 requests a second at
+> batches of 32. A request waits on average half a batch for the next one to start, then 100 ms for its own, so
+> about 150 ms. I'd let GPU workers pull batches from a queue bounded by waiting time, and send each result back
+> to the server holding the caller's connection. Before designing, I'd ask whether the 100 ms is model time or the
+> whole budget, because if it's the whole budget, back-to-back batches can't meet it."
+>
+> The rest of this page explains each part of that answer.
+
+The fixed 100 ms is there so you reason about queueing rather than about how the model works. The interviewer
+wants to see you turn one number into capacity and latency, then adapt the design when each assumption breaks.
+
+In a normal backend, a request's latency is mostly its own processing time. Here it is not. A GPU runs inputs in
+**batches** (groups run together in one pass of the model), and a batch costs about the same whether it holds 1
+input or 32. That changes two things:
+
+1. **Capacity depends on batch size, not on request cost.** Fuller batches mean more requests per second from the
+   same GPU.
+2. **Latency is mostly waiting.** A request waits for a batch to start, then for the batch to finish. Only the
+   second part is "model time".
+
+PracHub lists this title as an Anthropic onsite question. Its follow-ups are PracHub's own write-up (posted
+2026-10-01), and each breaks one assumption: batch time that depends on length, short requests stuck behind long
+ones, several models, and a 100 ms budget that might be end to end (<Cite id="s-0606cb2a41" />).
+
+## Clarify first
+
+- **What does the 100 ms cover?** "Is that the model's time per batch, or the caller's whole budget including
+  queueing and network? I'll assume model time only." The write-up asks you to state this.
+- **Maximum batch size?** "I'll assume 32 as the default and show 100 as well."
+- **Request rate, number of models and latency target?** Not given, so ask, then assume: "10,000 requests a
+  second, one model, and p99 under 400 ms."
+- **Synchronous callers?** Yes: each caller blocks until its own answer comes back.
+
+## Answer
+
+### Words you need first
+
+- **Batch size (B):** how many inputs one batch holds. Here 32 by default, at most 100.
+- **Back-to-back batches:** the GPU starts the next batch the moment the last one ends, so it is never idle.
+- **Utilisation:** the share of time the GPU is busy. You never plan for 100%, because then any burst makes the
+  queue grow without limit.
+
+### Capacity
+
+With a fixed 100 ms per batch, one GPU finishes 10 batches a second. So it serves **320 requests a second** at
+B = 32 and **1,000 a second** at B = 100.
+
+At the assumed 10,000 requests a second and B = 32, you need about **31 GPUs** running flat out. Plan to run
+each at 70% utilisation (an assumption, leaving room for bursts) and that becomes **45 GPUs**.
+
+### Latency: follow one request
+
+Take one request, R, arriving at a GPU whose batches run back to back.
+
+| Clock | What happens | What to say in the interview |
+|---|---|---|
+| 0 ms | R arrives. A batch is already running. | "R can't join a batch that has started." |
+| ~50 ms | On average, the running batch ends halfway through its 100 ms. R joins the next one. | "Average wait is half a batch." |
+| ~150 ms | R's batch finishes; the result goes back to R's caller. | "About 150 ms on average, plus network." |
+| up to 200 ms | If R arrived just as a batch started, it waited a full 100 ms first. | "Worst case is two batches: 200 ms." |
+
+So the answer is **about 150 ms on average and 200 ms at worst**, plus network. That fits a 400 ms target.
+
+Say it like this: "With fixed batch time, latency is half a batch of waiting plus one batch of running.
+Capacity is batch size over batch time."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Throughput per GPU = B ÷ 0.1 s: 32 ÷ 0.1 = 320/s; 100 ÷ 0.1 = 1,000/s.
+- GPUs at 100% = 10,000 × 0.1 ÷ 32 = 31.25. At 70% utilisation: 31.25 ÷ 0.7 = 44.6, so 45.
+- Latency with back-to-back batches: average wait 100 ÷ 2 = 50 ms, plus 100 ms of batch = 150 ms; worst 100 + 100
+  = 200 ms.
+
+</details>
+
+### The design
+
+```
+Callers (each waits on one call)
+   │
+   ▼
+API pods ── id + deadline, park a future, enqueue
+   │
+   ▼
+Queue ── bounded by waiting time
+   │  a free GPU worker takes up to B items
+   ▼
+GPU workers ── run the batch (100 ms)
+   │  send each result to the caller's pod
+   ▼
+API pod ── completes the future, writes the response
+```
+
+API pods park a **future** for each request (an object the handler waits on, completed later with the answer)
+and enqueue it with a deadline. GPU workers pull up to B items whenever they are free, so batches fill under load
+and launch immediately at low load. Results go straight back to the pod that holds the caller's connection. The
+queue is bounded by time, and the edge rejects work that can't make its deadline.
+
+### The follow-ups
+
+**Batch time depends on input length.** The fixed-cost assumption breaks. Model batch time as a fixed part plus
+a part per **token** (the unit text is counted in, roughly three quarters of a word): `T = a + c × Σ tokens`.
+Flush when the batch reaches a token budget instead of a request count. Put requests into separate queues by
+length, so a batch holds similar sizes. Fit `a` and `c` from production timings.
+
+**Short requests stuck behind long ones.** In a simple **static batch**, every input is padded to the length of
+the longest, so one long request sets the cost for everyone. A batch of 99 inputs of 100 tokens plus one of 4,000
+does only **3.5%** useful work. Fix it with length buckets, a separate pool of GPUs for very long requests, and,
+when the model writes replies, **continuous batching** (a finished reply's slot takes a new request at the next
+step instead of waiting for the whole batch).
+
+**Several models.** A batch holds one model. Keep a queue and worker pool per model, sized by GPU-time rather
+than request count, and keep the pools separate so a busy model can't starve the others.
+
+**100 ms is the end-to-end budget.** Then nothing is left for queueing, because back-to-back batches alone average
+about 150 ms. The options are smaller batches launched more often (more GPUs, each less full), a faster model, or
+a renegotiated budget. Say which hop gets which share of the 100 ms.
+
+Say it like this: "If 100 ms is the whole budget, the design as stated can't meet it. I'd say so, and offer the
+three ways out."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Static-batch efficiency is total real tokens ÷ (inputs × longest input): (99 × 100 + 4,000) ÷ (100 × 4,000) =
+13,900 ÷ 400,000 = 3.5%.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Fixed 100 ms batches"
+  senior={["Computes GPUs and latency from B and 100 ms, and adapts the flush rule to tokens when batch time varies."]}
+  staff={["Asks what the 100 ms covers before designing, sizes multi-model pools by GPU-time, and shows the end-to-end variant is infeasible as stated."]}
+/>
+
+## Small-team version
+
+At a small company, the hosted API you call already batches. The arithmetic still matters when you put a
+self-hosted **embedding model** (one that turns text into numbers for search) or a **reranker** (a model that
+re-orders search results) on a request path. Measure its batch time at a few batch sizes, compute capacity at your
+real peak, and put a deadline on every call. The embedding-pipeline lab's measured batching gain shows the
+fixed-cost effect on a CPU. A larger batch only pays when the queue is busy enough to fill it.
+
+Default to buying text generation from a hosted API and self-hosting only small models on the request path. What
+the self-hosted piece costs: one always-on NVIDIA L4 (a small data-centre GPU) at RunPod's $0.44 an hour is about
+**$321 a month**, and a second for failover makes it about **$642** (prices fetched 2026-10-11).
+
+The answer changes if one GPU can't cover your measured peak within your deadline, or if a data-residency rule
+moves text generation itself onto your own GPUs. Then the capacity arithmetic above applies.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+$0.44 × 730 hours ≈ $321 a month; two GPUs ≈ $642.
+
+</details>
+
+## Pitfalls
+
+- **Treating 100 ms as end-to-end latency without asking.** The two readings lead to opposite conclusions about
+  feasibility.
+- **Sizing with the maximum batch at 100% utilisation.** Any burst then grows the queue without limit.
+- **One queue for several models.** A batch holds one model, and a busy model starves the rest.
+- **Counting requests once batch time depends on length.** Count tokens; one long input costs as much as many
+  short ones.
+
+## Go deeper
+
+- Family walkthrough: [From one GPU batcher to a fleet](/system-design-labs/interviews/walkthroughs/batcher-to-fleet/), back-of-envelope and head-of-line sections.
+- <LabRef lab="embedding-pipeline" inline /> for a measured dynamic batcher; <LabRef lab="llm-inference" inline /> for where batching sits in a generation server.
+- Variable-length generation: [Continuous batching](/system-design-labs/interviews/walkthroughs/continuous-batching/).

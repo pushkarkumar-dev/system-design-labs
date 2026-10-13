@@ -1,0 +1,162 @@
+---
+question: infra-040
+family: distributed-training
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "There are three classic ways to split training. Data parallelism copies the model and splits the batch; it
+> averages gradients with an all-reduce, which costs each GPU about twice the gradient size per step however many
+> GPUs there are. Tensor parallelism splits each layer's matrix math; it needs an all-reduce inside every layer, so
+> it stays inside one machine on fast links. Pipeline parallelism splits the layers into stages; it only sends
+> activations between neighbours but leaves stages idle at the start and end of each step. Megatron splits the first
+> matrix by columns and the second by rows, so one all-reduce finishes the pair with no gather in between."
+>
+> The rest of this page explains each part of that answer.
+
+This is a whiteboard explanation round. Anyone can name the three strategies. What separates answers is whether each
+comes with its cost: which bytes move, how often, and over which link.
+
+### What makes this different from scaling a service
+
+Scaling a stateless service is easy: add copies behind a load balancer, and they never talk to each other. Training
+copies must talk. At the end of every step they have to agree on one set of weights, and if the model is too big for
+one GPU, the pieces have to exchange results in the middle of every layer. So each way of splitting the work is
+really a choice of **what traffic to create and on which link**. Inside one machine, GPUs talk over very fast direct
+links (**NVLink**). Between machines, traffic goes over a much slower network.
+
+### Words you need first
+
+- **Training step**: a **forward pass** over a batch, a **backward pass** that computes **gradients** (which way
+  each learned number should move), and an optimizer update.
+- **Activations**: the intermediate results each layer produces during the forward pass.
+- **Collective**: an exchange in which every GPU in a group contributes data and gets a combined result back.
+- **Matmul**: a matrix multiplication, the operation that makes up almost all of a model's work.
+
+The listed sub-questions come from PracHub's write-up of an Amazon-tagged question (<Cite id="s-9936fcb114" />).
+
+## Clarify first
+
+- **Training or inference?** "I'll assume training, in mixed precision."
+- **Hardware?** "8-GPU machines, fast links inside, a slower network between machines."
+- **Scope?** "Should I include ZeRO/FSDP and sequence parallelism, or only the three classics?"
+
+## Answer
+
+### The three strategies
+
+**Data parallel.** Every GPU holds the whole model and works on a different slice of the batch. After the backward
+pass, the gradients are averaged with an **all-reduce**, so every copy applies the same update. It is simple and
+efficient while the model fits on one GPU. Its cost: each GPU sends about 2 × the gradient size per step, and that
+doesn't shrink as you add GPUs.
+
+When the model's training state stops fitting, **ZeRO** (and PyTorch's version, **FSDP**) splits the optimizer state,
+then the gradients, then the weights across the copies. The all-reduce becomes a **reduce-scatter** plus an
+**all-gather**.
+
+**Tensor parallel.** Each layer's matmuls are split across GPUs. Its cost: all-reduces of activations inside every
+layer, two in the forward pass and two in the backward pass. That is a lot of traffic, so keep it inside the NVLink
+domain of one machine.
+
+**Pipeline parallel.** The layers are split into consecutive **stages** on different GPUs. Activations go
+**point-to-point** from one stage to the next. Its cost is idle time, the **bubble**: about (stages − 1) ÷
+micro-batches, where micro-batches are the slices the batch is cut into so stages can work at the same time
+([Narayanan et al., 2021](https://arxiv.org/abs/2104.04473)).
+
+| Strategy | What it splits | Traffic | Link it needs |
+|---|---|---|---|
+| Data parallel | the batch | all-reduce of gradients, once per step | can cross machines |
+| Tensor parallel | each layer's matmuls | all-reduce of activations, 2 forward + 2 backward per layer | NVLink, inside one machine |
+| Pipeline parallel | the layers | point-to-point activations between stages | can cross machines |
+
+### The collectives
+
+- **All-reduce**: everyone ends up with the sum of everyone's data.
+- **Reduce-scatter**: everyone ends up with the sum of one slice.
+- **All-gather**: everyone collects all the slices.
+- **Broadcast**: one GPU's data is copied to all (for example, the initial weights).
+
+An all-reduce is a reduce-scatter followed by an all-gather. That is why sharded data parallelism (ZeRO stages 1 and
+2) can cost the same bytes as plain data parallelism.
+
+The usual implementation is a **ring**: the GPUs pass slices around a circle, once to add them up and once to hand
+out the totals. Follow one example: **8 GPUs, a 1 GB gradient**. Each GPU sends **1.75 GB**, which takes
+**17.5 ms** at an assumed 100 GB/s. Double the GPUs and each still sends just under 2 GB.
+
+Say it like this: "A ring all-reduce costs each GPU about twice the buffer size, no matter how many GPUs. That's why
+adding data-parallel copies doesn't reduce anyone's traffic."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Ring collective traffic per GPU"
+  expr="all-reduce: 2(N − 1) ÷ N × S     reduce-scatter, all-gather: (N − 1) ÷ N × S"
+  vars={[
+    { sym: 'N', meaning: 'GPUs in the group' },
+    { sym: 'S', meaning: 'size of the full buffer' },
+  ]}
+  example="8 GPUs, 1 GB gradient: all-reduce sends 1.75 GB per GPU, 17.5 ms at an assumed 100 GB/s"
+/>
+
+2 × 7 ÷ 8 × 1 GB = 1.75 GB; 1.75 GB ÷ 100 GB/s = 17.5 ms. As N grows, 2(N − 1) ÷ N approaches 2.
+
+</details>
+
+### Column- then row-parallel
+
+Take the **MLP** block (the feed-forward part) of one **transformer layer**, the building block a language model
+repeats dozens of times. It does two matmuls with an activation function between them:
+Y = GeLU(X·A), then Z = Y·B. (GeLU is applied to each number separately.)
+
+1. **Split A by columns.** Each GPU computes its own columns of X·A. Because GeLU works number by number, each GPU
+   can apply it to its own columns without talking to anyone. Now each GPU holds a slice of Y.
+2. **Split B by rows.** Each GPU multiplies its slice of Y by its matching rows of B. The result is a partial Z.
+3. **One all-reduce** adds the partial Zs together.
+
+In the [Megatron-LM paper](https://arxiv.org/abs/1909.08053) this all-reduce is the **g** operator (all-reduce in the
+forward pass, nothing in the backward pass). It is paired with **f** (nothing forward, all-reduce backward) at the
+block's input.
+
+Why alternate? The column-split output is already split exactly the way the row-split layer needs its input, so no
+gather happens between them. Two column-split layers in a row would need an all-gather in between. Attention works
+the same way: the heads are split by columns, and the output projection by rows.
+
+Say it like this: "Column then row means the first matmul's output is already in the shape the second one needs. One
+all-reduce at the end, none in the middle."
+
+### When to use which
+
+Data parallelism until the model doesn't fit. Then split the training state (ZeRO/FSDP). Tensor parallelism inside a
+machine for wide layers. Pipeline parallelism across machines for deep models.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Parallelism explained"
+  senior={["Defines each strategy and collective correctly and derives why column then row needs one all-reduce."]}
+  staff={["Attaches a bandwidth cost to each and says which link it must ride, and that DP traffic per GPU is flat in N."]}
+/>
+
+## Small-team version
+
+On a small team this knowledge is mostly for reading configs and logs: a multi-GPU fine-tune with FSDP, or a two-GPU
+inference server with tensor parallelism. You rarely choose the layout yourself. But knowing why tensor parallelism
+across a slow link (PCIe, the ordinary expansion bus, instead of NVLink) crawls can save a wasted GPU rental.
+
+## Pitfalls
+
+- **Saying tensor and pipeline parallelism are the same thing.** One splits within layers, the other between them.
+- **Forgetting the backward-pass all-reduce.** Tensor parallelism pays in both directions.
+- **Saying "all-reduce" without the byte count.** The 2(N − 1)/N factor is the point.
+- **Missing why alternation avoids a gather.** That is the whole Megatron trick.
+
+## Go deeper
+
+- Family walkthrough: [Distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/), the table and TP ratio in its first deep dive.
+- Sharded matmul math: [Roofline and sharded matmul](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/).
+- Find the two MLP matmuls you would split: <LabRef lab="transformer" inline />.

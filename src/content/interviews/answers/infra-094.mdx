@@ -1,0 +1,187 @@
+---
+question: infra-094
+family: diagnose-infra-performance
+status: published
+labs: [observability]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll make it correct before I make it fast. First I run it on a small sample and check invariants, not
+> just crashes: every example appears once per epoch, and inputs still match their labels after shuffling,
+> because the bugs that matter here don't crash. Then I time the data loading on its own, without the
+> model, and profile it, because per-example work that should happen once is the usual culprit. If I run
+> short on time, I'll state the slowness hypothesis and the measurement that would confirm it."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see whether you can read someone else's data pipeline, find the bugs that make it
+wrong, and then find what makes it slow, all inside the clock.
+
+What makes this different from debugging a web service is how a training bug shows up. A broken API
+returns an error. A broken training pipeline usually keeps running. It just trains on the wrong data, and
+you find out hours later when the model is bad. So "it doesn't crash" means very little here. And the
+slowness question has its own trap: people blame the GPU, when the GPU is often sitting idle, waiting for
+Python to prepare the next batch.
+
+(The Anthropic MLE (machine learning engineer) candidate was told: "Here is a prewritten Python data pipeline for model training that
+is not running correctly. Find and fix the bugs", with "at least two bugs", and was then asked "What is
+making the script run inefficiently?" They ran out of time on the debugging and did not reach the
+hiring-manager stage <Cite id="s-6f56a76a5b" />. The report doesn't say what the bugs were. Time
+management is part of what is tested.)
+
+## Clarify first
+
+- **Is there a test, an expected output or a small sample to run against?** Run it first.
+- **What does "not running correctly" mean?** A crash, wrong output, or wrong training behavior?
+- **Fix all bugs before discussing speed, or as found?** Assume correctness first.
+- **How big is the real dataset?** That decides which slowness matters.
+
+## Answer
+
+### Words you need first
+
+- A training **data pipeline** reads raw examples, turns words into numbers the model can use, and groups
+  them into **batches** (here, 64 examples each) that are fed to the model.
+- One full pass over the data is an **epoch**.
+- Turning words into numbers needs a **vocabulary**: a table from each word to an id.
+- A **label** is the answer the model should learn for each example. Inputs and labels must stay paired.
+
+### The practice pipeline
+
+The report doesn't give the bugs, so the family walkthrough built a practice version and ran it on
+2026-10-12: 20,000 JSON lines of 40 words each, batches of 64, with two silent bugs and one hot spot.
+
+```python
+def encode(text, texts):
+    vocab = build_vocab(texts)              # HOT SPOT: rebuilt for every example
+    return [vocab[w] for w in text.split()]
+
+def batches(path, batch_size=64, seed=0):
+    texts, labels = load(path)
+    random.Random(seed).shuffle(texts)      # BUG 1: labels not shuffled with texts
+    random.Random(seed + 1).shuffle(labels)
+    for i in range(0, len(texts) - batch_size, batch_size):   # BUG 2: drops the tail
+        xs = [encode(t, texts) for t in texts[i:i + batch_size]]
+        yield xs, labels[i:i + batch_size]
+```
+
+### Follow it through the clock
+
+| Step | What you do | What you find | What to say in the interview |
+|---|---|---|---|
+| 1. Run on a sample | Run it end to end | It runs; nothing crashes | "No crash doesn't mean correct. I'll check invariants." |
+| 2. Count | Examples per epoch vs dataset size | 312 batches instead of 313; 32 examples missing | "The loop stops one batch early and drops the tail." |
+| 3. Pairing | Check a few examples keep their original labels | They don't | "Texts and labels are shuffled separately, so it trains on noise." |
+| 4. Time the loader alone | Five batches, no model | 26 s, about 81 ms per example | "An epoch would take about 27 minutes before the GPU does anything." |
+| 5. Profile | `cProfile` | Almost all time in `build_vocab` | "The vocabulary is rebuilt for every example. It belongs once per dataset." |
+| 6. Fix and re-measure | Build the vocabulary and encode once | Whole epoch in 0.18 s | "Same measurement, before and after." |
+
+### Correctness: invariants, not just crashes
+
+Crashes are easy. The bugs that cost the round are silent ones. Check invariants on a small sample:
+
+- **Examples per epoch equal the dataset size.** Off-by-one batching drops the tail or a whole batch. In
+  the practice version, `range(0, n - batch_size, batch_size)` yielded 312 batches instead of 313 for
+  20,000 examples.
+- **Inputs and labels stay paired after shuffling.** Shuffle one list of indices, never two lists
+  separately. Shuffling them apart trains on noise without crashing.
+- **Shapes, data types and padding match what the model expects**, and token ids fall inside the
+  vocabulary.
+- **Train and validation splits don't overlap.**
+
+Say it like this: "The bugs that cost this round are the ones that don't crash, so I check invariants, not
+just exceptions."
+
+### Performance: measure the input pipeline alone
+
+Time the loader without the model, then profile it with `cProfile` (Python's built-in profiler), or
+`py-spy` on a job that is already running. In the practice version, the profile pointed straight at the
+vocabulary rebuilt for every example. Five batches took 26 s, about **81 ms per example**, so an epoch
+would take roughly **27 minutes**. Building the vocabulary and encoding once brought the full epoch to
+**0.18 s**.
+
+Common causes worth naming:
+
+- Per-example work that belongs once per dataset: tokenizing, building a vocabulary, opening files.
+- Python loops over data that could be vectorized.
+- Reading from slow storage every epoch instead of caching.
+- In PyTorch, a `DataLoader` with `num_workers` at its default of 0, where "0 means that the data will be
+  loaded in the main process" ([torch.utils.data](https://docs.pytorch.org/docs/2.14/data.html), read
+  2026-10-12).
+
+On a GPU, here is the sign to look for: utilization dips between training steps while one CPU core is
+pinned at 100%. The model is waiting on input. More loader workers and pre-processed data fix it; a bigger
+GPU doesn't.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Batches:** 20,000 ÷ 64 = 312.5, so 313 batches, the last holding 32 examples. The buggy range stops one
+  batch early: 312 batches, 32 examples lost.
+- **Per example:** 26 s ÷ 5 batches ≈ 5.2 s per batch; 5.2 ÷ 64 ≈ **81 ms per example**.
+- **Per epoch:** 20,000 × 0.081 ≈ 1,620 s ≈ **27 minutes**, against 0.18 s once fixed.
+
+</details>
+
+### Manage the clock
+
+Fix and verify the correctness bugs first. Then state your slowness hypothesis and the measurement that
+would confirm it, even if there's no time to implement the fix. A stated, testable hypothesis is better
+than an unfinished refactor. Say it like this: "I'm out of time to change it, but I'd bet on the
+vocabulary rebuild, and one profile run would confirm it."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Fix it, then make it fast"
+  senior={["Finds silent bugs with invariant checks, profiles the input pipeline separately from the model, and fixes the hot spot."]}
+  staff={["Adds the invariant checks as tests, caches preprocessed data, and explains how to tell input-bound from compute-bound training from GPU utilization and step timing."]}
+/>
+
+In plain words: a Senior answer finds the silent bugs and the hot spot. A Staff answer also leaves the
+checks behind as tests, and can tell from GPU activity whether training is waiting on data or on math.
+
+## Small-team version
+
+On a small team, this shows up as an embedding or eval job that takes hours. (An **embedding** is a list
+of numbers a model produces for a piece of text, used for search.) The usual causes are the same shape:
+per-item work that belongs once per run, one API call per item instead of a batch, and no caching between
+runs.
+
+What to do:
+
+- Profile before adding parallelism.
+- Cache tokenized or embedded data, keyed by a hash of the content, so reruns skip unchanged items.
+- Add a count check at the end: items in equals items out.
+
+Fix the pipeline before reaching for more compute. Embedding 1M chunks of 500 tokens with
+text-embedding-3-small at $0.02 per 1M tokens costs about **$10** (OpenAI list price, fetched
+2026-10-11). (A **token** is the unit models read, roughly three-quarters of a word.) So the cost of a
+slow job is usually engineer hours and stale data, not API spend. An agent can spot a hot spot in a
+profile quickly; you check the invariants yourself.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Embedding cost:** 1,000,000 chunks × 500 tokens = 500M tokens; 500 × $0.02 = **$10**.
+
+</details>
+
+## Pitfalls
+
+- **Optimizing before the output is correct.** A fast pipeline that trains on shuffled labels is worse
+  than a slow correct one.
+- **Only fixing crashes.** The label and batching bugs here never raise an error.
+- **Blaming the GPU before timing the loader alone.** A GPU waiting on input won't get faster by being
+  bigger.
+- **Spending the clock on one rewrite.** A stated hypothesis with its measurement scores better than an
+  unfinished refactor.
+
+## Go deeper
+
+- Family walkthrough: [Diagnose slow or stuck infrastructure](/system-design-labs/interviews/walkthroughs/diagnose-infra-performance/), worked example 8.
+- Training-side context for the same round: [Distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/).
+- Instrumenting a pipeline: <LabRef lab="observability" inline />.

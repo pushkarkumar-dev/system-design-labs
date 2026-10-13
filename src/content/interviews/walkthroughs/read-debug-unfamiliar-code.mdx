@@ -1,0 +1,871 @@
+---
+title: "Read, explain and fix code you didn't write: a URL shortener with six bugs"
+summary: "You get a small codebase you didn't write, often AI-generated, and must explain it, find the bugs and fix them in one round. Show a method: run it, map it, rank suspicions, failing test, smallest fix, explain."
+track: cross
+format: coding
+family: read-debug-unfamiliar-code
+smallTeamFocus: "Most code a small team reviews is now written by an AI agent or by someone who left. Make agents bring a failing test with every diagnosis, reproduce before fixing, and look at what the model actually received."
+rounds: [debugging, ai-assisted-coding, practical-coding, domain-deep-dive]
+level: both
+timeboxMin: 60
+order: 213
+status: published
+basedOn: [eng-122, r2a-010, r2b-003, r2b-009, r2b-011]
+askedAt: [amazon, apple, google, microsoft, openai]
+labs:
+  - { lab: rate-limiter, role: proof, note: "Its tests pass but one concurrency test fails intermittently: a check-then-act logic race that the race detector doesn't report. A real, small bug to find by method." }
+  - { lab: cdn-edge, role: partial, note: "TestCoalescing_StaleIfError used to fail because a 5xx from the origin was returned as a successful fetch. The lab was fixed on 2026-10-13 and its tests now pass; the example below shows how the bug was found." }
+  - { lab: message-queue, role: partial, note: "The delayed-message test panics; the delay is truncated with int(delay.Seconds()) in pkg/queue/delay.go. Practise reading a panic back to its cause." }
+  - { lab: agent-framework, role: partial, note: "An agent codebase to explain (loop, tools, memory, sandbox) with a mock LLM; 3 of 15 tests fail because the parser can't read nested tool-call JSON." }
+gapLabs: []
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "I won't start by reading every file. First I'll run the tests and the main entry point, so I know what works
+> today. Then I'll map where requests come in, what state they touch, and where time, user input or threads
+> enter. I'll write down every suspicion and rank them by how much they hurt users, security and silent wrong
+> answers first. For each one I'll write a test that fails, make the smallest fix, watch it pass, and say in one
+> sentence why the original was wrong. If time runs out, I'll stop fixing and finish with a ranked list of what is
+> still broken."
+>
+> The rest of this page explains each part of that answer, using one small codebase from start to finish.
+
+### How this round differs from a normal coding round
+
+In a normal coding round you start from a blank file. You choose the data structures, you name things, and you
+know what every line is for, because you wrote it.
+
+Here the code already exists. Someone else made the decisions, and you have to work out what they were before you
+can judge them. More and more often that someone is an **AI coding assistant**: a tool built on a large language
+model (an **LLM**, the kind of model behind ChatGPT, Claude and Gemini) that writes code from a plain-English
+request. That changes the round in three ways:
+
+1. **The code looks finished.** Generated code has docstrings, tidy names and tests that pass. The bugs live in the
+   gap between what the code *says* it does and what it actually does.
+2. **Many bugs are silent.** A **silent bug** gives a wrong answer without an exception, a stack trace or a failing
+   test. You can only see it if you first know what "correct" looks like.
+3. **You are graded on method, not luck.** Finding a bug by staring is worth less than finding it by a process the
+   interviewer can watch and repeat: reproduce, prove, fix, explain.
+
+So the skill being tested is not "can you code". It is "can you build a correct picture of code you didn't write,
+quickly, and change it without breaking it".
+
+### Where it has been reported
+
+Several companies run a version of this round, and each hands you something slightly different:
+
+- **Microsoft:** a PracHub title, "Find the Bugs in an AI-Generated URL Shortener", dated June 2026. Only the title
+  is candidate-reported (<Cite id="s-d302bba651" />).
+- **Amazon online assessment (OA):** a task labelled "AI Debug". One candidate (OA taken 2026-10-09) describes a
+  Jira-like app where "creating an Issue and a sub-issue is broken" (<Cite id="s-26efabd25c" />). A PracHub
+  write-up of another candidate's OA describes a Spring Boot "Movie search backend" whose search needs partial and
+  case-insensitive matching on title or stars, a popularity sort and only published movies
+  (<Cite id="s-50480ec72b" />). Neither report names the AI tool. Amazon's own careers page says its redesigned SDE
+  technical assessment includes an interactive AI assistant (<Cite id="s-6aabb0c00d" />).
+- **OpenAI:** from Glassdoor snippets only, a final-loop round that hands you existing code with issues to refactor
+  and fix under time pressure. One candidate said structure and tests mattered more than big-O
+  (<Cite id="s-713b2d5493" />).
+- **Apple:** a PracHub title, walking the interviewer through an existing agentic PDF-evaluation codebase, tagged
+  Senior+ in July 2026 (<Cite id="s-0630fd2aff" />). Stage 7 below explains what that kind of codebase is.
+- **Google:** a planned "code comprehension" round, reported by Business Insider from an internal document (as
+  relayed by Shopifreaks). It covers "junior to mid-level roles being tested in select U.S. teams in the second
+  half of the year", where candidates "read, debug, and optimize" existing code with Gemini, Google's AI
+  assistant (<Cite id="s-b88d89c103" />). No first-hand account of the round running had been found as of 2026-10-11, and it
+  is not reported for Senior or Staff.
+
+<QuestionRow id="r2b-003" />
+<QuestionRow id="r2a-010" />
+<QuestionRow id="eng-122" />
+
+### The example this page follows
+
+A **URL shortener** turns a long link into a short code (`sho.rt/3x`) and later redirects anyone who visits the
+code to the original link. It is the Microsoft variant, and it is small enough to hold in your head, so this page
+works it end to end.
+
+The practice codebase was built for this guide: four files, 136 lines, four tests that pass, and six real bugs plus
+a race. Every stage below uses it. When the page talks about "the fix" or "the test", it means this codebase.
+
+### Words you need first
+
+- **Characterization test** (also called a **golden master**): a test that records what the code does *today*,
+  bugs included, and fails if that ever changes. You write it before refactoring, so you can move code safely.
+- **Race condition**: a bug that appears only when two threads run in an unlucky order. The common shape here is
+  **check-then-act**: "if the name is free, save it" done as two separate steps. Two threads can both see "free"
+  before either saves.
+- **Hypothesis list**: your written list of suspicions, each with where it is and how you would prove it. It is
+  how the interviewer sees your thinking.
+- **Regression test**: a test that stays in the suite after a bug is fixed, so the bug can't come back unnoticed.
+
+## What is being tested
+
+The clearest public statement of the grading is the Google plan: "Interviewers will evaluate AI fluency, including
+prompt engineering, output validation, and debugging skills" (<Cite id="s-b88d89c103" />). In plain words,
+**prompt engineering** means how well you word your requests to the assistant, and **output validation** means
+checking what the assistant tells you before you rely on it. Read the plan as three separate skills, because
+candidates often show only the first.
+
+1. **Building a model of code fast.** Where does a request enter? What state does it touch? What does the code
+   promise, through its docstrings, names and tests? And where does it break that promise?
+2. **Method over luck.** Interviewers watch whether you reproduce a bug before fixing it, write the failing test
+   first, and can explain why the original was wrong. A fix that makes a symptom disappear without an explanation
+   scores poorly even when it is right.
+3. **Checking AI output.** When an assistant is allowed, the question is whether you verify its claims. With
+   generated code, the common case is an explanation that is plausible, confident and wrong. Anthropic's randomized
+   study of 52 (mostly junior) engineers found the largest score gap between AI-assisted and hand-coding groups
+   "was on debugging questions" ([Anthropic research, 2026-01-29](https://www.anthropic.com/research/AI-assistance-coding-skills)).
+   Debugging is the skill most at risk from leaning on the assistant, and it is the one these rounds look for.
+
+The OpenAI report adds one point that applies to every variant: the refactor is judged on structure and tests
+(<Cite id="s-713b2d5493" />). So leave the code more testable than you found it.
+
+Say it like this: "I'll treat the assistant as a fast junior colleague. I'll use it for narrow questions, and I'll
+run something before I believe any answer it gives me."
+
+## Clarify and scope
+
+Ask a few questions before you read a line. Each one changes what "done" means:
+
+- **What is the spec?** It may be a README, the tests, a ticket or the interviewer's words. If the tests and the
+  docstrings disagree, which wins? Write down the behaviour you will treat as correct.
+- **How many bugs, and of what kind?** Some interviewers will tell you. A first-hand account of a Sierra debugging
+  round describes about 4–5 files, a diagram as the source of truth and about 3 bugs (<Cite id="s-6c08b2d69e" />).
+  If they won't say, assume more than one, and assume at least one is silent.
+- **Can I run it? Can I add tests? Can I use the assistant, and for what?**
+- **What does "done" mean?** Every bug fixed, or the most important ones fixed and the rest listed?
+- **For the explain-only variant (Apple):** who is the audience, and how deep should you go? Five minutes on the
+  architecture, then one request path, is a safe default.
+
+Say it like this: "If the tests and the docstring disagree, I'll treat the docstring as the spec and tell you each
+time I rely on that."
+
+Rewriting the design is out of scope unless they ask. You can still name a design flaw, such as a missing unique
+constraint or a cache with no way to remove stale entries. In the round, fix the bug that the flaw causes and
+propose the redesign in one sentence.
+
+## Plan before code
+
+Use the same five steps every time, and say each one out loud as you start it:
+
+1. **Run it.** Run the tests and the entry point. Green tests tell you what the author checked, which is often only
+   the **happy path** (the normal case where nothing goes wrong).
+2. **Map it.** List the entry points, the state and the boundaries: what calls what, where data is stored, and
+   where time, I/O or concurrency come in. Spend five minutes and write it down.
+3. **Rank hypotheses.** Read each function against its promise. Write down every suspicion, with where it is and
+   how you'd prove it. Rank by likely impact times how cheap it is to check. Silent data bugs and security bugs go
+   to the top.
+4. **Failing test, then fix.** Write one test per hypothesis and run it red. Make the smallest fix, run it green,
+   then run everything.
+5. **Explain.** For each bug, give one sentence on why the original was wrong and one on why the fix is right. Then
+   say what is still wrong and out of scope.
+
+### The round on a clock
+
+Here is how those steps fit a 60-minute round, with the shortener as the example. The times are a plan, not a
+measurement.
+
+| Clock | Step | What you do on the shortener | What to say in the interview |
+|---|---|---|---|
+| 0–10 min | **Run and map** | Run the four tests (green). Read `service.py` whole. Note the state: a store and a cache. | "Green tests only tell me what the author checked. Let me see what the code promises." |
+| 10–20 min | **Rank hypotheses** | Write seven suspicions in a table, ranked. | "Security and silent wrong redirects first, wrong analytics later." |
+| 20–55 min | **Test, fix, explain** | About 5 minutes per bug: red test, smallest fix, green, full suite. | "Here's why the original was wrong, and here's why this fix is enough." |
+| 55–60 min | **Summarize** | List what is still wrong and what you'd do next. | "Three things I didn't fix, ranked, with how I'd prove each one." |
+
+If you fall behind, stop fixing and finish the list. A ranked list of known bugs, with tests for half of them,
+beats three fixes nobody can check.
+
+## Solution in stages
+
+The practice codebase is Python 3.13. It has four files:
+
+- `codec.py` turns a number into a short **base-62** code (digits plus lower- and upper-case letters, so 62
+  symbols) and back.
+- `cache.py` is an **LRU cache**: it keeps the most recently used entries, up to a fixed count, and throws away
+  the least recently used one when it is full.
+- `store.py` is an in-memory store: a dictionary guarded by a lock.
+- `service.py` is the shortener itself.
+
+Its four tests pass. Eleven bug tests (nine functions, one of them run three times with different inputs) were
+then written before any fix. Ten failed and one passed; the one that passed teaches something, see Verification.
+After the fixes, all fifteen tests pass (run on 2026-10-12, Python 3.13.7).
+
+### Stage 1: run it and map it
+
+Start with a picture. This is the map you should be able to draw after ten minutes:
+
+```
+Caller (a web handler or a test)
+   │  shorten(url, alias, ttl_ms)   resolve(code)   delete(code)
+   ▼
+Shortener (service.py) ── checks the URL, makes codes, sets expiry
+   │                │                  │
+   ▼                ▼                  ▼
+LRU cache        Store              codec + clock
+(cache.py)       (store.py)         (codec.py, time.time)
+code → URL       code → Link        id → "3x"; "now" in seconds
+no lock          dict + lock
+```
+
+**Caller.** Anything that uses the shortener: a web handler in production, a test here. It has three verbs:
+shorten a URL, resolve a code back to its URL, and delete a code.
+
+**Shortener.** All logic lives here. It checks the URL, picks a code (a custom **alias** the user asked for, or a
+generated one), and works out when the link expires. It owns two kinds of state, the cache and the store, and the
+bugs are in how it keeps them in step.
+
+**LRU cache.** A fast copy of "code → URL" so most redirects don't touch the store. Note what it stores: only the
+URL. Note also what it lacks: a lock and an expiry.
+
+**Store.** The real record of each link, called a `Link`: code, URL, expiry time and a hit counter. The dictionary
+is protected by a lock, so single operations are safe across threads.
+
+**Codec and clock.** The codec turns a counter (0, 1, 2, …) into codes. The clock says what time it is, in
+**seconds since 1970** (Python's `time.time`). The clock is passed in, which is good news: tests can control time.
+
+The service is the entry point. Read it whole, because everything else hangs off it:
+
+```python
+"""URL shortener service. Generated with an AI assistant; reviewed for style."""
+class Shortener:
+    def __init__(self, store=None, clock=time.time):
+        self.store = store or Store()
+        self.cache = LRU(1024)
+        self.clock = clock
+
+    def _normalize(self, url: str) -> str:
+        if "://" not in url:
+            url = "http://" + url
+        if not urlparse(url).netloc:
+            raise InvalidURL(url)
+        return url
+
+    def shorten(self, url, alias=None, ttl_ms=None):
+        """Create a short link. ttl_ms: lifetime in milliseconds."""
+        url = self._normalize(url)
+        if alias:
+            if self.store.exists(alias):
+                raise AliasTaken(alias)
+            code = alias
+        else:
+            code = encode(self.store.next_id())
+        expires = None if ttl_ms is None else self.clock() + ttl_ms
+        self.store.save(Link(code, url, expires))
+        return code
+
+    def resolve(self, code):
+        """Return the target URL, or None if unknown or expired."""
+        cached = self.cache.get(code)
+        if cached:
+            return cached
+        link = self.store.get(code)
+        if link is None:
+            return None
+        if link.expires_at is not None and link.expires_at < self.clock():
+            return None
+        link.hits += 1
+        self.cache.put(code, link.url)
+        return link.url
+
+    def delete(self, code):
+        return self.store.delete(code)
+```
+
+Two words in that code need a gloss. `urlparse(url).netloc` is the host part of a URL: for
+`https://example.com/a` it is `example.com`. And `ttl_ms` is the **TTL** (time to live), how long the link should
+work, here promised in milliseconds.
+
+The map, written as notes: *entry points `shorten`, `resolve`, `delete`, `stats`. State lives in the store (dict
+plus lock) and the cache (an LRU of code → URL, no lock, no TTL). Codes come from a counter starting at 0 via
+`encode`. Time comes from `self.clock`, which returns epoch seconds.* That last note matters, because the docstring
+for `ttl_ms` says milliseconds. You have found a likely bug without running anything, just by writing down units.
+
+The existing tests are a clue too. `test_round_trip` creates a first link, ignores it, and checks the second one.
+A test that skips the first case is often hiding something.
+
+Say it like this: "Two pieces of state hold the same fact, the store and the cache. My first question is whether
+every path that changes one also changes the other."
+
+### Stage 2: rank the hypotheses
+
+Now read each function against its promise and write each suspicion down. This table is what you would put on the
+shared screen:
+
+| # | Suspicion | Where | How to prove it | Rank |
+|---|---|---|---|---|
+| 1 | Cached path skips the expiry check and never sees deletes | `resolve`, `delete` | resolve, delete, resolve again | high: silent wrong redirect |
+| 2 | Any scheme with `://` is accepted, including `javascript:` | `_normalize` | shorten `javascript://x%0Aalert(1)` | high: security |
+| 3 | `ttl_ms` is added to a clock in seconds | `shorten` | 5,000 ms TTL, move the clock 6 s | high: links live 1,000× too long |
+| 4 | A custom alias can equal a future generated code, and `save` overwrites | `shorten`, `store.save` | alias `"1"`, then two generated links | high: silent data loss |
+| 5 | `encode(0)` returns `""`, so the first link's code is empty | `codec.encode` | shorten once, check the code | medium |
+| 6 | Hits are counted only on a cache miss | `resolve` | resolve 3 times, check stats | medium: wrong analytics |
+| 7 | `exists` then `save` isn't atomic, so two callers can both claim an alias | `shorten` | two threads, widened window | medium: needs a race to show |
+
+A few rows need a sentence of explanation for anyone outside web security or concurrency:
+
+- **Row 2.** A `javascript:` link runs script in the visitor's browser when it is followed. A shortener that
+  accepts one lets an attacker hide script behind a harmless-looking short link.
+- **Row 4.** A user asks for the alias `"1"`. Later the counter reaches 1, `encode(1)` is also `"1"`, and `save`
+  silently replaces the user's link with someone else's.
+- **Row 7.** This is the check-then-act race from the word list. Both threads ask "is `sale` free?", both hear
+  "yes", and both save.
+
+Ranking out loud is part of the answer. It shows the interviewer you know which bugs hurt users and which only look
+bad.
+
+Say it like this: "Rows 1 to 4 can send a user to the wrong place or lose their link without any error, so I'll do
+those first. The hit counter is wrong analytics, which matters, but less."
+
+### Stage 3: failing tests first
+
+Write one test per row. Each test should fail on the original code for exactly the reason its row predicts.
+
+The tests use a fake clock. Because the shortener takes its clock as a parameter (this is called **dependency
+injection**), a test can pass in an object whose time it sets by hand. Time moves by assignment, so no test ever
+sleeps:
+
+```python
+class Clock:
+    def __init__(self, t=1_000_000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def test_deleted_link_stops_resolving():
+    s = Shortener()
+    code = s.shorten("https://gone.example")
+    s.resolve(code)                                    # warm the cache
+    assert s.delete(code)
+    assert s.resolve(code) is None
+
+
+@pytest.mark.parametrize("bad", ["javascript://x%0Aalert(1)", "ftp://files.example/a", "data://x/y"])
+def test_only_http_and_https_are_accepted(bad):
+    with pytest.raises(InvalidURL):
+        Shortener().shorten(bad)
+
+
+def test_ttl_is_milliseconds():
+    clk = Clock()
+    s = Shortener(clock=clk)
+    code = s.shorten("https://t.example", ttl_ms=5_000)
+    clk.t += 6                                         # six seconds later
+    assert s.resolve(code) is None
+
+
+def test_alias_is_not_overwritten_by_a_generated_code():
+    s = Shortener()
+    s.shorten("https://alias.example", alias="1")   # "1" is also encode(1)
+    s.shorten("https://x.example")
+    s.shorten("https://y.example")
+    assert s.resolve("1") == "https://alias.example"
+
+
+def test_every_resolve_counts_a_hit():
+    s = Shortener()
+    code = s.shorten("https://h.example")
+    for _ in range(3):
+        s.resolve(code)
+    assert s.stats(code)["hits"] == 3
+```
+
+`@pytest.mark.parametrize` runs one test function once per input. That is why "nine functions" became eleven
+tests: the scheme test runs three times.
+
+The race test (row 7) is harder, because a race only shows up when the timing is unlucky. The trick is to make the
+timing unlucky on purpose. The test temporarily replaces `Store.exists` with a slow version (replacing a method at
+runtime like this is called **monkeypatching**). The slow version waits on a **barrier**, a meeting point that
+releases both threads only when both have arrived. That holds the window between "check" and "act" open, so both
+threads pass the check before either saves. Without that, the race is real but would rarely show in a test run.
+
+```python
+def test_concurrent_alias_claims_one_winner():
+    import store as store_mod
+    real_exists = store_mod.Store.exists
+    gate = threading.Barrier(2)
+
+    def slow_exists(self, code):                       # widen the check-then-act window
+        r = real_exists(self, code)
+        try:
+            gate.wait(timeout=0.5)
+        except threading.BrokenBarrierError:
+            pass
+        return r
+
+    store_mod.Store.exists = slow_exists
+    try:
+        s, results = Shortener(), []
+
+        def claim(url):
+            try:
+                results.append(s.shorten(url, alias="sale"))
+            except AliasTaken:
+                results.append("taken")
+
+        ts = [threading.Thread(target=claim, args=(u,)) for u in ("https://a.example", "https://b.example")]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        assert sorted(results) == ["sale", "taken"]
+    finally:
+        store_mod.Store.exists = real_exists
+```
+
+Against the original code, ten of these tests fail, each for the reason its row predicts.
+
+Say it like this: "Before I change anything, I want to see this test fail for the reason I expect. A test I've
+never seen fail hasn't proved anything."
+
+### Stage 4: smallest fixes, with the reason for each
+
+Rows 4 and 7 look like two bugs, but they have one cause. Both come from "check, then write" done in two steps,
+followed by a `save` that overwrites whatever is there. So the store gets one **atomic** primitive (an operation
+that happens all at once under the lock, so no other thread can slip in between), and every new code goes through
+it. That fixes both rows together.
+
+```python
+    def save_if_absent(self, link: Link) -> bool:
+        """Atomic check-and-insert: the only way new codes enter the store."""
+        with self._lock:
+            if link.code in self._links:
+                return False
+            self._links[link.code] = link
+            return True
+
+    def add_hit(self, code):
+        with self._lock:
+            link = self._links.get(code)
+            if link is not None:
+                link.hits += 1
+```
+
+The service changes are below, as a diff (lines starting `-` are removed, `+` are added):
+
+```diff
+     def _normalize(self, url: str) -> str:
+         if "://" not in url:
+             url = "http://" + url
+-        if not urlparse(url).netloc:
++        parts = urlparse(url)
++        if parts.scheme not in ("http", "https") or not parts.netloc:
+             raise InvalidURL(url)
+         return url
+
+     def shorten(self, url, alias=None, ttl_ms=None):
+         url = self._normalize(url)
++        expires = None if ttl_ms is None else self.clock() + ttl_ms / 1000
+         if alias:
+-            if self.store.exists(alias):
++            if not self.store.save_if_absent(Link(alias, url, expires)):
+                 raise AliasTaken(alias)
+-            code = alias
+-        else:
++            return alias
++        while True:  # skip ids whose code is already taken by an alias
+             code = encode(self.store.next_id())
+-        expires = None if ttl_ms is None else self.clock() + ttl_ms
+-        self.store.save(Link(code, url, expires))
+-        return code
++            if self.store.save_if_absent(Link(code, url, expires)):
++                return code
+
+     def resolve(self, code):
+-        cached = self.cache.get(code)
+-        if cached:
+-            return cached
+-        link = self.store.get(code)
+-        if link is None:
++        entry = self.cache.get(code)            # (url, expires_at)
++        if entry is None:
++            link = self.store.get(code)
++            if link is None:
++                return None
++            entry = (link.url, link.expires_at)
++            self.cache.put(code, entry)
++        url, expires_at = entry
++        if expires_at is not None and self.clock() >= expires_at:
+             return None
+-        if link.expires_at is not None and link.expires_at < self.clock():
+-            return None
+-        link.hits += 1
+-        self.cache.put(code, link.url)
+-        return link.url
++        self.store.add_hit(code)                 # count every redirect, cached or not
++        return url
+
+     def delete(self, code):
++        self.cache.d.pop(code, None)             # invalidate before reporting success
+         return self.store.delete(code)
+```
+
+`codec.encode` gets `if n == 0: return ALPHABET[0]` and rejects negatives. Here are the explanations, one line each,
+which is the form to use out loud:
+
+- **Cache:** the cache stored only the URL, so expiry and deletion were invisible to it. It now stores the expiry
+  too, and `delete` removes the entry.
+- **Scheme:** checking for a host doesn't check the scheme. `javascript://x%0Aalert(1)` has a host (`x`), so the
+  shortener would redirect users to script. The fix allows only `http` and `https`.
+- **TTL:** the parameter is in milliseconds and the clock is in seconds. The original added them directly, so a
+  5-second link lived 5,000 seconds, about 83 minutes.
+- **Alias collision and race:** both came from "check, then write" in two steps, with an overwriting `save`. One
+  atomic insert that refuses to overwrite fixes both. Generated codes skip any id whose code an alias already took.
+- **Zero:** the encoding loop is `while n > 0`, which never runs for 0, so 0 became the empty string.
+- **Hits:** the counter lived on the cache-miss path only, so cached redirects were never counted.
+
+### Stage 5: say what is still wrong
+
+Finishing with an honest list is worth more than one more fix. These are real problems that the fixes above don't
+solve:
+
+- `resolve` can refill the cache from a read that started before `delete`, so a deleted link can come back for one
+  cache lifetime. Fixing that needs a version number or a **tombstone** (a "this was deleted" marker) per code.
+- The LRU cache itself has no lock, and its `move_to_end` runs from many request threads.
+- Every redirect now takes the store lock to count a hit. At high traffic, count hits in a separate counter
+  (per-thread, or an atomic increment in Redis) and flush them.
+- Design notes, not bugs: the counter-based codes are guessable, so anyone can enumerate links. Whether redirects
+  are 301 (cached by browsers forever) or 302 is a product decision with consequences for delete.
+
+Say it like this: "Here's what I'd still flag in code review, in order: the delete-then-refill race, the unlocked
+cache, and the hot lock on every redirect."
+
+### Stage 6: refactor under time pressure
+
+When the ask is "refactor and fix" (the OpenAI shape), there is a trap. If you move code and fix bugs at the same
+time, and a test changes, you can't tell whether you fixed a bug or broke something.
+
+The way out is a characterization test, from the word list. It runs the code you were handed over many generated
+inputs, records the answers (bugs included), and fails on any change you didn't intend. Here it is on a small
+pricing function:
+
+```python
+def legacy_price(items, coupon=None):          # code you were handed
+    t = 0
+    for i in items:
+        t += i["qty"] * i["price"]
+    if coupon == "TEN": t = t * 0.9
+    if t > 100: t -= 5
+    return round(t, 2)
+
+def cases(n=500, seed=1):
+    rng = random.Random(seed)
+    for _ in range(n):
+        items = [{"qty": rng.randint(0, 5), "price": rng.choice([0.99, 9.5, 20, 49.99])}
+                 for _ in range(rng.randint(0, 4))]
+        yield items, rng.choice([None, "TEN", "BOGUS"])
+
+def test_golden_master():
+    golden = [legacy_price(i, c) for i, c in cases()]   # pin today's behaviour, bugs included
+    refactored = legacy_price                            # swap in the new version here
+    assert [refactored(i, c) for i, c in cases()] == golden
+```
+
+The fixed seed means the same 500 inputs every run, so the test is repeatable. The order of work is then:
+
+1. Refactor with this test green the whole time.
+2. *Then* fix bugs one at a time.
+3. For each fix, update the golden values on purpose for the cases it changes, and say why.
+
+Mixing the two makes it impossible to tell a refactoring mistake from a fix.
+
+Say it like this: "First I'll pin what it does today, bugs and all. Then I'll restructure with that pin green. Only
+then will I change behaviour, one bug at a time."
+
+### Stage 7: explain an agentic codebase (the Apple shape)
+
+The Apple variant hands you an "agentic PDF-evaluation codebase" and asks you to explain it. That needs a few
+terms first.
+
+An **agent** is a program that calls an LLM in a loop and lets the model choose the next step, such as which tool
+to call or when to stop. A **tool call** is the model's request to run one of your functions; the model writes
+it as **JSON** (a small structured text format), and your code parses it and runs the function. **RAG**
+(retrieval-augmented generation) means that before calling the model, the code searches your documents for the
+most relevant passages, called **chunks**, and pastes them into the prompt. The **context window** is the most
+text the model can read in one call. A PDF evaluator built this way might look like this:
+
+```
+PDF + rubric
+   │
+   ▼
+Parse and chunk ── turns the PDF into text pieces
+   │
+   ▼
+Retriever ── finds the chunks relevant to each rubric item
+   │
+   ▼
+Prompt builder ── rubric + chunks + instructions = the rendered prompt
+   │
+   ▼
+LLM call ── returns text, maybe a tool call in JSON
+   │                    │
+   ▼                    ▼
+Output parser ◄── Tool dispatch (runs the tool, feeds the result back)
+   │
+   ▼
+Score / report
+```
+
+With code like this, reading the code is not enough. The behaviour depends on what the model *received*, and that
+text is built at runtime. So find the three **seams**, the places where data crosses into or out of the model
+(retrieval, the model call and tool dispatch), and wrap them to record what flows through:
+
+```python
+def traced(fn, log, name=None):
+    """Wrap any callable (LLM client, retriever, tool) and record what flows through it."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        t0 = time.perf_counter()
+        out = fn(*args, **kwargs)
+        log.append({"call": name or fn.__name__, "args": repr(args)[:200],
+                    "kwargs": repr(kwargs)[:200], "out": repr(out)[:200],
+                    "ms": round((time.perf_counter() - t0) * 1000, 1)})
+        return out
+    return wrapper
+```
+
+Run one document through it and explain the system from the log. Say what is retrieved and how much, the exact
+prompt the model got (the **rendered prompt**), how the output is parsed, and what happens when parsing fails.
+Then explain where it would break: a long PDF that exceeds the context window, a model that returns prose instead
+of JSON, or an evaluation with no **ground truth** (known correct answers to compare against).
+
+A typical bug in this kind of code is the one in this guide's agent-framework lab. Its parser can't read the
+nested tool-call JSON its own prompt asks for, so no tool call ever reaches the tool registry (lab-health notes,
+2026-10-11).
+
+Say it like this: "I'll explain this from what the model actually saw, not from the class diagram. Let me run one
+document and show you the prompt it got."
+
+## Verification
+
+Verification is where you prove the tests and fixes mean something:
+
+- **Run the failing tests against the original before trusting them.** Ten of the eleven bug tests failed on the
+  original code. That is how you know each test can actually detect its bug.
+- **One test passed against the buggy code, and that is the lesson.** The property `decode(encode(n)) == n` held
+  for every `n`, including 0, because `encode(0)` returns `""` and `decode("")` returns 0. A **round-trip test**
+  (encode, decode, compare) can't catch a bug that both directions share. The test that caught it checked what a
+  user would see: the first link's code is not empty.
+- **Run the whole suite after each fix,** not only the new test. The atomic-insert fix changed two code paths.
+- **For the race, run the test many times** (`pytest --count` with `pytest-repeat`, or a loop). A race test that
+  passes once proves little. In this guide's rate-limiter lab, the concurrency test fails in 24 to 184 of 500 plain
+  runs depending on load, and Go's `-race` detector reports no data race at all. Every access is atomic; the bug is
+  check-then-act (run on 2026-10-11 on an Apple M1 Ultra, Go 1.26.9). A race detector finds unsynchronized memory
+  access; it can't see a logic race where each step is safe on its own.
+- **For the Spring Boot variant:** write the test from the requirements list, one assertion per requirement
+  (partial match, case-insensitive, title or stars or both, popularity order, published only), before reading the
+  query code. The bug is usually in the one requirement nobody tested.
+
+Say it like this: "This round-trip test passing doesn't reassure me. Both directions could share the same mistake,
+so I'll test what the user sees instead."
+
+## Complexity and performance
+
+The "optimize" part of read-debug-optimize usually asks for one of three things:
+
+- **An accidental O(n) or O(n²).** Typical causes are a list scan inside a loop, a search that loads every row and
+  filters in memory, or a sort per request. In the movie-search shape, filtering by "published" and matching in
+  memory after `findAll()` is O(rows) per query. The fix to propose is to move the filter and a case-insensitive
+  `LIKE` into the query, with an index where it helps.
+- **Lock scope.** The fixed shortener takes the store lock on every redirect to count a hit. Under heavy read
+  traffic that lock becomes the bottleneck, so batch the counter or split it across shards.
+- **The cost of a fix.** `save_if_absent` in a loop is O(1) amortized: it only retries when an alias has already
+  taken the generated code, which is rare. Say that, instead of leaving the interviewer to wonder.
+
+Don't optimize before the bugs are fixed and tested. A faster wrong answer is still wrong, and the OpenAI
+candidate's report is that structure and tests counted for more than big-O (<Cite id="s-713b2d5493" />).
+
+## Small-team version
+
+On a team of a few engineers working with coding agents, most code under review was written by an agent or by
+someone who has left. Debugging production AI code adds a twist. The program's behaviour depends on things that
+aren't in the diff: the prompt, the model version and the retrieved data.
+
+### Rules for debugging with an agent without being misled
+
+- **A diagnosis comes with a failing test, or it is a guess.** Ask the agent for the reproducing test first, and
+  run it yourself before you read its fix. An agent's root-cause explanation sounds equally sure whether or not it
+  is true.
+- **Reproduce on the version that failed.** Every LLM request should leave a **trace**, a record of what it did
+  and with which versions. Take the prompt version, model id, retrieval index version (the searchable store of
+  document chunks) and feature flags from the failing request's trace, and pin them. Most "the model got worse" tickets turn out to be a changed
+  prompt, a changed index, or a different model behind a name that points to "the latest" model.
+- **Read what the model actually received.** Log the rendered prompt and the raw output for every LLM call, with a
+  tracing tool or the `traced` wrapper above. Many bugs blamed on the model are a cut-off context, an empty
+  retrieval, or a parse failure that was silently retried.
+- **Keep the fix small and the test permanent.** Each production bug becomes a regression test. If the failure is in
+  model output rather than code, it becomes an **eval case** instead: a saved input with its expected output, used
+  to score the model's behaviour on every change.
+- **Watch the plausible-but-wrong pattern.** In this page's codebase, the round-trip test was green, the code had a
+  docstring, and the alias check looked correct. The bugs sat in the gap between what the code said and what it
+  did. Agent-written code has many such gaps, because it reads well.
+
+### A real example from this guide's labs
+
+The cdn-edge lab is a small content delivery network (CDN) cache that sits in front of an **origin** server. Two
+features matter here. **Request coalescing** means many requests for the same missing item share one fetch from
+the origin. **Stale-if-error** means that when the origin fails, the cache serves its older copy instead of an
+error.
+
+Until it was fixed on 2026-10-13, its `TestCoalescing_StaleIfError` failed with "want X-Cache=STALE-IF-ERROR, got
+MISS". To practise on it, undo the 5xx check in `coalesce.go` and run the test. Following the method:
+
+- **Run it.** Only this test fails in the coalescing group; the coalescing test itself passes.
+- **Map it.** The stale fallback runs only when `coalescedFetch` returns an error.
+- **Hypothesis.** `fetchFromOrigin` treats a 500 as a successful HTTP exchange. It skips caching it (`StatusCode <
+  500`) but returns `err == nil`, so the fallback never runs.
+- **Fix.** Turn a 5xx into an error right after the fetch.
+
+In a scratch copy, that one change made the test pass, and the coalescing group went green (run on 2026-10-12, Go
+1.26.9). The lab itself is unchanged. The other failing test, tier promotion, is a separate bug.
+
+### Build, buy, skip
+
+**Buy** the coding agent and a tracing tool (open-source and self-hosted, or a vendor). **Build** the habits:
+failing test first, a written hypothesis list, traces that capture rendered prompts. **Skip** "let the agent fix
+it until the tests pass" on code you can't explain, because an agent can make a test pass by changing the test.
+
+Revisit when the team grows past the point where one person reviews every agent diff. At that point, rules like
+"every fix links its failing test" belong in CI, not in someone's head.
+
+### What it costs, roughly
+
+Logging the rendered prompt and raw output is the main new expense. At an assumed 50,000 LLM calls a day, that is
+about **680 MB a day, or about 20 GB a month** before compression. That is small for any log store, so keep it,
+with a retention limit and a redaction rule agreed first.
+
+An agent session that reproduces and fixes one bug costs **a few dollars** at list prices. The
+[drive-an-agent walkthrough](/system-design-labs/interviews/walkthroughs/ai-coding-drive-agent/#small-team-version)
+works an assumed 40-step session at about $6.84 uncached and $1.22 with **prompt caching** (the provider charges
+less when the start of a prompt repeats a recent one), at Claude Sonnet 5 prices fetched 2026-10-11. The expensive
+part is your review time, which is why the failing test comes first.
+
+The answer changes if prompts carry regulated data. Then the trace store needs the same access controls and
+retention as the source data, and that is a bigger project than the logging itself.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Trace storage:** an assumed 50,000 LLM calls a day of 3,400 tokens each, at about 4 bytes per token (a
+  **token** is the unit a model reads, roughly ¾ of a word): 50,000 × 3,400 × 4 ≈ 680 MB a day. Over 30 days,
+  680 MB × 30 ≈ 20 GB a month, before compression.
+- **TTL bug:** a 5,000 ms TTL added to a clock in seconds becomes 5,000 seconds, which is 1,000× the intended 5
+  seconds, or about 83 minutes.
+- **Round budget:** 60 minutes − 10 (run and map) − 10 (hypotheses) − 5 (summary) = 35 minutes, about 5 minutes
+  for each of seven suspicions.
+
+</details>
+
+<AINative title="Using the assistant in a debugging round">
+Give the assistant jobs whose answers you can check in seconds: "list every place this function's result is
+cached", "write a test that resolves a deleted link", "which callers pass seconds and which pass milliseconds".
+Don't ask "find the bugs" and accept the list. It will find some real ones, invent others, and miss the silent
+ones (an empty code for id 0, a hit counter on the wrong path). Then show the output validation the Google plan
+grades for (<Cite id="s-b88d89c103" />): run each claimed bug's test before you agree with it, and say when the
+assistant was wrong. In the Amazon OA shape, where an assistant is part of the assessment
+(<Cite id="s-6aabb0c00d" />), the record of what you checked is part of what is assessed.
+</AINative>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Same codebase, different bar"
+  senior={[
+    "Runs it, maps entry points and state, and writes a failing test before each fix.",
+    "Finds the functional bugs (TTL units, cache staleness, the empty first code) and explains each in one sentence.",
+    "Leaves the code more testable: an injected clock, one atomic store primitive.",
+  ]}
+  staff={[
+    "Ranks hypotheses by user impact out loud and puts the security and silent-data bugs first.",
+    "Sees the shared root cause (check-then-act with an overwriting save) and fixes the primitive, not each symptom.",
+    "Ends with what is still wrong (the delete/refill race, the hot lock, guessable codes) and what they'd change in review or CI so the class of bug can't recur.",
+  ]}
+/>
+
+In plain words: a Senior candidate fixes the bugs correctly and shows each one. A Staff candidate also sees that
+two bugs share one cause, fixes that cause once, and says what process change would stop the next one.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="Reported title (Microsoft, PracHub): the code was AI-generated. What would you look for first?">
+    The gaps AI code tends to leave: validation that checks one thing and misses the important one (netloc, not
+    scheme), units that disagree between a docstring and a call, caches with no invalidation path, check-then-act
+    on shared state, and tests that cover only the happy path (<Cite id="s-d302bba651" />).
+  </FollowUp>
+  <FollowUp q="Reported (Amazon OA, first-hand): creating an issue with a sub-issue is broken. How do you start?">
+    Reproduce it with a test that creates both and reads them back. Then trace the write path: is the parent id
+    set before the child is saved, is it saved in the same transaction, does the read join the right column? Bugs
+    like this are often an id assigned after use or a missing cascade (<Cite id="s-26efabd25c" />).
+  </FollowUp>
+  <FollowUp q="Reported (Amazon OA, PracHub write-up): the movie search must match partially, ignore case, search title, stars or all, sort by popularity and return only published movies.">
+    Write one test per requirement first, then read the query. Typical bugs: `equals` instead of `contains`, case
+    folded on one side only, "all" implemented as AND instead of OR, an ascending sort, and the published filter
+    applied after paging so pages come back short (<Cite id="s-50480ec72b" />).
+  </FollowUp>
+  <FollowUp q="Reported title (Apple, PracHub): explain an agentic PDF-evaluation codebase.">
+    Start with the request path and the three seams (retrieval, model call, tool dispatch), then run one document
+    through traced seams and explain from the log. Close with where it breaks and how you'd evaluate it
+    (<Cite id="s-0630fd2aff" />). The agentic-workflow family covers judging whether it should be an agent at all.
+  </FollowUp>
+  <FollowUp q="Reported (Google plan, news): read, debug and optimize with Gemini. What does 'output validation' look like?">
+    Every claim from the assistant gets checked against something you can run: a test, a log line, a trace. Say
+    out loud which suggestions you rejected and why (<Cite id="s-b88d89c103" />). This is reported for junior and
+    mid-level roles only, as of the 2026 reports.
+  </FollowUp>
+  <FollowUp q="Not reported; a natural next push: you have 10 minutes left and three bugs unfixed.">
+    Stop fixing. Write the three as a ranked list with where each is, how you'd prove it and the fix you'd make,
+    and skip-mark their tests. An honest list beats a rushed fix that breaks something else.
+  </FollowUp>
+  <FollowUp q="Not reported; a natural next push: the tests pass but the interviewer says there is still a bug.">
+    Look where the tests don't: concurrency, time boundaries, the first and the empty case, error paths, and
+    properties the test asserts trivially (the round-trip test here). Check whether a test asserts the buggy
+    behaviour.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Fixing before reproducing.** The fix may be right, but you can't show it, and you may fix the wrong thing.
+- **Reading files in directory order.** Start at the entry point and follow one request instead.
+- **Trusting green tests.** Here they checked only the happy path, and one skipped the first link.
+- **Accepting the assistant's bug list.** The Google plan grades "output validation" explicitly
+  (<Cite id="s-b88d89c103" />).
+- **Refactoring and fixing in the same step.** Pin behaviour first (Stage 6), as the OpenAI report's emphasis on
+  structure and tests suggests (<Cite id="s-713b2d5493" />).
+- **Silent fixes.** Every fix needs its one-sentence "why the original was wrong".
+- **Spending the round on one hard bug** while three easy, high-impact ones go unlisted.
+
+## Prove it with a lab
+
+These labs have real, small bugs, recorded in the guide's lab-health notes. That makes them good practice: code
+you didn't write, with a failure you can reproduce.
+
+<LabRef lab="rate-limiter" role="proof" note="Run TestDistributed_SharedCounterAcrossGoroutines a few hundred times: it fails intermittently, and -race stays silent because the bug is check-then-act, not a data race. Find it by reading, then prove the fix with the repeated run." />
+
+<LabRef lab="cdn-edge" role="partial" note="Fixed on 2026-10-13: a 5xx from the origin used to come back as a successful fetch, so the stale fallback never ran, and TestTiered_L2HitPromotesToL1 had an off-by-one in the test itself. To practise, undo the 5xx check in coalesce.go and find it again with the method above." />
+
+<LabRef lab="message-queue" role="partial" note="TestDelayedMessageNotVisibleBeforeDelay panics with index out of range. Read the panic back to its cause; the delay path truncates with int(delay.Seconds()) in pkg/queue/delay.go." />
+
+<LabRef lab="agent-framework" role="partial" note="An agent codebase to explain (loop, tools, memory with the last 5 turns, a sandbox) with a mock LLM. Three of 15 tests fail; two of those are the nested-JSON parser bug, a realistic agent-code failure." />
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-d302bba651" />
+- <Cite id="s-26efabd25c" />
+- <Cite id="s-50480ec72b" />
+- <Cite id="s-6aabb0c00d" />
+- <Cite id="s-62a8587fd2" />
+- <Cite id="s-713b2d5493" />
+- <Cite id="s-0630fd2aff" />
+- <Cite id="s-6c08b2d69e" />
+- <Cite id="s-b88d89c103" />
+- <Cite id="s-90bac7273b" />
+- <Cite id="s-e5567e3f2c" />
+- [Anthropic, How AI assistance impacts the formation of coding skills](https://www.anthropic.com/research/AI-assistance-coding-skills), 2026-01-29, fetched 2026-10-12

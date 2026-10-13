@@ -1,0 +1,177 @@
+---
+question: infra-027
+family: multipart-practical-coding
+status: published
+labs: [distributed-cron]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll keep tasks in a min-heap ordered by run time, then priority, then a counter, so ties never compare
+> functions. Time comes from an injected clock, and a `run_due()` method runs everything that is due, so every test
+> is exact and needs no sleeping. Cancel just records the id and the task is skipped when it comes up. Recurring
+> tasks reschedule to the next slot after now, not once per missed slot. Threads, worker limits and retries come
+> later, as additions around this core."
+>
+> The rest of this page explains each part of that answer.
+
+A **scheduler** is a class that holds tasks and runs each one when its time comes. The interviewer asks you to build
+one, then keeps changing it: cancellation, repeating tasks, failures, a limit on how many run at once.
+
+What makes it different from the cron jobs you already know is that you build the clock logic yourself, and you
+must test it. Code that sleeps until 3 a.m. can't be tested in a 90-minute round. So the first design decision is
+not the data structure; it is how time gets in. If the scheduler asks a function you pass in for "now", a test can
+move time forward instantly, and every later requirement can be tested the same way.
+
+The only evidence for this question is a Glassdoor search snippet for OpenAI software engineers describing a
+scheduler whose requirements kept changing over a 90-minute CoderPad session, CoderPad being a shared online code editor (<Cite id="s-9daac2715f" />). The
+page itself returned 403, so the details are unknown and confidence is low. It fits what Hello Interview describes
+for OpenAI: practical problems with "several behaviors to implement" and a lot of working code per session
+(<Cite id="s-4d55d9b987" />). The sequence below is a plausible staging for practice.
+
+## Clarify first
+
+- **Time:** real threads and sleeping, or a method the test calls with "now"? Assume an **injected clock** (a
+  function passed into the constructor that returns the current time) and a `run_due()` method. Threads can come
+  later.
+- **Tasks:** a callable plus a run time. Are return values or exceptions recorded?
+- **Order:** two tasks with the same run time: which first? Priority, then the order they were scheduled.
+- **Recurring tasks:** if the scheduler falls behind, run every missed occurrence, or only one? Assume one
+  catch-up run.
+- **Cancellation:** by id, effective immediately.
+
+Say it like this: "I'll inject the clock so tests can jump time forward. If we fall behind on a repeating task, I'll
+run it once and move on, not replay every missed slot. Tell me if you want the other policy."
+
+## Answer
+
+### Words you need first
+
+- A **min-heap** always gives you its smallest item in O(log n). Ordered by run time, its top is the next task due.
+- **Lazy deletion**: instead of digging a cancelled task out of the middle of the heap (slow), record its id and
+  skip it when it reaches the top.
+- A **recurring task** runs every `every` time units. **Missed runs** are the slots that passed while nobody called
+  `run_due()`.
+
+### The shape of it
+
+```
+ schedule(fn, at, every, priority) ──► min-heap of (at, priority, id, fn, every)
+ cancel(id) ──────────────────────────► cancelled ids (a set)
+                                              │
+ run_due() asks clock() for "now" ────────────┤
+                                              ▼
+                            pop every task with at <= now
+                              ├─ id cancelled?   → skip it
+                              ├─ otherwise       → run fn(), record result
+                              └─ recurring?      → push again at the next slot after now
+```
+
+**The heap** holds every pending task. Its tuple order is run time, then priority, then a unique id; the id means
+Python never has to compare two functions, which would raise an error.
+
+**The cancelled set** makes cancel O(1). The cost is paid later, when the task surfaces and is skipped.
+
+**`run_due()`** is the only place tasks run. It reads the clock once, so one call sees one consistent "now".
+
+### The code
+
+```python
+class Scheduler:
+    def __init__(self, clock):
+        self.clock = clock                            # injected: tests control time
+        self.heap, self.seq, self.cancelled = [], itertools.count(), set()
+
+    def schedule(self, fn, at, every=None, priority=0):
+        tid = next(self.seq)
+        heapq.heappush(self.heap, (at, priority, tid, fn, every))
+        return tid
+
+    def cancel(self, tid):
+        self.cancelled.add(tid)                       # lazy deletion
+
+    def run_due(self):
+        now, ran = self.clock(), []
+        while self.heap and self.heap[0][0] <= now:
+            at, prio, tid, fn, every = heapq.heappop(self.heap)
+            if tid in self.cancelled:
+                continue
+            ran.append(fn())
+            if every:                                 # next slot after now: no burst of catch-up runs
+                nxt = at + every * ((now - at) // every + 1)
+                heapq.heappush(self.heap, (nxt, prio, tid, fn, every))
+        return ran
+```
+
+### One run through it
+
+Schedule three tasks: "report" at 0 repeating every 10, "email" at 5, and "cleanup" at 8, then cancel cleanup. Move
+the fake clock and call `run_due()` each time. These results come from running the class above.
+
+| Clock | `run_due()` returns | Why | What to say in the interview |
+|---|---|---|---|
+| 0 | `["report"]` | report is due; it is pushed back for t=10 | "Recurring tasks re-enter the heap after they run." |
+| 5 | `["email"]` | email is due; report (now t=10) is not | "The heap top tells me in O(1) whether anything is due." |
+| 35 | `["report"]` | cleanup (t=8) is cancelled and skipped; report missed t=10, 20 and 30 but runs **once**, next due at **40** | "After a pause, one catch-up run, not a burst of three." |
+| 40 | `["report"]` | back on schedule | "The schedule stayed aligned to the original slots." |
+
+The tests behind the card drive a fake clock in this way: a cancelled task never runs, and a recurring task
+scheduled at 0 every 10 runs once when the clock jumps to 35 and is next due at 40. They passed when run on
+2026-10-12.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+The next slot is `at + every × (floor((now − at) ÷ every) + 1)`. For the report task at the t=35 call:
+at = 10 (the slot it was waiting for), every = 10, now = 35. (35 − 10) ÷ 10 = 2.5, floor 2, plus 1 = 3, so the next
+slot is 10 + 10 × 3 = **40**. Using `at + every` instead would give 20, which is already in the past, so the task
+would run again in the same call: the burst you said you'd avoid.
+
+</details>
+
+### Likely next requirements and the change each needs
+
+- **A task throws:** catch, record, and keep the loop alive; decide whether a recurring task keeps its schedule.
+- **Concurrency limit:** a worker pool of size k; `run_due` hands due tasks to the pool instead of calling them.
+- **Dependencies between tasks:** a task becomes due only when its parents succeeded (Kahn's algorithm, run
+  incrementally: count each task's unfinished parents and release it at zero; see the task-manager card).
+- **Real time:** a thread that sleeps until the heap's top is due, woken by a condition variable when an earlier
+  task is scheduled.
+- **Timeouts and retries** per task.
+
+Say it like this: "Because time and execution are separate, threads and a worker pool are wrappers around
+`run_due`, not a rewrite."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Scheduler class"
+  senior={["Heap with stable tie-breaking, lazy cancel, injected clock, a test per requirement as it arrives."]}
+  staff={["Decides missed-run and failure policies out loud, keeps the clock and execution separate so threads and limits are additions rather than rewrites, and uses the interviewer to pick which of many follow-ups matter."]}
+/>
+
+## Small-team version
+
+Don't write a scheduler at work. Use your platform's cron, a managed scheduler, or a job queue with delayed jobs.
+
+What you own is the policy, and it is the same policy the interview asks about:
+
+- **Missed runs:** when a run is missed (a deploy, an outage), do you backfill every slot or skip to the next one?
+- **Idempotent jobs:** a double run must be harmless, because every scheduler will occasionally run a job twice.
+- **Alerting:** someone must hear when a run fails, or a nightly job can be broken for weeks.
+
+## Pitfalls
+
+- **`time.time()` inside the class.** Tests then need real sleeps and become slow and flaky.
+- **Removing cancelled tasks from the middle of the heap.** That is O(n) per cancel; skipping them is O(1).
+- **Recurring tasks that fire a burst of catch-up runs after a pause.** Usually not what anyone wants; ask.
+- **No tie-breaker in the heap tuple.** Two tasks at the same time and priority make Python compare two functions,
+  which raises.
+
+## Go deeper
+
+- Family walkthrough: [Multi-part practical coding](/system-design-labs/interviews/walkthroughs/multipart-practical-coding/), for pacing a 90-minute round.
+- A real scheduler with missed-run backfill: <LabRef lab="distributed-cron" inline />. It scans all jobs for the earliest next run and reads the wall clock; compare it with the heap and injected clock here.
+- Dependencies between tasks: [eng-062](/system-design-labs/interviews/questions/eng-062/).

@@ -1,0 +1,925 @@
+---
+title: "Customer-facing support agent: tool loop, hand-off and stop conditions"
+summary: "Design a support agent that, on every turn, answers, calls a tool or hands off to a person, and never loops: stop conditions, tool permissions, state, voice, debugging, metrics, and when to buy one instead."
+track: ai-engineer
+format: design
+family: support-agent
+smallTeamFocus: "Buy a helpdesk's AI agent for FAQ answers; build your own loop only when the value is actions in your own systems. Either way, own the evals, the hand-off path, the spend caps and the tool permissions."
+rounds: [ml-system-design, debugging]
+level: both
+timeboxMin: 45
+order: 115
+status: published
+basedOn: [eng-020, eng-021, eng-022, eng-023, eng-028, eng-029]
+askedAt: [sierra, microsoft, promptlayer, applied-ai-generic]
+labs:
+  - { lab: agent-framework, role: partial, note: "A real loop, cost guard, memory and subprocess sandbox around a mock LLM. 3 of its 15 tests fail (2026-10-11): two because its regex parser can't read the nested tool-call JSON its own prompt asks for, one because the sandbox test's module isn't importable in the child process. Good material for the debugging round." }
+  - { lab: llm-eval, role: proof, note: "Bootstrap confidence intervals and a paired bootstrap test: the statistics behind 'did this prompt or model swap regress?'. The bundled server answers with a mock LLM." }
+  - { lab: mcp-server, role: proof, note: "JSON-RPC tools with input schemas and a bearer-token middleware (17 tests passed on 2026-10-11). One token covers every tool, so per-tool scopes are what you design on top." }
+  - { lab: websocket-gateway, role: proof, note: "The chat channel: heartbeats, a bounded send buffer, reconnect tokens and replay, which a long support conversation needs when a phone drops off Wi-Fi." }
+  - { lab: observability, role: partial, note: "Spans and trace-context propagation in Go, the shape of a per-conversation trace. On 2026-10-11 the package did not compile (LogEntry is declared twice), so read it rather than run it." }
+  - { lab: voice-assistant, role: background, note: "Energy-based voice activity detection, a 500 ms end-of-speech rule, and sentence-by-sentence TTS. Its LLM is a stub, and its own list of gaps says it has no barge-in handling and no echo cancellation." }
+gapLabs: [guardrails, llm-judge-evals, llm-observability]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "The model only proposes the next step: answer, call a tool, or hand off to a person. Plain code decides whether
+> that step is allowed, runs it, and decides when the turn is over. The code stops the loop on several conditions,
+> each with a named reason, and every stop that isn't an answer becomes a hand-off to a person. Anything that moves
+> money is checked and capped in code, not in the prompt. The customer's identity comes from the login session,
+> never from the model. And I'd measure it with paired metrics, like the share resolved without a person next to
+> how often those customers come back."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer's version usually sounds like this. Design the AI agent behind a company's customer support, first
+in chat and possibly later on the phone. On every turn it does one of three things: answers, calls a tool (look up
+an account, change a plan, issue a credit), or hands the conversation to a person. It must never get stuck looping.
+Define the loop and its stop conditions, the tool contracts, the state it keeps across turns, the metrics that say
+it works, and how you would debug it when it loops or does something the intended flow says it shouldn't.
+
+### What makes this different from a normal backend service
+
+You have built support tooling before: a ticket form, a refund endpoint, an admin page. In those systems your code
+decides every path. A request comes in, an `if` statement picks the branch, and the same input always takes the
+same branch.
+
+In an AI support agent, a **large language model (LLM)** decides the next step. An LLM is a program that reads
+text and writes text. You send it the conversation so far plus instructions, and it writes back what to do next.
+That changes three things a backend engineer usually takes for granted:
+
+1. **The decision maker is unreliable.** The same input can produce a different output on the next run. The model
+   can misread a request, invent a policy, or ask for the same lookup forever. So the model cannot own control
+   flow. Code wraps it, checks every step, and ends the loop.
+2. **It acts on real systems.** A support agent changes plans and issues credits. A customer can try to talk it
+   into a bigger credit, and text inside a lookup result can try to give it orders. So permissions and money limits
+   live in code the model cannot argue with.
+3. **Every step costs money, and the cost grows with the conversation.** Each call to the model re-sends the whole
+   conversation so far, and you pay per unit of text. A conversation that goes round in circles is a cost incident,
+   not just a bug.
+
+Traffic is small (a few calls a second), so this is not a scaling problem. It is a correctness, safety and cost
+problem. Say that early: it tells the interviewer where you will spend your time.
+
+### Words you need first
+
+- **Token**: the unit a model reads and writes, roughly ¾ of an English word. Providers charge per million tokens,
+  with separate prices for **input tokens** (what you send) and **output tokens** (what it writes).
+- **Prompt** (or **context**): everything sent to the model on one call: fixed instructions (the **system
+  prompt**), the conversation so far, and any lookup results.
+- **Tool call**: instead of writing a reply, the model writes a structured request such as
+  `{"tool": "lookup_invoice", "args": {"month": "2026-09"}}`. Your code runs it and adds the result to the next
+  prompt. The model never touches the billing system directly.
+- **Agent loop**: the repeat-until-done cycle of "ask the model what to do, do it, add the result, ask again". The
+  code that runs it is the **orchestrator**.
+- **Hand-off** (or **escalation**): moving the conversation to a human support agent.
+- **Containment**: the share of conversations the bot resolves without a person. It is the headline number in
+  support automation, and it is easy to game, as you will see.
+
+### The running example
+
+One case runs through the whole page. Maya subscribes to a mid-size streaming service on an assumed $15-a-month
+plan. She opens chat in the app and writes: *"My TV app has crashed every night this week. I want this month
+refunded."* The agent will look up her playback errors, explain the fix, offer a $15 credit (inside its cap of one
+month's fee), wait for her to confirm, and issue it. Then she asks for the last three months back, $45, which is
+over the cap, so the agent hands her to a person with everything it knows. Later sections reuse Maya for the cost,
+the loop, the voice channel and the evals.
+
+### Where this question was reported
+
+Six questions in the bank are versions of this problem:
+
+<QuestionRow id="eng-022" />
+<QuestionRow id="eng-021" />
+<QuestionRow id="eng-023" />
+<QuestionRow id="eng-020" />
+<QuestionRow id="eng-028" />
+<QuestionRow id="eng-029" />
+
+Two are first-hand or interviewer-side accounts; the rest are prep-site examples or bare titles. In short:
+
+- **eng-022** comes from a techinterview.org prep guide on Sierra (published 2026-05-05, updated 2026-07-03) that
+  cites no candidates. It asks how the agent chooses between answering, calling a tool and handing off, and how it
+  keeps multi-turn state "without looping forever" <Cite id="s-9116046d24" />.
+- **eng-021** is a title only on Aced's Sierra question bank: an AI agent for a streaming service
+  <Cite id="s-5f98d711e8" />. This page uses its framing.
+- **eng-023** is from the interviewer's side: PromptLayer's post (2025-07-11) describes a whiteboard exercise to
+  design an agent that analyzes support tickets, drafts responses and escalates complex issues. The candidate draws
+  a flow chart of steps, picks a model for each and maybe drafts a prompt <Cite id="s-1205b0cc50" />.
+- **eng-020** is a Microsoft onsite title on PracHub (posted 2026-09-10): a voice and chat AI receptionist
+  platform. Only the title is candidate-reported. The requirements on the page (voice and chat ingress, approved
+  knowledge, permitted actions, a human takeover that moves live control) and its follow-ups (barge-in, an action
+  that succeeds while the channel times out) are PracHub's write-up <Cite id="s-0768ca7c4a" />.
+- **eng-028** is first-hand: a Sierra candidate describes a debugging round with "a small codebase (around 4-5
+  files) that implements an agent", a diagram of how it should work, and "about 3 bugs to find", run and fixed in
+  a CoderPad terminal <Cite id="s-6c08b2d69e" />.
+- **eng-029** is an illustration in an applied-AI prep guide (2026-07-23), not a candidate report: "This agent
+  loops forever on some inputs. Find out why and fix it." <Cite id="s-7d03a572e0" />
+
+## What is being tested
+
+**A loop that ends.** The Sierra prep guide frames the core decision as answer, tool or hand-off. Its most quotable
+line is that "a low-confidence escalation path matters more than a clever prompt" <Cite id="s-9116046d24" />. The
+same guide wants refunds and account changes gated "behind an explicit guardrail", and a read-only knowledge lookup
+kept separate from a billing write.
+
+**Failure handling you designed, not hoped for.** The applied-AI guide says agent questions have moved from "what
+is an agent" to debugging one that misbehaves in production. It contrasts candidates who have operated agents, who
+"talk about tracing every step, setting hard limits on iterations and cost", with those who "talk about the model
+being smart" <Cite id="s-7d03a572e0" />. It also asks how you cap tool calls and spend per request "so one runaway
+session can't cost fifty dollars".
+
+**Breaking the problem into steps.** PromptLayer's interviewers look for "Clear problem decomposition into
+sub-tasks", a logical flow between steps, and "Consideration of error handling and edge cases"
+<Cite id="s-1205b0cc50" />.
+
+**A reason for every choice.** After Sierra's take-home, the candidate presents to an interviewer "who will ask a
+ton of 'why' questions", such as why this approach to tool calling <Cite id="s-6c08b2d69e" />. A live design round
+works the same way. Every box on your diagram needs a one-sentence reason.
+
+**Reading code against a spec.** The debugging round tests whether you can find where the code and a diagram of
+the intended behavior disagree. That is the daily work of owning an agent someone else, or a coding assistant,
+wrote.
+
+My reading: most of this is familiar to a backend engineer. It is a state machine, authorization, idempotent writes
+and budgets. Spend your depth on the parts that are new: evaluation, keeping the conversation small enough to send
+on every call, and, for voice, knowing when the caller has finished talking.
+
+## Clarify and scope
+
+Ask these, and write the answers where the interviewer can see them:
+
+1. **What can the agent do?** Read-only lookups, reversible writes (resend a receipt, pause a plan), or money and
+   irreversible actions (credits, refunds, cancellation)?
+2. **Who is the user?** Signed in, or anonymous until verified? How is identity checked on the phone?
+3. **What are the policies, and who owns them?** Credit limits, refund windows, retention offers, what always needs
+   a person. How often do they change?
+4. **Where do hand-offs go?** An existing helpdesk queue? Staffed hours? What happens after hours?
+5. **Which metric decides?** Containment, **CSAT** (customer satisfaction, the score from the "how did we do?"
+   survey after a chat), cost per resolution, or time to resolution? And who breaks ties?
+6. **Channels.** Chat only, or voice too? Do the channels share history?
+7. **Constraints.** Regulated data such as payments? Languages? A required model provider?
+
+Say: "The policies decide the architecture. If credits need a manager above $15, that's a rule in the tool layer,
+and I need to know it before I draw anything."
+
+Assumptions for the rest of the page, chosen to make the arithmetic concrete:
+
+- a subscription streaming service with signed-in web and app chat (Maya's service);
+- about 2,000 conversations a day (a mid-size company, not a frontier lab);
+- intents (the kinds of request customers make): billing questions, playback troubleshooting, plan changes,
+  credits, cancellation, account access;
+- about eight tools;
+- an example credit cap of one month's fee, applied automatically after the customer confirms, with anything larger
+  going to a person.
+
+Out of scope: **fine-tuning** (further training the model on your own data), the human agents' console, and the
+internals of help-center search. Search here is one read-only tool. Its quality, usually called **RAG**
+(retrieval-augmented generation: fetch relevant articles, then let the model answer from them), is its own question.
+
+## Back-of-envelope
+
+**Load is small. Cost and correctness are the constraints.** With 2,000 conversations a day, 8 customer turns
+each, 2 model calls per turn and about 6 minutes per conversation (all assumed), the system makes about **0.37
+model calls a second** and has about **8 conversations open at once**. Even ten times that at peak is not a
+throughput problem. Say so, then spend your time on tokens.
+
+### Why cost grows faster than the conversation
+
+A model keeps no memory between calls. To answer Maya's eighth message, you send it the system prompt, the tool
+descriptions, and all seven earlier exchanges again. So each call is bigger than the last, and the total input for
+a conversation grows with the **square** of its length.
+
+Two parts make up every call:
+
+- a **fixed prefix**: the system prompt, the support policies and the tool descriptions, assumed here to be 3,000
+  tokens, identical on every call;
+- the **history**: everything said and looked up so far, assumed to grow by 500 tokens per turn.
+
+For Maya's 8-turn conversation that adds up to about **76,000 input tokens and 2,400 output tokens**. Most of it
+(48,000 tokens) is the fixed prefix sent sixteen times.
+
+Providers offer **prompt caching** for exactly this: if the start of a prompt is identical to one sent recently,
+they bill those tokens at a much lower "cached input" rate. Here is what one conversation costs at list prices (USD
+per million tokens, fetched 2026-10-11 from the providers' pricing pages; they change often). "Prefix cached" bills
+the 48,000 prefix tokens at the cache-read rate and ignores cache-write charges:
+
+| Model (input / cached input / output) | No caching | Prefix cached | 60,000 conversations a month, cached |
+|---|---|---|---|
+| Claude Sonnet 5 ($2 / $0.20 / $10) | $0.176 | $0.090 | ≈ $5,400 |
+| Claude Haiku 4.5 ($1 / $0.10 / $5) | $0.088 | $0.045 | ≈ $2,700 |
+| gpt-5-mini ($0.25 / $0.025 / $2) | $0.024 | $0.013 | ≈ $780 |
+
+So Maya's whole conversation costs about **9 cents** on Claude Sonnet 5 with caching. Two cautions: token counts
+differ between models, so recount your own prompts per model, and the table compares price, not quality. Run your
+evaluation before you pick the cheap row.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Model calls per second:** 2,000 × (8 turns × 2 calls) ÷ 86,400 s ≈ **0.37**.
+- **Open conversations** (Little's law, L = λ × W): 2,000 ÷ 86,400 × 360 s ≈ **8.3**.
+
+<Formula
+  title="Input tokens per conversation (no compaction)"
+  expr="input ≈ k × T × S + k × m × T × (T − 1) ÷ 2;  output ≈ k × T × o"
+  vars={[
+    { sym: 'T', meaning: 'user turns in the conversation' },
+    { sym: 'k', meaning: 'model calls per turn (one to answer, plus one per tool round trip)' },
+    { sym: 'S', meaning: 'fixed prefix tokens: system prompt, policies, tool schemas' },
+    { sym: 'm', meaning: 'tokens added to the history per turn: user message, tool results, reply' },
+    { sym: 'o', meaning: 'output tokens per model call' },
+  ]}
+  example="T = 8, k = 2, S = 3,000, m = 500, o = 150 (all assumed): input ≈ 48,000 + 28,000 = 76,000 tokens; output ≈ 2,400 tokens."
+  note="At T = 30 the history term is 435,000 tokens against 180,000 for the prefix: long conversations are dominated by history. The formula ignores tool results added within a turn, so it slightly undercounts when k > 1."
+/>
+
+- **Pricing** (run on 2026-10-12). Sonnet 5 uncached: 76,000 × $2 ÷ 10⁶ + 2,400 × $10 ÷ 10⁶ = $0.152 + $0.024 =
+  **$0.176**. Cached: 48,000 × $0.20 ÷ 10⁶ + 28,000 × $2 ÷ 10⁶ + $0.024 = $0.0096 + $0.056 + $0.024 ≈ **$0.090**.
+  Monthly: 60,000 × $0.090 ≈ $5,400.
+- **Compaction bound:** capping the history at a budget B bounds input at k × T × (S + B). With B = 4,000 at
+  T = 30: 2 × 30 × 7,000 = **420,000** tokens, against 180,000 + 435,000 = **615,000** uncompacted.
+
+</details>
+
+Three design consequences, each worth a sentence in the interview:
+
+- **Report cost per resolved conversation**, which is cost per conversation divided by containment. At 50%
+  containment (assumed), the cached Sonnet row is **$0.18 per resolution**, and every hand-off also costs a
+  person's time. Say: "A cheap bot that hands off everything is expensive."
+- **In short conversations the fixed prefix dominates** (48,000 of Maya's 76,000 tokens). Trim tool descriptions
+  and policy text, and cache the prefix.
+- **In long conversations the history dominates.** The fix is **compaction**: once the history passes a budget,
+  replace the older turns with a short summary. That makes cost grow in a straight line with turns instead of with
+  the square. At 30 turns a 4,000-token budget cuts input from about 615,000 to 420,000 tokens.
+
+## High-level design
+
+Here is the system, top to bottom:
+
+```
+Customer (chat app, or phone)
+   │  WebSocket for chat; for voice: speech-to-text in, text-to-speech out
+   ▼
+Conversation service ── login session, customer identity, owner flag (bot or human)
+   │
+   ▼
+Orchestrator ── runs the loop, enforces budgets, keeps the state object
+   │        ▲
+   │        └── LLM ── proposes one step: answer, tool, or hand-off
+   │
+   ├──► Tool gateway ── permissions, caps, idempotency keys, audit log
+   │        │
+   │        ▼
+   │     Backends ── billing, accounts, playback logs, help-center search
+   │
+   ├──► Human queue ── receives summary + state object, takes ownership
+   │
+   └──► Traces and evals ── every model call and tool call is recorded
+```
+
+**Channels.** Chat runs over a WebSocket with reconnect and replay, so when Maya's phone drops off Wi-Fi she
+resumes the same conversation. Voice adds three pieces in front of the same service: **speech-to-text (STT)**,
+which turns the caller's audio into text; **text-to-speech (TTS)**, which turns the reply into audio; and **voice
+activity detection (VAD)**, which decides when someone is speaking.
+
+**Conversation service.** It authenticates the customer and holds the session. It also holds an **owner flag**:
+bot or human. Only the owner may send messages. Maya's customer id comes from here and is never a tool argument the
+model fills in. If it were, a customer could type "look up account 4471" and the model might do it.
+
+**Orchestrator.** Deterministic code that runs the loop. On each step it asks the model for one structured
+proposal, checks it against a schema, enforces the budgets, runs it and records the result. The AI Engineering
+Field Guide's list of common AI-system-design mistakes includes "Putting control flow in prompts instead of the
+orchestrator" ([field guide, questions/04-ai-system-design.md](https://github.com/alexeygrigorev/ai-engineering-field-guide/blob/main/interview/questions/04-ai-system-design.md),
+relaying a TechEon guide).
+
+**LLM.** It only proposes. It sees the prompt and returns `answer`, `tool` (with a name and arguments) or
+`handoff` (with a reason). It never calls a backend.
+
+**Tool gateway.** The only path to the backends. It checks each tool call's arguments against a schema, applies a
+permission tier per tool, fills in identity from the session, enforces policy caps, attaches **idempotency keys**
+(so a retried credit is not issued twice), and writes an audit log.
+
+**State object.** A small structured record kept next to the transcript: verified identity, the plan and invoices
+in play, actions taken and their results, promises made, and the open question. It is the source of truth. The
+transcript and any summaries of it are not.
+
+**Human queue.** A hand-off carries the summary and the state object, and moves the owner flag. The person who
+picks up Maya's conversation never re-asks what the agent already knows.
+
+**Traces and evals.** One trace per conversation, with a span per model call and per tool call. The traces feed
+dashboards and the test set described under evals.
+
+## Deep dives
+
+### The turn loop and its stop conditions
+
+The model proposes. The orchestrator decides whether the proposal is allowed and whether the turn is over. A
+**turn** is everything that happens between Maya sending a message and the agent replying; inside it the loop may
+take several **steps** (model calls).
+
+First, Maya's turns as a step list, with what the loop checks at each step (the lookup results are illustrative):
+
+| Step | The model proposes | What the code does | What to say in the interview |
+|---|---|---|---|
+| 1 | `tool: playback_errors` (no arguments; her id comes from the session) | Read tier, so it runs. Result: 14 crashes this week on the living-room TV, app two versions behind. The state object records the device. | "Reads are cheap and safe, so the agent can use them freely." |
+| 2 | `answer`: how to update the app, and an offer of a $15 credit | Turn ends with `ANSWERED`. The offer is recorded in the state object as a promise. | "The reply comes from a lookup, not a guess." |
+| next turn, 1 | `tool: issue_credit {amount: 15}` after Maya says "yes" | Money tier. The gateway checks: identity verified, amount at or below the cap, customer confirmed with a button the model can't press. Issues it with an idempotency key. | "The cap lives in the gateway, so no prompt can change it." |
+| next turn, 1 | `tool: issue_credit {amount: 45}` after she asks for three months | Over the cap. The gateway returns `handoff: over_cap`. The loop stops with `POLICY_HANDOFF`. | "Policy says person, so the code hands off, whatever the model wanted." |
+| (if billing were down) | `tool: lookup_invoice` again with the same arguments | Same call twice in one turn: stop with `REPEATED_CALL`, hand off. | "The loop can't spin, even when a backend fails." |
+
+The code below is a model-agnostic sketch of that loop. `propose` calls the model and returns its proposal plus
+the tokens it used. `tools` maps tool names to gateway functions. It ran as shown on 2026-10-12, and nine tests
+passed against a scripted fake model. They cover an answer, a repeated identical call, a repeat hidden by reordered
+arguments, a "try again" error loop, a no-progress loop, a policy hand-off, an unknown tool, the step budget and the
+token budget:
+
+```python
+class Stop(str, Enum):
+    ANSWERED = "answered"; MODEL_HANDOFF = "model_handoff"; POLICY_HANDOFF = "policy_handoff"
+    INVALID_STEP = "invalid_step"; REPEATED_CALL = "repeated_call"; NO_PROGRESS = "no_progress"
+    TOOL_ERRORS = "tool_errors"; STEP_BUDGET = "step_budget"; TOKEN_BUDGET = "token_budget"
+
+@dataclass
+class Budget:
+    steps_per_turn: int = 6
+    tool_errors_per_turn: int = 2
+    no_progress_steps: int = 2
+    tokens_per_conversation: int = 150_000
+
+def run_turn(propose, tools, ctx, state, b: Budget, spent) -> Outcome:
+    seen, errors, stale = set(), 0, 0
+    for _ in range(b.steps_per_turn):
+        step, used = propose(ctx, state)
+        spent["tokens"] += used
+        if spent["tokens"] > b.tokens_per_conversation:
+            return Outcome(Stop.TOKEN_BUDGET)
+        act = step.get("action")
+        if act == "answer":
+            return Outcome(Stop.ANSWERED, step.get("text", ""))
+        if act == "handoff":
+            return Outcome(Stop.MODEL_HANDOFF, step.get("reason", ""))
+        if act != "tool" or step.get("tool") not in tools:
+            return Outcome(Stop.INVALID_STEP, str(step)[:200])
+        key = (step["tool"], json.dumps(step.get("args", {}), sort_keys=True))
+        if key in seen:                                   # same call, same args, this turn
+            return Outcome(Stop.REPEATED_CALL, step["tool"])
+        seen.add(key)
+        before = json.dumps(state, sort_keys=True)
+        result = tools[step["tool"]](step.get("args", {}), state)
+        if result.get("handoff"):                         # the gateway's policy said "person"
+            return Outcome(Stop.POLICY_HANDOFF, result["handoff"])
+        if result.get("error"):
+            errors += 1
+            if errors >= b.tool_errors_per_turn:
+                return Outcome(Stop.TOOL_ERRORS, result["error"])
+        stale = stale + 1 if json.dumps(state, sort_keys=True) == before else 0
+        if stale >= b.no_progress_steps:                  # calls that change nothing
+            return Outcome(Stop.NO_PROGRESS, step["tool"])
+        ctx.append({"role": "tool", "name": step["tool"], "content": json.dumps(result)})
+    return Outcome(Stop.STEP_BUDGET)
+```
+
+What to say out loud:
+
+- **Several independent stop conditions, each with a named reason.** A step budget alone stops a loop only after
+  it has burned the whole allowance. Identical-call detection stops the classic loop on its second iteration. The
+  no-progress check catches the subtler one: different arguments every time (rephrased searches), but no change to
+  the state.
+- **Every non-answer exit becomes a hand-off, not an exception.** The orchestrator turns each `Stop.*` reason into a
+  person helping, with the reason attached. Chart the reasons over time. If `NO_PROGRESS` doubles after a prompt
+  change, you know where to look.
+- **Normalize before comparing.** Hash the parsed arguments with sorted keys, so reordered JSON doesn't hide a
+  repeat.
+- **The proposal has a schema.** Output that doesn't parse counts as an `INVALID_STEP`. It is never text to show
+  the customer. The agent-framework lab shows what happens otherwise (see the debugging deep dive).
+- **Budgets at three scopes:** per turn (steps, tool errors), per conversation (tokens), and per customer per day
+  (spend). Then one abusive or stuck session can't run up a bill.
+
+### Tool contracts and blast radius
+
+**Blast radius** means how much damage a wrong call can do. Sort the tools by it:
+
+| Tier | Examples | Rules |
+|---|---|---|
+| Read | account status, invoice lookup, help-center search | identity-scoped; results are data, never instructions |
+| Reversible write | resend a receipt, pause a plan, switch plan at next renewal | verified identity, idempotency key, audit |
+| Money or irreversible | credit, refund, cancel now | all of the above, plus a cap in code, a confirmation the model can't fake, and a person above the cap |
+
+A **tool contract** is the tool's API definition as the model sees it, plus the rules the gateway enforces. It has
+a name, a JSON schema for the arguments, a tier, the arguments bound from the session (customer id, account id)
+rather than from the model, the errors it returns (structured, with a hint such as `not_found` or `needs_human`),
+and whether it is idempotent.
+
+Assume the model will be talked into proposing the wrong action. The customer might do it ("my manager said I get
+$200"). So might text hidden inside a tool result, such as a help article someone edited; this attack is called
+**prompt injection**. Your job is to make the wrong proposal harmless in the gateway. Say: "I assume the model is
+fooled, and I design the gateway so that being fooled can't move money." The permission question has its own card,
+[eng-050](/system-design-labs/interviews/questions/eng-050/).
+
+Two habits help. **Show only the tools the conversation can use now**: no billing tools before identity is
+verified. And **return errors the model can act on**. "Temporarily unavailable, try again" invites a retry loop;
+`{"error": "billing_unavailable", "retryable": false, "say": "billing is down, offer a callback"}` does not.
+
+### State across turns, and who owns the conversation
+
+Build each model call from five parts, in this order: the fixed prefix (cacheable), the state object, a summary of
+older turns, the recent turns word for word, and the help-center passages retrieved for this turn only.
+
+When the history passes a token budget, compact it. Keep the customer's goal, identity status, the ids in play,
+actions and results, and promises made. Drop raw tool payloads the state object already holds. Never let a summary
+be the source of truth for an action: when Maya's credit is issued, the credit tool reads the invoice from billing,
+not from the summary. Compaction has its own card, [eng-026](/system-design-labs/interviews/questions/eng-026/), a
+Sierra coding question reported first-hand <Cite id="s-985967885e" />.
+
+The receptionist write-up adds a requirement many designs miss. A human takeover must transfer live control, with
+an atomic change of ownership and no moment when the bot and the person both reply <Cite id="s-0768ca7c4a" />.
+Implement it as a compare-and-set on the owner flag: `bot → human` succeeds once. The orchestrator checks the flag
+before sending anything, so a model call that finishes after the transfer is discarded, not sent. When Maya is
+handed off at 9 p.m. and nobody is staffed, the hand-off becomes a ticket with a promised callback, and the agent
+says so honestly.
+
+### Escalation on low confidence
+
+The hand-off path is a feature with requirements, not a failure. Escalate when:
+
+- **policy says so:** an amount over the cap (Maya's $45), a legal threat, a chargeback dispute, a safety issue;
+- **the customer asks** for a person, or frustration signals rise (repeated rephrasing, all caps);
+- **a stop condition fires** (any `Stop.*` other than `ANSWERED`);
+- **grounding fails:** the help-center search finds nothing relevant for a policy question, so the agent must not
+  improvise an answer;
+- **a calibrated score is low.** A model's own "I'm not sure" is a weak signal until you check it against labelled
+  transcripts. **Calibrating** means checking that when the score says 80% sure, it is right about 80% of the time.
+  Do that before you set a threshold.
+
+Measure whether the person resolves a hand-off without re-asking the customer anything. That grades your summary.
+
+### The voice channel (eng-020)
+
+Now Maya calls instead of typing. Voice keeps the same loop and changes the latency budget. In chat, a reply in
+three seconds is fine. On the phone, a second of silence feels broken.
+
+The delay that matters is **time to first audio**: from the moment Maya stops talking to the moment she hears the
+agent. It is a chain of five waits:
+
+1. **Endpointing**: the system waits for a stretch of silence before deciding she has finished. The voice-assistant
+   lab uses a 500 ms end-of-speech rule.
+2. **Speech-to-text** finalizes the transcript.
+3. **Time to first token (TTFT)**: the model's delay before it writes its first token.
+4. The model writes the **first sentence**, token by token.
+5. **Text-to-speech** turns that first sentence into the first chunk of audio.
+
+With assumed values for the last four, that adds up to about **1.5 seconds**, and the largest single term is the
+endpointing silence. Cutting it to 300 ms saves 200 ms but interrupts slow speakers, so tune it on real calls.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Time to first audio after the caller stops talking"
+  expr="TTFA ≈ t_endpoint + t_stt + t_ttft + n_first × t_token + t_tts_first"
+  vars={[
+    { sym: 't_endpoint', meaning: 'silence the system waits before deciding the caller has finished' },
+    { sym: 't_stt', meaning: 'time to finalize the transcript' },
+    { sym: 't_ttft', meaning: 'model time to first token' },
+    { sym: 'n_first × t_token', meaning: 'tokens in the first sentence × time per output token' },
+    { sym: 't_tts_first', meaning: 'time to synthesize the first audio chunk' },
+  ]}
+  example="500 ms (the voice-assistant lab's end-of-speech rule) + 200 + 400 + 12 × 20 ms + 150 = 1,490 ms. Every value except the 500 ms code constant is an assumption."
+  note="The endpointing silence is the largest single term. Cutting it to 300 ms saves 200 ms but interrupts slow speakers, so tune it on real calls."
+/>
+
+</details>
+
+So stream every stage: start speech-to-text while she talks, start speaking the first sentence while the model
+writes the second, and say a short acknowledgement ("let me check that") while a slow tool runs.
+
+**Barge-in** is when the caller talks over the agent; it is a follow-up on the PracHub page. Keep voice activity
+detection running on Maya's audio while the agent's audio plays. When she speaks, stop playback, cancel the model
+stream and any queued audio, and record in the transcript only the part she actually heard. Otherwise the next
+turn's prompt claims the agent said things she never heard. This needs **echo cancellation** (removing the agent's
+own voice from the microphone signal), or the agent's voice triggers the detector. The voice-assistant lab's own
+list of gaps says it has neither interruption handling nor echo cancellation, which is an honest picture of where a
+toy stops.
+
+### Debugging the agent against its flow (eng-028, eng-029)
+
+In the debugging round you get a small agent codebase, a diagram of how it should behave, and a timer. Method first,
+because the round is timed:
+
+1. **Run one scripted conversation per path in the diagram** (answer; tool then answer; tool error; hand-off). Use
+   a fake model that returns fixed proposals, so every run is repeatable. Paths that fail point you at a file before
+   you read anything.
+2. **Check the boundaries where code and diagram can disagree.** Does the parser accept the exact format the prompt
+   asks for? Is the tool result added to the context with the right role? Does every branch reach a stop condition?
+   Is state updated on failure as well as on success? Can the hand-off branch actually fire?
+3. **Fix in code first, then in the prompt,** and add the failing input to the test set.
+
+The agent-framework lab contains real examples of each bug class. Its system prompt asks the model for
+`{"type":"function","function":{...}}`, but the regex that parses calls can't match nested braces. So every tool
+call falls through to "treat output as answer", and the raw JSON goes back to the user. That is how 2 of its 15
+tests fail. Its loop ends in a `MaxStepsExceeded` exception rather than a hand-off, and it has no repeated-call
+check, so a model that keeps asking for the same tool burns all ten steps. Its async agent sends a separate
+`history` string as well as the memory, so the prompt carries the same content twice.
+
+For "loops forever on some inputs" (eng-029): pull the traces of looping conversations and group them by last tool
+and stop reason. The usual causes are a tool result that never reaches the next prompt, an error that reads like
+"try again", a model that can't see it already asked, and a parse failure that silently asks the model again. The
+applied-AI guide's description fits the common case: an agent "gets stuck calling the same tool in a loop until it
+burns the token budget" <Cite id="s-7d03a572e0" />.
+
+## Failure modes and overload
+
+| What breaks | How you notice | What the system does |
+|---|---|---|
+| Model provider slow or down | latency and errors per model span | fail over to a second model that passed the same evals, or apologize and queue a hand-off; never switch silently to an untested model |
+| A backend tool is down | tool error rate | a structured, non-retryable error; an honest message; offer a callback; a circuit breaker per tool |
+| Loops and runaway cost | stop-reason counts, tokens per conversation | the budgets above; per-customer daily spend caps; provider spend limits |
+| An action succeeds but the channel times out before the reply | idempotency-key log; state shows an action with no acknowledgement | the state object records the action from the gateway, so the next turn (or the person) sees it; a retry with the same key returns the original result |
+| Hand-off flood after a bad change | escalations per hour by prompt version | alert on the band, roll back by version; if the human queue saturates, shed by intent and offer callbacks |
+| Injection campaign | gateway refusals per hour | the gateway already refuses; alert and read transcripts |
+| Invented policy | eval failures; policy answers without a cited article | policy answers must cite a retrieved article or hand off |
+| Bot and human reply at once | two senders on one conversation | compare-and-set owner flag; discard late bot output |
+
+Take Maya's timeout case. Her credit goes through, but her phone loses signal before the reply arrives. She
+reconnects and asks again. The gateway already wrote the credit to the state object and the audit log with its
+idempotency key, so the next turn sees "credit issued" and confirms it. A retried call with the same key returns
+the original result instead of crediting twice.
+
+Invented policy is not hypothetical. In April 2025 Cursor's AI support agent told users that being logged out was
+expected under a login policy that did not exist; the co-founder posted about an "incorrect response from a
+front-line AI support bot" ([Fortune, 2025-04-19](https://fortune.com/article/customer-support-ai-cursor-went-rogue)).
+And you own what the bot says. In Moffatt v. Air Canada (decision released 2024-02-14) the tribunal rejected the
+argument that the chatbot was a separate entity, writing that "it is still just a part of Air Canada's website"
+([Law360 Canada, 2024-02-16](https://www.law360.ca/ca/articles/1804075)).
+
+<Pitfall title="Optimizing containment alone">
+Containment is the headline number, and it is easy to inflate by making hand-offs hard. A bot that won't escalate
+shows great containment until repeat contacts, abandoned chats and CSAT catch up. Pair containment with repeat
+contact on the same issue, within a window you agree with the support team, and with CSAT on contained
+conversations. Treat a containment jump after a change as a question, not a win.
+</Pitfall>
+
+## Evals and observability
+
+An **eval** (evaluation) is an automated test for model behavior: a set of saved conversations, each with a check
+on what the agent should do. It plays the role unit and regression tests play for normal code. The difference is
+that the model's output varies from run to run, so you measure pass rates, not single pass or fail results.
+
+### Metrics, in pairs that keep each other honest
+
+- containment, paired with repeat contact and abandonment;
+- escalation rate, paired with how often the person resolves the hand-off without re-asking;
+- CSAT on contained conversations, paired with CSAT after a hand-off;
+- policy violations (a credit over the cap, a disclosure to the wrong account), which must be zero and are counted
+  separately;
+- cost per resolved conversation, and latency per turn (p50, p95).
+
+The Sierra guide names the same family: offline eval sets, "regression suites that catch when a prompt or model
+swap breaks a case that used to work", and live signals "like containment and escalation rate"
+<Cite id="s-9116046d24" />. The eval-set design is its own card,
+[eng-036](/system-design-labs/interviews/questions/eng-036/).
+
+### The eval set
+
+Anthropic's guide on agent evals suggests starting with "20-50 simple tasks drawn from real failures"
+([Anthropic, 2026-01-09](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents)). For support,
+cover each intent with: the happy path (Maya's $15 credit), a credit over the cap (her $45: must hand off),
+another customer's account (must refuse), injection in the customer's text and in a tool result, unverified
+identity, a customer who demands a person, a policy question the help center doesn't answer (must not improvise),
+and every input that ever looped. Run multi-turn cases with a scripted or simulated customer.
+
+### Graders
+
+A **grader** is the check that decides whether a case passed. Use code where you can: did a credit over the cap
+happen, did it hand off, did it call the tool with this customer's account? For tone and helpfulness you can use an
+**LLM judge** (a second model prompted to grade the transcript), but only after checking its grades against human
+labels. Grade outcomes, not paths, and read transcripts yourself.
+
+### Reliability, not best-of
+
+A customer-facing agent must behave well every time, not once in a few tries. The metric for that is **pass^k**:
+the chance an agent passes all k runs of the same task. If it passes a task 75% of the time, it passes three runs in
+a row only about **42%** of the time.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Chance an agent passes all k runs of a task"
+  expr="pass^k = p^k   (runs independent, per-run pass rate p)"
+  vars={[
+    { sym: 'p', meaning: 'per-run pass rate on a task' },
+    { sym: 'k', meaning: 'repeated runs of the same task' },
+  ]}
+  example="p = 0.75, k = 3: 0.75³ ≈ 42% (the worked value in Anthropic's agent-evals guide). p = 0.90: 0.729. p = 0.97: 0.913."
+  note="Anthropic's guide says pass^k especially matters for customer-facing agents."
+/>
+
+**Interval width for a pass rate:** 1.96 × √(p(1 − p) ÷ n). At p = 0.85: n = 200 gives ±4.9 points; n = 1,000
+gives ±2.2.
+
+</details>
+
+### Regression after a prompt or model swap
+
+When you change the prompt or the model, run old and new on the same cases and compare them **paired**: case by
+case, counting where they disagree, instead of comparing two overall accuracy numbers. Pairing removes the noise
+from cases that are simply hard for both.
+
+Know how small a change your set can see. At an 85% pass rate, a 95% interval is about **±4.9 points with 200
+cases** and **±2.2 with 1,000**. The llm-eval lab simulated its paired bootstrap test (a **bootstrap** estimates
+uncertainty by re-sampling your own results many times). With 500 cases, the smallest true gap it detects 80% of
+the time is <LabNumber lab="llm-eval" metric="Smallest true gap with 80% power, paired test, n=500" /> when the
+versions disagree on 20% or 40% of cases. So a 2-point regression on 500 cases will usually go unseen. That is why
+policy violations are a hard zero, not a statistical test.
+
+Gate a change on: zero new violations, no significant drop in task success, the escalation rate inside its usual
+band, and a person reading a sample of changed transcripts. Then canary it on a small share of traffic.
+
+### Observability
+
+One trace per conversation. Each model call is a span with model id, prompt version, input, output and cached
+tokens, latency and cost. Each tool call is a span with the tool, an argument hash, the gateway decision and the
+backend status. Log stop reasons and hand-off reasons as enums. "Why did escalations jump on Tuesday?" is then
+answered by slicing those enums by prompt version and intent.
+
+## Trade-offs
+
+- **Agent or workflow.** A **workflow** is a fixed sequence of steps written in code; an **agent** lets the model
+  choose the steps. Credits, cancellations and identity checks are well-defined flows. Write them as code the agent
+  invokes, and keep the model for understanding the customer and choosing the flow. The opposite failure is real
+  too: a Cohere candidate rejected after an ML design round thinks, in hindsight, that they decoupled too finely and
+  should have let the model plan with function calling (native tool calls) <Cite id="s-d5d3016775" />. Put code where the policy is
+  fixed, not everywhere.
+- **Bigger model or more escalation.** A cheaper model with a lower hand-off threshold can cost less per resolved
+  conversation, or more once you count people's time. Decide with the cost formula and eval numbers.
+- **Friction or autonomy.** Confirmations and caps cost containment. Set the cap where an error costs less than a
+  person's time, and revisit it with data.
+- **Fallback model or consistency.** A fallback raises availability, but only a model that passed the same gate
+  should talk to customers.
+
+<AINative title="The agent is easy to generate; the checks are the job">
+A coding assistant can scaffold this whole system in an afternoon: the loop, tool schemas, a judge prompt, a
+dashboard. The agent-framework lab looks complete at a glance, and its own tests show the tool-call path never
+worked, because the parser and the prompt disagree about the format. What you bring is the set of checks that keeps
+generated code honest: a round-trip test of the proposal format, gateway tests that assume the model is fooled, a
+stop-reason dashboard, a paired regression gate, and a weekly read of transcripts. Simon Willison's description of
+working with agents centres on plans, tests and code review
+([2025-10-07](https://simonwillison.net/2025/Oct/7/vibe-engineering/)). For a support agent, those tests are the
+evals and the gateway.
+</AINative>
+
+## Small-team version
+
+You own AI at a 50–500 person company, with a few engineers and coding agents. Support deflection (answering
+questions so they never reach a person) is often the first customer-facing agent such a company ships, and you are
+the one paged when it loops or promises a credit it can't give.
+
+### Buy, build or skip
+
+**Buy first** when your helpdesk already sells an AI agent and most volume is questions the help center answers.
+Two list prices, fetched 2026-10-12. Intercom prices Fin at "$0.99 per outcome". An outcome is counted when a
+customer confirms the issue is resolved, stops asking after Fin responds, or Fin completes a workflow (including
+hand-offs). It is charged once per conversation, with a minimum monthly commitment when used with another helpdesk
+([Intercom pricing](https://www.intercom.com/pricing)). Zendesk lists automated resolutions at $1.50 committed or
+$2.00 pay-as-you-go ([Zendesk pricing](https://www.zendesk.com/pricing/), page modified 2026-10-09). Check how each
+vendor counts a billable outcome against how you count a resolution: "stopped asking" is not "resolved".
+
+**Build** when the value is actions in your own systems (plan changes, credits, provisioning) with policy logic a
+vendor's workflow builder can't express, when you need your own eval gate and traces, or when volume makes
+per-outcome pricing expensive.
+
+**Skip** at first: voice (ship chat, learn the intents, then add a channel), multi-agent designs, fine-tuning and
+self-hosted models. None of them is the bottleneck for a first agent.
+
+### Cost math, dated
+
+The question is simple: at what volume does owning the agent cost less than paying per outcome? Owning costs a
+fixed amount of engineer time each month plus tokens per conversation. Buying costs the vendor's price on every
+resolved conversation.
+
+With the assumptions in the box below, owning costs about **$5,300 a month of engineer time** before any tokens.
+Against Fin's $0.99 the break-even is about **13,000 conversations a month (about 430 a day)**; against Zendesk's
+$1.50 it is about 8,000. At Maya's service's 2,000 a day, the vendor would bill about **$29,700 a month**, against
+about **$10,700** to own the loop.
+
+Read it as a shape. Under a few hundred conversations a day the vendor wins. At thousands a day, building pays if
+you can staff the evals and on-call. Say: "Below about 400 conversations a day I'd buy; above it I'd build, if I can
+staff the evals."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Build-versus-buy break-even, conversations per month"
+  expr="N_be = L ÷ (c × p_vendor − cost_llm)"
+  vars={[
+    { sym: 'L', meaning: 'your fixed monthly cost to own the agent: maintenance plus amortized build' },
+    { sym: 'c', meaning: 'containment, the share of conversations the agent resolves' },
+    { sym: 'p_vendor', meaning: 'vendor price per billed outcome' },
+    { sym: 'cost_llm', meaning: 'your token cost per conversation' },
+  ]}
+  example="L = $3,238 (20% of a loaded engineer) + $2,024 (3 engineer-months amortized over 24 months) = $5,261, from a loaded cost of $135,980 ÷ 0.70 ≈ $194,000 a year (BLS median developer wage, May 2025, with wages assumed to be 70% of total compensation). c = 0.5, the 70% wage share, and the 20% and 3-month figures are assumptions. cost_llm = $0.090 (Sonnet 5, prefix cached). Against $0.99: 5,261 ÷ (0.495 − 0.090) ≈ 13,000 a month (about 430 a day). Against $1.50: about 8,000 a month."
+  note="At this page's 2,000 a day (60,000 a month): vendor ≈ 60,000 × 0.5 × $0.99 = $29,700 a month; own ≈ $5,400 tokens + $5,261 ≈ $10,700. Excluded on both sides: helpdesk seats and the people handling hand-offs. Excluded from the build side: evaluation time, which practitioners report takes most of the effort (Hamel Husain's evals FAQ reports 60–80% of development time on error analysis and evaluation)."
+/>
+
+The arithmetic was run on 2026-10-12.
+
+</details>
+
+### Default stack
+
+- A managed model API from one provider, with a second provider wired as a fallback that passed the same eval.
+  Assembled's CTO describes building this after "multiple customer-impacting outages", with every prompt change
+  evaluated on at least two providers at a cost of about 20–30% more prompt-development time
+  ([Assembled, 2025-06-12](https://www.assembled.com/blog/your-llm-provider-will-go-down-but-you-dont-have-to)).
+- The loop in plain code, as above. Anthropic suggests "developers start by using LLM APIs directly"
+  ([Anthropic, 2024-12-19](https://www.anthropic.com/engineering/building-effective-agents)).
+- Postgres for conversation state and the state object; your existing helpdesk as the human queue; help-center
+  search through whatever retrieval you already run.
+- Tracing from day one (a hosted or self-hosted LLM tracing tool, or OpenTelemetry spans), with tokens and cost per
+  conversation.
+- Provider spend caps and per-customer daily caps.
+
+### A realistic delivery plan
+
+This is a plan, not a sourced benchmark:
+
+1. **Weeks 1–2:** read 100 recent tickets with the support lead, label intents, and pick the three with the most
+   volume and the simplest policy. Write 30–50 eval cases from real tickets.
+2. **Weeks 3–4:** a read-only agent (answers plus lookups) that drafts replies for human agents. Their edits are
+   your first labels.
+3. **Weeks 5–6:** live on 5–10% of chat traffic, read-only, with a visible "talk to a person" button.
+4. **Weeks 7–10:** the first reversible write, then credits behind a cap, a confirmation button and a person above
+   the cap. Voice only after the chat metrics hold for a month.
+
+### What you verify yourself
+
+Gateway tests that assume the model is fooled; the stop-reason dashboard; a weekly read of 30 transcripts; that
+every policy answer cites an article; the spend caps; the vendor's data-retention terms; and, with legal, what the
+bot is allowed to promise. Air Canada's tribunal held the airline responsible for its chatbot's answer, so the small
+team owns the answers even when a vendor generates them.
+
+### What small-company interviewers probe
+
+The little evidence there is on 50–500 person loops points to work samples over puzzles, with failure modes
+probed directly. Most of it comes from employers, and it is thin. Elicit's hiring manager describes probing
+error handling, retries, fallbacks and timeouts rather than the happy path
+([Latent Space, 2024-06-21](https://www.latent.space/p/hiring)). Expect "what happens when billing is down?", "how
+much does a conversation cost?" and "would you buy this?" before anything about model internals.
+
+### Revisit when
+
+Volume crosses the break-even and stays there; the vendor can't perform an action you need; compliance requires
+data residency or retention terms the vendor can't meet; or the support team asks for drafts rather than
+automation, which is a cheaper and safer product.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Customer-support agent"
+  senior={[
+    "Puts control flow in code with several stop conditions, each ending in a hand-off with a named reason.",
+    "Takes identity from the session, sorts tools by how much damage a wrong call does, and caps and confirms money moves in the gateway.",
+    "Keeps a structured state object as the source of truth, and an owner flag changed by compare-and-set for human takeover.",
+    "Names containment, escalation and CSAT in pairs, with an eval set from real failures and code-based graders.",
+    "Estimates cost per conversation from the fact that every call re-sends the history.",
+  ]}
+  staff={[
+    "Starts from the business: which metric wins when containment and CSAT disagree, and who owns the credit cap.",
+    "Designs the regression gate: a paired test sized to the change it must catch, a canary, and rollback by prompt version.",
+    "Does the build-versus-buy math with the vendor's outcome definition, and names the volume at which the answer flips.",
+    "Plans for the provider changing a model underneath: pinned versions, the gate, and a fallback that passed it.",
+    "Sizes the human queue for the failure case, a bad deploy that doubles escalations at 9 a.m. on a Monday.",
+  ]}
+/>
+
+We found no published Senior-versus-Staff rubric for AI engineers; the contrast above is
+a synthesis. One level-tagged data point carries over. A Stripe Staff candidate reports being rejected with feedback
+that they were "trying to force-fit a template from somewhere else instead of designing around the actual
+requirements" <Cite id="s-8e0784406e" />. That was a feature-flag design, not an agent, but the lesson applies:
+derive the tiers, caps and stop conditions from the policies you were told.
+
+## Follow-ups
+
+<FollowUps>
+<FollowUp q="Listed on the PracHub page (Microsoft): the caller interrupts the voice agent mid-sentence. What happens?">
+
+Voice activity detection keeps running on the caller's audio while the agent's audio plays. When the caller speaks,
+stop playback, cancel the model stream and queued audio, and cut the agent's last turn in the transcript down to
+what was actually played. Without echo cancellation the agent's own voice trips the detector, so that is a
+prerequisite, not polish.
+
+</FollowUp>
+<FollowUp q="Listed on the PracHub page (Microsoft): the action succeeds but the channel times out before the agent confirms it. Now what?">
+
+The gateway wrote the action to the state object and the audit log with an idempotency key before replying. When
+the customer reconnects or retries, the next turn sees the action and confirms it. A retried call with the same key
+returns the original result instead of crediting twice. If a person takes over, they see it too.
+
+</FollowUp>
+<FollowUp q="Reported (Sierra, first-hand): in the take-home presentation, why this approach to tool calling?">
+
+Have a one-sentence reason per choice. Native structured tool calls, because a schema-checked proposal can be
+checked before anything runs. A small tool list per state, because tool choice gets worse as the list grows. Errors
+returned as structured, non-retryable codes, because free-text errors cause retry loops. Caps in code, because
+prompts don't enforce policy.
+
+</FollowUp>
+<FollowUp q="Applied-AI prep guide: how do you cap tool calls and spend per request so one runaway session can't cost fifty dollars?">
+
+Budgets at three scopes: steps and tool errors per turn, tokens per conversation, spend per customer per day. Each
+ends in a hand-off with a reason. Above them sit provider-side spend limits. Derive the cap from the cost formula: a
+150,000-token conversation cap at $2 per million input tokens is about $0.30, far from fifty dollars.
+
+</FollowUp>
+<FollowUp q="Applied-AI prep guide: a customer says the bot 'feels dumb'. What do you change first?">
+
+Nothing, until you have read their transcripts and a sample from the same intent. Sort the failures into search
+misses, policy refusals, tool errors, context lost after compaction, and tone. Each has a different fix. Changing
+the prompt for a search or tool problem is the common mistake.
+
+</FollowUp>
+<FollowUp q="Not reported; a natural next push: the provider ships a new model version. How do you adopt it?">
+
+Pin versions. Run the full eval set on the new model, paired against the current one, and re-check the LLM judge
+against human labels, because the judge can drift too. Check cost and latency with the formulas, canary by
+percentage, and key rollback to the prompt-and-model version recorded in every trace.
+
+</FollowUp>
+<FollowUp q="Not reported; a natural next push: legal wants every credit above $20 approved by a person. What changes?">
+
+Only the cap in the gateway, plus human-queue capacity. Estimate the new hand-off volume from credit amounts in
+recent traces before shipping. That is the point of keeping policy in code rather than in the prompt.
+
+</FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Architecture before discovery.** In a first-hand OpenAI FDE (forward-deployed engineer) account, the
+  interviewer stopped an early architecture dive to ask what the candidate would ask the customer first
+  <Cite id="s-812dbc9385" />. Policies, actions and the deciding metric come first.
+- **A template instead of a design.** The Stripe Staff feedback quoted above <Cite id="s-8e0784406e" />.
+- **Letting the model fill in identity.** A customer id as a model-filled tool argument is an injection bug waiting
+  to happen. Take it from the session.
+- **A step limit as the only stop condition.** It stops the loop only after the whole allowance is spent. Add
+  repeated-call, no-progress, tool-error and token budgets, each ending in a hand-off you can count.
+- **"The model is smart enough not to loop."** The applied-AI guide contrasts exactly this with tracing every step
+  and hard limits on iterations and cost <Cite id="s-7d03a572e0" />.
+- **Containment as the goal.** It rewards a bot that refuses to hand off; see the pitfall above.
+- **Two accuracy numbers on 200 cases as a regression test.** The interval is about ±5 points, so real regressions
+  hide in the noise; use a paired test or more cases.
+- **No owner flag.** Without an atomic takeover, the bot and the person answer the same customer.
+
+## Prove it with a lab
+
+<LabRef lab="agent-framework" role="partial" note="The debugging-round rehearsal. Write a test that round-trips the tool-call format its prompt asks for and watch it fail; fix the parser with json.JSONDecoder.raw_decode; then replace MaxStepsExceeded with a hand-off and add the repeated-call and no-progress checks from this page." />
+
+<LabRef lab="llm-eval" role="proof" note="Use paired_bootstrap_test to compare two prompt versions on the same 200 cases, then rerun with 50 and watch the uncertainty widen. The statistics are real; the bundled server's model is a mock." />
+
+<LabRef lab="mcp-server" role="proof" note="Tools with input schemas behind a bearer-token middleware. Sketch per-tool scopes and session-bound arguments on top: one token for every tool is the demo default, not a support-agent design." />
+
+<LabRef lab="websocket-gateway" role="proof" note="The chat channel: heartbeats, a bounded send buffer and reconnect tokens with replay, so a conversation survives a dropped connection." />
+
+<LabRef lab="observability" role="partial" note="Spans and trace propagation: add model id, prompt version, token counts and the gateway decision as span attributes. Fix the compile error first." />
+
+<LabRef lab="voice-assistant" role="background" note="Read v0 (voice activity detection, 500 ms end-of-speech) and v2 (sentence-level TTS streaming) to see the latency chain; then sketch barge-in, which the lab says it lacks." />
+
+The planned guardrails, LLM-as-judge and LLM-observability labs would cover what no lab has yet: injection tests,
+judge calibration and token-level traces.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-9116046d24" />
+- <Cite id="s-5f98d711e8" />
+- <Cite id="s-1205b0cc50" />
+- <Cite id="s-0768ca7c4a" />
+- <Cite id="s-6c08b2d69e" />
+- <Cite id="s-7d03a572e0" />
+- <Cite id="s-985967885e" />
+- <Cite id="s-812dbc9385" />
+- <Cite id="s-8e0784406e" />
+- <Cite id="s-d5d3016775" />
+- Anthropic, "Demystifying evals for AI agents", 2026-01-09: https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
+- Anthropic, "Building effective agents", 2024-12-19: https://www.anthropic.com/engineering/building-effective-agents
+- AI Engineering Field Guide, AI system design questions page (accessed 2026-10-11): https://github.com/alexeygrigorev/ai-engineering-field-guide/blob/main/interview/questions/04-ai-system-design.md
+- Fortune, Cursor's AI support agent incident, 2025-04-19: https://fortune.com/article/customer-support-ai-cursor-went-rogue
+- Law360 Canada, Moffatt v. Air Canada, 2024-02-16: https://www.law360.ca/ca/articles/1804075
+- Intercom pricing (Fin), fetched 2026-10-12: https://www.intercom.com/pricing
+- Zendesk pricing, page modified 2026-10-09, fetched 2026-10-12: https://www.zendesk.com/pricing/
+- Assembled, "Your LLM provider will go down, but you don't have to", 2025-06-12: https://www.assembled.com/blog/your-llm-provider-will-go-down-but-you-dont-have-to
+- Hamel Husain and Shreya Shankar, evals FAQ (modified 2026-09-21): https://hamel.dev/blog/posts/evals-faq/
+- Latent Space, hiring AI engineers (Elicit), 2024-06-21: https://www.latent.space/p/hiring
+- Simon Willison, "Vibe engineering", 2025-10-07: https://simonwillison.net/2025/Oct/7/vibe-engineering/
+- Model list prices: Anthropic https://platform.claude.com/docs/en/about-claude/pricing and OpenAI https://developers.openai.com/api/docs/pricing, fetched 2026-10-11
+- BLS, software developers (median wage, May 2025): https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm

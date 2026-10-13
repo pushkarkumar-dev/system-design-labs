@@ -1,0 +1,201 @@
+---
+question: r2b-021
+family: kv-store-durable-log
+status: published
+labs: [wal, kafka-lite]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "First the contract: a buffered logger does not wait for the disk, so a crash loses whatever is still in the
+> buffer. Callers append to an in-memory buffer under a short lock and return. One background thread swaps the
+> buffer out and writes it when it gets big, when a timer fires, or on close, always outside the lock. The buffer
+> has a size limit; when it's full, callers either wait or the line is dropped and counted. And close drains the
+> last buffer before it returns."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+You have used loggers for years without thinking about how they write. This question asks you to build one that
+many threads share, and the point is to take slow file I/O off the callers' hot path. Three things make it
+harder than it looks:
+
+1. **The contract decides the design.** A buffered logger is *not* a durable log. If every line had to be on disk
+   before `log()` returned, you would need a different design (a durable writer that shares each disk flush across a batch of callers). Say which
+   one you are building before writing code.
+2. **The lock must be short.** If a caller holds the lock while the file is written, every other thread waits for
+   the disk, and you have rebuilt the slow logger you were replacing.
+3. **Edges lose data quietly.** An unbounded buffer grows until the process is killed. A sloppy `close` loses the
+   last lines, which are usually the ones explaining why the process stopped.
+
+The evidence is a title on PracHub (a site that collects reported questions), "Implement a Concurrent Buffered File Logger", tagged Databricks Senior+ and
+dated 2026-07-30 on the page when read on 2026-10-12 (<Cite id="s-6db00549b3" />). Only the title is
+candidate-reported.
+
+## Clarify first
+
+Spend a minute on the contract. Say your assumptions out loud:
+
+- **Durability.** "Must a line be on disk when `log()` returns? I'll assume not: it's buffered, so a crash loses
+  what's in the buffer." If the answer is yes, this becomes the durable writer
+  ([r2b-020](/system-design-labs/interviews/questions/r2b-020/)).
+- **Ordering.** "Must each thread's lines stay in order? I'll keep per-thread order."
+- **Full buffer.** "When the buffer is full, block the caller or drop the line? I'll block by default and offer a
+  non-blocking mode that drops and counts."
+- **Flush policy.** "Flush on size, on time, or both? I'll do both, plus on close."
+
+## Answer
+
+### Words you need first
+
+- The **buffer** is an in-memory list of lines not yet written to the file.
+- A **flush** writes the buffer to the file. Here it hands the bytes to the operating system; it does not call
+  **fsync**, the system call that forces bytes onto the drive. So lines survive the process crashing only once
+  flushed, and survive a power cut only once the operating system writes them out on its own.
+- A **critical section** is the code that runs while holding a lock. Keeping it short is the whole performance
+  story here.
+- A **condition variable** lets a thread sleep until another thread signals that something changed (for example,
+  "the buffer passed the size threshold").
+
+### The picture
+
+```
+ many caller threads
+      │ log(line): take the lock, append to the buffer, release
+      ▼
+┌───────────────────────────────┐
+│ shared buffer (bounded)       │  full → block the caller, or drop and count
+└───────────────────────────────┘
+      │ writer thread wakes when the buffer passes 64 KiB, every 0.2 s, or on close
+      │ swaps the buffer for an empty one (under the lock)
+      ▼
+┌───────────────────────────────┐
+│ writer thread                 │  writes the swapped-out lines (outside the lock)
+└───────────────────────────────┘
+      ▼
+ log file (handed to the OS; no fsync)
+```
+
+**The callers** only touch memory, for a few microseconds under the lock. **The shared buffer** has a hard limit
+(8 MiB in the code below), which is the memory bound. **The writer thread** is the only code that touches the
+file. Its trick is the swap: it replaces the full buffer with an empty one while holding the lock, which takes
+a moment, then writes the old buffer with the lock released, so callers keep logging during the slow write.
+
+### Follow one line through it
+
+Picture an AI feature that logs a trace line for every model call: `call=812 model=small latency_ms=430`.
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| 1 | A request thread calls `log(...)`. It takes the lock, appends the bytes, releases it and returns. | "The caller pays for a list append, not a disk write." |
+| 2 | More lines arrive from other threads. The buffer passes 64 KiB, so the caller that crossed it signals the writer. | "Size flush keeps writes large and efficient." |
+| 3 | On a quiet afternoon the buffer never reaches 64 KiB, so the writer wakes after 0.2 s anyway. | "Time flush bounds how stale the file can be." |
+| 4 | The writer swaps the buffer for an empty one, then writes our line with the lock released. | "File I/O never happens under the callers' lock." |
+| 5 | If the process crashes before step 4, our line is gone. | "That's the contract I stated up front." |
+| 6 | At shutdown, `close` wakes the writer and waits for it to finish the last buffer. | "Close drains; nothing logged before close is lost." |
+
+### The code
+
+```python
+class BufferedLogger:
+    def __init__(self, path, flush_bytes=64 * 1024, interval=0.2, max_buffer=8 << 20):
+        self._f = open(path, "ab")
+        self._buf, self._n = [], 0
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)      # wakes the writer thread
+        self._room = threading.Condition(self._lock)    # wakes blocked callers
+        self._closed, self.dropped = False, 0
+        self._flush_bytes, self._interval, self._max = flush_bytes, interval, max_buffer
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def log(self, line, block=True):
+        data = line.encode() + b"\n"
+        with self._lock:
+            if self._closed:
+                raise ClosedError()
+            while self._n + len(data) > self._max:
+                if not block:
+                    self.dropped += 1                    # shed, and count it
+                    return False
+                self._room.wait()
+            self._buf.append(data)
+            self._n += len(data)
+            if self._n >= self._flush_bytes:
+                self._cv.notify()
+        return True
+
+    def _run(self):
+        while True:
+            with self._lock:
+                if not self._closed and self._n < self._flush_bytes:
+                    self._cv.wait(timeout=self._interval)
+                buf, self._buf, self._n = self._buf, [], 0
+                closed = self._closed
+                self._room.notify_all()
+            if buf:
+                self._f.write(b"".join(buf))             # file I/O outside the lock
+                self._f.flush()                          # to the OS, no fsync
+            if closed:
+                return
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            self._cv.notify()
+        self._t.join()                                   # drains the last buffer
+        self._f.close()
+```
+
+Two condition variables share one lock. `_cv` wakes the writer when there is work. `_room` wakes callers blocked
+on a full buffer once the writer has swapped it out. The `dropped` counter is public on purpose: if you shed
+lines, someone should be able to see how many.
+
+### Test it
+
+A test with 16 threads × 500 lines checks that every line arrives exactly once and each thread's lines stay in
+order. It passed in the family walkthrough's run on 2026-10-12.
+
+### Alternatives worth naming
+
+- **Per-thread buffers merged by the writer.** Less lock contention, but keeping a sensible order across threads
+  is harder.
+- **A bounded queue of lines.** Simpler to reason about, with more per-line overhead.
+
+And name what the logger deliberately does not do: no fsync, so a crash loses up to one interval or one buffer of
+lines. Say: "In a crash this loses roughly the last 0.2 seconds of logs, more if the disk has fallen behind. For audit
+events that's not acceptable, so those go somewhere durable."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Buffered logger"
+  senior={["Short critical section, I/O outside the lock, size and time flush, bounded buffer, drain on close, and an ordering test."]}
+  staff={["States the loss contract up front, chooses block or drop per log class (drop debug, never drop audit), exposes a dropped counter, and says when the answer should be the durable writer instead."]}
+/>
+
+In plain words: a Senior candidate builds a fast, bounded, correct logger. A Staff candidate starts from what may
+be lost, treats different kinds of log lines differently, and knows when to switch to a durable writer.
+
+## Small-team version
+
+Use your language's logging library with a queue handler (Python's `logging.handlers.QueueHandler`, for one) and
+ship logs to a managed collector. That costs nothing to set up and does this whole design for you.
+
+Keep audit events (who changed a prompt, who approved an agent action) out of the lossy path: write them to the
+database. The exercise is still worth practising, because AI features generate large trace volumes, and a
+logger that writes to disk synchronously on the request path is a common latency bug.
+
+## Pitfalls
+
+- **Writing to the file while holding the lock callers need.** Every caller then waits for the disk.
+- **An unbounded buffer.** It grows until the process is killed, losing everything buffered.
+- **Losing the last buffer at shutdown.** Those are often the lines that explain the shutdown.
+- **Calling it durable without an fsync.** A buffered logger has a loss window; say how big it is.
+
+## Go deeper
+
+- Family walkthrough: [Key-value store to durable log](/system-design-labs/interviews/walkthroughs/kv-store-durable-log/), "The buffered logger variant".
+- The durable contrast: [event writer shared by thousands of threads](/system-design-labs/interviews/questions/r2b-020/).
+- Labs: <LabRef lab="kafka-lite" inline /> (batched fsync with an explicit loss window) and <LabRef lab="wal" inline />.

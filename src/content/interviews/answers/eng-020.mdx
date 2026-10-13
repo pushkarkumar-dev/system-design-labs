@@ -1,0 +1,203 @@
+---
+question: eng-020
+family: support-agent
+status: published
+labs: [voice-assistant, websocket-gateway, agent-framework]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "One shared agent loop serves every business on the platform, and each business brings its own knowledge, tools
+> and hours. The business is identified by the phone number dialled or the chat widget, never by the model. On the
+> phone, every stage streams, because the caller hears silence as failure; the biggest delay is waiting to be sure
+> the caller has finished talking. A human takeover is an atomic change of who owns the conversation, so the bot
+> and the person never both answer. And an action is recorded with an idempotency key before the reply, so a
+> dropped call never books twice."
+>
+> The rest of this page explains each part of that answer.
+
+The prompt is short: design a voice and chat AI receptionist platform. Underneath it are two problems you may not
+have met as a backend engineer.
+
+The first is the **AI agent**. A **large language model (LLM)** is a program that reads text and writes text. In an
+agent it reads the conversation and proposes the next step: answer, call a **tool** (an API your code runs for it,
+such as "check the calendar"), or hand the conversation to a person. The model is unreliable: it can misread a
+request or be talked into a wrong action. So code runs the loop, checks every step, and owns the rules.
+
+The second is **real-time voice**. A web request that takes 1.5 seconds is slow but acceptable. On a phone call,
+1.5 seconds of silence after you stop talking feels like the line dropped. Every design choice on the voice path is
+about shrinking that silence.
+
+It is also a **multi-tenant** platform: many small businesses (tenants) share one system, each with its own data
+and permissions. You already know how to isolate tenants in a database. Here you must also isolate what the model
+can see and which tools it can call.
+
+This is a Microsoft onsite system-design title on PracHub (posted 2026-09-10). Only the title is
+candidate-reported; the page's requirements (voice and chat ingress, approved knowledge per business, permitted
+actions, a human takeover that transfers live control) and follow-ups (barge-in, an action that succeeds while the
+channel times out) are PracHub's write-up <Cite id="s-0768ca7c4a" />. The voice latency chain and the ownership
+hand-off are where you separate yourself.
+
+## Clarify first
+
+Say your assumptions out loud:
+
+- **Who are the tenants?** "I'll assume many small businesses, each with its own hours, knowledge and actions, such
+  as bookings and messages."
+- **Phone numbers?** "Each business forwards its line to the platform, so the dialled number tells us the tenant."
+- **Which actions need confirmation?** "Bookings need the caller to confirm; plain answers don't."
+- **Is there a person to hand off to?** "Often not, especially after hours, so the fallback is taking a message."
+- **Shared history?** "Voice and chat share history for the same customer, matched by phone number or login."
+
+## Answer
+
+### Words you need first
+
+- **Speech-to-text (STT)** turns the caller's audio into text. **Text-to-speech (TTS)** turns the reply into audio.
+- **Voice activity detection (VAD)** decides, from the audio signal, whether someone is speaking right now.
+  **Endpointing** is the decision that the caller has finished her turn, made after a stretch of silence.
+- **Token**: the unit a model reads and writes, roughly ¾ of a word. **Time to first token (TTFT)** is the model's
+  delay before its first token appears.
+- **Barge-in**: the caller starts talking while the agent is still speaking.
+
+### The system
+
+```
+Phone call ──► Telephony ──► VAD + streaming STT ─┐
+Chat widget ──► WebSocket ───────────────────────┤
+                                                  ▼
+                       Conversation service ── tenant id, caller identity, owner flag
+                                                  │
+                                                  ▼
+                       Orchestrator ── runs the loop; LLM proposes answer / tool / hand-off
+                                                  │
+                    ┌─────────────────────────────┼──────────────────────────┐
+                    ▼                             ▼                          ▼
+     Tenant tool gateway              Streaming TTS (voice only)       Human takeover
+     calendar, CRM, messages;         sentence-sized chunks            bridge call or chat,
+     credentials scoped per tenant                                     or take a message
+```
+
+**Telephony and chat.** The phone carrier delivers audio; chat arrives over a WebSocket. Both feed the same
+conversation service, so one agent serves both channels.
+
+**Conversation service.** It finds the tenant from the dialled number or the chat widget's key. The tenant id is
+never a value the model fills in. If it were, a caller could say "check the calendar for the other clinic" and the
+model might try. It also holds an **owner flag** (bot or human) that decides who may speak.
+
+**Orchestrator.** Plain code that runs the answer, tool or hand-off loop with step and cost limits. Each tenant
+brings its own approved knowledge, tool list, policies and hours. Answering a question and executing an action are
+separate tool tiers: anyone can ask the opening hours, but a booking needs confirmation.
+
+**Tenant tool gateway.** Every tool call goes through it, with credentials scoped to that one tenant. A bug in a
+prompt cannot reach another tenant's calendar, because the gateway never holds those credentials for this call.
+
+**Streaming TTS.** The reply is spoken a sentence at a time while the model is still writing the rest.
+
+**Human takeover.** Moves live control to a person, described below.
+
+### Follow one call through it
+
+A caller rings a dental clinic on the platform and says, *"Can I move my Thursday cleaning to next week?"* Here is
+the clock after she stops talking (every value except the 500 ms is an assumption, worked out in the box below):
+
+| Clock | Step | What happens | What to say in the interview |
+|---|---|---|---|
+| 0 → 500 ms | **Endpointing** | VAD hears silence and waits to be sure she has finished. | "This wait is the biggest term, and the hardest to tune." |
+| 700 ms | **STT final** | The transcript is finalized. | "STT streams while she talks, so only the tail is left." |
+| 1,100 ms | **First token** | The model has read the prompt and starts writing. | "Time to first token is about 400 ms here." |
+| 1,340 ms | **First sentence** | The model has written about 12 tokens: "Sure, let me check next week." | "Speak an acknowledgement while the calendar lookup runs." |
+| 1,490 ms | **First audio** | TTS plays the first chunk. | "About 1.5 seconds of silence; much longer feels broken." |
+| later | **Booking** | She picks Tuesday 10:00 and confirms; the gateway books it with an idempotency key. | "Record the action before replying." |
+
+So the answer to "how fast does it respond?" is about **1.5 seconds to first audio**, and the endpointing silence
+is the largest single piece. Cutting it to 300 ms saves 200 ms but interrupts slow speakers, so tune it on real
+calls. Say: "I'd stream every stage, and speak a short acknowledgement while a slow tool runs."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Time to first audio"
+  expr="TTFA ≈ t_endpoint + t_stt + t_ttft + n_first × t_token + t_tts_first"
+  vars={[
+    { sym: 't_endpoint', meaning: 'silence before deciding the caller finished' },
+    { sym: 't_stt', meaning: 'time to finalize the transcript' },
+    { sym: 't_ttft', meaning: 'model time to first token' },
+    { sym: 'n_first × t_token', meaning: 'first sentence tokens × time per token' },
+    { sym: 't_tts_first', meaning: 'time to synthesize the first audio chunk' },
+  ]}
+  example="500 ms (the voice-assistant lab's end-of-speech rule) + 200 + 400 + 12 × 20 ms + 150 = 1,490 ms; all but the 500 ms are assumptions."
+/>
+
+</details>
+
+### Barge-in
+
+Halfway through "Tuesday at ten or Wednesday at two", the caller says "Tuesday!" Keep VAD running on her audio
+while TTS plays. When she speaks: stop playback, cancel the model stream and any queued audio, and cut the agent's
+turn in the transcript down to what she actually heard. If you log the whole planned sentence, the next prompt
+claims the agent offered things she never heard.
+
+This needs **echo cancellation**, which removes the agent's own voice from the microphone signal. Without it, the
+agent's voice triggers the detector and it interrupts itself. Say: "Echo cancellation is a prerequisite for
+barge-in, not polish."
+
+### Human takeover
+
+The PracHub write-up asks that takeover transfer live control. Give each conversation an owner flag changed by
+compare-and-set: `bot → human` succeeds exactly once. Only the owner may speak or send. If the model finishes a
+reply after the person took over, that reply is discarded. For voice, bridge the call to the person with the
+summary on their screen. If no one is available, take a message and promise a callback.
+
+### The action succeeds, but the channel times out
+
+The booking went through, but the call dropped before the agent said so. The gateway recorded the booking with an
+**idempotency key** (a unique id per intended action, so repeating it returns the first result) before replying.
+When she calls back, the next turn sees the booking and confirms it, and a retry returns the original booking
+instead of making a second one. A person who takes over sees it too.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Voice and chat receptionist"
+  senior={["Builds the latency chain with streaming, handles barge-in, and isolates tenants at the tool layer."]}
+  staff={["Treats ownership transfer as a consistency problem, sizes per-tenant cost, and decides what ships first (chat) and what metric gates voice."]}
+/>
+
+## Small-team version
+
+Don't build the telephony and speech stack first. Use a hosted voice-agent or telephony platform, and check its
+latency and barge-in on your own calls. Ship chat, learn what callers ask, then add voice.
+
+You own the parts no vendor can: tenant isolation of tools and knowledge, the takeover logic, and the set of test
+calls (recorded with consent) that you replay after every change.
+
+Model tokens are the small part of the bill: about **$1,350 a month** for an assumed 500 conversations a day. Price
+the voice platform's per-minute charges from its own dated pricing page and add them. Build your own speech stack
+only if those charges or its latency become the problem.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+The family walkthrough prices a conversation at about $0.09 (Claude Sonnet 5, prefix cached, list prices fetched
+2026-10-11). With an assumed 500 conversations a day: 500 × 30 × $0.09 ≈ **$1,350 a month**.
+
+</details>
+
+## Pitfalls
+
+- **Waiting for the whole model reply before speaking.** The caller hears seconds of silence; stream sentence by
+  sentence.
+- **Logging the full planned reply after a barge-in.** The next turn's context then claims things the caller never
+  heard.
+- **A hand-off that suggests calling someone.** The requirement is to transfer live control, not to give out a
+  number.
+- **Tenant id as a model-filled argument.** One persuasive caller can then reach another business's data.
+
+## Go deeper
+
+- Family walkthrough: [Customer-facing support agent](/system-design-labs/interviews/walkthroughs/support-agent/), especially "The voice channel (eng-020)" and "State across turns, and who owns the conversation".
+- Labs: <LabRef lab="voice-assistant" inline /> (pipeline shape; its LLM is a stub and it lacks barge-in), <LabRef lab="websocket-gateway" inline /> for the chat channel, <LabRef lab="agent-framework" inline /> for the loop.

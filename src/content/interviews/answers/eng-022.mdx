@@ -1,0 +1,171 @@
+---
+question: eng-022
+family: support-agent
+status: published
+labs: [agent-framework, llm-eval]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "The model proposes one step at a time: answer, call a tool, or hand off. Plain code checks each proposal, runs
+> it, and decides when the turn is over. The code stops the loop on several conditions: too many steps, too many
+> tool errors, the same call twice, calls that change nothing, or a token budget. Each stop has a named reason, and
+> every stop that isn't an answer becomes a hand-off to a person with that reason attached. The hand-off is a
+> designed outcome, not a crash."
+>
+> The rest of this page explains each part of that answer.
+
+The real question: can you put an unpredictable decision maker inside a loop that is guaranteed to end?
+
+In normal backend code, a loop ends because you wrote its exit condition, and the same input always takes the same
+path. In a support agent, a **large language model (LLM)**, a program that reads text and writes text, decides each
+step. Given the conversation so far, it proposes what to do next. The same input can give a different proposal next
+time. It can ask for the same lookup forever, or decide a failed lookup should be "tried again" indefinitely.
+
+So you can't trust the model to stop. You build the stopping into code around it, and you decide in advance what
+the customer experiences when the agent gives up: a person, with context, not an error page.
+
+The prep guide this comes from says "a low-confidence escalation path matters more than a clever prompt"
+<Cite id="s-9116046d24" />. The round is decided by your stop conditions, how you detect a loop, and what happens
+when the agent gives up.
+
+## Clarify first
+
+- **Which tools exist, and which move money or can't be undone?** "I'll assume reads, reversible writes and credits."
+- **Is the user signed in?** "Yes, so identity comes from the session."
+- **Where do hand-offs go, and is the queue staffed around the clock?** "Business hours; callbacks after."
+- **What does a turn cost in latency?** "It's chat, so a few seconds is fine."
+- **Which metric decides, containment or customer satisfaction?** "And who breaks ties?"
+
+## Answer
+
+### Words you need first
+
+- **Tool call**: instead of replying, the model writes a structured request such as "look up invoice 2026-09". Your
+  code runs it and adds the result to what the model sees next.
+- **Turn**: everything between the customer sending a message and the agent replying. Inside one turn the loop may
+  take several **steps**, each one a model call.
+- **Token**: the unit a model reads and writes, roughly ¾ of a word. You pay per token, and every step re-sends the
+  conversation so far.
+- **Hand-off**: moving the conversation to a human support agent.
+
+### The model proposes, code decides
+
+```
+customer message
+      │
+      ▼
+┌──────────────── Orchestrator (plain code) ─────────────────┐
+│  ask LLM for one proposal ──► answer   ──► reply, turn ends │
+│        ▲                 ──► handoff  ──► person, turn ends │
+│        │                 ──► tool     ──► check budgets,    │
+│        │                                 repeats, schema    │
+│        │                                     │              │
+│        │                         Tool gateway (permissions, │
+│        │                         caps) ──► backend          │
+│        └──── add result, update state ◄──────┘              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+Each step, the **orchestrator** (the code that runs the loop) asks the model for one structured proposal:
+`answer`, `tool` (a name plus arguments) or `handoff` (with a reason). It checks the proposal against a schema. It
+sends tool calls through a **tool gateway** that enforces permissions and caps. Then it records the result in a
+**state object**, a small structured record of what is known and done.
+
+### Follow one turn through the loop
+
+Maya writes: *"I was charged twice in September."* Suppose the billing system is down, and its error message says
+"temporarily unavailable, try again".
+
+| Step | The model proposes | What the code does | What to say in the interview |
+|---|---|---|---|
+| 1 | `tool: lookup_invoice`, month 2026-09 | Runs it. Error. Tool-error count: 1. | "An error that says 'try again' invites a loop." |
+| 2 | `tool: lookup_invoice`, same month | Same tool and same arguments twice in one turn. Stop: `REPEATED_CALL`. | "Identical-call detection catches the classic loop on its second iteration." |
+| → | (no more model calls) | Hand-off with the reason, the state object and a summary. | "Maya gets a person and an honest message, not a spinning bot." |
+
+Without that check, the loop would have kept going until a step limit, paying for every step. A better error
+message prevents the loop in the first place: return `retryable: false` and a suggested next step ("billing is
+down, offer a callback").
+
+### The stop conditions, each with a named reason
+
+- **Steps per turn** (for example 6) and **tool errors per turn** (for example 2).
+- **The identical call twice in one turn.** Compare the tool name plus its arguments, hashed with sorted keys, so
+  reordered JSON doesn't hide a repeat.
+- **No progress**: calls that leave the state unchanged two steps in a row. This catches rephrased searches, where
+  the arguments differ every time but nothing new is learned.
+- **Tokens per conversation and spend per customer per day.** These cap cost even when the cause is unknown.
+- **An invalid proposal**: an unknown tool, or output that doesn't parse. Count it; never show it to the customer.
+
+Every exit that is not an answer becomes a hand-off carrying the reason, the state object and a summary. The family
+walkthrough has a version of this loop that ran on 2026-10-12 with nine passing tests, one per exit.
+
+Say: "A step limit alone isn't enough. It stops the loop only after it has burned the whole allowance."
+
+### When to hand off on purpose
+
+- **Policy says so**: an amount over the cap, a legal threat.
+- **The customer asks** for a person.
+- **Grounding fails**: no help article supports a policy answer, so the agent must not improvise one.
+- **A calibrated confidence score is low.** A model's own "I'm not sure" is a weak signal until you check it against
+  labelled transcripts. **Calibrated** means that when the score says 80%, the agent is right about 80% of the time.
+
+### State across turns
+
+The state object holds verified identity, the ids in play, actions taken and their results, and promises made. When
+a long conversation is shortened by summarizing older turns, the state object is never summarized. Summaries are
+for the model to read; actions always read the backend. Say: "If the summary says the invoice was $15 and billing
+says $20, billing wins."
+
+### Know it works
+
+Chart stop reasons by prompt version: if `NO_PROGRESS` doubles after a change, you know where to look. Keep every
+input that ever looped in your test set. And measure **pass^k**: the chance the agent passes all k runs of the same
+test case. A customer-facing agent must be right every time, not once in three tries.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="The reasoning loop"
+  senior={["Lists several stop conditions, each ending in a hand-off with a reason, and keeps policy in a tool gateway."]}
+  staff={["Defines the hand-off as a product with its own metric, and names the dashboard (stop reasons by prompt version) that would show a change made looping worse."]}
+/>
+
+## Small-team version
+
+At a 50–500 person company, buy a helpdesk's AI agent if most volume is FAQ answers. Build this loop when the value
+is actions in your own systems, such as plan changes and credits.
+
+The loop itself is a few hundred lines of plain code over a model API, which a coding assistant can draft. What you
+write and own: gateway tests that assume the model is fooled, the budgets, the stop-reason dashboard, provider
+spend caps, and a weekly read of transcripts.
+
+The family walkthrough puts the build-versus-buy line at about **13,000 conversations a month (about 430 a day)**
+against Intercom Fin's $0.99 per outcome (listed 2026-10-12). Below that, buy.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Break-even = fixed monthly cost ÷ (containment × vendor price − token cost per conversation). With about $5,300 a
+month of engineer time, 50% containment and $0.09 of tokens per conversation (all assumed, per the walkthrough):
+5,261 ÷ (0.5 × 0.99 − 0.09) ≈ **13,000 conversations a month**.
+
+</details>
+
+## Pitfalls
+
+- **A step limit as the only stop condition.** The loop burns the whole allowance before it stops.
+- **Raising an exception on a loop instead of handing off with a reason.** The customer sees an error, and you
+  can't count why it happened.
+- **Letting the model fill in the customer id as a tool argument.** A customer can then talk it into reading another
+  account.
+- **Trusting self-reported confidence without calibration.** "I'm fairly sure" from a model is not a measured
+  probability.
+
+## Go deeper
+
+- Family walkthrough: [Customer-facing support agent](/system-design-labs/interviews/walkthroughs/support-agent/), especially "The turn loop and its stop conditions" and "Escalation on low confidence".
+- Permissions in depth: [eng-050](/system-design-labs/interviews/questions/eng-050/). Compaction: [eng-026](/system-design-labs/interviews/questions/eng-026/).
+- Labs: <LabRef lab="agent-framework" inline /> (read its loop, then add the missing checks), <LabRef lab="llm-eval" inline /> for the regression gate.

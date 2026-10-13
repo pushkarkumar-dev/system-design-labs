@@ -1,0 +1,185 @@
+---
+question: eng-093
+family: concurrent-io-workers
+status: published
+labs: [rate-limiter]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Before I ask the assistant for any code, I'll write the interfaces myself: a fetch function behind a pacer
+> that every request goes through, retries included; a frontier that puts titles with uncovered first letters
+> first; and one coordinator that owns what's been seen and covered and decides when to stop. Then I'll ask
+> for one piece at a time and check each against the interface. I'll size the number of workers from the
+> rate limit, because more workers than that only wait in line."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer is testing two things at once: can you build a polite, prioritized crawler in 75 minutes, and
+can you direct an AI coding assistant without letting it hand you code you can't vouch for?
+
+What makes this round different from a normal crawler question is the assistant. It will write a working-looking
+concurrent crawler in seconds. The hard parts are the ones it tends to get subtly wrong: deciding when the
+crawl is finished, keeping retries inside the rate limit, and not fetching a page twice. So the skill being
+measured shifts from typing code to designing the pieces and checking what comes back.
+
+PracHub, an interview-question aggregator, lists it as a Glean MLE round: pair with an AI coding assistant to crawl Wikipedia, crawl pages whose
+title starts with a letter not yet seen first, crawl at random once all 26 letters are covered, and respect a
+rate limit (<Cite id="s-9adea8ab98" />;
+[question page](https://prachub.com/interview-questions/ai-paired-rate-limited-wikipedia-crawler-that-prioritizes-unseen-title-initials),
+dated 2026-09-30, read 2026-10-12). Its third listed part is working with the assistant: planning interfaces
+and reviewing generated code. Confidence is medium, because it comes from an aggregator.
+
+## Clarify first
+
+- **What is the rate limit, and is it per host?** The page gives no number. Ask, and assume one shared limit.
+- **Is a letter covered when a page is discovered or when it is fetched?** "I'll say fetched."
+- **What about digits, punctuation and non-Latin initials?** "They never count toward the 26."
+- **API or HTML?** The MediaWiki API (Wikipedia's own API) returns links as data; scraping HTML adds parsing
+  for no benefit.
+- **When does the crawl stop?** "I'll assume a page budget, and report coverage when it runs out."
+
+## Answer
+
+### Words you need first
+
+- **Frontier**: the set of titles found but not yet fetched.
+- **Priority queue** (a heap in Python's `heapq`): a queue that always hands out the item with the smallest
+  key first.
+- **Pacer**: a gate every request passes through, which spaces request starts so the crawler never exceeds the
+  rate limit.
+- **Covered letter**: a letter for which at least one page whose title starts with it has been fetched.
+
+### Plan the interfaces first, then delegate
+
+Write these yourself, as signatures and docstrings, before asking the assistant for code:
+
+```
+Coordinator ── owns seen and covered; stops on budget or an empty frontier
+   │  pop the next title
+   ▼
+Frontier (priority queue) ── push(title), pop() → title
+   │  key: initial still uncovered first, then random order
+   ▼
+Workers (W of them) ── fetch_links(title) → list of titles
+   │  every request, retries included, waits on the pacer first
+   ▼
+Pacer ── one shared limit; honors Retry-After on a 429
+   │
+   ▼
+MediaWiki API
+```
+
+**The coordinator** is the only code that changes `seen` and `covered`, so there are no locks to get wrong.
+It also owns the stop rule.
+
+**The frontier** decides order. Titles whose first letter is still uncovered come out first; after that,
+random.
+
+**The workers** only fetch. `fetch_links(title)` returns the linked titles and nothing else.
+
+**The pacer** is shared by every worker. Retries go through it too, because a retry is a request.
+
+Then ask for one piece at a time, and read each against the interface. Say it like this: "I'll write the
+interfaces and the stop rule myself, and have the assistant fill in one function at a time."
+
+### Rate limit and concurrency together
+
+Concurrency doesn't speed you past the limit. Once you are at the limit, extra workers only wait on the pacer.
+**Little's law** gives the right number: the number of requests in flight equals the rate they start times
+how long each one takes.
+
+<Formula
+  title="Workers needed under a rate limit (Little's law)"
+  expr="W ≈ R × L"
+  vars={[
+    { sym: 'R', meaning: 'allowed requests per second' },
+    { sym: 'L', meaning: 'latency per request, seconds' },
+  ]}
+  example="An assumed 10 requests/s and 300 ms latency: 10 × 0.3 = 3 workers; more only queue on the pacer"
+/>
+
+Little's law is `L = λ × W` (<Cite id="s-b9e76e614c" />). In the family walkthrough's runs (2026-10-12, a fake
+site), 64 workers under a 100 requests/s pacer took 2.01 s for 190 requests, against 190 ÷ 100 = 1.9 s
+predicted. The limit set the time, not the pool.
+
+The pacer reserves a start time under a lock and sleeps *outside* the lock, so one sleeping worker doesn't
+hold up the others. On a 429 ("Too Many Requests"), honor the `Retry-After` header, which says how long to
+wait, and route the retry through the same pacer.
+
+### Follow one crawl through it
+
+An illustrative start, to show how the frontier behaves (titles and order are made up for the example):
+
+| Step | What happens | Covered so far | What to say in the interview |
+|---|---|---|---|
+| 1 | Fetch the seed, "Graph theory" | G | "The seed covers G." |
+| 2 | Its links are pushed: "Euler", "Edge (graph)", "Graph coloring", "Vertex" | G | "E and V are uncovered, so those titles jump the queue; G titles go to the back." |
+| 3 | Pop "Euler", fetch it | E, G | "Each fetch can cover one new letter." |
+| 4 | Pop "Edge (graph)": E was uncovered when it was pushed, but is covered now | E, G | "Lazy check: push it back with the lower priority." |
+| 5 | Pop "Vertex", fetch it | E, G, V | "Uncovered letters keep going first." |
+
+### Re-prioritizing the frontier
+
+When a page is fetched and its initial becomes covered, other queued titles with that initial drop in
+priority. Use a lazy check: pop, and if the title's initial is now covered while uncovered candidates exist,
+push it back with the lower key. That avoids rebuilding the heap on every fetch.
+
+### Follow-ups listed on the page
+
+**Rare letters (Q, X, Z).** Set a fetch budget per uncovered letter, or seed from a known index page, and
+report partial coverage when the budget ends. **Resuming after a crash.** Append each fetched title to a log,
+and rebuild `seen`, `covered` and the frontier from it on start.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="AI-paired crawler"
+  senior={["Working prioritized crawler within the limit, with a pacer every request passes through and generated code reviewed piece by piece."]}
+  staff={["Owns the interfaces and the tests before delegating, sizes concurrency from the limit, and names what the assistant got wrong and how it was caught."]}
+/>
+
+In plain words: a Senior answer works and stays inside the limit. A Staff answer designs before delegating,
+and can point at the specific mistake the assistant made and the test that caught it.
+
+## Small-team version
+
+This is how the AI owner at a small company works most days: plan interfaces, delegate pieces to an
+assistant, verify. The actions:
+
+- **Keep the parts that decide correctness in your hands**: the stop condition, the rate limit, the dedup key,
+  and a test against a fake server.
+- **Test the two usual assistant mistakes first**: a termination check on an empty queue, and a retry loop
+  that skips the limiter.
+- **Size provider calls the same way.** Anthropic's Start tier lists 1,000 requests a minute for Sonnet 5
+  (rate-limit docs, fetched 2026-10-12), about 16.7 a second, so at an assumed 2 s per call about **33
+  calls** in flight saturate it.
+
+Default: a pacer set below the tier limit, and the provider's batch API (about 50% off) for anything that can
+wait.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Rate:** 1,000 requests ÷ 60 s ≈ **16.7** per second.
+- **In flight:** 16.7 × 2 s ≈ **33** calls.
+- **Formula example:** 10 requests/s × 0.3 s = **3** workers.
+
+</details>
+
+## Pitfalls
+
+- **Letting the assistant write the whole crawler in one go.** You then debug code you didn't design, under
+  a clock.
+- **Retries that bypass the rate limiter.** A retry is a request; it must wait on the pacer like any other.
+- **Re-sorting the entire frontier after every fetch.** The lazy check does the same job far more cheaply.
+- **No stopping rule for letters that may never appear.** Without a budget, the crawl can run forever
+  looking for a Q.
+
+## Go deeper
+
+- Family walkthrough: [Concurrent I/O workers](/system-design-labs/interviews/walkthroughs/concurrent-io-workers/), Stage 3 and the AI note.
+- AI-assisted round tactics: [AI-assisted coding in a codebase](/system-design-labs/interviews/walkthroughs/ai-coding-in-codebase/).
+- The limiter itself: <LabRef lab="rate-limiter" inline />.

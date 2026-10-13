@@ -1,0 +1,148 @@
+---
+question: eng-064
+family: rag-in-code
+status: published
+labs: [embedding-pipeline, vector-index]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Embedding code usually fails silently: it runs, returns plausible scores, and they are wrong. So I won't start
+> by reading. I'll build a three-document case where I know the right answer, run the function, and check
+> invariants one at a time: one ID per row, every row has length 1 after normalizing, the query and documents have
+> the same dimension, and scores come out highest first. That usually finds the wrong normalization axis, the
+> ascending sort, the IDs that no longer match their rows, and the 16-bit overflow, and I add a regression test
+> for each."
+>
+> The rest of this page explains each part of that answer.
+
+The test is method. Do you build a tiny case with a known answer, or read code and guess? And do you know the
+specific ways vector code goes silently wrong?
+
+What makes this different from debugging ordinary backend code is that nothing crashes. A broken SQL query fails
+loudly or returns obviously wrong rows. A broken similarity search still returns a list of documents with scores
+between −1 and 1, and the list looks reasonable. The only way to see the bug is to know what the answer should be.
+That is why the method matters more than reading speed.
+
+(The report is one line from an interviewer-side post: "Debug this code that processes embeddings", listed as a
+standard coding exercise with an AI twist <Cite id="s-1205b0cc50" />. This card assumes the common shape: a short
+function that normalizes, stores and searches vectors, runs without errors, and returns plausible but wrong
+results.)
+
+### Words you need first
+
+- **Embedding**: a vector of numbers (for example 384 of them) that a model computes from text, so that similar
+  meanings point in similar directions. Each document is one row of a matrix.
+- **Normalize**: divide a vector by its length so its length becomes 1. For normalized vectors, the dot product
+  equals **cosine similarity**, the score search ranks by (1 = same direction, 0 = unrelated).
+- **Dimension**: how many numbers each vector has. It is fixed per embedding model, so two different
+  dimensions mean two different models.
+- **fp16**: a 16-bit floating-point number, half the size of a normal 32-bit float (**float32**). Its largest
+  value is 65,504.
+
+## Clarify first
+
+- **What is the symptom: wrong results, NaNs, slow, or a crash?** "I'll assume search results look random."
+- **Can I run it and add tests?** "I'll assume yes."
+- **Which model produced the vectors, and are they already normalized?** This rules bugs in or out.
+- **Is there a known-good query?** "I'll assume not, so I'll build one."
+
+## Answer
+
+### Method: a case where you know the answer
+
+Build a three-document corpus whose vectors have different lengths and point in different directions, for
+example `a = [3, 1, 0]`, `b = [0, 2, 2]` and `c = [1, 0, 1]`. Query with `[0, 1, 1]`. It points exactly the way `b`
+does, so the right top result is `b` (cosine 1.0, against 0.5 for `c` and 0.22 for `a`). Run the function and
+check the top result. Then check the invariants one at a time:
+
+1. Row count equals ID count.
+2. Every row has length 1 after normalization.
+3. The query dimension equals the document dimension.
+4. Scores come back sorted highest first.
+
+Say: "Let me build a tiny case where I know the answer before I read anything." It is the sentence the
+interviewer is waiting for.
+
+### The usual bugs
+
+```python
+def search_buggy(query_vec, doc_vecs, doc_ids, k=3):
+    docs = np.array(doc_vecs, dtype=np.float16)       # 1: fp16 overflows when squaring
+    docs = docs / np.linalg.norm(docs, axis=0)         # 2: normalizes columns, not rows
+    q = np.asarray(query_vec, dtype=np.float32)        # 3: query never normalized
+    scores = docs @ q
+    order = np.argsort(scores)[:k]                     # 4: ascending: least similar first
+    ids = sorted(set(doc_ids))                         # 5: ids no longer line up with rows
+    return [(ids[i], float(scores[i])) for i in order]
+```
+
+Walk the three-document case through it, and each bug shows itself:
+
+| Bug | How it shows up | The fix | What to say in the interview |
+|---|---|---|---|
+| 1. dtype | With large values, scores become `inf` or NaN | Compute in float32 | "Squaring large values overflows fp16." |
+| 2. Axis | Row lengths aren't 1 after "normalizing" (row `a` comes out about 1.05) | `np.linalg.norm(m, axis=1, keepdims=True)`, with an epsilon so zero rows don't become NaN | "Rows are vectors, so I normalize along axis 1." |
+| 3. Unnormalized query | Scores larger than 1 (`b` scores about 1.79) | Normalize the query too | "For one query it changes the scale, not the order. It breaks any score threshold and any comparison across queries." |
+| 4. Sort direction | `b`, the right answer, comes back last | `np.argsort(-scores)`, or `argpartition` for top-k | "argsort is ascending, so this returns the least similar first." |
+| 5. Alignment | With IDs given out of order, the right row gets the wrong name | Keep `doc_ids` in row order | "Any `set()`, `sorted()` or filter applied to IDs but not to rows misaligns them." |
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **fp16 overflow:** a vector's length needs the sum of its squared values. For a 384-dimension vector with
+  values near 300, that is 384 × 300² ≈ 34.6M, far above fp16's maximum of 65,504, so it overflows to infinity.
+
+</details>
+
+### Beyond the function
+
+The bug is often outside the function. Check these too:
+
+- **Batching code that dedupes with `set()`** and zips results back onto the original list. A set has no order,
+  so vectors land on the wrong text. Dedupe with `dict.fromkeys` and map results back by key.
+- **A query and documents embedded by different models.** Dimensions like 384 against 1,536 should raise an
+  error, not quietly broadcast.
+- **Models that expect different prefixes** for queries and passages.
+- **Text silently cut off** at the model's input limit (256 word pieces, the model's own tokens, for
+  all-MiniLM-L6-v2).
+- **Vectors from an old model mixed with a new one** after a partial re-embed.
+
+The family walkthrough describes the fix and tests each bug. Those tests ran on 2026-10-12, and the buggy version
+returns the wrong top document on the three-document case.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Embedding bug hunt"
+  senior={["Builds a known-answer case first, finds the axis, sort, dtype and alignment bugs, and adds a regression test for each."]}
+  staff={["Also asks how bad vectors got into the index, and adds guards at ingestion (dimension and norm checks, the model version stored with every vector)."]}
+/>
+
+## Small-team version
+
+These are the bugs AI-written code produces: plausible, runs, wrong. On a small team nobody reviews vector code
+line by line, so put the checks in code:
+
+- **Assert the invariants in the ingestion path.** Row count, dimension, and length 1 after normalizing.
+- **Keep a known-answer test in CI.** The three-document case costs nothing to run.
+- **Store the model name with each vector.** It costs nothing and prevents mixing two embedding models after a
+  model change.
+
+Even two closely related models disagree a lot. The embedding-pipeline lab measured the overlap between the 10
+nearest neighbours each of two related models returns, and found a neighbour overlap@10 of
+<LabNumber lab="embedding-pipeline" metric="Neighbour overlap@10" />.
+
+## Pitfalls
+
+- **Reading the code for 20 minutes** instead of running a three-vector test, which finds most of these bugs in
+  one go.
+- **Fixing the first bug and stopping.** These functions usually have several.
+- **"Fixing" NaNs with `np.nan_to_num`.** It hides the zero vector instead of finding out why it was indexed.
+
+## Go deeper
+
+- Family walkthrough, the debugging section: [Build a small RAG in code](/system-design-labs/interviews/walkthroughs/rag-in-code/#debugging-embedding-code-the-promptlayer-variant).
+- Labs: <LabRef lab="embedding-pipeline" inline />, <LabRef lab="vector-index" inline />.

@@ -1,0 +1,166 @@
+---
+question: infra-058
+family: multi-tenant-gpu-serving
+status: published
+labs: [faas-runtime, llm-inference, container-orchestrator]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Two hundred models can't all sit on GPUs, and a big model can't be loaded from storage while a user waits,
+> because that takes over a minute. So I keep models in tiers: on the GPU, in the server's RAM about a second away,
+> on local disk, and in the object store. I pin the busy models, and unload the rest from the GPU by a rent-or-buy
+> rule: keep a model while its idle cost is below the cost of reloading it plus the price of a slow first request.
+> Big models get unloaded sooner because idling costs eight GPUs, and I choose what to unload so that whole
+> machines come free for them."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see whether you treat "which models stay loaded" as a cost decision, not a cache-hit-rate
+decision.
+
+You've built caches: keep hot items in memory, evict the least recently used. This looks like the same problem, and
+that's the trap. Three things are different:
+
+1. **Items are huge and slow to load.** A model's learned numbers (its **weights**) take 16 GB for an
+   8-billion-parameter model and about 140 GB for a 70-billion-parameter one (written 8B and 70B). Loading one can
+   take from about a second to over a minute.
+2. **Items are different sizes, and some need a whole machine.** A big model is split across all 8 GPUs of one
+   machine (a **node**), and all 8 must be free together.
+3. **An empty slot isn't free.** A loaded model that isn't serving still occupies GPUs that cost dollars an hour.
+
+The prep article this comes from names the signals: constant factors, memory at long context, and why cold-loading
+a 70B model "takes real seconds" (<Cite id="s-9597947584" />). The round is decided by whether you can put a price
+on an eviction.
+
+### Words you need first
+
+- **HBM.** The GPU's own fast memory (high-bandwidth memory), 80 GB on each GPU here. A model must be in HBM to
+  serve.
+- **Host DRAM and NVMe.** The server's ordinary RAM, and its local SSD.
+- **Residency.** Where a model's weights live right now: HBM, DRAM, NVMe or only the object store.
+- **Replica.** One running copy of a model on one or more GPUs.
+
+## Clarify first
+
+- **Size mix and traffic skew.** "I'll assume 150 one-GPU models, 40 two-GPU models, 10 large models each on a whole
+  8-GPU node, and about 10 models carrying most traffic."
+- **What may a first request to an unloaded model do?** Wait, queue with an estimate, get a 503, or fall back to
+  another model?
+- **Where do weights live, and how fast can they move?** "I'll assume 2 GB/s from the object store, 6 GB/s from NVMe
+  and 20 GB/s per GPU from DRAM."
+- **Do rarely used models have any latency promise at all?**
+
+## Answer
+
+### Show why it's a question
+
+One replica of every model needs **310 GPUs**, about 39 nodes, and most of them would sit idle serving the rarely
+used models. That cost is the reason to unload anything.
+
+### Use tiers, not one cache
+
+| Where the weights are | Time to start serving a 70B (140 GB) on 8 GPUs | What to say in the interview |
+|---|---|---|
+| HBM | serving now | "Pinned for the busy models." |
+| Host DRAM | **about 0.9 s** | "A miss here is cheap, so I can unload from the GPU aggressively." |
+| NVMe | **about 23 s** | "Fine for rarely used models with no promise." |
+| Object store only | **about 70 s** | "Never load from here while a user waits." |
+
+One node's assumed 1 TB of DRAM holds **about 62 small models** a second away from serving. That warm tier is what
+makes aggressive unloading from the GPU safe.
+
+### Unload by rent-or-buy
+
+Keeping a model loaded while idle is like renting skis: you pay every second. Unloading it is like buying: you pay
+once, with a reload and a slow first request for the next user. The classic **ski-rental** rule says keep renting
+until you've paid as much as buying would cost, then buy. It never costs more than twice the best choice you could
+have made with hindsight.
+
+As a timeout: unload a model after it has been idle for **τ** seconds, where τ is its reload time plus the price of a
+slow first request (the **cost of a cold miss**) spread over the GPUs it holds. That price is a product decision. With
+an assumed 300 GPU-seconds:
+
+- an 8B model on 1 GPU, falling back to NVMe, stays loaded through **about 5 minutes** of idleness;
+- a 70B model on 8 GPUs, falling back to NVMe, stays loaded through only **about 61 seconds**.
+
+Big models are unloaded sooner per idle second, because idling costs eight GPUs. Pin the busy models (the **head**
+of the traffic), run τ on the rest (the **tail**), and watch for **thrash**: a model reloaded several times an hour should get a small permanent replica instead.
+
+### Make unloading placement-aware
+
+Freeing eight GPUs helps a big model only if they're on one node. A set of GPUs that must be free together on one
+node is called a **gang**. So pick models to unload that free a whole gang, not just the least recently used ones.
+
+### Count memory for requests, not just weights
+
+While a model writes replies, each running request holds a saved summary of its tokens (words, roughly) in GPU
+memory, the **KV cache**. At 4,096 tokens per request an 8-GPU 70B replica holds **about 324 requests**. At 128K
+tokens it holds **about 10**. A model that "fits" may still be unable to serve its traffic.
+
+Say: "I don't evict by recency alone. I evict by what an idle model costs versus what a reload costs, and I free GPUs
+in shapes the big models can use."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Everything loaded:** 150 × 1 + 40 × 2 + 10 × 8 = 310 GPUs ÷ 8 ≈ 39 nodes.
+- **Load times for 140 GB:** DRAM into 8 GPUs at 8 × 20 = 160 GB/s → 140 ÷ 160 ≈ 0.9 s; NVMe 140 ÷ 6 ≈ 23 s; object
+  store 140 ÷ 2 = 70 s. **DRAM tier:** 1,000 GB ÷ 16 GB ≈ 62 small models.
+
+<Formula
+  title="Break-even idle time"
+  expr="τ = T_load + C_miss ÷ G"
+  vars={[
+    { sym: 'T_load', meaning: 'reload time from the tier the model falls back to' },
+    { sym: 'C_miss', meaning: 'price of a cold miss in GPU-seconds (a product decision)' },
+    { sym: 'G', meaning: 'GPUs the model holds' },
+  ]}
+  example={[
+    "8B on 1 GPU from NVMe, miss priced at an assumed 300 GPU-s: 2.7 + 300 = about 5 minutes",
+    "70B on 8 GPUs from NVMe: 23 + 300 ÷ 8 ≈ 61 seconds",
+  ]}
+/>
+
+- **KV room:** 8 × 80 − 140 − 8 × 8 (assumed overhead) = 436 GB. Per token 327,680 B. At 4,096 tokens ≈ 324 requests;
+  at 128K one request is about 42.9 GB, so about 10.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Residency"
+  senior={["Builds the tiers, derives τ, pins the head and evicts by gang."]}
+  staff={["Gets C_miss from the product owner per tier, replays a day of traffic to compare policies, and alerts on thrash."]}
+/>
+
+In plain words: Senior gets the mechanism. Staff gets the business input (the price of a slow first request) from
+the person who owns it, proves a new policy on recorded traffic before shipping it, and alerts when it misbehaves.
+
+## Small-team version
+
+A small company has a handful of models, not 200. Keep them all loaded, or put several fine-tuned variants of one
+base model on one GPU as LoRA adapters (small add-on files that customise a shared model), which removes eviction
+entirely. If traffic is bursty and low, rent per-token (serverless) endpoints and let the provider solve residency;
+check how its cold starts behave for your model.
+
+Revisit when idle GPU-hours on rarely used models become a real line on the bill. One always-on H100 at about $3.95
+an hour (Modal's per-second price, fetched 2026-10-11) costs about **$2,884 a month** (3.95 × 730), so a
+model that serves a few requests a day costs that much whether it's used or not.
+
+## Pitfalls
+
+- **LRU over 200 models without load times.** Recency ignores that one reload takes a second and another takes a
+  minute.
+- **Loading large models from the object store on demand.** The first user waits over a minute.
+- **Counting only weights.** At long context, the KV cache sets capacity.
+- **Freeing scattered GPUs.** Eight free GPUs on eight nodes can't host one big model.
+
+## Go deeper
+
+- Family walkthrough: [Run many models for many tenants](/system-design-labs/interviews/walkthroughs/multi-tenant-gpu-serving/#deep-dives), residency deep dive and back-of-envelope.
+- Moving weights fast: [Move big bytes fast](/system-design-labs/interviews/walkthroughs/move-big-bytes/).
+- Labs: <LabRef lab="faas-runtime" inline /> (warm pool with idle eviction), <LabRef lab="llm-inference" inline />.

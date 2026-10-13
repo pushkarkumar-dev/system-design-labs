@@ -1,0 +1,201 @@
+---
+question: infra-065
+family: llm-from-scratch
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll build a decoder, the kind of transformer that writes text. Token ids become vectors, a stack of blocks
+> updates those vectors, and an output layer turns the last one into a score for every possible next token.
+> Each block does attention, where each token looks back at earlier tokens, then a small per-token network, and
+> each of those is added back onto its input. I'll build it bottom-up, test each piece, and finish with three
+> checks: the output shape, that changing the last token doesn't change earlier outputs, and that the training
+> loss starts near its expected value and drops when I overfit a tiny batch."
+>
+> The rest of this page explains each part of that answer.
+
+"Implement a transformer" sounds huge. In one sitting it means a small decoder: embeddings, a stack of blocks
+and an output head. The test is whether you can put the parts together in the right order, keep the shapes
+straight, and show that the model never looks at the future.
+
+For a backend engineer, think of it as a pipeline of pure functions over arrays. Every stage takes a
+`(batch, tokens, d_model)` array and returns the same shape, except the first (ids to vectors) and the last
+(vectors to scores). The hard part isn't any single stage. It is that a stage wired in the wrong order still
+runs and still returns numbers, so you need checks that would notice.
+
+(The only evidence is one Blind commenter: "I got asked to implement transformer in my final nvidia interview
+two years ago" <Cite id="s-a129aa6451" />.) So the round is from about 2024, with no detail on scope.
+
+## Clarify first
+
+- **Architecture.** "Decoder-only, GPT-style, rather than encoder-decoder? I'll assume decoder-only."
+- **Scope.** "Forward pass only, or a training step too? I'll do the forward pass, then add a loss if there's
+  time."
+- **Norm and feed-forward.** "Pre-norm with LayerNorm or RMSNorm, and a feed-forward layer 4× wider than the
+  model? I'll assume that."
+- **Positions.** "Learned position vectors, fixed sinusoidal ones, or RoPE? I'll assume learned."
+- **Test sizes.** "I'll test with a tiny model: vocabulary 50, `d_model` 64, 2 layers."
+
+## Answer
+
+### Words you need first
+
+- **Token**: a small piece of text, stored as an integer id. The set of all ids is the **vocabulary**, of size
+  `V`.
+- **Embedding**: a learned table that turns each id into a vector of `d_model` numbers. A second table adds
+  the token's position.
+- **Attention**: each token scores itself and every earlier token, turns the scores into weights, and takes a
+  weighted mix of their information. A **causal mask** hides later tokens.
+- **Feed-forward (MLP)**: a small two-layer network applied to each token on its own.
+- **Residual connection**: `x = x + f(x)`. Each sub-layer's output is added back onto its input, so
+  information can pass straight through the stack.
+- **Normalization (LayerNorm)**: rescales each token's vector to a steady size. **Pre-norm** applies it inside
+  the residual branch, before the sub-layer.
+- **Logits**: the final scores, one per vocabulary entry, for what comes next.
+
+### A picture of the model
+
+```text
+token ids            (B, T)
+   │  token embedding + position embedding
+   ▼
+x                    (B, T, d_model)
+   │
+Block × n_layers
+   │   x = x + attention(norm(x))     tokens look back at earlier tokens
+   │   x = x + mlp(norm(x))           each token transformed on its own
+   ▼
+final norm
+   │  output head (linear layer)
+   ▼
+logits               (B, T, V)        one score per vocabulary entry, per position
+```
+
+**Embeddings** turn ids into vectors and mark their positions. **Each block** first lets tokens share
+information through attention, then processes each token separately. Both steps are residual, so a block can
+learn to change only a little. **The final norm and head** turn each position's vector into `V` scores. The
+logits at position `t` are the model's guess for token `t + 1`.
+
+### Follow one batch through it
+
+Use the tiny test model: vocabulary 50, `d_model` 64, 2 layers. Feed one sequence of 8 token ids:
+
+| Stage | Shape | What to say in the interview |
+|---|---|---|
+| ids | `(1, 8)` | "One sequence of eight tokens." |
+| embeddings + positions | `(1, 8, 64)` | "Positions 0 to 7 come from a second table." |
+| after block 1, block 2 | `(1, 8, 64)` | "Blocks keep the shape; that makes them stackable." |
+| logits | `(1, 8, 50)` | "Fifty scores at each position: a guess for the next token." |
+| loss | a single number | "Compare positions 0–6 with the tokens at 1–7." |
+
+### The code
+
+Build bottom-up and test each piece: attention, then a block, then the model.
+
+```python
+class Block(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.ln1, self.attn = nn.LayerNorm(d_model), MultiHeadAttention(d_model, n_heads)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model))
+
+    def forward(self, x):                                   # (B, T, d_model)
+        x = x + self.attn(self.ln1(x))                      # pre-norm residual
+        return x + self.mlp(self.ln2(x))
+
+class GPT(nn.Module):
+    def __init__(self, vocab, d_model, n_heads, n_layers, max_len):
+        super().__init__()
+        self.tok, self.pos = nn.Embedding(vocab, d_model), nn.Embedding(max_len, d_model)
+        self.blocks = nn.ModuleList(Block(d_model, n_heads) for _ in range(n_layers))
+        self.ln, self.head = nn.LayerNorm(d_model), nn.Linear(d_model, vocab, bias=False)
+
+    def forward(self, ids):                                 # (B, T) -> (B, T, vocab)
+        x = self.tok(ids) + self.pos(torch.arange(ids.shape[1]))
+        for b in self.blocks:
+            x = b(x)
+        return self.head(self.ln(x))
+```
+
+### The loss and the off-by-one
+
+Training teaches the model to predict the next token. The loss is cross-entropy (how surprised the model is
+by the right answer) between the logits at each position and the token one step later:
+`F.cross_entropy(logits[:, :-1].reshape(-1, V), ids[:, 1:].reshape(-1))`. Shift by one. Forgetting the shift
+is the most common off-by-one in this round: the model then learns to copy its input.
+
+### Why pre-norm
+
+The norm sits inside each residual branch, so the straight path from input to output is never normalized.
+Signals and gradients can flow through a deep stack untouched, which is why deep stacks train stably. Say:
+"Pre-norm keeps a clean highway through the residual adds."
+
+### Verification that fits in five minutes
+
+1. **Shape:** the output is `(B, T, V)`.
+2. **Causality:** change the last token; the logits at every earlier position must not change.
+3. **Loss sanity:** a fresh model guesses roughly uniformly, so the loss starts near **ln(V)**, about 3.9 for
+   V = 50. Train a few steps on one tiny batch, and the loss should drop as the model memorizes it.
+
+### What a modern model changes
+
+Mention the upgrades even if you don't write them: RMSNorm (a simpler norm with no mean subtraction), SwiGLU (a
+gated feed-forward layer), RoPE (positions encoded by rotating vectors inside attention), GQA (several query
+heads sharing one set of keys and values, which shrinks the cache) and a KV cache (stored keys and values, so
+generation runs only the new token each step).
+
+## Senior vs Staff
+
+<LevelContrast
+  title="A whole transformer"
+  senior={["A working decoder with the shifted loss and a causality check."]}
+  staff={["Says what each modern change buys (GQA for cache size, RoPE for position handling, SwiGLU for quality at equal parameters) and how they would test generation with a cache."]}
+/>
+
+## Small-team version
+
+Nobody at a 50–500 person company builds a transformer for production. Writing one once is still the cheapest
+way to understand the numbers on your bill:
+
+- **Why context costs memory.** Every token in the conversation keeps stored keys and values (the KV cache)
+  while the reply is written.
+- **Why output is slow.** The prompt is read in one pass, but each output token needs its own pass.
+- **Why a fine-tune changes weights but not the architecture.** The pipeline above stays the same; only the
+  numbers in the tables change.
+
+The second point shows up directly on the bill. At Claude Sonnet 5's list prices ($2 per 1M input tokens, $10
+per 1M output tokens, fetched 2026-10-11), a request with 3,000 input and 400 output tokens costs about **1
+cent**, and **12% of the tokens are 40% of the cost**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Input: 3,000 × $2/M = $0.006. Output: 400 × $10/M = $0.004. Total $0.010.
+- Output share of tokens: 400 ÷ 3,400 ≈ 12%. Output share of cost: $0.004 ÷ $0.010 = 40%.
+- Starting loss: ln(50) ≈ 3.91.
+
+</details>
+
+Treat the build as study, not as a project. Default: a managed API, with `max_tokens` set per feature.
+
+## Pitfalls
+
+- **Forgetting the causal mask.** The model sees the answer during training and learns nothing useful.
+- **Forgetting to shift targets by one.** The model learns to copy the current token instead of predicting the
+  next.
+- **Mixing up post-norm and pre-norm.** Normalizing after the residual add changes how deep stacks train; say
+  which one you chose.
+- **Positions past `max_len` with no check.** The position table runs out and indexing fails at the first long
+  input.
+- **Spending the hour on training before the forward pass is tested.** An untested forward pass makes every
+  later failure ambiguous.
+
+## Go deeper
+
+- Family walkthrough: [Stage 5: a modern block](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#stage-5-a-modern-block) and [Verification](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#verification).
+- Build and train it: <LabRef lab="transformer" inline />.

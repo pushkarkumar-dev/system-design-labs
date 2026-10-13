@@ -1,0 +1,171 @@
+---
+question: infra-029
+family: concurrent-io-workers
+status: published
+labs: [load-balancer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll replace the sequential loop with a fixed number of worker threads, sized from the API's limit, not
+> from my CPU count. Each call gets its own future, so its result or its error stays tied to its input, and
+> I return results in input order, not finishing order. The queue in front of the workers is bounded, so a
+> caller that submits too fast is made to wait. And I'll be honest about timeouts: a Python thread can't be
+> killed, so the real timeout has to be set on the HTTP client itself."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you understand what a thread pool guarantees and what it doesn't.
+
+You have used thread pools for years, usually inside a framework. The difference here is that you are asked
+to own the behaviour at the edges: which order results come back in, what happens to one failed call among a
+hundred, how many calls run at once, and what "timeout" and "cancel" actually stop. Those edges are where
+pools surprise people.
+
+The PracHub title is "Parallelize Blocking API Calls with a Thread Pool", from a Baseten technical screen
+(<Cite id="s-fa7d3ae628" />). Listed on the PracHub page (Baseten): replace sequential blocking calls with a
+bounded pool, keep each result tied to its input and in input order, and define worker limits, timeout and
+failure semantics, cancellation and cleanup, and tests for out-of-order completion. It is an aggregator
+listing, not a first-hand account, so confidence is low.
+
+## Clarify first
+
+- **Use `ThreadPoolExecutor`, or build the pool?** "I'll show the standard library first, and build it from
+  primitives if you want."
+- **How many calls, and what limits the server or client?** This sets the worker count.
+- **On one failure: per-item errors, or cancel the rest?** "I'll return per-item errors, with an option to
+  fail fast."
+- **Is the client object thread-safe?** If not, give each worker its own client.
+- **Does the client library have a per-call timeout?** The pool can't add one that really stops the call.
+
+## Answer
+
+### Words you need first
+
+- **Blocking call**: a function that doesn't return until the remote side answers, holding its thread the
+  whole time.
+- **Future**: an object returned when you submit a task. It later holds the result or the exception.
+  `future.result()` waits for it.
+- **Bounded queue**: a queue with a maximum size. When it is full, adding to it blocks. Making a fast caller
+  wait like this is called **backpressure**.
+- **Sentinel**: a special value placed on the queue that tells a worker to stop.
+
+### With the standard library
+
+`ThreadPoolExecutor(max_workers=W).map(fn, items)` returns results in input order. For per-item errors,
+submit futures, keep the list in input order, and call `result()` on each inside a `try`.
+
+Python's default worker count is `min(32, (os.process_cpu_count() or 1) + 4)` as of 3.13
+([docs](https://docs.python.org/3/library/concurrent.futures.html), read 2026-10-12). That default suits a mix
+of work on one machine. For blocking API calls, pick W from the API's limit instead: W ≈ rate × latency. This
+is **Little's law**: the number of calls in flight equals the rate they start times how long each takes. Say
+it like this: "My CPU count doesn't matter here. The API's limit does."
+
+### Built from primitives
+
+```
+Caller ── submit(fn, args) creates a Future and puts (future, fn, args) on the queue
+   │  blocks if the queue is full (backpressure)
+   ▼
+Bounded queue (max_queued items)
+   │
+   ▼
+N worker threads ── each: take an item; skip it if cancelled; run fn; set result or exception
+   │
+   ▼
+Futures ── map() reads them in input order: [f.result() for f in futures]
+   │
+   ▼
+shutdown() ── one sentinel per worker, then join every thread
+```
+
+**`submit`** puts `(future, fn, args)` on the queue and returns the future at once.
+
+**Each worker** first calls `set_running_or_notify_cancel()`. That returns false if the task was cancelled
+while it waited, so cancelled tasks never run. Then it sets the result, or the exception, on that task's own
+future. One task's error never leaks into another's.
+
+**`map`** submits everything and returns `[f.result() for f in futures]`. Because the list is in input order,
+the results are too, whatever order the calls finish in.
+
+**`shutdown`** puts one sentinel per worker on the queue and joins them all.
+
+The family walkthrough has the 30-line version.
+
+### Follow the tests through it
+
+Run on 2026-10-12, five tests passed. Each one checks one promise:
+
+| Test | Promise it checks | What to say in the interview |
+|---|---|---|
+| 200 calls with random delays | Input order is kept | "Results line up with inputs, not with finishing order." |
+| Ten 100 ms calls on ten workers finish in under 0.3 s | Calls really run in parallel | "Sequential would be a full second." |
+| One task raises | The error stays with its own task; the next task still returns | "One bad call doesn't poison the batch." |
+| `submit` on a full queue | It blocks, then resumes when a worker frees up | "That's backpressure, so memory stays bounded." |
+| Cancel a queued task | It never runs | "Cancellation works for work that hasn't started." |
+
+### Timeouts and cancellation, honestly
+
+`future.result(timeout=…)` stops the **caller** waiting. It does not stop the thread. Python threads can't be
+killed, so the blocking call keeps its worker until it returns. Give every call a client-side I/O timeout, for
+example the HTTP client's own timeout setting. `shutdown(cancel_futures=True)` (Python 3.9+) cancels work that
+hasn't started; calls already running finish.
+
+Say it like this: "A timeout on the future is for the caller. The timeout that frees the worker has to live in
+the HTTP client."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Thread pool"
+  senior={["Bounded pool with ordered results, per-task exceptions, a bounded queue for backpressure and a tested shutdown."]}
+  staff={["Sizes the pool from the downstream limit, explains why timeouts must live in the client rather than the pool, and adds a retry budget so failures don't multiply load."]}
+/>
+
+In plain words: a Senior answer builds a pool that keeps its promises. A Staff answer also sizes it from the
+service it calls, and adds a **retry budget** (a cap on retries as a share of all calls) so a struggling
+service isn't buried under retries.
+
+## Small-team version
+
+This is the code that calls an LLM or embedding API for every row in a table. The actions:
+
+- **Size the pool from the provider's rate limit**, not from the CPU count.
+- **Give the HTTP client a timeout.**
+- **Retry only 429 and 5xx**, with **jittered backoff** (a random, growing wait between tries) and a cap on
+  attempts. A 429 means "too many requests"; a 5xx means the server had a bad moment.
+- **Write results keyed by row id**, so a rerun skips finished rows.
+- **For work that can wait hours, use the provider's batch API.** They are about half price per the
+  providers' pricing pages (fetched 2026-10-11) and replace the pool entirely.
+
+A worked case, with assumed sizes. Classifying 1M rows at 500 input and 50 output **tokens** each (a token is
+roughly ¾ of a word, the unit LLM APIs bill by) on gpt-5-mini ($0.25 / $2 per million tokens, fetched
+2026-10-11) costs about **$225**, or about **$112** through the batch API. Online, a pool of W ≈ rate ×
+latency: 10 requests a second allowed at 2 s per call is **20 workers**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Input per row:** 500 tokens × $0.25 ÷ 1,000,000 = $0.000125.
+- **Output per row:** 50 tokens × $2 ÷ 1,000,000 = $0.0001.
+- **1M rows:** 1,000,000 × ($0.000125 + $0.0001) = **$225**; half through the batch API ≈ **$112**.
+- **Pool size:** 10 requests/s × 2 s = **20** workers.
+
+</details>
+
+## Pitfalls
+
+- **Returning results in completion order.** The caller expects input order, and mismatched results are a
+  silent data bug.
+- **An unbounded queue.** Submitting a million tasks holds a million futures in memory at once.
+- **Believing `result(timeout=…)` cancels the call.** It only stops the caller waiting; the thread stays busy.
+- **One shared, non-thread-safe client.** Every worker using it at once can corrupt requests; give each
+  worker its own.
+
+## Go deeper
+
+- Family walkthrough: [Concurrent I/O workers](/system-design-labs/interviews/walkthroughs/concurrent-io-workers/), "The same shape, four more times".
+- Retry budgets and breakers in front of a slow dependency: <LabRef lab="load-balancer" inline />.
+- The async LLM-client version of this problem: [Concurrent LLM API client](/system-design-labs/interviews/walkthroughs/concurrent-llm-client/).

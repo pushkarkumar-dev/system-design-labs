@@ -1,0 +1,178 @@
+---
+question: eng-056
+family: concurrent-llm-client
+status: published
+labs: [rate-limiter, load-balancer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "First I'll write one request function that retries only the failures worth retrying: server errors, 429s
+> and timeouts, with a random, growing wait. Everything else raises an error that carries its status code.
+> Then fallback ids are short: for each product I try its ids in order, a 404 means 'try the next id', a
+> server error was already retried, and a 400 stops. Products run concurrently under a cap, and if two
+> products share an id, I look it up once."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer is checking whether your first ten minutes of code survive the next three requirements. The
+first task is easy: call an endpoint that sometimes fails. The second task builds on it. If you hard-coded
+the first answer, the second one means a rewrite.
+
+What makes this different from an ordinary "add a retry" ticket is that **a failure can mean three different
+things**, and the code has to tell them apart:
+
+1. **"Try again later."** The server had a bad moment (a 503, a timeout). The same request will probably work
+   if you wait.
+2. **"This id doesn't exist; try the next one."** A 404 for one product id. Waiting won't help, but the next
+   candidate id might work right now.
+3. **"Your request is wrong; stop."** A 400. Nothing you retry or try next will fix it.
+
+A loop that treats all three the same is either slow (it waits on 404s) or wrong (it retries 400s).
+
+The round was reported first-hand at Sierra as "a practical multi-part problem that builds progressively": an
+endpoint that "fails occasionally but eventually succeeds", then a product list with fallback IDs to resolve
+into product objects, where "each follow-up adds new requirements on top of your existing code"
+(<Cite id="s-6c08b2d69e" />). The account says it tests "flexible, extensible code from the start". It ran on
+CoderPad, in Python or TypeScript.
+
+## Clarify first
+
+Ask these, and say your assumption for each:
+
+- **Which failures are transient?** "I'll assume 5xx, 429 and timeouts get retried, and other 4xx don't."
+- **What does a missing product return?** "I'll assume 404, which means try the next id, not retry."
+- **What does "eventual set of IDs" mean?** The report doesn't say. Assume an ordered list of candidate ids
+  where the first that exists wins, and ask whether ids can chain to other ids.
+- **What if every id is gone?** "I'll report it as missing rather than guess."
+- **Can products share ids?** If so, look each id up once.
+
+## Answer
+
+### Words you need first
+
+- **Transient** failures are temporary: a retry after a short wait will probably succeed.
+- **Backoff** is waiting longer after each failed attempt. **Full jitter** makes each wait a random number
+  between zero and that growing ceiling, so many clients that failed together don't retry on the same tick.
+- **429** means "Too Many Requests" (you hit a rate limit). The server may add a **Retry-After** header saying
+  how long to wait.
+- **Single flight** means that if two callers want the same thing at the same time, only one request goes
+  out, and both share its answer.
+
+### The shape of the code
+
+```
+resolve_products()      ← all products at once, at most 8 lookups in flight
+   │  for each product: try ids in order
+   ▼
+resolve(ids)            ← 404 → next id · found → done · all gone → None
+   │  shared dict of lookups by id (single flight)
+   ▼
+fetch(id)               ← turns a 404 into None; anything else fatal is raised
+   │
+   ▼
+_request()              ← the one retry function: retry 5xx/429/timeouts, raise FatalError(status) otherwise
+```
+
+**`_request`** is stage 1, the flaky endpoint. **`fetch`** knows one product rule: a 404 is not an error, it
+is an answer ("gone"). **`resolve`** knows the fallback rule: the first id that exists wins. **`resolve_products`**
+runs every product at once, under a cap. Each box adds one rule, which is exactly how the follow-ups arrive.
+
+### Stage 1: the flaky endpoint
+
+Don't write `while True: try ... except: pass`. Write one `_request` function with an outcome table:
+
+- retry 408, 429 and 5xx with full-jitter backoff (`uniform(0, min(cap, base × 2^attempt))`);
+- honour Retry-After, up to a cap, so a bad header can't park the job for an hour;
+- wrap each attempt in a whole-attempt deadline;
+- stop after `max_attempts`;
+- for anything else, raise a `FatalError` that carries the status code.
+
+Never catch `CancelledError`. In Python's asyncio, that is how "the caller gave up" travels through your
+code, and catching it turns "stop" into "try again". Say it like this: "The error carries its status, so the
+next stage can tell a 404 from a 400 without parsing strings."
+
+### Stage 2: fallback ids
+
+Because the error carries its status, resolution is short. For each product, walk its ids in order. A 404
+returns `None` and moves on. A 5xx was already retried inside `_request`. A 400 stops. Run products
+concurrently behind a semaphore (a counter of permits that caps how many lookups run at once). Keep a dict of
+in-flight lookup tasks keyed by id, so two products that share an id cause one request.
+
+### Follow one catalog through it
+
+The family walkthrough's version ran on 2026-10-12 against a fake server. In it, the catalog endpoint fails
+twice with 503, ids p7, p8 and p9 are gone (404), and id p4 fails once with 503.
+
+| What happens | Which rule handles it | What to say in the interview |
+|---|---|---|
+| The catalog call fails twice, then works | `_request` retries | "The flaky endpoint is stage 1. I already handle it." |
+| A product's first id is gone (404) | `fetch` returns `None`, `resolve` tries the next id | "A 404 is an answer, not a failure. No waiting." |
+| Two products share a missing id | the lookups dict | "The shared id is fetched once, and both products see the result." |
+| p4 fails once with 503 | `_request` retries | "Fetched twice: once failed, once worked. The resolver never knew." |
+| Every id of one product is gone | `resolve` returns `None` | "I report it missing. I don't guess a product." |
+| Result | | Three products resolved, one reported missing, the shared missing id fetched once, p4 fetched twice. |
+
+### The next requirements, before they arrive
+
+Mention these before the interviewer asks. It shows the structure is ready for them:
+
+- **Chains:** if one id can point to another, follow it with a visited set and a hop limit, so a cycle raises
+  instead of looping.
+- **Observability:** return which id matched, so the caller can count how often fallbacks are used.
+- **Per-item errors:** return an error per product instead of failing the batch, if the caller wants that.
+
+Structure is what's graded here: one retry function, one resolve function, and tests per outcome.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Flaky endpoint and fallback ids"
+  senior={["Separates retry, next-id and stop outcomes, shares lookups, and tests each path against a fake."]}
+  staff={["Asks whether fallback use is a data-quality signal someone should see, and whether retries are safe (idempotent) for every endpoint involved."]}
+/>
+
+In plain words: a Senior answer gets the three outcomes right and proves it. A Staff answer also asks two
+system questions. First, is a rising number of fallbacks a sign that something upstream is broken? Second, is
+every call here **idempotent**, meaning safe to repeat? A lookup is. A call that creates or charges something
+may not be.
+
+## Small-team version
+
+This is what calling a messy internal or partner API looks like, often from inside an agent tool.
+
+- **Build once:** write the outcome table in a shared helper and reuse it everywhere.
+- **Delegate:** an agent can generate the resolution code. You write the fake server with a flaky mode, a 404
+  mode and a shared-id case.
+- **Watch:** log fallback hits. A rising rate usually means an upstream migration nobody announced.
+- **Revisit:** when the partner offers a bulk lookup endpoint, which replaces N calls with one.
+
+Single flight is worth it when ids are shared. With assumed numbers, 10,000 products with about 1.5 candidate
+ids each, 2,000 of them shared, it saves **2,000 lookups**, about **100 seconds** at a partner limit of 20
+requests/s. Writing and testing the helper is about a day of one engineer, roughly **$750**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Lookups without dedupe:** 10,000 products × 1.5 candidate ids = 15,000 lookups (assumed).
+- **With dedupe:** 2,000 ids are shared (assumed), so 15,000 − 2,000 = 13,000 lookups.
+- **Time at 20 requests/s (assumed partner limit):** 15,000 ÷ 20 = 750 s against 13,000 ÷ 20 = 650 s.
+- **Engineer cost:** one day at an assumed $194K loaded cost per year is roughly $750.
+
+</details>
+
+## Pitfalls
+
+- **Retrying 404s with backoff.** That turns "try the next id" into seconds of waiting per product.
+- **A bare `except`.** It retries a 400 that will never succeed, or swallows cancellation.
+- **Looking up the same id once per product.** Shared missing ids cost a request each time instead of once.
+- **Hard-coding the first requirement.** Each follow-up then means a rewrite under time pressure.
+- **Guessing when every id is gone.** Report the product as missing; a guess hides a data problem.
+
+## Go deeper
+
+- Family walkthrough: [Concurrent LLM API client](/system-design-labs/interviews/walkthroughs/concurrent-llm-client/), stages 2–4.
+- Retry budgets: <LabRef lab="load-balancer" inline />. Server-side throttling: <LabRef lab="rate-limiter" inline />.
+- Sibling: [eng-057](/system-design-labs/interviews/questions/eng-057/) (async retries in existing code).

@@ -1,0 +1,851 @@
+---
+title: "Make an LLM feature fast and affordable: latency budgets, token cost, caching, model choice"
+summary: "Split the wait into stages you can measure, price every request in tokens, then pull the cheap levers first: shorter prompts, prompt caching, batch APIs, a cheaper model where the eval allows. Self-host only with the GPU math."
+track: cross
+format: design
+family: llm-cost-latency
+smallTeamFocus: "Tag every call by feature, then pull the cheap levers first: shorter prompts, prompt caching, batch APIs for offline work, a cheaper tier where the eval allows. Self-hosting rarely wins on cost at small-team volumes."
+rounds: [ml-system-design, domain-deep-dive, debugging]
+level: both
+timeboxMin: 45
+order: 117
+status: published
+basedOn: [eng-015, eng-073, eng-076, eng-078, infra-075]
+askedAt: [fireworks-ai, openai, other, promptlayer, scale-ai]
+labs:
+  - { lab: rag, role: proof, note: "Measured retrieval and reranking latency per stage: the numbers a latency budget for a grounded chatbot starts from." }
+  - { lab: embedding-pipeline, role: proof, note: "Measured batching gain and LRU cache hit rates for embeddings: two of the cheapest cost levers." }
+  - { lab: llm-inference, role: partial, note: "A real KV cache and the KV-size formula; its batching runs one forward pass per request and it has no TTFT or TPOT measurement." }
+  - { lab: speculative-decoding, role: partial, note: "The acceptance math for a decode-latency lever, with mock draft and target models." }
+  - { lab: model-quantizer, role: partial, note: "INT8 and INT4 sizes and weight error, measured on GPT-2; perplexity is illustrative." }
+  - { lab: observability, role: partial, note: "Spans and histograms for a per-stage latency breakdown, once its Go package compiles." }
+gapLabs: [llm-gateway, llm-observability]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "Before I change anything, I'd split one request into stages and time each one: my own code, retrieval, waiting
+> for the model, the model reading the prompt, and the model writing the answer. The user mostly feels the wait for
+> the first word, so I'd stream and set the target on that. For cost, I'd price every request in tokens: tokens in,
+> tokens out, and how many calls one user action makes. Then I'd pull the cheap levers first: shorter prompts,
+> shorter answers, prompt caching, batch pricing for work nobody waits for, and a cheaper model wherever our eval
+> says it still passes. Running our own GPUs is a privacy or scale decision, and I'd only make it with the GPU
+> arithmetic in hand."
+>
+> The rest of this page explains each part of that answer.
+
+Here is the task as it is usually set. A feature built on a large language model (LLM, the kind of model behind
+chat assistants) is too slow, too expensive, or both. Or you are designing one that must hit a latency target and a
+budget from day one. You are asked to find where the time and money go, choose what to change, and say what each
+change costs in quality and engineering time.
+
+### Why this is not a normal "make it faster, make it cheaper" problem
+
+In a normal backend, a slow endpoint usually means a slow query or a missing index. Cost is mostly servers, and a
+request costs about the same as any other request. You fix the slow part, add a cache, and you are done.
+
+An LLM feature differs in four ways, and a good answer is built around them:
+
+1. **You pay per word, not per server.** A provider charges for every **token** (a chunk of text, roughly ¾ of a
+   word) that goes into the model and every token that comes out. One long request can cost a thousand times more
+   than a short one. So cost is a property of each request's *shape*, and you can change it in code.
+2. **The wait has two very different parts.** The model first reads the whole prompt, then writes the answer one
+   token at a time. The first part decides when the first word appears. The second decides how long the full answer
+   takes. They have different causes and different fixes.
+3. **Many of the cheap fixes change the output.** A shorter prompt, a smaller model or a cache can make the answer
+   worse in ways no error rate shows. So every cost or speed change has to pass a quality check, called an **eval**
+   (a fixed set of test inputs with a way to score the outputs).
+4. **Running the model yourself is a hardware problem.** If you host an open model, the limits come from GPU
+   memory and memory speed, and an idle GPU costs the same as a busy one.
+
+If you explain those four things and then measure before you optimise, you have the core of a strong answer.
+
+### Words you need first
+
+- **Prompt and output.** Everything sent to the model is the **prompt** (instructions, retrieved documents, chat
+  history, the user's message). Those are **input tokens**. What the model writes back are **output tokens**.
+  Output tokens usually cost four to eight times as much as input tokens on the prices used on this page.
+- **Prefill.** The model reads the whole prompt in one big pass. This is called **prefill**, and its length
+  grows with the number of prompt tokens.
+- **Decode.** The model then writes the answer one token per step. This is called **decode**. The time per step is
+  the **time per output token (TPOT)**.
+- **TTFT.** **Time to first token**: how long until the first word of the answer appears. It includes everything
+  before the model, any waiting in a queue, and prefill.
+- **Tier.** Providers sell models in sizes: small, cheap and fast; large, expensive and better at hard tasks. A
+  **tier** is one of these sizes.
+
+Other terms are explained where they first appear.
+
+Five reported questions share this problem: an OpenAI forward-deployed engineer screen, a candidate's design task
+from an unnamed company, a Scale AI-tagged list entry, an interviewer-side post from PromptLayer and a Fireworks prep
+guide.
+
+### The five versions in the question bank
+
+<QuestionRow id="eng-076" />
+<QuestionRow id="eng-015" />
+<QuestionRow id="eng-073" />
+<QuestionRow id="eng-078" />
+<QuestionRow id="infra-075" />
+
+- **Diagnose slow responses (OpenAI, eng-076).** In a first-hand account of a 60-minute technical screen, the
+  interviewer asked: "Walk me through how you'd diagnose high latency in an LLM inference pipeline." Then "we
+  discussed batching strategies and caching" (<Cite id="s-812dbc9385" />).
+- **Design a support chatbot (unnamed company, eng-015).** A candidate's write-up (DEV, 2025-05-26) of a design task:
+  a chatbot that "should use open-source models to maintain data privacy", "must handle 100+ concurrent users", has
+  "Response latency should be under 2 seconds", answers from company documents, and needs analytics, a cost estimate
+  and risks (<Cite id="s-ba9c761b13" />).
+- **An insurance-claims agent on a budget (Scale AI, eng-073).** An entry on Aced, a question-list aggregator (low
+  confidence, not a candidate report), about a claims agent that controls "LLM/token cost". Its model answer ends: "The strong move is
+  treating cost and guardrails as first-class design constraints rather than afterthoughts"
+  (<Cite id="s-d7a8e88bf0" />).
+- **Which model for which task (PromptLayer, eng-078).** Written from the interviewer's side (2025-07-11): which
+  model provider a candidate leans on for which task. The post wants strong, current opinions and lists "Boring
+  textbook answers" as a red flag (<Cite id="s-1205b0cc50" />).
+- **Read a first-token timeline (Fireworks, infra-075).** A prep guide on PracHub (an interview-question aggregator),
+  not a candidate report, lists
+  reading a time-to-first-token timeline as a technical-review topic (<Cite id="s-b6632d5df9" />).
+
+### The example used on this page
+
+One case runs through the whole page: the support chatbot from eng-015. A user asks a question about the
+company's refund policy. The system looks up the relevant parts of the company's documents, adds them to the prompt,
+and asks an open model to answer with citations. We follow that one message through every stage, put a time on each
+stage, then put a price on it. Later we reuse the same message to compare a hosted API against renting GPUs.
+
+## What is being tested
+
+**Measuring before fixing.** The OpenAI screen asked for a diagnosis first and fixes second
+(<Cite id="s-812dbc9385" />). A strong answer splits the request into stages, says which number measures each one,
+and only then proposes batching or caching for the stage that is actually slow.
+
+**Getting percentiles right.** A **p95** is the time 95% of requests beat. The Fireworks prep guide warns: "Never add
+the p95 of each component and call that the request p95; those component tails can belong to different requests"
+(<Cite id="s-b6632d5df9" />). The slow 5% of retrievals and the slow 5% of model calls are usually different
+requests. So per-stage p95s tell you which stage is slow, and the request's p95 has to come from timing whole
+requests.
+
+**Arguing cost in tokens.** Cost is prompt length, answer length, the number of model calls per user action, how
+much of the prompt is cached, and the price of the tier you use. An agent (a model that calls tools in a loop, explained below) multiplies all of these
+by its number of steps.
+
+**Current, hands-on judgment.** PromptLayer's interviewer post says "Top models change daily" and that it has
+"never met a great AI Engineer" without strong opinions on LLM strategy (<Cite id="s-1205b0cc50" />). An opinion
+backed by your own eval and a dated price beats a ranking you read somewhere.
+
+**A full design with numbers** in the chatbot version: how many requests at once, the latency, the GPUs needed for an
+open model, a monthly cost and a list of risks (<Cite id="s-ba9c761b13" />).
+
+## Clarify and scope
+
+Spend a few minutes on these. Each one changes the numbers.
+
+1. **Which latency?** Time to first token, time to the full answer, or time until an action is done? For chat, the
+   answer **streams**: each token is sent to the screen as soon as it exists, so the first word is what the user
+   feels. A tool step or a JSON extraction has no useful partial output, so its target is the full answer. Say:
+   "For chat I'd set the target on time to first token; for a background extraction, on the full answer."
+2. **Which percentile, measured where?** p50 (the median) and p95, measured at the client or at the server. A "2 s"
+   target with no percentile is a median target in practice.
+3. **Concurrent users or concurrent requests?** "100 concurrent users" is not 100 requests in flight. Most users
+   are reading or typing. Ask how often a user sends a message, or assume a rate and convert it (shown below).
+4. **Token shape.** How long are the system instructions, the retrieved documents, the chat history and the answer?
+   How many model calls does one user action make? If the feature exists, ask for real traces.
+5. **Quality bar.** Which eval decides whether a cheaper model or a shorter prompt is acceptable? Without one, every
+   cost lever is a guess. Say: "Before I trade quality for cost, I need a test set that tells me what I gave up."
+6. **Budget and constraints.** The monthly budget, data rules (the chatbot version requires open models for
+   privacy), and whether any work can wait hours.
+
+**Out of scope:** low-level GPU programming and the provider's internal serving system, unless you host the model
+yourself.
+
+## Back-of-envelope
+
+This section follows the chatbot message from start to finish: first the clock, then the GPU, then the bill.
+
+### The assumptions
+
+State these out loud, labelled as assumptions:
+
+- **Traffic:** 100 active users at peak, each sending one message every 30 seconds.
+- **Prompt:** 3,000 tokens: 500 of system instructions, 2,000 of retrieved document text, 500 of chat history.
+- **Answer:** 300 tokens.
+- **Model and hardware:** Llama-3.1-8B, an open model with 8 billion **parameters** (the learned numbers that make up
+  the model), stored at 2 bytes per number (a format called **bf16**), on one NVIDIA A100 GPU with 80 GB of memory.
+  An open model because the task requires one.
+- **Decode speed:** 40 tokens per second per user, so 25 ms per output token.
+
+### Follow one message through the stages
+
+The user types *"Can I get a refund after 30 days?"* and presses Enter. Here is the path:
+
+```
+User's browser
+   │  message arrives
+   ▼
+Gateway ── login, per-user token quota
+   │
+   ▼
+Prompt builder ── system instructions + history + new message
+   │
+   ▼
+Retriever ── finds the document passages most related to the question
+   │
+   ▼
+Reranker ── re-scores those passages and keeps the best few
+   │
+   ▼
+Model server queue ── waits until the GPU has room for this request
+   │
+   ▼
+Prefill ── the model reads all 3,000 prompt tokens  → first token
+   │
+   ▼
+Decode ── one token every ~25 ms, streamed to the browser
+```
+
+Two of these boxes need a word of explanation. The **retriever** finds relevant text: the company documents were
+split into short passages (**chunks**) ahead of time, and each chunk was turned into a list of numbers (an
+**embedding**) that places similar meanings close together. The retriever embeds the question the same way and
+returns the closest chunks, often combined with keyword search. This is called **retrieval-augmented generation
+(RAG)**. The **reranker** is a second, more careful model that scores each candidate chunk against the question, so
+only the best few go into the prompt.
+
+Now put a clock on it. The two retrieval numbers were measured in this site's rag lab on an Apple M1 Ultra, on its
+CPU and on MPS (its built-in GPU): a hybrid
+(embedding plus keyword) search over 5,852 chunks takes
+<LabNumber lab="rag" metric="Hybrid retrieve() v1, 5,852 chunks (CPU / MPS)" />, and a reranker scoring 20 candidates
+takes <LabNumber lab="rag" metric="Cross-encoder rerank, 20 candidates (CPU / MPS)" />. The other numbers are assumed
+or worked out further down.
+
+| Clock | Stage | What happens | What to say in the interview |
+|---|---|---|---|
+| 0 ms | Gateway and prompt build | Login, quota, joining the prompt pieces (about 20 ms, assumed). | "My own code should cost milliseconds. If it costs more, that is the first fix." |
+| ~20 ms | Retrieve | Hybrid search finds candidate chunks: tens of milliseconds in the lab. | "Retrieval is cheap at this corpus size." |
+| ~55 ms | Rerank | The reranker scores 20 candidates: hundreds of milliseconds on a CPU in the lab. | "On a CPU the reranker alone is a fifth of a 2-second budget. I'd check whether it earns its place." |
+| ~0.47 s | Queue | Waits for room on the GPU. Near zero when quiet, the main source of delay when busy. | "Under load, this is where time to first token grows." |
+| ~0.47 s | Prefill | The model reads 3,000 tokens: about **0.32 s**. | "Prefill grows with prompt length, so trimming retrieved text shortens it." |
+| **~0.8 s** | First token | The first word reaches the browser. | "Time to first token is about 0.8 seconds, inside the 2-second target." |
+| ~8.3 s | Last token | 299 more tokens at 25 ms each, about 7.5 s. | "The full answer can't arrive in 2 seconds at any GPU price. So we stream, and the target is time to first token." |
+
+That last row is the most important sentence in the chatbot version. Say it in the first five minutes: "A 300-token
+answer at 40 tokens a second takes 7.5 seconds. So '2 seconds' has to mean 'first word in 2 seconds, p95', and we
+stream the rest."
+
+### How many requests are really in flight
+
+"100 concurrent users" sounds like 100 requests running at once. It isn't. Most of the time a user is reading the
+last answer or typing the next question.
+
+The tool for this is **Little's law**, which you may know from queueing: the number of things in a system equals
+the rate they arrive times how long each one stays. Messages arrive at 100 users ÷ 30 s = 3.33 per second. Each one
+stays about 8.3 seconds (0.8 s to the first token plus 7.5 s of writing). So about **28 requests are in flight**, not
+100.
+
+Say: "Little's law turns 100 users into about 28 requests in flight. That is the number I size the GPU for."
+
+### Does one GPU hold it?
+
+To answer, you need one more idea. While the model writes an answer, it keeps a saved summary of every token so far,
+so it does not have to re-read the whole conversation for each new word. This saved summary is called the **KV
+cache** (it stores two vectors, a "key" and a "value", per token per layer of the model). It lives in GPU memory for
+as long as the answer is being written.
+
+For Llama-3.1-8B, the KV cache costs 128 KiB (about 131 KB) per token. Each of our requests holds about 3,300 tokens (3,000 in
+plus 300 out). So 28 requests in flight hold about **12.1 GB** of KV cache. The model's own numbers (its **weights**)
+take about **16 GB**. Together that is about **28 GB of an 80 GB GPU**, plus some working memory (an assumed 5 GB).
+It fits with room to spare.
+
+Speed is the other question. Each decode step has to read the whole model and every active KV cache from GPU memory.
+GPU memory (called **HBM**, high-bandwidth memory) is fast, but not infinitely so: about 2,039 GB per second on this
+A100. Reading 28 GB takes about **13.8 ms**. That is the floor for one step, so each user can get at most about **72
+tokens per second**. Our assumed 40 tokens per second is about 55% of that ceiling, which is realistic.
+
+Prefill is the opposite kind of work. Reading 3,000 tokens at once is mostly arithmetic, not memory reading. At the
+A100's peak arithmetic speed it takes about **0.16 s**; at an assumed 50% of peak, about **0.32 s**. That is the
+prefill time in the clock table.
+
+Say: "One A100 holds 28 conversations easily. The decode floor is about 14 ms a step, so 40 tokens a second per user
+is plausible. Prefill for a 3,000-token prompt is about a third of a second."
+
+The hardware numbers come from NVIDIA's A100 page (<Cite id="s-8e443a8b66" />) and the model shape from the
+Llama-3.1-8B configuration file (<Cite id="s-20bffa9709" />). The argument that decode is limited by memory reading
+follows the techinterview explainer (<Cite id="s-4525fcd815" />), which implies the formula without writing it out.
+
+### What one message costs on an API
+
+Now price the same message on a hosted API instead. Cost is simply tokens times price, with one twist: **prompt
+caching**. If the start of a prompt is identical to a recent prompt, the provider can reuse the work it already did
+for that text. Those reused tokens are billed as **cached input**, which is much cheaper. On most Claude models a
+cache read costs 0.1× the normal input price (Anthropic pricing, fetched 2026-10-11).
+
+In our message, the system instructions and the most common document chunks can sit at the start of the prompt and
+be cached. Assume 2,000 of the 3,000 input tokens are cached. On Claude Sonnet 5 ($2 per million input tokens, $0.20
+per million cached input tokens, $10 per million output tokens), the message costs about **$0.0054**, half a cent.
+Without the cache it costs **$0.009**. Caching cuts this request by **40%**.
+
+Notice where the money goes. The 300 output tokens cost $0.003, more than all 3,000 input tokens together once the
+cache works. Say: "Output tokens are the expensive ones. Capping answer length is often the biggest single saving."
+
+### When cost grows faster than traffic: an agent
+
+The claims agent (eng-073) shows a trap that the chatbot doesn't have. An **agent** is a loop: the model reads the
+task, decides to call a **tool** (a function your code runs, such as "look up claim history"), reads the result,
+and decides again, until it finishes. Each step sends the *whole* conversation so far back to the model.
+
+So each step's prompt is longer than the last. Assume each claim takes 8 steps. Each step resends 4,000 tokens of
+instructions, tool descriptions and the claim itself, and adds 1,500 tokens (a tool result plus the model's turn).
+Without caching, one claim reads **86,000 input tokens**, not 8 × 5,500. The total grows with the *square* of the
+number of steps. Doubling the steps to 16 makes it **268,000 tokens, 3.1× more**.
+
+On Sonnet 5, with 300 output tokens per step (assumed), that is **$0.196 per claim** without caching and **$0.070**
+with it, because most of each step's prompt is a repeat of the last step's. At an assumed 1,000 claims a day, that
+is **$5,880 versus $2,100 a month**.
+
+Say: "Agent cost grows with the square of the step count, so a step cap matters more than any price. I'd set a
+per-claim token budget and escalate to a human when it runs out." The Aced model answer frames it the same way: state
+a per-claim token budget as a service-level agreement (<Cite id="s-d7a8e88bf0" />).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Requests in flight (Little's law)"
+  expr="L = λ × W"
+  vars={[
+    { sym: 'λ', meaning: 'arrival rate: 100 users ÷ 30 s = 3.33 requests per second (assumed)' },
+    { sym: 'W', meaning: 'time per request: about 0.8 s to first token + 300 tokens at an assumed 40 tokens/s = 8.3 s' },
+  ]}
+  example="L = 3.33 × 8.3 ≈ 28 requests in flight, not 100"
+/>
+
+<Formula
+  title="Does one GPU hold it? KV cache and decode bound"
+  expr="KV bytes = in_flight × tokens × 2 × layers × n_kv_heads × head_dim × bytes;  step time ≥ (weights + KV) ÷ HBM bandwidth"
+  vars={[
+    { sym: 'KV per token', meaning: 'Llama-3.1-8B bf16: 2 × 32 × 8 × 128 × 2 = 131,072 B' },
+    { sym: 'weights', meaning: '8.03 B params × 2 B = 16.06 GB (exact config basis)' },
+    { sym: 'HBM bandwidth', meaning: 'A100 80GB SXM: 2,039 GB/s' },
+  ]}
+  example={[
+    "KV: 28 × 3,300 × 131,072 B = 12.1 GB; with weights 28.2 GB of 80 GB, plus an assumed 5 GB overhead",
+    "Step floor: 28.2 GB ÷ 2,039 GB/s = 13.8 ms, so at most about 72 tokens/s per stream at 100% of bandwidth",
+    "The assumed 40 tokens/s is about 55% of that floor; aggregate demand 28 × 40 = 1,120 tokens/s",
+  ]}
+/>
+
+<Formula
+  title="Prefill time for a 3,000-token prompt"
+  expr="prefill ≥ (2 × params × n + 2 × layers × hidden × n²) ÷ peak FLOP/s"
+  vars={[
+    { sym: 'n', meaning: 'prompt tokens not served from a prefix cache (3,000)' },
+    { sym: 'peak', meaning: 'A100 dense BF16: 312 TFLOPS' },
+  ]}
+  example={[
+    "Weights: 2 × 8.03 × 10⁹ × 3,000 = 4.82 × 10¹³ FLOPs; attention: 2 × 32 × 4,096 × 3,000² = 2.36 × 10¹² (about 5% more)",
+    "Total 5.05 × 10¹³ ÷ 3.12 × 10¹⁴ ≈ 0.16 s at 100% of peak; at an assumed 50% of peak about 0.32 s",
+  ]}
+/>
+
+<Formula
+  title="Time to first visible token, by stage"
+  expr="TTFT_user = t_gateway + t_build + t_retrieve + t_rerank + t_queue + t_prefill + t_first_step + t_network"
+  vars={[
+    { sym: 't_build', meaning: 'assembling the prompt: history, templates, tool schemas' },
+    { sym: 't_retrieve, t_rerank', meaning: 'retrieval and optional reranking' },
+    { sym: 't_queue', meaning: 'waiting for a slot at the model server or provider' },
+    { sym: 't_prefill', meaning: 'processing the prompt tokens the cache does not already hold' },
+  ]}
+  example="Full answer time = TTFT_user + (output_tokens − 1) × TPOT, where TPOT is the time per output token"
+/>
+
+<Formula
+  title="Cost per request with prompt caching"
+  expr="cost = (in − in_cached) × p_in + in_cached × p_cache_read + out × p_out   (+ cache writes)"
+  vars={[
+    { sym: 'p_cache_read', meaning: 'cache-read price; 0.1× base input on most Claude models (Anthropic pricing, fetched 2026-10-11)' },
+    { sym: 'cache writes', meaning: '1.25× base input for a 5-minute cache write on Anthropic; ignored in the examples below' },
+  ]}
+  example={[
+    "Claude Sonnet 5 ($2 in, $0.20 cached, $10 out per M), 3,000 in with 2,000 cached, 300 out:",
+    "1,000 × $2/M + 2,000 × $0.20/M + 300 × $10/M = $0.002 + $0.0004 + $0.003 = $0.0054",
+    "Without the cache: 3,000 × $2/M + $0.003 = $0.009; caching cuts this request by 40%",
+  ]}
+/>
+
+<Formula
+  title="Input tokens over an agent loop with no caching"
+  expr="total_input = N × C₀ + Δ × N(N + 1) ÷ 2"
+  vars={[
+    { sym: 'N', meaning: 'tool-calling steps per claim (assumed 8)' },
+    { sym: 'C₀', meaning: 'tokens resent every step: instructions, tools, the claim (assumed 4,000)' },
+    { sym: 'Δ', meaning: 'tokens each step adds: a tool result plus the model turn (assumed 1,500)' },
+  ]}
+  example={[
+    "8 × 4,000 + 1,500 × 36 = 32,000 + 54,000 = 86,000 input tokens per claim",
+    "Sonnet 5, no caching, 300 output tokens per step (assumed, 2,400 total): 86,000 × $2/M + 2,400 × $10/M = $0.172 + $0.024 = $0.196 per claim",
+    "With caching, only C₀ + N × Δ = 16,000 tokens are new; the other 70,000 are cache reads: 16,000 × $2/M + 70,000 × $0.20/M + $0.024 = $0.070",
+    "At an assumed 1,000 claims a day: $5,880 vs $2,100 a month",
+  ]}
+  note="Derived formula. Capping N matters more than any price: doubling N to 16 makes the uncached total 16 × 4,000 + 1,500 × 136 = 268,000 tokens, 3.1× more."
+/>
+
+</details>
+
+## High-level design
+
+The design is the same whether you are fixing an existing feature or building a new one. Every stage of the request
+reports how long it took and how many tokens it used, so time and money can be pinned to a stage, a feature and a
+model.
+
+```
+                 ┌──────────── request path ────────────┐
+User ──▶ Gateway ──▶ Prompt build ──▶ Retrieve ──▶ Rerank ──▶ Model queue ──▶ Prefill ──▶ Decode ──▶ User
+            │             │               │           │            │              │           │
+            └─────────────┴───────────────┴─────┬─────┴────────────┴──────────────┴───────────┘
+                                                 ▼
+                     Trace collector ── one record per stage: duration, tokens,
+                                        cache hits, model, cost, feature tag
+                                                 │
+                                                 ▼
+                     Dashboards and alerts ── time to first token per feature,
+                                              cost per feature per day, budgets
+```
+
+**Gateway.** The entry point. It checks who the user is and how many tokens they may still use. Limits here should
+count tokens, not requests, because one long request can cost as much as a thousand short ones.
+
+**Prompt build, retrieve, rerank.** Your own code. Their time is pure overhead on top of the model, so each should
+be milliseconds, except the reranker, which is a model in its own right.
+
+**Model queue, prefill, decode.** On a hosted API these happen inside the provider and you see them as one number
+(time to first token) plus a stream. If you host the model, you see each part separately.
+
+**Trace collector.** Each request gets one **trace**: a record made of **spans**, one per stage, each with a start
+time and a duration. This is the same idea as distributed tracing in any microservice system. The model spans add
+the things that matter here: input tokens, cached input tokens, output tokens, the model used, time to first token,
+time per output token and the cost. Every span carries a **feature tag** (which product feature made the call), so
+the bill can be split by feature.
+
+**Dashboards and alerts.** Built from the traces. They answer "which stage owns the slow requests?" and "which
+feature owns the bill?".
+
+With that in place, the method has three steps:
+
+1. **Instrument first.** One trace per request, one span per stage, tokens and cost on every model span.
+2. **Find the biggest term.** For latency: which stage owns the p95? For cost: which feature, and which kind of
+   token (uncached input, cached input or output)?
+3. **Apply the lever aimed at that term,** measure again, and keep the change only if the eval still passes.
+
+For the chatbot, the candidate's own write-up describes a React front end, NGINX, FastAPI, Kafka, the Milvus vector
+database with BGE-M3 embeddings, fine-tuned Llama-2 7B and 13B models with a small MiniLM classifier routing between
+them, and Prometheus and Grafana for monitoring (<Cite id="s-ba9c761b13" />). The routing idea, a small model for
+easy questions and a larger one for hard ones, is the same lever as choosing a cheaper tier on an API. The write-up's
+own monthly estimate is about $2,070 on five GPU instances. Whatever your numbers are, expect to be asked how you got
+them.
+
+## Deep dives
+
+### Diagnosing high latency (eng-076)
+
+This is the OpenAI version. Work from the outside in, and change one thing at a time.
+
+1. **Is it the model or everything else?** Compare the time to first token the client sees with the model span's
+   own time to first token. The gap is time in your code: prompt building, retrieval, a synchronous database call,
+   or several model calls in a row. Say: "If the gap is big, the model isn't my problem."
+2. **Serial calls.** Count model calls per user action, and check whether they run one after another. Three
+   1-second calls in a row take 3 seconds. Run independent ones in parallel, or merge them into one call.
+   Honeycomb's write-up on its query assistant reports 2–15+ second responses and says chaining calls was ruled out
+   for that reason ([Honeycomb](https://www.honeycomb.io/blog/hard-stuff-nobody-talks-about-llm), page dated
+   2024-08-24).
+3. **First token or the rest?** A slow first token with a normal per-token speed points at long prompts, queueing,
+   or a prompt cache that isn't being hit. A normal first token with a long total time points at answer length: cap
+   the answer length (`max_tokens`), ask for a shorter format, or stream.
+4. **Prompt length.** Plot time to first token against input tokens. If it climbs in a straight line, prefill is the
+   cost. Trim the retrieved text (fewer, better chunks after reranking), shorten the history, and put the parts that
+   never change first so the prompt cache can reuse them.
+5. **Queueing.** If time to first token climbs with load but not with prompt length, requests are waiting for
+   capacity. On an API that often means rate limits: the provider returns HTTP 429 ("too many requests") and the
+   client library quietly retries with backoff, so the delay looks like a slow model. If you host the model, it means
+   the GPU is full. Check retries per request.
+6. **Tails.** Look at p95 and p99 per stage and per group of similar prompt lengths, then at the p95 of whole
+   requests from traces. The Fireworks guide's advice to "measure latency by input-length cohort and tenant" applies
+   (<Cite id="s-b6632d5df9" />).
+
+Then come batching and caching, the reported follow-up (<Cite id="s-812dbc9385" />). **Batching** means running
+several users' requests through the model together. On a server you run, it raises throughput and lowers cost per
+token, because the model's weights are read once per step for everyone in the batch; each request's steps get a
+little slower. **Caching** removes work entirely. Say which stage each one helps.
+
+### Reading a first-token timeline (infra-075)
+
+This is the Fireworks version. You host the model and are shown one request's timeline from arrival to first
+token. It usually has these segments, in order:
+
+1. **Network and TLS** to the server.
+2. **Admission:** authentication, rate limits and token budget checks. Should take milliseconds.
+3. **Queue wait:** time until the **scheduler** (the part of the serving software that decides which requests run
+   in the next step) gives this request a place.
+4. **Tokenisation** (turning text into tokens) and the **prefix-cache lookup** (checking whether the start of this
+   prompt is already in GPU memory from an earlier request).
+5. **Prefill** of the tokens not found in the cache, possibly in pieces between other requests' decode steps.
+6. **The first decode step,** turning the token back into text, and the first write to the client.
+
+Three things change how you read it.
+
+- **A prefix cache shortens prefill, not decode.** Take a 70-billion-parameter model on four A100 GPUs and a
+  2,000-token prompt: prefill takes about 226 ms at peak speed. If 1,600 of those tokens are already cached, only 400
+  are read, which takes about 226 × 400 ÷ 2,000 ≈ **45 ms**. At this length the cost is close to proportional to the
+  number of tokens.
+- **Chunked prefill trades one user's first token for everyone else's smoothness.** A long prompt can be read in
+  pieces, between other users' decode steps, so their words keep flowing. The new request's first token arrives a
+  little later. This is called **chunked prefill**.
+- **Queue time is the usual culprit under load,** and it shows up as slowness in whatever segment happens to include
+  it. The guide warns that "Device utilization alone cannot distinguish a busy queue from CPU starvation" and that
+  "Later decode does not belong in TTFT" (<Cite id="s-b6632d5df9" />). A busy GPU and a starved CPU can look the same
+  on a utilisation graph.
+
+**Admission** should count tokens and GPU memory, not just requests. The same guide: "Keep admission bounded by both
+request count and estimated token/KV-memory demand" (<Cite id="s-b6632d5df9" />). Ten requests with 100,000-token
+prompts are not the same load as ten with 1,000.
+
+### Which provider for which task (eng-078)
+
+This is the PromptLayer version. Its own sample question is about creative writing across Claude, OpenAI and Gemini,
+and it expects opinions that are current (<Cite id="s-1205b0cc50" />). Prices are a fact you can bring. Quality per
+task is something you assert only from your own evals, with a date.
+
+A defensible structure:
+
+| Task class | Typical tier | Why |
+|---|---|---|
+| Classification, tagging, extraction to a schema | Smallest tier that passes the eval | High volume, short outputs, easy to check with code |
+| Customer-facing answers grounded in retrieved text | Mid tier | Quality matters, latency matters, volume is moderate |
+| Hard reasoning, long agent runs, code changes | Top tier, with step caps | Failures are expensive; volume is low |
+| Embeddings | A dedicated embedding model | Priced per input token only; batch the backfill |
+| Anything nobody waits for | Same tier through a batch API | Batch is 50% off at Anthropic, OpenAI and Google per their pricing pages (fetched 2026-10-11) |
+
+A **batch API** lets you submit many requests at once and collect the answers later, within hours, at a discount.
+
+The price spread is large. As fetched on 2026-10-11, output tokens cost $0.50 per million on Claude Haiku 5.5
+(prompts up to 100K tokens) and $20 on Claude Opus 5.5: 40×
+([Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)). OpenAI listed gpt-5-nano at $0.40
+and gpt-5.5 at $30 per million output tokens ([OpenAI pricing](https://developers.openai.com/api/docs/pricing)).
+
+Tokens are not the same size across providers either. Each model has its own **tokenizer** (the rule that splits text
+into tokens), and Anthropic's page says Claude 4.7+ models produce about 30% more tokens for the same text. So compare
+cost per task on your own prompts, not price per token. Say: "I compare cost per completed task, measured on our
+prompts, not the price list."
+
+Surveyed teams mostly choose by task, not by cost: the Amplify Partners 2026 report found 87% use several models,
+44% route by task type and 11% by cost
+([Amplify Partners](https://amplifypartners.com/blog-posts/the-2026-ai-engineering-report)). A good answer names your
+current picks, the date you last checked them, and the eval that justified each.
+
+### The levers, in the order to pull them
+
+Cheap, reversible levers come first. Each row says what the lever helps, how much it saves, and what it costs you.
+
+| Lever | Helps | Saves | Costs |
+|---|---|---|---|
+| Trim prompt: fewer chunks, shorter history, shorter instructions | Cost, first token | Proportional to input tokens removed | Possible quality loss; eval it |
+| Cap output (`max_tokens`, terse formats) | Cost, total time | Output costs 5× input or more on most tiers priced here | Truncated answers if too tight |
+| Prompt caching (stable prefix first) | Cost, first token | Cached input at 0.1× on most Claude models | Prompt layout discipline; write surcharge |
+| Batch API for offline work | Cost | 50% | Hours of delay |
+| Route easy requests to a cheaper tier | Cost, often latency | Up to the price ratio between tiers | A router and an eval per tier |
+| Parallelise or merge serial calls | Latency | Sum becomes max | Harder error handling |
+| Stream | Perceived latency | Nothing in cost | Can't retry after the first byte |
+| Exact-match cache | Cost, latency on repeats | Hit rate × cost | Staleness; key must include model version |
+| Semantic cache | Cost | Hit rate × cost | Wrong answers at hit rate × error rate |
+| Self-host (quantise, speculative decoding, batching) | Cost at high steady volume; control | Depends on utilisation | GPUs, on-call, labour |
+
+Two rows need a definition. An **exact-match cache** returns a stored answer when the identical prompt comes again,
+like any response cache. A **semantic cache** also returns a stored answer when a *similar* question comes again,
+judged by embeddings. It saves more, and it is wrong whenever two similar questions need different answers.
+
+Caching also stretches your provider limits. Anthropic's rate-limit doc says cached reads don't count toward input
+tokens per minute for most models, and works an example: a limit of 2M input tokens per minute at an 80% cache hit
+rate allows about 10M total input tokens per minute
+([rate limits doc](https://platform.claude.com/docs/en/api/rate-limits), fetched 2026-10-11).
+
+Whether a cache is worth building depends on how often requests repeat. For embeddings, a plain least-recently-used
+cache in the embedding-pipeline lab hit
+<LabNumber lab="embedding-pipeline" metric="LRU hit rate, Zipf s=1.0 over 100k texts, cache 10,000" /> on a synthetic
+stream where a few texts are very common. A uniform stream hits far less, and bulk loading of new documents hits
+nothing. Measure your own repeat rate before you build one.
+
+### Levers that only exist when you own the GPU
+
+- **Quantisation** stores each weight in fewer bits, so the model is smaller and each decode step reads fewer bytes.
+  At 4 bits per weight plus one small scale number per 32 weights (4.5 bits in total), the 8B model shrinks from
+  16.06 GB to about 4.5 GB (8.03 B × 4.5 ÷ 8, derived). Quality must be measured. The model-quantizer lab shows why
+  the grouping matters: on GPT-2, the weight error with one scale per 32 weights is
+  <LabNumber lab="model-quantizer" metric="INT4 weight error, one scale per 32 weights (GPT-2, 48 matrices)" />,
+  against
+  <LabNumber lab="model-quantizer" metric="INT4 weight error, one scale per tensor (GPT-2, 48 matrices)" /> with one
+  scale for a whole matrix. That is error in the weights, not task quality.
+- **Speculative decoding** uses a small, fast "draft" model to guess the next few tokens, and the big model checks
+  all the guesses in one step. When most guesses are accepted, the big model produces several tokens per step. The
+  lab's formula gives
+  <LabNumber lab="speculative-decoding" metric="Expected tokens per target call (per-token acceptance 0.82, K=5)" />
+  tokens per big-model call when each guess is accepted 82% of the time and the draft guesses 5 tokens ahead (the
+  lab uses mock models). Tokens per call is not the speedup, because the draft model costs time too, and the gain
+  shrinks as more users share each step.
+- **Continuous batching and prefix caching** come with the serving software. **Continuous batching** lets finished
+  requests leave the batch and new ones join between steps, instead of waiting for the whole batch to finish. Work out
+  its gain from your own mix of answer lengths rather than quoting a multiplier; published figures range from about
+  2× to 20×.
+
+## Failure modes and overload
+
+- **Provider rate limits at peak.** Latency jumps because the client retries 429s with backoff. Show retries per
+  request in traces. Send the overflow to a second key, model or provider instead of backing off against the same one.
+- **Spend cap reached.** Anthropic documents that at the monthly cap the API returns 429 without a retry-after header,
+  and SDK retries fail until the next month ([rate limits doc](https://platform.claude.com/docs/en/api/rate-limits)).
+  A feature with no budget alert finds out from customers.
+- **Runaway agent loops.** The square-of-the-steps growth above, with no step cap. Cap steps and dollars per run, and
+  alert on runs past the 99th percentile of steps.
+- **A long prompt starves the queue.** If you host the model, one 100,000-token prefill delays every request behind
+  it. Chunked prefill and admission by token budget bound the damage.
+- **Stale or poisoned cache.** An exact-match cache keyed without the model or prompt version serves old answers
+  after an upgrade. Put both in the key, and flush on a version change.
+- **Cheaper tier, silent quality loss.** Cost drops and complaints rise weeks later. Gate tier changes on an eval and
+  track quality per model in production afterwards.
+- **Overload on your own GPU.** When queued work would miss its deadline, reject it by priority tier with 429 and a
+  Retry-After header, instead of queueing without limit.
+
+<Pitfall title="Optimising the wrong stage">
+Proposing a bigger GPU or a new serving engine before a stage breakdown. If retrieval, reranking or serial calls own
+the p95, faster decode changes nothing the user sees. Measure per stage, then per request, then choose.
+</Pitfall>
+
+## Evals and observability
+
+- **A trace per request** with stage spans, tokens by kind (uncached, cached, output), model, time to first token,
+  time per output token, cost and feature tag. Generic tracing doesn't record tokens or cost; the planned
+  LLM-observability lab would cover these attributes.
+- **Dashboards:** p50 and p95 time to first token and full-answer time per feature and per prompt-length group; cost
+  per feature per day; cache hit rate; retries and 429s per provider key; cost per successful task.
+- **A quality gate on every lever.** Shorter prompts, cheaper tiers, quantised models and caches all change outputs.
+  Run the feature's eval set before and after, and track quality per model in production.
+- **Budget alerts** per feature (a soft alert at a share of the budget, a hard cap where the owner agreed) and an
+  anomaly alert on cost per request, which catches loops and prompt bloat early.
+
+Say: "Every cost lever is also a quality change, so each one ships behind the eval, like a schema change ships behind
+a migration test."
+
+## Trade-offs
+
+| Decision | Gain | Cost | Choose differently when |
+|---|---|---|---|
+| Stream and target the first token | Meets an interactive target | No retry after the first byte | Structured outputs nobody reads partially |
+| Rerank retrieved chunks | Better context, fewer tokens | Hundreds of ms on CPU (rag lab) | Tight first-token target and retrieval is already good |
+| Cheaper tier for easy requests | Large cost cut | Router errors; an eval per tier | Volume is small; quality differences are costly |
+| Prompt caching | Cost and first token | Prompt layout constraints | Prompts share no stable prefix |
+| Batch API | 50% off | Hours of delay | Someone waits for the result |
+| Self-host an open model | Privacy, control, cost at high steady load | GPUs, on-call, utilisation risk | Volume is low or bursty and no residency rule applies |
+| Semantic cache | Cost on near-repeats | Confident wrong answers | Wrong answers are cheap and requests repeat |
+
+<AINative title="Agents run the experiments; you choose the metric and check the arithmetic">
+Cost and latency work is a loop of small experiments: trim the prompt, change the chunk count, try a cheaper tier,
+re-run the eval, compare the dashboards. An agent can run that loop overnight: write the load script, sweep chunk
+counts, produce the eval diff and the cost table. What you verify yourself is the part an agent gets plausibly
+wrong: that the eval set represents real traffic, that cost per request uses the provider's reported usage including
+cached tokens, that percentiles come from per-request traces rather than summed stage p95s, and that a cheaper
+configuration did not win by failing quietly on a slice of users. Keep the eval set out of the agent's tuning loop,
+or it will optimise toward it.
+</AINative>
+
+## Small-team version
+
+At a company of 50–500 people, the bill and the slow-response complaints land on one person's desk. Most of the
+saving comes from token arithmetic, routing and caching, not new infrastructure. Surveyed teams mostly call hosted
+APIs: inference is the layer most often bought
+([Amplify Partners 2026](https://amplifypartners.com/blog-posts/the-2026-ai-engineering-report)), and 40% say cost
+regularly shapes their ambition.
+
+### Build, buy or skip
+
+- **Build:** a feature tag and token logging on every call (in your client library or gateway), a span per stage,
+  and a weekly cost-per-feature report. This is a day of work with an agent.
+- **Buy:** the provider's prompt caching and batch APIs, and a tracing tool, such as Langfuse, which stays open
+  source and self-hostable after joining ClickHouse ([Langfuse, 2026-01-16](https://langfuse.com/blog/joining-clickhouse)),
+  or a vendor.
+- **Middle path for open models:** an open-weight model on a **serverless endpoint** (a provider runs the open model
+  and bills per token, so you rent no GPUs). Together listed gpt-oss-120B at $0.15 in and $0.60 out per million
+  tokens ([Together pricing](https://www.together.ai/pricing), fetched 2026-10-11).
+- **Skip:** a semantic cache, a learned router and self-hosting until measured traffic justifies them.
+
+### The chatbot's monthly bill, five ways
+
+Take the same chatbot message and run it for a month. Assume 8 business hours a day and 22 working days. At 3.33
+requests per second that is 96,000 requests a day and about **2.11 million a month**. Each request is 3,000 input
+tokens (2,000 of them a cacheable prefix) and 300 output tokens. Cache-write charges and tokenizer differences are
+ignored, and quality is not compared.
+
+| Option | Per request | Per month |
+|---|---|---|
+| Claude Sonnet 5, caching | about half a cent | ≈ $11,400 |
+| gpt-5-mini, caching | about a tenth of a cent | ≈ $1,900 |
+| Claude Haiku 5.5, caching | about 0.03 cents | ≈ $570 |
+| gpt-oss-120B on Together, no cache discount assumed | about 0.06 cents | ≈ $1,330 |
+| Self-host Llama-3.1-8B on 2× A100 80GB, always on | fixed | $2,030–$2,320 for GPUs + ≈ $2,430 of engineer time |
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Requests: 3.33 requests/s × 28,800 s = 96,000 a day; × 22 days = 2.11 M a month.
+- Claude Sonnet 5: 1,000 × $2/M + 2,000 × $0.20/M + 300 × $10/M = $0.0054 per request → ≈ $11,400 a month.
+- gpt-5-mini: 1,000 × $0.25/M + 2,000 × $0.025/M + 300 × $2/M = $0.0009 → ≈ $1,900.
+- Claude Haiku 5.5: 1,000 × $0.10/M + 2,000 × $0.01/M + 300 × $0.50/M = $0.00027 → ≈ $570.
+- gpt-oss-120B on Together: 3,000 × $0.15/M + 300 × $0.60/M = $0.00063 → ≈ $1,330.
+- Self-host: two A100 80GB (one for load, one for redundancy) at RunPod's $1.39–$1.59 an hour, always on:
+  2 × $1.39–$1.59 × 730 h = $2,030–$2,320, plus ≈ $2,430 for 15% of an engineer: 15% of a loaded $194K a year, which is the BLS May 2025 median
+  software-developer wage of $135,980
+  ([BLS](https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm), fetched 2026-10-12)
+  divided by an assumed 0.70 for benefits and overhead, then ÷ 12.
+- One GPU's ceiling: 28 streams ÷ 13.8 ms per step ≈ 2,000 tokens per second, against 1,120 tokens per second of
+  peak demand.
+
+</details>
+
+Prices from [Anthropic](https://platform.claude.com/docs/en/about-claude/pricing),
+[OpenAI](https://developers.openai.com/api/docs/pricing), [Together](https://www.together.ai/pricing) and
+[RunPod](https://www.runpod.io/pricing), all fetched 2026-10-11.
+
+How to read it: if the privacy rule allows a provider with acceptable data terms, the managed options are cheaper
+than two always-on GPUs. Those GPUs serve about 1,120 tokens per second at peak, against a ceiling of about 2,000 on
+one GPU, and sit idle outside business hours. If the rule truly forbids sending data out, self-host, and know you are
+paying for privacy, not saving money. Say exactly that: "Self-hosting here is a privacy decision. On cost alone, a
+hosted endpoint wins at this volume."
+
+An outside analysis agrees. Cohorte's break-even analysis (2026-09-20) found that a rented 2× H100 node can't break
+even against the same open model on a serverless endpoint at business-hours duty cycles, and that self-hosted cost
+per million output tokens moves from $0.30 at full load to $12.77 at 10% load
+([Cohorte](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even)).
+
+### What you still own and verify
+
+- The eval set that every cost lever must pass, kept away from whoever is tuning.
+- Per-feature budgets and alerts, and the provider spend cap set on purpose, not discovered.
+- Step and dollar caps on any agent loop.
+- Cost per successful task, reported monthly, so a cheap feature that fails is visible.
+
+### Revisit when
+
+Steady volume reaches hundreds of millions of tokens a month at high utilisation; a residency rule forbids the API;
+the API bill threatens unit economics; or a fine-tuned small model beats the API on your own eval.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Latency and cost"
+  senior={[
+    "Breaks latency into stages and finds the dominant one from traces, without summing stage p95s.",
+    "Prices a request in tokens by class (uncached, cached, output) and multiplies out to a monthly bill.",
+    "Pulls the cheap levers first: trimming, caching, batch APIs, streaming, a cheaper tier behind an eval.",
+    "Does the GPU math for self-hosting: KV memory, decode floor, prefill time, utilisation.",
+  ]}
+  staff={[
+    "Turns targets into contracts: a per-feature budget, a per-run token cap, a p95 TTFT objective, each with an owner.",
+    "Attributes cost per feature and reports cost per successful task, so trade-offs are made by the people who own them.",
+    "Calls self-hosting a privacy or control decision unless measured volume and utilisation say otherwise, and names the number that would change it.",
+    "Keeps every lever reversible and gated on an eval that the tuning loop cannot see.",
+  ]}
+/>
+
+In plain words: a Senior answer finds the slow stage and the expensive token and fixes them with the cheap levers. A
+Staff answer also turns the targets into budgets with owners, and says which measured number would change the
+decision to self-host.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="Reported (OpenAI): after the diagnosis, where do batching and caching help?">
+    Batching helps a server you run: it spreads each step's weight reads across many requests, raising throughput and
+    cutting cost per token at a small latency cost per request. Caching removes work: prompt and prefix caching cut
+    prefill time and input cost, and an exact-match cache removes whole calls on repeats. Name the stage each one
+    targets.
+  </FollowUp>
+  <FollowUp q="Reported task (unnamed company): the full answer can't arrive in 2 seconds. What do you do?">
+    Stream, and define the target as p95 time to first token, then show the first-token budget per stage. If a
+    structured answer must be complete in 2 s, cap the output length and use a smaller or quantised model, and say
+    what quality it costs.
+  </FollowUp>
+  <FollowUp q="Aced list (Scale AI): the claims agent's token cost doubled after a prompt change. How do you find out why?">
+    Compare tokens by kind per claim before and after: steps per claim, input per step, cached share, output per
+    step. A broken cache prefix (a timestamp at the top of the prompt) or one extra step changes the
+    square-of-the-steps total sharply.
+  </FollowUp>
+  <FollowUp q="Interviewer-side post (PromptLayer): which model do you use for creative writing, and why?">
+    Give your current pick with the date and the evidence: the eval or side-by-side comparison you ran, what it cost
+    per task, and what would make you switch. An opinion with no date or evidence reads as a textbook answer.
+  </FollowUp>
+  <FollowUp q="Prep guide (Fireworks): TTFT doubled but GPU utilisation is unchanged. What is happening?">
+    Probably queueing or work on the CPU side: the scheduler queue, tokenisation or a starved CPU, which a GPU
+    utilisation graph can't show. Look at the timeline's queue-wait and pre-prefill segments, grouped by prompt
+    length.
+  </FollowUp>
+  <FollowUp q="Not reported; a natural next push: when would you add a semantic cache?">
+    When requests repeat in meaning, wrong answers are cheap, and you have measured the false-hit rate on labelled
+    pairs from real traffic. Savings are hit rate × cost per call; harm is hit rate × false-hit rate × cost of a
+    wrong answer.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Summing stage p95s.** The slow tails of different stages belong to different requests, as the Fireworks guide
+  warns (<Cite id="s-b6632d5df9" />). Take the request p95 from traces.
+- **Optimising before measuring.** The OpenAI screen asked for a diagnosis first (<Cite id="s-812dbc9385" />). Break
+  the request into stages, then change one thing at a time.
+- **Treating concurrent users as concurrent requests.** Most users are reading or typing; Little's law with a stated
+  message rate gives the real number.
+- **Promising a full 300-token answer in 2 s.** Decode speed makes that impossible; stream and make the first token
+  the target.
+- **Cost as an afterthought in agent designs.** Agent cost grows with the square of the steps, which is the Aced
+  model answer's point (<Cite id="s-d7a8e88bf0" />). Set a per-run token budget and step cap from the start.
+- **Textbook model rankings.** PromptLayer lists "Boring textbook answers" as a red flag (<Cite id="s-1205b0cc50" />).
+  Give dated picks backed by your own evals and prices.
+- **Self-hosting to save money at low volume.** Idle GPUs cost the same as busy ones; do the break-even arithmetic
+  with measured utilisation and labour.
+
+## Prove it with a lab
+
+There is no LLM-gateway or LLM-observability lab yet. These labs give real numbers for parts of the budget.
+
+<LabRef lab="rag" role="proof" note="Run its benchmark to get your own per-stage retrieval and rerank latency; then cut candidates from 20 to 10 and measure both latency and hit@3." />
+
+<LabRef lab="embedding-pipeline" role="proof" note="Measure batching gain and cache hit rate on your own text distribution before claiming either." />
+
+<LabRef lab="llm-inference" role="partial" note="Compute the KV cache for your model and context with its formula; it has no TTFT or TPOT measurement, so add timing spans as an exercise." />
+
+<LabRef lab="speculative-decoding" role="partial" note="Work the acceptance math for your draft and target; the models are mocks, so measured speedup is out of scope." />
+
+<LabRef lab="model-quantizer" role="partial" note="Compare per-group and per-tensor INT4 error; pair it with a task eval before claiming quality holds." />
+
+<LabRef lab="observability" role="partial" note="Fix the compile errors, then add token, cost and TTFT attributes to its spans." />
+
+The [platform gateway walkthrough](/system-design-labs/interviews/walkthroughs/llm-platform-gateway/) covers where
+feature tags, budgets and routing live, and the
+[RAG system design walkthrough](/system-design-labs/interviews/walkthroughs/rag-system-design/) covers the retrieval
+half of the chatbot.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-812dbc9385" />: OpenAI FDE technical screen (latency diagnosis, batching and caching)
+- <Cite id="s-ba9c761b13" />: candidate write-up of the open-model support chatbot task (2025-05-26)
+- <Cite id="s-d7a8e88bf0" />: Aced question list (Scale AI claims agent; model answer)
+- <Cite id="s-1205b0cc50" />: PromptLayer, interviewer-side post (2025-07-11)
+- <Cite id="s-b6632d5df9" />: PracHub Fireworks prep guide (TTFT timeline, admission)
+- <Cite id="s-8e443a8b66" />: NVIDIA A100 specifications; <Cite id="s-20bffa9709" />: Llama-3.1-8B config
+- <Cite id="s-4525fcd815" />: decode-bound explainer
+- [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing), [Anthropic rate limits](https://platform.claude.com/docs/en/api/rate-limits), [OpenAI pricing](https://developers.openai.com/api/docs/pricing), [Together pricing](https://www.together.ai/pricing), [RunPod pricing](https://www.runpod.io/pricing) (all fetched 2026-10-11)
+- [Cohorte, self-hosted LLM break-even](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even) (2026-09-20)
+- [Amplify Partners 2026 AI Engineering Report](https://amplifypartners.com/blog-posts/the-2026-ai-engineering-report); [Honeycomb on building with LLMs](https://www.honeycomb.io/blog/hard-stuff-nobody-talks-about-llm) (2024-08-24); [Langfuse joins ClickHouse](https://langfuse.com/blog/joining-clickhouse) (2026-01-16); [BLS software developers](https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm)

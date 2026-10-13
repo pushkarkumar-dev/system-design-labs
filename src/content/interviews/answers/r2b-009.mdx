@@ -1,0 +1,195 @@
+---
+question: r2b-009
+family: read-debug-unfamiliar-code
+status: published
+labs: [agent-framework, rag, llm-eval]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll start with what goes in and what comes out, then walk one PDF through the stages with the file and function
+> for each. Then I'll run one document with logging around the three places where data enters or leaves the
+> model, so I can explain the system from what the model actually received, not just from the code. I'll say
+> whether it's really an agent or a fixed pipeline, where it breaks, and how we'd know its scores are right."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you can build an accurate picture of an LLM system fast, and explain it at
+the right depth.
+
+Some terms first. A **large language model (LLM)** takes text in and produces text out. An **agent** is a program
+that calls an LLM in a loop and lets the model choose the next step, such as which function to call or when to
+stop. **RAG** (retrieval-augmented generation) means the code first searches your documents for the passages most
+relevant to the question, called **chunks**, and pastes them into the text sent to the model.
+
+Here is what makes explaining this code different from explaining a normal backend. In a normal service, the code
+*is* the behaviour: read the handler and you know what happens. In an LLM system, a big part of the behaviour is
+decided by text that is assembled at runtime: the instructions, the retrieved chunks and the model's reply. Two
+runs of the same code can behave differently because a different chunk was retrieved. So you can't explain it from
+the call graph alone. You have to look at what the model received and what it sent back.
+
+(Only the title of this question is candidate-reported: walking through an existing agentic PDF-evaluation
+codebase, tagged Senior+ in July 2026 <Cite id="s-0630fd2aff" />. Expect follow-ups on why it is built this way,
+where it breaks and how you'd know it works.)
+
+## Clarify first
+
+Ask, and state an assumption for each:
+
+- **Who is the audience, and how long do I have?** "I'll assume an engineer, 10–15 minutes, then questions."
+- **Can I run it, and is there a sample PDF?** "I'll assume yes; running it beats reading it."
+- **What does 'evaluation' mean here?** Grading a document against a **rubric** (a list of criteria with scores),
+  or evaluating the agent itself?
+- **Is the model real or mocked** in this environment?
+
+## Answer
+
+### Step 1: one paragraph of purpose, then one request path
+
+Say what goes in (a PDF and a rubric?), what comes out (a score, a structured report?), and the stages in between.
+Name the file and function for each stage. A typical shape, which you should redraw from the real code:
+
+```
+PDF + rubric
+   │
+   ▼
+Parse and chunk ── PDF text split into pieces
+   │
+   ▼
+Retriever ── picks the chunks relevant to each rubric item
+   │
+   ▼
+Prompt builder ── rubric + chunks + instructions = the rendered prompt
+   │
+   ▼
+LLM call ── text back, maybe a tool call written as JSON
+   │                    │
+   ▼                    ▼
+Output parser ◄── Tool dispatch (runs the function, feeds the result back)
+   │
+   ▼
+Aggregate ── per-item scores into one report
+```
+
+**Parse and chunk.** Turns the PDF into text and splits it, because the model can only read a limited amount at
+once. That limit is the **context window**.
+
+**Retriever.** Chooses which chunks the model sees. If it picks the wrong ones, the model grades the wrong text.
+
+**Prompt builder.** Fills a template with the rubric and chunks. The final text it produces is the **rendered
+prompt**, and it is the single most useful thing to look at.
+
+**LLM call and tool dispatch.** The model may ask to run one of your functions (a **tool call**), written as
+**JSON**, a small structured text format. Your code parses it, runs the function and sends the result back.
+
+**Output parser and aggregate.** Turn the model's reply into scores. This is where silent failures hide.
+
+### Step 2: find the three seams and trace them
+
+A **seam** is a place where data crosses into or out of the model. There are three: retrieval, the model call and
+tool dispatch. They decide the behaviour, so wrap them so that one run records what flows through:
+
+```python
+def traced(fn, log, name=None):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        t0 = time.perf_counter()
+        out = fn(*args, **kwargs)
+        log.append({"call": name or fn.__name__, "args": repr(args)[:200],
+                    "out": repr(out)[:200], "ms": round((time.perf_counter() - t0) * 1000, 1)})
+        return out
+    return wrapper
+
+retriever.search = traced(retriever.search, log)
+client.complete = traced(client.complete, log)
+```
+
+Then explain the system from the log, following one document. The right-hand column shows the kind of thing you might find; your log will differ:
+
+| Step in the log | What you look at | What to say in the interview |
+|---|---|---|
+| `search` | How many chunks came back, and how large | "For this rubric item it retrieved these chunks. This one is a table header, which is suspicious." |
+| `complete` input | The rendered prompt | "This is exactly what the model saw. Note the instructions ask for JSON." |
+| `complete` output | The raw reply | "Here's what came back, before any parsing." |
+| Parser | How the reply became a score | "If this doesn't parse, the code retries once and then defaults to zero." |
+
+The last line is the kind of thing you only learn by running it. A default of zero on a parse failure means a
+broken reply looks like a bad document.
+
+### Step 3: explain the control flow honestly
+
+Is it really an agent, where the model chooses the next step? Or is it a fixed pipeline that happens to call an
+LLM? What stops the loop: a step limit, a "done" tool, a cost budget? What happens when parsing fails: a retry, a
+default value, a crash?
+
+Say it like this: "Despite the name, this is a fixed pipeline. The model never chooses the next step; the code
+does. That's a good thing here, because it's easier to test."
+
+### Step 4: say where it breaks
+
+Have these ready:
+
+- **A long PDF exceeds the context window,** and the text is cut off without any error.
+- **Tables and scanned pages parse badly,** so the retriever works on garbled text.
+- **The model returns prose instead of JSON,** and the parser fails.
+- **Retrieval returns nothing,** and the model grades anyway.
+- **Scores drift when the model version changes.**
+
+This guide's agent-framework lab has a real instance of the parsing class: its parser can't read the nested
+tool-call JSON its own prompt asks for, so no tool call reaches the registry (2 of its 15 tests fail on this, as of
+2026-10-11).
+
+### Step 5: how you'd know it works
+
+Build a small labelled set of documents with expected scores. Measure agreement with human graders. Re-run the set
+on every prompt or model change, so a change that makes scores worse is caught before it ships. A set like this,
+used to score an LLM system, is called an **eval set**.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Explain an agent codebase"
+  senior={["Gives an accurate request path with file names, traces the model call, and lists concrete failure modes."]}
+  staff={["Questions whether it needs to be an agent, ties each failure mode to a test or eval, and says what they'd change first and why."]}
+/>
+
+In plain words: Senior explains the system correctly from what it does. Staff also asks whether it should be built
+this way, and links every risk to a check.
+
+## Small-team version
+
+Inherited AI code is the normal case at a small company: a prototype someone built with a framework, now in
+production. The first week's job is this exact walkthrough, plus turning on tracing of rendered prompts and raw
+outputs. Then build a 20–50 case labelled set, so the next change can be checked.
+
+Running that set is cheap: **about $2.50 per run** for 50 PDFs on Claude Sonnet 5, so run it on every prompt or
+model change. Labelling the 50 cases is the real cost, a day or two of someone who knows the documents.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+A **token** is the unit a model reads and bills by, roughly ¾ of a word. Assume each PDF uses 20,000 input tokens
+and 1,000 output tokens. At Claude Sonnet 5 list prices ($2 per million input tokens, $10 per million output
+tokens, fetched 2026-10-11):
+
+- Input: 20,000 × $2 ÷ 1,000,000 = $0.04 per PDF.
+- Output: 1,000 × $10 ÷ 1,000,000 = $0.01 per PDF.
+- 50 PDFs: 50 × ($0.04 + $0.01) = **$2.50** per run.
+
+</details>
+
+## Pitfalls
+
+- **Explaining the framework's abstractions instead of what this code does.** The interviewer asked about this
+  system, not the library.
+- **Never looking at a rendered prompt.** Without it, you are guessing what the model was told.
+- **Calling a fixed pipeline an agent, or the reverse.** The difference decides how you test it.
+- **No answer to "how do you know the scores are right?"** Without a labelled set, nobody knows.
+
+## Go deeper
+
+- Family walkthrough: [Read, explain and fix code you didn't write](/system-design-labs/interviews/walkthroughs/read-debug-unfamiliar-code/), stage 7.
+- Whether it should be an agent at all: [agent or workflow?](/system-design-labs/interviews/walkthroughs/agentic-workflow-design/)
+- Labs to practise explaining: <LabRef lab="agent-framework" inline />, <LabRef lab="rag" inline />, <LabRef lab="llm-eval" inline />.

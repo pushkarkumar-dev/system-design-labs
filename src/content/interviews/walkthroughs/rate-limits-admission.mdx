@@ -1,0 +1,785 @@
+---
+title: "Rate limits, credits and admission control for an LLM API"
+summary: "Limits for an LLM API in plain words: count tokens as well as requests, apply every rule in one atomic step, keep GPU credits as a ledger, and decide what to accept, queue or reject when the GPUs are full."
+track: ai-infra
+format: design
+family: rate-limits-admission
+smallTeamFocus: "Keep per-customer token quotas in your own database, reserve and refund per request, stay under the provider's limits and spend cap, and treat a spend-cap 429 differently from a rate-limit 429."
+rounds: [system-design, domain-deep-dive]
+level: both
+timeboxMin: 45
+order: 231
+status: published
+basedOn: [infra-060, infra-061, infra-062, infra-017]
+askedAt: [openai, xai, fireworks-ai]
+labs:
+  - { lab: rate-limiter, role: proof, note: "Token bucket, sliding window and a Redis-backed tiered limit. It counts requests, fails open on a store error, and its flaky concurrency test is a check-then-act race: the exact bug compound rules invite." }
+  - { lab: load-balancer, role: proof, note: "Circuit breaker after 5 consecutive 5xx and a 20% retry budget: the overload half of admission control." }
+  - { lab: kv-cache, role: background, note: "A Redis-style key-value cache, not an LLM KV cache: a place to practise atomic counters with TTLs." }
+gapLabs: [llm-gateway]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+"Design the limits in front of an LLM inference API."
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'd limit tokens, not just requests, because one request can cost a thousand times more than another. I don't
+> know how long the reply will be when the request arrives, so I reserve the most it could cost and refund the
+> rest when it finishes. One request matches several limits at once, per key, per organization, per model and per
+> day, so I check all of them and debit all of them in one atomic step. Prepaid credits are money, so I keep them
+> as an append-only ledger, not a balance column. And being under your limits doesn't mean the GPUs have room: a
+> separate admission step accepts, queues or rejects each request based on whether it can finish in time."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+### What makes this different from the rate limiter you already know
+
+You have probably built or used a rate limiter. A typical one says "100 requests per minute per API key". Each
+request costs about the same: a few milliseconds of CPU and a database read. So counting requests is a fair way to
+share the servers.
+
+An API in front of a large language model (**LLM**), a program that reads text and writes text, breaks that
+assumption in four ways:
+
+1. **Requests are not equal.** The model reads and writes text in small pieces called **tokens**; a token is
+   roughly ¾ of an English word. A request that sends 100 tokens and one that sends 100,000 tokens are both "one
+   request", but for a 70-billion-parameter model the second costs the GPU (the specialised chip that runs the
+   model) about 2,000 times more work: a thousand times more text, roughly doubled by the work that grows with the
+   square of the prompt length (worked out in the box below). A requests-only limit can't protect anything.
+2. **The cost is unknown when the request arrives.** You can count the tokens the caller sends. You can't know
+   how many tokens the model will write back until it has finished. The caller only gives an upper bound.
+3. **Several limits apply to the same request.** Providers limit each key, each organization, each model and
+   each day, in requests and in tokens. Checking them one at a time leaves gaps that concurrent requests slip
+   through.
+4. **"Full" means something different.** A web server that is busy just gets slower. A GPU server holds memory
+   for every request it is working on, for the many seconds it takes to write the reply. When that memory runs
+   out, new requests must wait or be turned away, even if the caller is well within its limits.
+
+Credits add a fifth twist: once customers prepay for GPU time, a limit becomes money, and money needs the rules
+you would use for payments.
+
+### Words you need first
+
+- **Input tokens** are the tokens the caller sends (the **prompt**: instructions, history and the new message).
+  **Output tokens** are the tokens the model writes back. Providers count and price them separately, because
+  writing is slower per token than reading.
+- **`max_tokens`** is a field the caller sets on each request: the most output tokens the model may write. It is
+  the only thing you know about the output when the request arrives.
+- **RPM** and **TPM** are requests per minute and tokens per minute. Anthropic splits TPM into **ITPM** (input
+  tokens per minute) and **OTPM** (output tokens per minute).
+- A **token bucket** is the classic limiter: a bucket holds up to N units and refills at a steady rate; each
+  request takes units out and is refused when there aren't enough. (The word "token" here is the limiter's unit,
+  not an LLM token. On this page the bucket's units are LLM tokens, so the two happen to line up.)
+
+### Where this was asked
+
+Four reported prompts share this problem, and all four rest on thin evidence, so treat each as a title, not a spec:
+
+- **A distributed rate limiter for an LLM inference API**, from an OpenAI Senior software-engineer loop, seen only
+  as a Glassdoor search snippet because the page itself returned HTTP 403 (<Cite id="s-3b9dae2c4c" />).
+- **A GPU credit management system**, tagged OpenAI on a company-tagged question list (<Cite id="s-5fa409d1c2" />).
+- **Rate limiters that enforce compound rules** (several limits on one request), listed for xAI in a university
+  career-blog post seen as a snippet (<Cite id="s-a297e9309b" />).
+- **Admission control for a serving fleet**: which requests to accept, queue or reject when GPUs are saturated.
+  A PracHub prep guide for Fireworks AI lists it among technical-review topics, next to reading a time-to-first-token
+  timeline. It is the site's own guide, not a candidate report (<Cite id="s-b6632d5df9" />).
+
+<QuestionRow id="infra-060" />
+<QuestionRow id="infra-061" />
+<QuestionRow id="infra-062" />
+<QuestionRow id="infra-017" />
+
+Read together they make one design: a limiter that counts tokens, applies several rules at once, draws down a
+prepaid balance, and sits in front of a scheduler that can say "not now". The serving system behind it is the
+[ChatGPT-style serving walkthrough](/system-design-labs/interviews/walkthroughs/chat-serving-streaming/).
+
+## What is being tested
+
+No source gives a rubric for these prompts. What follows is what the problem demands, checked against how two
+public LLM APIs actually limit traffic.
+
+- **Do you pick the right unit?** Anthropic measures requests, input tokens and output tokens per minute for each
+  model class; OpenAI measures requests and tokens per minute and per day
+  ([Anthropic rate limits](https://platform.claude.com/docs/en/api/rate-limits),
+  [OpenAI rate limits](https://developers.openai.com/api/docs/guides/rate-limits), both fetched 2026-10-12). An
+  answer that counts only requests misses the point of the question.
+- **Do you handle the unknown cost?** The two providers solve it differently. OpenAI's limit is "calculated as the
+  maximum of `max_tokens` and the estimated number of tokens", which is a reservation. Anthropic says OTPM is
+  "evaluated in real time as output tokens are produced" and "`max_tokens` parameter does not factor into OTPM".
+  Knowing that both designs exist, and what each costs, is a strong signal.
+- **Do you apply several rules atomically?** Per key, per organization, per model, per minute and per day, all on
+  one request. "Check every rule, then debit every rule" must be one step, or two requests race through the gap.
+- **Can you put a number on accuracy?** A central counter is exact but adds a network round trip. Counters kept on
+  each gateway are fast but let some extra traffic through. The question is how much extra you accept, stated as a
+  number.
+- **Do you treat credits as money?** Grants, holds, consumption and expiry need a ledger, idempotency and
+  reconciliation, not a mutable balance column.
+- **Do you know overload is about deadlines?** A request that will miss its deadline should be rejected now,
+  cheaply, not after it has waited in a queue and used GPU time.
+
+## Clarify and scope
+
+Two words first. **Overshoot** means traffic let through above a limit. Letting traffic through when the limit
+store is down is called **failing open**; blocking it is **failing closed**. Both come back in the deep dives.
+
+Spend two minutes pinning down the setup. Say each assumption out loud and write it down:
+
+| Question | Why it matters | Assumption to write down |
+|---|---|---|
+| Who is limited? | Shapes the keys | API key inside a project inside an organization; plus a global pool per model |
+| In what units? | Shapes the counters | Requests, input tokens and output tokens; GPU-hours for credits |
+| Which time windows? | Shapes the bucket | Per minute (smooth, token bucket) and per day or month (a hard quota) |
+| How exact? | Central or local counting | Up to about 5% overshoot of a per-minute limit is fine; anything tied to money is exact |
+| Store outage: let traffic through or block it? | Availability against cost | Let through for paid per-minute limits, with a local fallback; block when prepaid credit is gone |
+| How much traffic? | Store load | 2,000 requests a second at peak, 1,500 input + 300 output tokens each (assumed) |
+| Regions? | Counter replication | One primary region; other regions get a fixed share of global limits |
+| Credits: prepaid, expiring, refundable? | Ledger rules | Prepaid grants with expiry dates; promotional grants are spent first |
+
+Out of scope: pricing, invoicing and tax; abuse detection beyond limits; the inference engine itself.
+
+### The example we follow through this page
+
+One organization, **Acme** (made up), runs through every section. Its numbers are assumptions:
+
+- Acme's organization limit is **40 million tokens per minute** (40 M TPM).
+- A typical Acme request sends **1,500 input tokens** with `max_tokens` set to **1,000**. The model actually writes
+  **300 output tokens**.
+- Acme is on the paid tier. The same API also serves a free tier and batch jobs.
+- Acme also prepays for GPU time to run a fine-tuning job (training the model further on its own data) estimated
+  at **8 GPUs for 3 hours**.
+
+Say: "Let me follow one Acme request through the design, then one Acme job through the credit system."
+
+## Back-of-envelope
+
+Seven numbers come before any boxes. Each is explained in words here with its result; the derivations are in the
+box at the end of this section.
+
+### 1. The gateway handles hundreds of millions of tokens a minute
+
+At 2,000 requests a second with 1,800 tokens each, the gateway sees **216 million tokens a minute**. Acme's 40 M
+TPM limit refills at about **666,667 tokens a second**. These numbers tell you a token counter changes by
+thousands on every request, not by one.
+
+### 2. The limit store needs about 4,000 operations a second
+
+Each request touches the store twice: once to **reserve** (take tokens out before the model runs) and once to
+**settle** (put back what wasn't used, after it finishes). That is **4,000 store operations a second**, each
+touching five counters. That is small for one in-memory store, but check your store's measured rate rather than a
+quoted one. Charging per streamed token instead would be **600,000 writes a second** just for output, which is why
+nobody does it that way.
+
+### 3. Reserving the worst case and never refunding wastes 28% of the limit
+
+The gateway reserves what the request *could* cost: 1,500 input tokens plus the 1,000 `max_tokens`, so **2,500**.
+When the reply finishes at 300 tokens, the real cost is **1,800**, so the meter refunds **700**.
+
+Why the refund matters: if Acme were charged 2,500 per request, its 40 M limit would admit **16,000 requests a
+minute**. Charged the real 1,800, it admits about **22,200**. Without refunds Acme loses about **28%** of the
+throughput it paid for.
+
+Say: "Reserve the worst case so we never go over, then refund at completion so the customer gets what they paid
+for."
+
+### 4. A fixed one-minute window lets through twice the limit
+
+A **fixed window** resets a counter at the top of every minute. A caller can spend the whole limit at 0:59 and
+the whole limit again at 1:00: **up to 2× the limit in two seconds**. A token bucket refills continuously and caps
+any burst at the bucket's size. Anthropic documents exactly this choice: "capacity is continuously replenished up
+to your maximum limit, rather than being reset at fixed intervals", and notes a 60 RPM limit "might be enforced as
+1 request per second".
+
+### 5. One busy customer becomes one hot key, and leases fix it
+
+At 40 M TPM and 1,800 tokens per request, Acme can send about **370 requests a second**. Two store operations each
+means about **741 operations a second on one key**, and all of them land on the same shard of the store.
+
+The fix is a **lease**: each gateway node takes a block of tokens from Acme's central bucket and spends it
+locally, going back to the store only when the block runs out. Assume 20 gateway nodes and a lease of 50,000
+tokens. The worst case is that every node holds a full unused lease when Acme hits its limit, so the overshoot is
+at most **1 million tokens, 2.5% of a minute's limit**. In exchange, the store sees about **13 lease renewals a
+second** instead of 741 operations.
+
+Say: "I'd pick the overshoot I can accept first, then size the lease from it."
+
+### 6. The admission queue has a useful maximum length: about 52
+
+On the serving side, assume one GPU node can work on 699 conversations at once and each reply takes about 20
+seconds (the chat-serving walkthrough's numbers). It finishes about **35 requests a second**. The delay before the
+first word of the reply appears is called **time to first token (TTFT)**. If the free tier's TTFT budget leaves
+1.5 seconds for waiting in the queue (assumed), then a queue longer than about **52** requests guarantees that the
+next one misses its deadline. So the 53rd free request should be rejected at once.
+
+### 7. A GPU-hour buys about 8 million output tokens at best
+
+If credits are counted in **GPU-hours** (one GPU for one hour) and inference draws on them, you need a conversion
+rate. At peak, one 8-GPU node writes about 18,500 tokens a second and reads prompts at about 56,100 tokens a second
+(chat-serving walkthrough). That gives **0.12 GPU-hours per million output tokens** and **0.040 GPU-hours per
+million input tokens**. These are floors at full use; a real rate adds headroom for idle capacity.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Tokens per minute at the gateway"
+  expr="TPM = requests per second × (input + output tokens) × 60"
+  vars={[
+    { sym: 'requests per second', meaning: '2,000 at peak (assumed)' },
+    { sym: 'input + output', meaning: '1,500 + 300 = 1,800 tokens (assumed)' },
+  ]}
+  example={[
+    '2,000 × 1,800 × 60 = 216 M tokens per minute',
+    'A 40 M TPM organization limit refills at 40,000,000 ÷ 60 ≈ 666,667 tokens per second',
+  ]}
+/>
+
+- **A long prompt versus a short one** (Llama-3.1-70B shapes, reading cost ≈ 2 × parameters × n + 2 × layers ×
+  hidden size × n²): at n = 100 that is about 1.41 × 10¹³ operations; at n = 100,000 it is 1.41 × 10¹⁶ +
+  1.31 × 10¹⁶ ≈ 2.72 × 10¹⁶, about **1,900×** more, so "about 2,000×".
+- **Store load:** 2,000 requests × 2 operations = 4,000 per second. Per-token charging: 2,000 × 300 = 600,000
+  writes per second for output alone.
+
+<Formula
+  title="Reserve and refund"
+  expr="reserve = input_tokens + max_tokens;  refund = reserve − (input_tokens + actual_output_tokens)"
+  vars={[
+    { sym: 'max_tokens', meaning: 'the cap the caller sets; 1,000 here' },
+    { sym: 'actual_output_tokens', meaning: 'known only at completion; 300 here' },
+  ]}
+  example={[
+    'Reserve 1,500 + 1,000 = 2,500; refund 700; charge 1,800',
+    'Under 40 M TPM, never refunding admits 40 M ÷ 2,500 = 16,000 requests per minute instead of 40 M ÷ 1,800 ≈ 22,200: 28% less throughput',
+  ]}
+/>
+
+- **Hot key:** 666,667 ÷ 1,800 ≈ 370 requests per second; × 2 operations ≈ 741 store operations per second.
+
+<Formula
+  title="Lease overshoot bound"
+  expr="worst-case overshoot ≤ gateway nodes × lease size"
+  vars={[
+    { sym: 'gateway nodes', meaning: '20 (assumed)' },
+    { sym: 'lease size', meaning: 'tokens a node takes from the central bucket at once; 50,000 here' },
+  ]}
+  example={[
+    '20 × 50,000 = 1 M tokens, 2.5% of a 40 M per-minute limit',
+    'Renewals: 666,667 ÷ 50,000 ≈ 13 per second instead of 741 store operations',
+  ]}
+  note="Unused lease returns to the bucket when a node's demand drops or its lease expires."
+/>
+
+- **Admission queue (Little's law):** completion rate = 699 slots ÷ 20 s ≈ 35 per second. Useful queue length =
+  35 × 1.5 s ≈ 52. The 53rd request will miss its deadline.
+- **Credits in GPU units:** 1 M output tokens ÷ 18,500 per second ≈ 54 s on an 8-GPU node, so 8 × 54 ÷ 3,600 =
+  0.12 GPU-hours. 1 M input tokens ÷ 56,100 per second ≈ 17.8 s, so 8 × 17.8 ÷ 3,600 = 0.040 GPU-hours.
+
+</details>
+
+## High-level design
+
+Here is the whole path, top to bottom. Limits are checked once, atomically, at the edge. Admission happens per
+serving pool. Usage settles back into the counters and the credit ledger.
+
+```
+Client (Acme's API key)
+   │ 1. request: 1,500-token prompt, max_tokens 1,000
+   ▼
+Edge gateway ── checks the key, finds project / org / tier / model, counts prompt tokens
+   │ 2. one atomic "reserve 2,500" across every matching rule
+   ├────────────► Limit store ── buckets: key RPM, key TPM, org TPM, model-pool TPM, org per day
+   │ 3. prepaid? check credit balance minus open holds
+   ▼
+Admission control (one per GPU pool) ── queue by class, each with a deadline;
+   │                                     admit when the GPUs have memory free
+   │ 4. the model reads the prompt and writes the reply
+   ▼
+GPU pool ── writes 300 tokens and streams them back
+   │ 5. usage event: request id, 1,500 in, 300 out
+   ▼
+Meter ── settles the reservation: refund 700, once per request id
+   │ 6. capture entry
+   ▼
+Credit ledger ── grants, holds, captures, releases, expiries
+```
+
+**Edge gateway.** It authenticates the key, looks up which project, organization, tier and model the request
+belongs to, and counts the prompt's tokens. Then it runs one compound reserve against the limit store, or against
+a local lease for a hot customer. If any rule refuses, it returns HTTP 429 naming the rule that blocked and a
+`Retry-After` worked out from how fast that bucket refills.
+
+**Limit store.** A fast shared store, such as Redis, holding one token bucket per rule and scope. The reserve runs
+inside the store as one script, so no other request can interleave with it.
+
+**Credit check.** For prepaid organizations, the gateway also checks that the credit balance minus open holds
+covers the reservation. This read can be cached for a few seconds; the hold itself is written at admission.
+
+**Admission control.** This is separate from limits. A caller within its limits can still be told "not now"
+because the GPUs are full. It queues requests by tier with a deadline, admits them when GPU memory is free, and
+returns HTTP 503 when the queue is longer than the deadline allows.
+
+**GPU pool.** The servers that run the model. Each request holds GPU memory for as long as its reply is being
+written. That held memory is called the **KV cache**: the model's saved working state for one conversation. It is
+what limits how many requests a GPU node can run at once.
+
+**Meter.** When a request completes, is cancelled or fails, the pool emits a usage event with a unique id. The
+meter settles the reservation (refunds the difference) and posts a consumption entry to the ledger. Because the
+event has a unique id, a retried event is ignored instead of charged twice. This property is called being
+**idempotent**.
+
+**Credit ledger.** An append-only list of entries per organization: grants, holds, captures, releases and
+expiries. Balances are computed from the entries, never stored as the only truth. An hourly job compares ledger
+totals with metered usage.
+
+### Acme's request through the boxes
+
+| Step | What happens to Acme's request | What to say in the interview |
+|---|---|---|
+| **1. Gateway** | Key checked; 1,500 prompt tokens counted. | "I count input tokens at the edge; I can't count output yet." |
+| **2. Reserve** | 2,500 tokens taken from key TPM, org TPM, model-pool TPM and org-per-day; 1 from key RPM. All in one script. | "Check every rule, then debit every rule, as one step." |
+| **3. Credits** | Acme pays as it goes, so no hold. A prepaid customer would get a hold here. | "Prepaid balances fail closed: no balance, no request." |
+| **4. Admission** | Paid-tier queue has room within its deadline; the request waits until GPU memory is free. | "Being under your limit doesn't mean the GPUs have room." |
+| **5. GPUs** | The model writes 300 tokens and streams them back. | "The real cost is only known now." |
+| **6. Meter** | Usage event settles: 700 tokens go back to every token bucket. | "Settle is idempotent on the request id, so a retried event can't refund twice." |
+
+### Three different kinds of "no"
+
+This design produces three different refusals, and callers must be able to tell them apart:
+
+- **429, over your limit.** "Wait this long, then retry." It carries `Retry-After`.
+- **503, we are overloaded.** "Retry later, or try elsewhere." It also carries `Retry-After`.
+- **Your prepaid balance is gone.** This should not look retryable at all.
+
+Anthropic's API makes the same split: its spend-cap 429 has no `retry-after` and carries
+`enforced_spend_limit_reached`, so clients don't retry until the month resets.
+
+Say: "If every refusal looks the same, well-behaved clients retry the wrong ones and make overload worse."
+
+## Deep dives
+
+### Compound rules in one atomic step
+
+Model each rule as four fields: which part of the request it is keyed on (the key, the organization, the model),
+the unit (requests or tokens), the bucket size, and the period. Acme's request matches five rules: key RPM, key
+TPM, organization TPM, model-pool TPM and organization tokens per day.
+
+The check must look at all of them before debiting any of them. Here is what goes wrong otherwise:
+
+- **Wasted capacity.** A request passes the key rule, gets debited, then fails the organization rule. The key
+  capacity is gone for a request that never ran.
+- **Races.** Two requests arrive together. Both read "room for one more" on the organization bucket, both
+  debit, and the organization goes over its limit. This is a **check-then-act race**: the check and the action
+  are separate steps, and another request runs between them.
+
+A minimal in-process version, with the refund path. The lock makes the check-and-debit one step:
+
+```python
+class CompoundLimiter:
+    """Every rule that matches a request must have room, or nothing is debited."""
+    def __init__(self, rules, clock=time.monotonic):
+        # rules: {name: (scope_field, unit, capacity, per_seconds)}, unit "requests" or "tokens"
+        self.rules, self.clock = rules, clock
+        self.buckets, self.lock = {}, threading.Lock()
+
+    def reserve(self, req, est_tokens):
+        now = self.clock()
+        with self.lock:
+            need = []
+            for name, (field, unit, _, _) in self.rules.items():
+                b = self._bucket(name, req[field], now)      # token bucket per (rule, scope)
+                b.refill(now)                                # continuous refill
+                need.append((name, unit, b, 1 if unit == "requests" else est_tokens))
+            for name, _, b, n in need:                       # 1) check every rule
+                if b.level < n:
+                    return False, None, name, (n - b.level) / b.rate   # blocking rule, Retry-After
+            for _, _, b, n in need:                          # 2) then debit all of them
+                b.level -= n
+            return True, [b for _, unit, b, _ in need if unit == "tokens"], None, 0.0
+
+    def refund(self, holds, est_tokens, actual_tokens):
+        back = max(0, est_tokens - actual_tokens)
+        with self.lock:
+            for b in holds:
+                b.level = min(b.capacity, b.level + back)
+```
+
+When a rule refuses, the method returns its name and the wait time: the missing tokens divided by the bucket's
+refill rate. That number becomes the `Retry-After` header. A refund goes back to the token buckets only, never the
+request counter, because the request really did happen.
+
+Four tests passed on 2026-10-12 under Python 3.13.7 in the guide's scratch environment: a request that fits its
+key rule but not its organization rule debits nothing; a refund restores `reserve − charge` (1,800 charged of
+2,500 reserved) but never the request count; a bucket refills 1,000 tokens in 6 s at 10,000 per minute; and 16
+threads hammering one organization are granted exactly its 15,000-token capacity, no more.
+
+**In a shared store** the lock becomes one server-side operation per request: a Lua script in Redis (Redis runs a
+script start to finish without interleaving other commands), or a single transaction in Postgres. The script reads
+every bucket, refills it, checks, and debits. Two practical details:
+
+- **Keep a request's keys together.** A sharded Redis can only run one script on one shard. Put the organization
+  id in a **hash tag** (a part of the key name in braces that Redis uses to pick the shard), so the key, project
+  and organization counters land on the same shard. A global per-model pool spans organizations, so it lives
+  elsewhere. Reserve in the pool first, then run the organization script, and release the pool reservation if the
+  second step fails. Say plainly that this pair is not one transaction, and that the pool can briefly look fuller
+  than it is.
+- **Return the blocking rule.** Report which rule refused and when it will have room, in headers like the
+  providers do (`x-ratelimit-remaining-tokens`, `anthropic-ratelimit-tokens-remaining`). Callers can't back off
+  correctly without it.
+
+Rule interactions are policy, and worth stating: the most restrictive rule wins, and a lower-level limit never
+raises a higher one. Anthropic documents this for its workspaces: "Organization-wide limits always apply, even if
+Workspace limits add up to more" ([rate limits](https://platform.claude.com/docs/en/api/rate-limits), fetched
+2026-10-12).
+
+### Reserve the maximum, or count output as it streams?
+
+This is the design choice where the two big providers differ, so expect it as a follow-up.
+
+- **Reserve and refund** (OpenAI's documented approach, as above). The caller can never go over the limit. The
+  cost is throughput: until the refund lands, capacity sits reserved for tokens that will never be written. In
+  Acme's case that is 28% if refunds never happened, and a smaller, shorter-lived gap when they do.
+- **Count output as it is produced** (Anthropic's documented approach for OTPM). Nothing is held back, so
+  capacity is fully used. The cost is possible overshoot: several long replies already running can push a
+  customer past its output limit before the counter catches up.
+
+Say: "Reserving protects the limit and costs throughput. Counting live protects throughput and risks a short
+overshoot. If the limit protects money, I reserve. If it protects GPU time and a little overshoot is fine, I count
+live."
+
+### Exact, fast, or regional: where the counter lives
+
+| Option | Accuracy | Added latency | Use for |
+|---|---|---|---|
+| Central store, one call per request | Exact | One store round trip | Most traffic; daily and monthly quotas |
+| Local leases from a central bucket | Overshoot ≤ nodes × lease | Near zero on the hot path | Hot organizations (Acme's 741 → 13 operations per second) |
+| Purely local buckets, limit ÷ nodes | Wrong when load is uneven across nodes | Zero | Abuse limits where precision doesn't matter |
+| Per-region split of a global limit | Exact per region, but some capacity sits unused in quiet regions | Zero cross-region | Multi-region, rebalanced every few minutes from usage |
+
+**Fail open or fail closed** is a per-rule decision, not a global one. Failing open on a per-minute limit for a
+paid customer protects availability and costs a few minutes of overshoot; the GPU admission layer is the real
+backstop. Failing open on a prepaid balance gives away money. When the store is down, fall back to local buckets
+at each node's share of the limit rather than to no limit at all.
+
+**Reservation leaks.** A gateway that crashes between reserve and settle never refunds, and the customer is
+throttled below its limit. Give every reservation an id and a time-to-live (TTL) equal to the longest allowed
+request. A sweeper refunds expired ones, and the meter's settle is idempotent on that id, so a late settle after
+the sweep doesn't refund twice.
+
+**Clocks.** Refill each bucket using the store's clock inside the script, not each gateway's clock. Gateways
+whose clocks disagree would otherwise refill the same bucket at different rates.
+
+### GPU credits are a ledger, not a balance
+
+A credit system answers four questions: what was granted, what is reserved, what was consumed, and what expired.
+If you keep a single "balance" number you can answer none of them after the fact, you can't tell which grant
+expired, and a retried charge silently takes money twice.
+
+Keep append-only entries per organization instead. Here is Acme's fine-tuning job:
+
+| Entry | Meaning | Acme's example |
+|---|---|---|
+| `grant` | Credit added, with an expiry | +1,000 GPU-hours purchased, expires 2027-10-01; +100 promotional, expires 2026-11-01 |
+| `hold` | Credit set aside for work about to run | −24 GPU-hours for the job (8 GPUs × 3 h) |
+| `capture` | Credit actually used, metered | −0.133 GPU-hours per minute of the job (8 GPU-minutes) |
+| `release` | The unused part of a hold, given back | + whatever the job didn't use when it ends |
+| `expire` | What was left of a grant at its expiry | − the remaining part of a grant at its expiry time |
+
+The rules that make it correct:
+
+- **Available = grants − captures − open holds − expiries.** Admission checks "available", not "balance".
+- **Spend the earliest-expiring grant first,** so Acme's promotional 100 hours are used before its purchased
+  credit. Record which grant each capture drew from; expiry and refunds need it.
+- **Idempotent metering.** Each usage event carries a unique key, `(job id, minute)` for jobs or the request id for
+  inference, so a retried event can't double-charge.
+- **A zero-balance policy for running work.** Stop admitting new work at zero. For running jobs, decide in
+  advance: allow a small overdraft (a negative floor), or save the job's progress (a **checkpoint**) and stop it.
+  Long jobs need fresh holds in chunks as they run, not one hold at the start.
+- **Reconcile.** Hourly, compare ledger captures with the GPU-seconds in the scheduler's own records, and alert
+  on any gap above a small threshold. The ledger is the source of truth for money; the scheduler is the source
+  of truth for time.
+
+Say: "Credits are money, so I'd build them like payments: append-only entries, idempotent charges, and a
+reconciliation job against the system that actually did the work."
+
+Hello Interview lists "a credit-tracking service" among OpenAI's practical coding problems
+(<Cite id="s-4d55d9b987" />); the coding version (expiring credits, changing requirements) is in the
+[multi-part practical coding walkthrough](/system-design-labs/interviews/walkthroughs/multipart-practical-coding/).
+
+### Admission control when the GPUs are full
+
+Limits answer "is this caller entitled?". Admission answers "can we serve this in time?". When a GPU pool
+saturates, each new request gets one of four outcomes:
+
+1. **Accept** if the GPUs have KV-cache memory for the prompt plus a reserve for the reply, and a slot is free.
+2. **Queue** by priority class, with the request's deadline attached. The Google SRE book's criticality levels
+   are a usable vocabulary: `CRITICAL_PLUS`, `CRITICAL`, `SHEDDABLE_PLUS`, `SHEDDABLE`, the last for "traffic for
+   which frequent partial unavailability and occasional full unavailability is expected"
+   ([Google SRE book, Handling Overload](https://sre.google/sre-book/handling-overload/), fetched 2026-10-12).
+   Map paid interactive traffic to the top and free and batch traffic to the bottom.
+3. **Reject now** when the queue already holds more than the deadline allows (52 in the example above), and drop
+   queued requests whose callers have disconnected. Rejecting at the edge costs microseconds. Serving a request
+   whose caller already gave up costs a full read of its prompt on the GPUs.
+4. **Degrade** before rejecting, where the product allows: cap `max_tokens`, cap the context length (how much
+   earlier conversation the model is given to read), or route free traffic to a smaller model.
+
+The measure that tells you whether this works is **goodput**: requests finished within their deadline per
+second. Raw throughput can stay high while goodput collapses, because the GPUs are busy finishing replies nobody
+is waiting for.
+
+**Admission has to survive its own clients.** Every rejected request comes back as a retry. The SRE book measures
+uncontrolled retries growing load "to somewhere just below 3X", and a 10% per-client retry budget reducing it "to
+just 1.1x"; it also says retry only "at the layer immediately above the layer that is rejecting them". For
+client-side throttling it describes letting requests run until they are K times accepts, and "We generally prefer
+the 2x multiplier."
+
+## Failure modes and overload
+
+| Failure | What you see | What to do |
+|---|---|---|
+| Limit store slow or down | Gateway latency rises; errors | Per rule, fail open or closed; local fallback buckets at each node's share |
+| One hot organization | One shard saturated | Leases for that key; split its counters by rule |
+| Reservations never settled | Customers throttled below their limit | Reservation TTL and sweeper; idempotent settle |
+| Stream ends without a usage record | Lost revenue or a lost refund | Charge the reservation by default; reconcile from serving logs |
+| Retry storm after an overload | Up to 3× load on a pool already full | Retry budgets, `Retry-After`, client-side throttling, reject early |
+| Clocks differ across gateways | Buckets refill at different rates | Refill using the store's clock inside the script |
+| Credit grant expires mid-job | Job stops unexpectedly | Re-hold periodically; warn before expiry; decide the overdraft policy in advance |
+
+<Pitfall title="One counter, one unit">
+A single requests-per-minute counter can't protect an LLM API. A 100-token request and a 100,000-token request
+differ in the GPU work to read them by about 2,000×. Count input and output tokens separately (they cost
+different amounts of GPU time), and keep the request counter for abuse.
+</Pitfall>
+
+## Evals and observability
+
+What to put on the dashboard, and why each line is there:
+
+- **Rejections by rule and by tier**, as a rate. A rule that never fires is set wrong; one that fires on most of
+  a customer's traffic is a support ticket waiting to happen.
+- **Measured overshoot**: tokens granted per window divided by the limit, per rule. With leases this should stay
+  under the bound you computed (2.5% in Acme's case).
+- **Reservations older than the longest allowed request.** This is the leak detector.
+- **Limit-store p99 latency** and how often the gateways fall back to local buckets.
+- **Admission**: queue wait per class, rejections by reason (limit, overload, balance), and goodput, not raw
+  throughput.
+- **Ledger**: the reconciliation gap between captures and scheduler GPU-seconds; holds older than their job;
+  grants expiring in the next 7 days.
+- **Customer view**: remaining tokens and reset time in response headers, and a usage page. Customers who can see
+  their limits retry less.
+
+Test the limiter like a concurrency primitive. Write a property test that no window ever grants more than the
+bucket holds while many threads hammer it, plus a fault test that kills the gateway between reserve and settle
+and checks that the sweeper gives the tokens back.
+
+## Trade-offs
+
+| Decision | What you gain | What you give up | Choose differently when |
+|---|---|---|---|
+| Reserve `max_tokens` at admission | Never over the limit | Throughput (28% in the example) until refunds land | Output is short and predictable: reserve an estimate, settle actual |
+| Count output in real time (Anthropic's model) | No over-reservation | Possible overshoot while long replies stream | Strict cost caps matter more than utilization |
+| Token bucket | Smooth refill, bounded burst | Slightly more state than a counter | You need calendar quotas: a fixed daily or monthly window |
+| Central store | Exact | A round trip per request | Hot keys: leases |
+| Fail open on per-minute limits | Availability during store outages | Bounded overshoot | Prepaid money: fail closed |
+| Ledger entries | Auditable, reversible, expiry-aware | More rows; balances must be computed | Never for money |
+| Reject on deadline | Goodput holds under overload | Some callers see errors sooner | Batch traffic with no deadline: queue it durably instead |
+
+<AINative title="Agents as callers, and agents as authors">
+Agent loops change the traffic: each step resends a growing context, so one agent run can consume many requests'
+worth of input tokens, and it retries automatically. Per-run token caps and per-key concurrency caps belong
+alongside per-minute limits. On the build side, an agent writes a token bucket and a Lua script quickly, and
+gets the subtle parts wrong in plausible ways: debiting one rule before checking the next, refilling with the
+caller's clock, refunding twice after a retry. The rate-limiter lab's own intermittent test failure is a
+check-then-act race of exactly this kind. What you verify yourself: a many-thread test that the total granted
+never exceeds capacity, a crash-between-reserve-and-settle test, and the fail-open or fail-closed choice per
+rule, which is a business decision no agent should make.
+</AINative>
+
+## Small-team version
+
+At a 50–500 person company you rarely run an inference API for outsiders. You do expose AI features to your own
+customers, pay a provider per token, and live under the provider's limits. Three limits stack on top of each
+other: your customer's plan, your organization's limits at the provider, and the provider's monthly spend cap.
+
+### Build
+
+- **Per-customer token quotas** in the database you already run. A monthly quota is one row per customer per month
+  with a "reserved" and a "used" column; update it in one transaction at reserve and at settle. Minute-level limits
+  go in Redis if you have it, or a token bucket in each app process if you run a handful of instances.
+- **Reserve and refund using the provider's reported usage.** Providers report token usage on every response;
+  check how yours reports it on a streamed response, and settle from that, not from your own estimate.
+- **One shared guard for the provider limit.** All your users share one organization limit at the provider.
+  Anthropic's Start tier lists 1,000 RPM, 2,000,000 input and 400,000 output tokens per minute for Sonnet 5. For
+  most models only uncached input counts toward the input limit. (Cached input is input the provider stored from
+  an earlier request with the same prefix, billed at a discount.) So with an 80% cache hit rate, 2 M ITPM covers
+  about 10 M total input tokens per minute (the docs' own example). Keep your own process-wide budget a little under those
+  numbers, so one heavy customer hits your 429 before everyone hits the provider's.
+- **Sort the provider's 429s.** A rate-limit 429 carries `retry-after`: wait and retry, or route to another
+  deployment. A spend-cap 429 has none and won't clear until the month resets: alert a human and degrade the
+  feature. Don't retry it.
+
+### Size it
+
+Take an assumed feature at 50,000 requests a day, each with 3,000 input tokens (2,000 of them cached) and 400
+output tokens. On Claude Sonnet 5 at list price that is about **$0.0064 per request**, or about **$9,600 per 30
+days** (prices from [Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing), fetched
+2026-10-11).
+
+The Start tier's monthly spend cap is $500 and Build's is $1,000; Scale's is $200,000. So the rate limits are not
+what stops this feature; the spend cap is. Request the right tier before launch, not on launch day.
+
+For customer plans, price the quota from the same arithmetic. A plan that includes 1,000 requests a month of this
+feature costs you at most **$6.40 per customer** in model spend. Show customers their usage before you bill them
+for it: Cursor's move from 500 included requests to $20 of usage at API rates produced surprise charges, an
+apology and refunds
+([TechCrunch, 2025-07-07](https://techcrunch.com/2025/07/07/cursor-apologizes-for-unclear-pricing-changes-that-upset-users/)).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Per request on Sonnet 5** ($2 per million input tokens, $0.20 per million cached input tokens, $10 per million
+  output tokens, list prices fetched 2026-10-11): 1,000 × $2 ÷ 1 M = $0.0020; 2,000 × $0.20 ÷ 1 M = $0.0004;
+  400 × $10 ÷ 1 M = $0.0040. Total **$0.0064**.
+- **Per 30 days:** 50,000 × 30 × $0.0064 = **$9,600**.
+- **Per customer plan:** 1,000 × $0.0064 = **$6.40**.
+- **Store writes:** reserve plus settle is 2 × 50,000 ÷ 86,400 ≈ **1.2 writes a second** on average.
+
+</details>
+
+### Buy or skip
+
+- **Skip** a distributed limiter service, leases and regional splits until one store can't keep up. At 50,000
+  requests a day you make about one write a second on average.
+- **Use the provider's controls** as a backstop: a spend limit below the tier cap, and per-workspace rate limits,
+  which Anthropic supports so one workspace can't starve the others.
+- **Adopt a gateway** (a LiteLLM-style proxy with virtual keys and budgets) when several teams or several
+  providers share keys. Before that, a module in your backend is enough.
+- **Skip GPU credits** entirely unless you resell compute.
+
+### Revisit when
+
+- Several app instances need one minute-level limit and per-process buckets drift apart: move the counters to
+  Redis.
+- You add a second provider: limits become per provider, and fallback must respect both.
+- You run your own model on your own GPUs: then admission control by KV-cache memory and queue deadlines (above)
+  becomes your problem too.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Limits"
+  senior={[
+    "Counts input and output tokens, uses token buckets, and reserves then refunds.",
+    "Checks every rule before debiting any, in one atomic script.",
+    "Returns 429 with the blocking rule and a computed Retry-After.",
+  ]}
+  staff={[
+    "States the accepted overshoot as a number and derives lease size and node count from it.",
+    "Chooses fail-open or fail-closed per rule from what each rule protects (availability vs money).",
+    "Compares reservation against real-time output counting, with the throughput cost of each.",
+  ]}
+/>
+
+<LevelContrast
+  title="Credits and admission"
+  senior={[
+    "Models credits as grants and consumption with expiry, spends earliest-expiring first, and meters idempotently.",
+    "Queues by tier and rejects when the queue can't meet deadlines.",
+  ]}
+  staff={[
+    "Separates entitlement (limits, credits) from capacity (admission) and gives each its own error.",
+    "Plans retry budgets and client throttling so a rejection doesn't come back as 3× load.",
+    "Defines reconciliation between the ledger and the scheduler, and who owns a gap.",
+  ]}
+/>
+
+In plain words: a Senior answer gets each mechanism right. A Staff answer also puts numbers on the trade-offs
+(how much overshoot, how much throughput) and decides, per rule, what failure is acceptable and who owns it.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="(Reported title, OpenAI; snippet only) Make the rate limiter distributed across many gateway nodes and regions.">
+    Use a central store for most keys, and leases for hot ones, with overshoot at most nodes × lease. Give each
+    region a fixed share of the global limit and rebalance it from usage. When the store is down, fall back to
+    local buckets (<Cite id="s-3b9dae2c4c" />).
+  </FollowUp>
+  <FollowUp q="(Reported title, xAI; snippet only) A request matches five limits. How do you apply them without races?">
+    One atomic script that refills, checks every bucket, then debits all of them; nothing is debited if any
+    rule fails. Put a request's keys on one shard with a hash tag; reserve the cross-tenant model pool
+    separately and release it on failure (<Cite id="s-a297e9309b" />).
+  </FollowUp>
+  <FollowUp q="(Reported title, OpenAI) A customer's credits expire while a long job is running. What happens?">
+    Hold in chunks rather than once, spend earliest-expiring grants first, warn before expiry, and apply the
+    policy decided in advance: a small overdraft, or checkpoint and stop the job (<Cite id="s-5fa409d1c2" />).
+  </FollowUp>
+  <FollowUp q="(Fireworks AI prep guide) The fleet is saturated. Which requests do you accept, queue or reject?">
+    Accept what fits in GPU memory now; queue by priority class with deadlines; reject at once when the queue
+    holds more than the deadline allows; degrade free and batch traffic first. Measure goodput, not throughput
+    (<Cite id="s-b6632d5df9" />).
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) You don't know the output length. Reserve max_tokens, or count output as it streams?">
+    Reserving never overshoots and costs throughput until refunds land (28% in the example if they never did);
+    counting live uses capacity fully and can overshoot while long replies run. OpenAI documents the first,
+    Anthropic the second.
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) The limit store is down. Fail open or closed?">
+    Per rule: open with local fallback buckets for paid per-minute limits, closed for prepaid balances and
+    anything that is really a spending cap.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Counting only requests.** Both major providers limit tokens per minute as well as requests
+  ([OpenAI](https://developers.openai.com/api/docs/guides/rate-limits), fetched 2026-10-12).
+- **Checking one rule, debiting it, then checking the next.** A request that fails a later rule has already spent
+  the earlier ones, and concurrent requests race through the gap.
+- **Fixed windows for per-minute limits.** They allow up to 2× the limit across a boundary. Use a token bucket, as
+  Anthropic documents ([Anthropic rate limits](https://platform.claude.com/docs/en/api/rate-limits)).
+- **A mutable balance column for credits.** There is no audit trail, no expiry by grant, and retries
+  double-charge.
+- **Treating every 429 as retryable.** A spend-cap 429 without `retry-after` won't clear until the month resets.
+- **Unbounded retries on overload.** Retries push load toward 3×; a 10% budget keeps it near 1.1×
+  ([SRE book](https://sre.google/sre-book/handling-overload/)).
+- **Queueing requests that will miss their deadline.** They cost GPU time and help nobody.
+
+## Prove it with a lab
+
+<LabRef lab="rate-limiter" role="proof" note="Token bucket, sliding window and a Redis-backed limit with free, basic and premium tiers (100 / 1,000 / 10,000 per minute)." />
+
+What to change to make it this design: give `Allow` a cost (`Allow(key, n)` with n = estimated tokens), add a
+refund, and replace the Redis `INCR` + `EXPIRE` pipeline with one script that checks several rules. Two findings
+from reading the code on 2026-10-11 are worth fixing as exercises. The distributed limiter **fails open** on a
+pipeline error, which may or may not be the right choice per rule. And its handlers set `Retry-After` after
+`WriteHeader`, so the header never reaches the client. Its intermittently failing concurrency test is a
+check-then-act logic race that Go's `-race` detector does not report: the same class of bug a compound check
+invites. Its benchmark rows are estimates; don't quote them.
+
+<LabRef lab="load-balancer" role="proof" note="A breaker that opens after 5 consecutive 5xx and a retry budget of 20%." />
+
+This is the overload half. A retry budget caps how much retries multiply load, and a circuit breaker stops
+sending to a failing backend. Its v2 retry has a known bug (the retry runs after the first 5xx was already
+written), so don't copy that path.
+
+<LabRef lab="kv-cache" role="background" note="A Redis-style cache with TTLs, not an LLM KV cache." />
+
+Useful only as a place to practise counters with expiry and atomic updates.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-3b9dae2c4c" />: OpenAI Senior SWE questions on Glassdoor (snippet only): distributed rate limiter for an LLM API
+- <Cite id="s-5fa409d1c2" />: company-tagged AI engineer question list: GPU credit management (OpenAI)
+- <Cite id="s-a297e9309b" />: xAI interview overview (snippet): rate limiters with compound rules
+- <Cite id="s-b6632d5df9" />: PracHub Fireworks AI prep guide: admission control as a technical-review topic
+- <Cite id="s-4d55d9b987" />: Hello Interview OpenAI L5 guide: credit-tracking service among coding problems
+- [Anthropic API rate limits](https://platform.claude.com/docs/en/api/rate-limits) (official, fetched 2026-10-12): token bucket, RPM/ITPM/OTPM, cache-aware ITPM, spend caps, headers
+- [OpenAI rate limits](https://developers.openai.com/api/docs/guides/rate-limits) (official, fetched 2026-10-12): RPM/RPD/TPM/TPD, organization and project limits, max_tokens counted
+- [Google SRE book: Handling Overload](https://sre.google/sre-book/handling-overload/) (official, fetched 2026-10-12): criticality, retry budgets, client-side throttling
+- [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) (official, fetched 2026-10-11)
+- [TechCrunch: Cursor apologizes for unclear pricing changes](https://techcrunch.com/2025/07/07/cursor-apologizes-for-unclear-pricing-changes-that-upset-users/) (news, 2025-07-07)

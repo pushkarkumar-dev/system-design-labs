@@ -1,0 +1,724 @@
+---
+title: "LLM-as-judge and human labels: when to trust automated grading"
+summary: "How to check an LLM that grades other LLM outputs: compare it with human labels, report how many failures it catches, correct agreement for chance, test its biases, and handle outputs people judge by taste."
+track: ai-engineer
+format: deep-dive
+family: llm-judge
+smallTeamFocus: "Build small pass/fail judges yourself and check each one against 50 failing and 50 passing labels from one domain expert. Buy nothing for this. Skip crowdsourced labels and fine-tuned judges until you measure a need."
+rounds: [take-home, domain-deep-dive]
+level: both
+timeboxMin: 45
+order: 218
+status: published
+basedOn: [eng-040, eng-042, r2a-009, r2b-010]
+askedAt: [amazon, apple, applied-ai-generic]
+labs:
+  - { lab: llm-eval, role: proof, note: "bootstrap_ci gives an interval on any list of pass/fail flags, including judge-agrees-with-human flags. Its own list of what the toy misses names model-graded evaluation and Cohen's kappa, so the judge itself is yours to build." }
+  - { lab: rag, role: background, note: "A retrieval pipeline whose answers you can grade for faithfulness against the retrieved chunks." }
+gapLabs: [llm-judge-evals]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "An LLM judge is a classifier, so I won't trust it until I've measured it. I'll write one pass/fail judge per
+> failure mode, have a person label a set of examples, and compare. I'll report how many real failures the judge
+> catches and how many good answers it wrongly fails, with intervals, plus an agreement score that corrects for
+> luck. The bar for letting it replace people is that it agrees with people about as well as two people agree
+> with each other, on examples I never tuned it on. And I'll re-check it whenever the model, the prompt or the
+> traffic changes."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+### Words you need first
+
+A **large language model (LLM)** is a model that reads text and writes text back. The text you send it is the
+**prompt**. Many products first look up documents that might help (for example, the three most relevant help
+articles) and paste them into the prompt. Those pasted documents are the **retrieved context**, and this
+look-up-then-answer pattern is called **RAG** (retrieval-augmented generation).
+
+An **LLM judge** (the interview phrase is **LLM-as-judge**) is a second LLM call whose only job is to grade the
+first one's output. You give it the answer, whatever it needs to check that answer, and a written set of rules,
+the **rubric**. It returns a grade, ideally just "pass" or "fail" (a **binary** grade). Each judge should check one **failure
+mode**: one specific way an answer can go wrong, such as making up facts or ignoring the question.
+
+A **human label** is the grade a person gives the same output. The person is an **annotator** (or labeller).
+
+### What makes this different from testing normal code
+
+You already know how to test a backend. A unit test has an exact expected value: the function returns 42 or it
+doesn't. The test itself is trusted, because it is a few lines of code anyone can read.
+
+LLM output breaks both halves of that. First, there is no single right answer. "Your refund window is 14 days"
+and "You can get a refund within two weeks of purchase" are both correct. An exact string
+comparison would accept at most one of them. Second, the thing doing the checking is itself an LLM. It is fast and cheap, but it makes mistakes,
+and its mistakes are not random: it has habits, such as liking longer answers.
+
+So the job in this family is not "write a judge". It is **measure the judge**, the way you would measure a
+flaky health check before letting it page someone. You compare its grades with people's grades, you count the
+kinds of mistakes it makes, and you decide what it is allowed to decide.
+
+Two more terms come up in every version of the question:
+
+- **Faithfulness**: does the answer stick to the retrieved context, or does it claim things the context doesn't
+  support? An unfaithful answer is what people call a hallucination.
+- **Relevance**: does the answer actually address the question that was asked?
+
+### The four questions in the bank
+
+All four ask the same thing from different angles: when can an automated grader be trusted, and what do you do
+where it can't?
+
+- **The take-home.** You get a prompt and about 30 input/output pairs with human labels. You must build an
+  automatic faithfulness and relevance check and calibrate it against the labels. The techinterview.org
+  applied-AI prep guide describes this as "a common take-home" with "thirty sample input/output pairs"; it is the
+  guide's own description, not a candidate report
+  (<Dated asOf="2026-07-23" src="s-7d03a572e0">techinterview.org applied-AI guide</Dated>).
+- **Is the judge reliable?** The same guide says that once you say "LLM-as-judge", a good interviewer asks how you
+  know the judge is any good (<Cite id="s-7d03a572e0" />).
+- **Inter-annotator agreement.** A 2025 PracHub listing tagged Apple Machine Learning Engineer, titled roughly
+  "explain annotation agreement and LLM vs human judges". Only the title is candidate-reported
+  (<Cite id="s-0630fd2aff" />).
+- **Video generation.** An Amazon Applied Scientist (L4) phone screen, posted on Aced in September 2026: which
+  metrics would you use to evaluate generated video, and what if users have subjective standards? The outcome was
+  still pending when posted (<Cite id="s-2ec7fd48b0" />).
+
+<QuestionRow id="eng-040" />
+<QuestionRow id="eng-042" />
+<QuestionRow id="r2b-010" />
+<QuestionRow id="r2a-009" />
+
+### The example that runs through this page
+
+We will follow one take-home from start to finish. A company runs a support chatbot. For each customer question
+it retrieves help articles and writes an answer. You get 30 of those answers, each labelled by a support lead as
+**pass** or **fail** for faithfulness. Here is one failing pair (an illustrative example, not from a real
+dataset):
+
+| Part | Content |
+|---|---|
+| Question | "Can I return my headphones after 30 days?" |
+| Retrieved context | "Returns are accepted within 14 days of delivery. Opened audio products cannot be returned." |
+| Answer | "Yes, you have 30 days to return any product." |
+| Human label | **fail** (the answer contradicts the context) |
+
+Of the 30 pairs, the support lead marked **9 fail and 21 pass**. Keep those two numbers in mind; most of the
+arithmetic on this page comes from them.
+
+## What is being tested
+
+The applied-AI guide is blunt about the trap. It shows a short faithfulness judge and says the interviewer is
+checking "whether you'd trust its output before testing it against humans. The right answer is no."
+(<Cite id="s-7d03a572e0" />). What they want instead is **calibration**: grade a labelled set with the judge,
+compare with the human labels, measure agreement, and tighten the rubric until the two line up.
+
+Under that, the interviewer is looking for three skills.
+
+1. **Measuring a measurement.** A judge is a classifier, just like a spam filter. You need its error rates, with
+   honest uncertainty, on data it was not tuned on. You also need to say what 30 labels can and cannot show.
+2. **Knowing where human judgment is weak.** People disagree too. If two experts agree only moderately, no judge
+   can be held to more than that. Some disagreement is a vague rubric; some is genuine taste.
+3. **Product sense for outputs judged by taste.** For generated video or creative writing there is no reference
+   answer at all. You split quality into parts you can check, ask people to compare outputs instead of scoring
+   them, and tie the result to what users actually do.
+
+My reading: interviewers care less about the judge's prompt than about the numbers you put next to it. They also
+want to see that you know the judge's quality is not fixed. It drifts when the judge model, its prompt or the mix
+of inputs changes.
+
+Say it like this: "The judge prompt is the easy part. The work is proving how often it's wrong, and in which
+direction."
+
+## Clarify and scope
+
+Spend the first few minutes pinning down what the judge is for. Each question below changes the design.
+
+- **What decision will the score drive?** "If the judge blocks a release, it must catch most real failures. If it
+  only feeds a trend dashboard, I can tolerate more noise."
+- **Pass/fail or a score?** Push for pass/fail per failure mode. Hamel Husain and Shreya Shankar's evals FAQ puts
+  it this way: "Binary evaluations force clearer thinking and more consistent labeling." A 1-to-10 score (a
+  **Likert scale**) invites every annotator to use the scale differently.
+- **Who made the labels, and how?** One expert or several? With a written rubric? Were the labels themselves
+  checked for agreement?
+- **How many failures are there?** "If only 3 of the 30 are failures, everything I say about catching failures
+  rests on 3 examples." In our example there are 9.
+- **One answer at a time, or comparing two?** Grading one answer against a rubric is called **pointwise**.
+  Asking "which of these two answers is better?" is called **pairwise**. They have different biases, covered
+  below.
+- **Which judge model, at what cost?** "Can I pin an exact model version, so the judge doesn't change under me?"
+
+Out of scope: training a reward model (a model trained to score outputs, used to train another model further), and
+the release gate that consumes the judge's scores. That gate is the
+[eval-system](/system-design-labs/interviews/walkthroughs/eval-system/) family.
+
+## Core concepts
+
+### The system in one picture
+
+There are two loops. The **calibration loop** runs offline, on labelled examples, and tells you how good the
+judge is. The **production loop** runs on live traffic and uses the judge, corrected by what calibration found.
+
+```
+            CALIBRATION (offline, on labelled examples)
+ ┌──────────────────────────────────────────────────────────────┐
+ │  Sample of real outputs                                      │
+ │        │                                                     │
+ │        ▼                                                     │
+ │  Domain expert labels each one pass / fail  ──► label set    │
+ │        │                                        │            │
+ │        │                         split into dev  and  test   │
+ │        ▼                                   │          │      │
+ │  Judge prompt ◄── tune on dev only ────────┘          │      │
+ │        │                                              │      │
+ │        ▼                                              ▼      │
+ │  Judge grades test set ──► compare with labels ──► report    │
+ │                            (TPR, TNR, kappa, intervals)      │
+ └──────────────────────────────────────────────────────────────┘
+                                  │  judge version + its error rates
+                                  ▼
+            PRODUCTION (online, on live traffic)
+ ┌──────────────────────────────────────────────────────────────┐
+ │  Live answers ──► sampler ──► judges (async, one per         │
+ │                               failure mode)                  │
+ │                                    │                         │
+ │                                    ▼                         │
+ │                 raw failure rate ──► corrected rate          │
+ │                                    │                         │
+ │                                    ▼                         │
+ │                    dashboard / release gate / alerts         │
+ └──────────────────────────────────────────────────────────────┘
+```
+
+**Sample of real outputs.** You label outputs your system actually produced, not invented ones. Real outputs
+contain the failures you actually have.
+
+**Domain expert labels.** One person who knows what a correct answer looks like grades each output pass or fail.
+This is the expensive, slow, irreplaceable part.
+
+**Dev and test split.** You divide the labels into two groups. You look at the **dev** set while you improve the
+judge's prompt. You only use the **test** set at the end, to report numbers. This is the same reason you don't
+evaluate a model on its training data.
+
+**Judge prompt.** The rubric plus instructions, sent to an LLM with each output to grade.
+
+**Report.** The judge's two error rates (TPR and TNR in the diagram) and its agreement score (kappa), each with an
+interval. The next sections explain all four.
+
+**Production loop.** The judge runs on a sample of live answers, in the background. Its raw failure rate is then
+corrected using the error rates from calibration, and the corrected number feeds dashboards and gates.
+
+### The judge is a classifier: count its two kinds of mistake
+
+Decide which outcome is the "positive" one. In this family the positive class is **fail**: an unfaithful or
+irrelevant answer. That is the thing you are hunting for, like spam in a spam filter.
+
+Now compare the judge's grade with the human label on each pair. The judge can be wrong in two ways, and they
+cost different things.
+
+- **True-positive rate (TPR)**: of the answers people marked fail, the share the judge also failed. A judge with
+  low TPR lets bad answers through. In a release gate, that is how regressions ship.
+- **True-negative rate (TNR)**: of the answers people marked pass, the share the judge also passed. A judge with
+  low TNR raises false alarms. People stop trusting it and start ignoring it.
+
+Why not just report **accuracy**, the share of all pairs where judge and human agree? Because accuracy hides
+which kind of mistake is being made. Say 10% of answers fail. A "judge" that passes everything is 90% accurate
+and catches nothing.
+
+Here is our example. The judge was run on the 30 labelled pairs.
+
+| | Human said **fail** (9) | Human said **pass** (21) |
+|---|---|---|
+| Judge said **fail** | 7 (caught) | 2 (false alarm) |
+| Judge said **pass** | 2 (missed) | 19 (correctly passed) |
+
+So **TPR is 7 of 9, about 78%**, and **TNR is 19 of 21, about 90%**. The judge agreed with the human on 26 of
+30 pairs.
+
+Say it like this: "I report TPR and TNR, not accuracy. Accuracy can be 90% for a judge that never fails anything."
+
+The FAQ recommends exactly these two numbers. It also says to measure them on a held-out test split, after you
+tune the judge prompt on a separate dev split. Tuning on the same labels you report on overfits the judge, even
+if those labels never appear in its prompt: you keep editing until it gets those particular examples right.
+
+### Uncertainty: what 30 labels can and cannot show
+
+"78%" sounds precise. It isn't. It rests on 9 examples. If the support lead had happened to pick 9 slightly
+different failing answers, the judge might have caught 6 or 9 of them.
+
+A **confidence interval** is the range of true rates that are consistent with what you observed. The usual
+choice for a small pass/fail count is the **Wilson interval**, which behaves sensibly near 0% and 100%. You
+don't need its formula in the interview; you need its results:
+
+| Measure | Value | 95% interval (Wilson) |
+|---|---|---|
+| Agreement | 26 of 30 = 86.7% | 70% to 95% |
+| TPR | 7 of 9 = 78% | **45% to 94%** |
+| TNR | 19 of 21 = 90% | 71% to 97% |
+
+Read the TPR row out loud: the judge catches somewhere between about half and nearly all real failures. That is
+not enough to let it block a release. With 50 labelled failures and the same observed rate (39 of 50), the
+interval narrows to roughly **65% to 87%**. That is why the FAQ asks for at least 50 failing and 50 passing
+examples before you trust a judge.
+
+Say it like this: "On 30 labels the judge looks promising, but its catch rate is known only to within about
+plus or minus 25 points. I wouldn't let it gate anything yet."
+
+### Agreement that corrects for luck: Cohen's kappa
+
+Agreement of 86.7% sounds good, but some of it would happen by chance. Imagine a judge that ignores the answer
+and says "pass" 70% of the time at random. Because the human also says "pass" about 70% of the time, they would
+often agree by luck alone.
+
+**Cohen's kappa** (written κ) removes that luck. It compares the agreement you observed with the agreement you
+would expect if the two raters were guessing at their usual rates. Kappa is 1 for perfect agreement and 0 for
+agreement no better than chance.
+
+In our example both the human and the judge said "fail" on 9 of 30 items (30%) and "pass" on 21 (70%). Chance
+alone would give about 58% agreement. The judge got 86.7%. That works out to **κ = 0.68**. And a judge that
+always says "pass" would agree 70% of the time with **κ = 0**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Cohen's kappa for two raters"
+  expr="κ = (p_o − p_e) ÷ (1 − p_e),   p_e = Σ over labels of (share rater A gives it × share rater B gives it)"
+  vars={[
+    { sym: "p_o", meaning: "observed agreement: share of items both raters labelled the same" },
+    { sym: "p_e", meaning: "agreement expected by chance from each rater's label frequencies" },
+  ]}
+  example={[
+    "30 pairs, 26 agree: p_o = 0.867. Both raters say pass on 70% of items: p_e = 0.7 × 0.7 + 0.3 × 0.3 = 0.58",
+    "κ = (0.867 − 0.58) ÷ 0.42 = 0.68",
+    "A judge that always says pass agrees 70% of the time with κ = 0",
+  ]}
+/>
+
+- **Why the always-pass judge gets κ = 0:** it says pass 100% of the time, so p_e = 1.0 × 0.7 + 0 × 0.3 = 0.7. Its
+  observed agreement is also 0.7. So κ = (0.7 − 0.7) ÷ 0.3 = 0.
+- **Wilson interval for TPR, 7 of 9:** p = 0.778, z = 1.96. Centre = (p + z² ÷ 2n) ÷ (1 + z² ÷ n) = 0.695;
+  half-width = z × √(p(1 − p) ÷ n + z² ÷ 4n²) ÷ (1 + z² ÷ n) = 0.242. Interval **0.45 to 0.94**.
+- **With 39 of 50:** the same formula gives **0.65 to 0.87**.
+
+The script that produced the interval table is in the Worked examples section; it was run on 2026-10-12.
+
+</details>
+
+Kappa is the right number when you compare judge-versus-human with human-versus-human, because both are
+agreements between two raters. With more than two raters, or with some items missing labels, **Fleiss' kappa**
+or **Krippendorff's alpha** play the same role. The FAQ recommends a chance-corrected measure such as Cohen's
+kappa whenever more than one person annotates.
+
+### Inter-annotator agreement is the ceiling
+
+Before asking how well the judge agrees with people, ask how well people agree with each other. That number is
+called **inter-annotator agreement**. Measure it by having two annotators label the same items without seeing
+each other's labels, then compute kappa between them.
+
+The FAQ's workflow: measure agreement, sit down together over the disagreements, sharpen the rubric, and repeat
+until agreement is consistently high. The disagreements are the useful part. Each one shows where the definition
+of "faithful" is ambiguous. For example: does a correct fact that isn't in the context count as unfaithful? Two
+reasonable people can disagree until the rubric says.
+
+This gives you the test for replacing people. A judge may stand in for an annotator on one failure mode when:
+
+1. its agreement with the human consensus is about as high as one annotator's agreement with another,
+2. on a held-out set it was never tuned on,
+3. and it stays there when you re-check it on fresh labels.
+
+That is the framing of Zheng et al.'s MT-Bench paper (2023), which tested GPT-4 as a judge of chat answers. It
+reported GPT-4 matched human preferences, "achieving over 80% agreement, the same level of agreement between
+humans" (arXiv 2306.05685). Treat that as evidence the method can work. It says nothing about today's judge on
+your data.
+
+Say it like this: "I can't hold a judge to a higher standard than my annotators meet. Human-to-human agreement is
+the bar."
+
+### The judge's known habits (biases) and how to neutralise them
+
+LLM judges make mistakes in predictable directions. The applied-AI guide lists three: judges "favor longer
+answers", favour "whichever response comes first when comparing two", and "lean toward text from their own model
+family" (<Cite id="s-7d03a572e0" />). The MT-Bench paper names the same three: **position bias** (preferring the
+first answer shown), **verbosity bias** (preferring longer answers) and **self-enhancement bias** (preferring
+output from its own model family). It adds a fourth weakness: limited reasoning on maths.
+
+| Bias | What it looks like | Fix |
+|---|---|---|
+| Position (pairwise) | Swap the two answers and the winner changes | Run each pair in both orders. Count a win only if it holds in both; otherwise call it a tie (MT-Bench's conservative method) |
+| Verbosity | Longer answers pass more often, even when they say no more | Grade one failure mode at a time with a pass/fail rubric. Compare answers of similar length. Check the judge's pass rate by length bucket |
+| Self-preference | The judge favours text written by its own model family | Measure it: compare agreement on outputs from its own family with agreement on others. The FAQ says using the same model is "usually fine" for narrow pass/fail tasks if TPR and TNR on held-out labels are high |
+| Weak reasoning | Wrong grades on maths or multi-step logic | Give the judge a reference answer or the exact context it needs, and let it answer "Unknown" (Anthropic's agent-evals guide, in Sources) |
+
+The sources disagree on self-preference, so say both views. The guide treats it as a known bias. The FAQ treats it
+as something your held-out agreement numbers will either show or not.
+
+### Correcting the judge's failure rate on live traffic
+
+Once you know TPR and TNR, you can fix the judge's raw numbers in production. The FAQ: "Once you know your judge's
+True Positive and True Negative rates, you can correct its estimates to determine the actual failure rate in your
+system."
+
+The idea: the judge's raw failure rate mixes real failures it caught with good answers it wrongly failed. If you
+know how often each happens, you can work backwards. Suppose the judge fails 12% of live answers, with TPR 0.85
+and TNR 0.95. The true failure rate is about **9%, not 12%**. The difference is false alarms.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Corrected failure rate"
+  expr="f_true ≈ (f_judge + TNR − 1) ÷ (TPR + TNR − 1)"
+  vars={[
+    { sym: "f_judge", meaning: "share of outputs the judge marks as failures" },
+    { sym: "TPR, TNR", meaning: "the judge's rates on held-out human labels" },
+  ]}
+  example="f_judge = 0.12, TPR = 0.85, TNR = 0.95: (0.12 − 0.05) ÷ 0.80 = 0.0875, so about 9%, not 12%"
+  note="Valid only while TPR and TNR hold. Re-measure when the judge's model or prompt or the input mix changes."
+/>
+
+Where it comes from: the judge fails a real failure with probability TPR and a good answer with probability
+(1 − TNR). So f_judge = TPR × f_true + (1 − TNR) × (1 − f_true). Solve for f_true.
+
+</details>
+
+This correction is only as good as the TPR and TNR behind it. If the judge model changes, or the traffic shifts
+to a new kind of question, re-measure first.
+
+## Worked examples
+
+### The 30-pair take-home, step by step
+
+Back to the support chatbot. Here is the take-home as a sequence of decisions, with what to write in your README
+at each step.
+
+| Step | What you do | What to say in the README |
+|---|---|---|
+| 1. Split the problem | Write **two** judges, one for faithfulness and one for relevance | "One judge per failure mode is easier to check against labels. The FAQ calls one judge for many kinds of error the most common mistake." |
+| 2. Use code where code can decide | A plain check that every cited source actually exists in the retrieved context | "Deterministic checks first; the LLM only for what needs judgment." |
+| 3. Write the faithfulness judge | Input: retrieved context and answer. Output: pass/fail plus a list of unsupported claims | "Asking for the unsupported claims makes each fail easy to audit." |
+| 4. Write the relevance judge | Input: question and answer. Output: pass/fail | "Relevance doesn't need the context at all." |
+| 5. Split the 30 | Tune on about 15 (dev), report on the other 15 (test) | "30 is too few for both tuning and reporting. I'm saying so up front." |
+| 6. Report | TPR, TNR, agreement and kappa, each with an interval | "Promising, not proven. Here's what 50+50 labels would tell us." |
+| 7. Show disagreements | Each pair where judge and human differ, and what it taught you | "For each miss: what the judge got wrong, and which rubric line I changed because of it." |
+
+The numbers in the Core concepts section use all 30 pairs to keep the arithmetic easy. On a real 15/15 split each
+half has only 4 or 5 failures, so the test-set intervals are even wider. That is worth saying, because it shows
+you understand why 30 labels is a starting point, not a result.
+
+Here is the short script that computes the report. It was run on 2026-10-12.
+
+```python
+from math import sqrt
+
+def wilson(k, n, z=1.96):
+    p = k / n
+    den = 1 + z * z / n
+    mid = (p + z * z / (2 * n)) / den
+    half = z * sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return mid - half, mid + half
+
+def agreement_report(human, judge):
+    """Lists of 'pass' / 'fail' in the same order. 'fail' is the positive class."""
+    n = len(human)
+    tp = sum(h == j == "fail" for h, j in zip(human, judge))
+    tn = sum(h == j == "pass" for h, j in zip(human, judge))
+    pos, neg = human.count("fail"), human.count("pass")
+    p_o = (tp + tn) / n
+    p_h, p_j = pos / n, judge.count("fail") / n
+    p_e = p_h * p_j + (1 - p_h) * (1 - p_j)
+    return {
+        "accuracy": (p_o, wilson(tp + tn, n)),
+        "kappa": (p_o - p_e) / (1 - p_e),
+        "TPR": (tp / pos, wilson(tp, pos)),
+        "TNR": (tn / neg, wilson(tn, neg)),
+    }
+```
+
+Fed our 30 labels, it gives:
+
+| Measure | Value | 95% interval (Wilson) |
+|---|---|---|
+| Agreement | 26 of 30 = 86.7% | 70% to 95% |
+| Cohen's kappa | 0.68 | (too few items for a useful interval) |
+| TPR | 7 of 9 = 78% | 45% to 94% |
+| TNR | 19 of 21 = 90% | 71% to 97% |
+
+What to write in the README's conclusion: on 30 labels the judge looks promising, but its TPR is known only to
+within about ±25 points, which is not enough to let it block a release. With 50 failing and 50 passing labels (the
+FAQ's minimum for debugging a judge) and the same observed rate, 39 of 50, the TPR interval narrows to roughly 65%
+to 87%. Then list what you would label next, and keep a test split you never tuned on.
+
+Say it like this: "The judge is ready to be a dashboard signal, not a release blocker. Here is the labelling plan
+that would change that."
+
+### Video generation, judged by taste
+
+The Amazon question moves the same method to a harder place. A text-to-video model takes a prompt such as "a red
+car driving through rain at night" and produces a few seconds of video. There is no correct video to compare
+against, and two viewers can honestly disagree about which of two clips is better.
+
+The move is to separate what a machine can measure from what only people can decide.
+
+**What a machine can measure, one dimension at a time:**
+
+- **Realism across a whole set of videos.** **Fréchet Video Distance (FVD)** runs generated videos and real videos
+  through a feature extractor and measures how far apart the two sets of features are. Lower is closer to real.
+  Its authors report it correlates well with human judgment (Unterthiner et al., arXiv 1812.01717). Its limits:
+  it needs a reference set of real videos, and it scores a whole set, so it says nothing about one prompt.
+- **Specific defects.** **VBench** splits video quality into 16 dimensions, such as whether the subject keeps the
+  same identity across frames, motion smoothness, flickering between frames, and spatial relationships ("the cup
+  is left of the plate"). Each dimension was validated against human preference labels (arXiv 2311.17982).
+- **Does the video match the prompt?** **CLIP** is a model that scores how well an image matches a caption.
+  Scoring each frame against the prompt gives a rough adherence score (CLIPScore was proposed for image captions,
+  arXiv 2104.08718). Or ask a **multimodal judge** (an LLM that can also look at images or video) narrow pass/fail
+  questions: "Is there a red car?" "Is it raining?" Calibrate that judge against human labels exactly as in the
+  take-home.
+- **Operational numbers.** Generation time, cost per accepted video, and failure rate.
+
+**When users judge by their own taste:**
+
+- **Ask people to compare, not to score.** "Which of these two videos better fits this prompt?" is easier to
+  answer consistently than "rate this from 1 to 10". **Chatbot Arena** ranks chat models from crowdsourced
+  pairwise votes with a **Bradley–Terry model**, a statistical model that turns many "A beat B" votes into one
+  strength score per model (arXiv 2403.04132). The same works for two video models.
+- **Measure agreement per dimension.** If raters agree strongly on visual defects and weakly on style, the defect
+  disagreements are errors and the style disagreements are taste.
+- **Split results by user group.** Report win rates per segment. A model that wins with marketing teams can lose
+  with film editors, and an average hides that.
+- **Watch what users do.** Regenerate rate, download or share rate, and edits after generation are preference
+  signals users give you for free.
+- **Calibrate any automatic judge per dimension**, against the human pairwise data, not against one overall score.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Bradley–Terry win probability"
+  expr="P(A beats B) = 1 ÷ (1 + e^(s_B − s_A))"
+  vars={[
+    { sym: "s_A, s_B", meaning: "fitted strength scores of two models" },
+  ]}
+  example="s_A − s_B = 0.4: P = 1 ÷ (1 + e^−0.4) ≈ 0.60, so A wins about 60% of pairs"
+/>
+
+</details>
+
+Say it like this: "For taste, I don't look for one score. I measure defects automatically, ask people to compare
+pairs, and check whether different user groups want different things."
+
+## Common follow-ups in depth
+
+### "When would you trust an LLM judge over human judges?"
+
+Never in general. Per failure mode, when four things hold. People agree with each other well enough that the label
+means something. The judge's agreement with the human consensus, on held-out items, is close to the
+human-to-human level. Its TPR is high enough for the decision it drives. And you re-check it on fresh labels on a
+schedule.
+
+Anthropic's agent-evals guide keeps people in the loop for exactly this: "Reserve systematic human studies for
+calibrating LLM graders or evaluating subjective outputs where human consensus serves as the reference standard."
+People stay better for new failure modes nobody has labelled yet, for high-stakes individual decisions, and for
+taste.
+
+### "The judge disagrees with people on 20% of items. What do you do?"
+
+Read the disagreements before touching the prompt. The FAQ lists the usual causes: the judge is missing context,
+the instructions are vague, or the labels are wrong. It also warns that automated prompt tuning, done too early,
+hides problems that are not about the prompt. A quick test: if you can't decide the right label yourself, the
+rubric is the problem, not the judge.
+
+### "Your labels themselves drift"
+
+The FAQ calls this **criteria drift**: reviewing outputs changes what you think "good" means. Treat the rubric
+like code. Version it. When it changes, relabel the examples it affects and re-measure the judge against the new
+labels.
+
+### "Pointwise or pairwise grading?"
+
+Pointwise grading (one answer against a rubric) gives an absolute pass rate you can track over time and gate on.
+It suits pass/fail failure modes such as "makes a claim the context does not support".
+
+Pairwise grading (which of two answers is better) is easier for people and judges to answer consistently when
+quality is a matter of degree. It is the natural design for comparing two prompts or two models. Its costs: you
+must control position bias by running both orders, ties need a rule, and the result is a preference between two
+versions, not a quality level. It can't tell you whether either version is good enough to ship.
+
+A common split: pointwise pass/fail judges for regression gates and production monitoring, pairwise comparison
+for choosing between candidate prompts or models, and people for the pairs where the judge's two orderings
+disagree.
+
+### "How many labels do you need?"
+
+Work backwards from the uncertainty you can tolerate on the rate that matters, usually TPR. With 9 labelled
+failures the 95% interval on TPR spans about 50 points. With 50 failures it spans about 20 points.
+
+If failures are rare in production, don't label random traffic where 95% of items pass. Sample on purpose:
+collect failures from **error analysis** (reading through real conversations and tagging what went wrong) until
+you have enough.
+
+### "Can the judge run inline as a guardrail?"
+
+A **guardrail** is a check that runs before the answer reaches the user and can block it. The FAQ says you would
+"almost never" use a slow, non-deterministic LLM judge as a synchronous guardrail. Run judges in the background on
+samples. Keep inline checks fast and deterministic, such as a regex or a schema check.
+
+## Small-team version
+
+At a company of 50 to 500 people you have no labelling team. That is exactly why you lean on judges, and why a
+cheap calibration check is your insurance against optimising toward a broken metric.
+
+### Build, buy, skip
+
+- **Build** the judges: plain API calls, one per failure mode, with a pinned model version. Build the agreement
+  report above, and a small annotation screen where the expert sees one output and clicks pass or fail. The FAQ
+  reports that teams with custom annotation tools "iterate ~10x faster". A coding agent can plausibly build a
+  simple one in hours (an estimate, not a sourced figure).
+- **Buy** nothing specific. If you already run a tracing tool with annotation queues (Langfuse self-hosted, or a
+  hosted platform), use its queue to collect labels.
+- **Skip** crowdsourced labellers for your core failure modes (the FAQ advises against outsourcing error
+  analysis), judge models you train yourself, and 1-to-10 rubrics.
+
+### Default, and when to change it
+
+One domain expert labels. The FAQ calls this person the "benevolent dictator", and recommends it for most small
+and medium companies. Add a second annotator and measure kappa when the domain is regulated or the expert's calls
+are contested. Start with a capable judge model, then try a cheaper one and measure how much TPR and TNR you lose.
+
+### What it costs
+
+The labels cost more than the tokens. They are also the part you can't skip.
+
+- **Labels:** 100 labels per judge is about **3.3 hours** of expert time, about **$310**.
+- **Judge calls:** about **half a cent per call**, so 1,000 judged outputs cost about **$4.75**.
+- **Production:** judging every one of an assumed 600 answers a day with two judges is about **$5.70 a day**,
+  about **$170 a month**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+List prices fetched 2026-10-11 from [Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing).
+Pay data from the [BLS software developers page](https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm)
+(median, May 2025); wages are about 70% of total compensation per the
+[BLS employer-costs release](https://www.bls.gov/news.release/ecec.nr0.htm).
+
+- **Loaded hourly cost:** BLS median developer pay of $135,980 ÷ 0.70 ÷ 2,080 hours ≈ **$93 an hour**.
+- **Labels:** 100 labels at an assumed 2 minutes each = 200 minutes ≈ 3.3 hours × $93 ≈ **$310**.
+- **One judge call:** assume 4,500 input tokens and 50 output tokens (a **token** is roughly ¾ of a word; APIs
+  bill per token). On Claude Haiku 4.5 at $1 per million input and $5 per million output:
+  4,500 × $1 ÷ 10⁶ + 50 × $5 ÷ 10⁶ = $0.0045 + $0.00025 = **$0.00475**.
+- **Production:** 600 answers × 2 judges = 1,200 calls × $0.00475 ≈ **$5.70 a day**; × 30 ≈ **$170 a month**.
+
+</details>
+
+### Delivery plan
+
+**Week 1:** read 30 or more real conversations, write down the failure modes you see, and label 100 examples per
+failure mode with dev and test splits. **Week 2:** write the judges, tune on dev, and report TPR, TNR and kappa
+with intervals on test. Publish the disagreements. **After that:** a monthly re-check on 20 to 30 fresh labels per
+judge, and an immediate one whenever the judge model changes.
+
+### What you check, and what interviewers probe
+
+You personally check the labels, the held-out split, and every change to a judge prompt. Small-company
+interviewers tend to ask what you did when you had no labels, how many you needed, and how you knew the judge was
+still right three months later.
+
+<AINative title="Let an agent tune the judge; keep the labels and the test split yours">
+An agent can draft judge prompts, build the annotation screen, and iterate a judge prompt against your dev
+labels; the FAQ suggests giving it one specific failure to detect and a way to measure progress against the
+labels. What you keep: the first 30 or more labels, written before any agent suggests failure modes, and a test
+split the agent never sees, because an agent optimizing against labels it can read will overfit them. Check
+every diff to a rubric or a label as carefully as a code diff.
+</AINative>
+
+### Revisit when
+
+Volume makes weekly label refreshes a real cost, several teams share one judge, or a regulator asks for documented
+human review.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Trusting a judge"
+  senior={[
+    "Builds one binary judge per failure mode, reports TPR, TNR and kappa on a held-out split, with intervals.",
+    "Names position, verbosity and self-preference bias and tests for them; uses order swaps in pairwise grading.",
+    "Says plainly what 30 labels can show (agreement roughly) and cannot (TPR within ±10 points).",
+  ]}
+  staff={[
+    "Starts from inter-annotator agreement and treats the human-to-human level as the bar for replacing people.",
+    "Treats the judge as versioned infrastructure: pinned model, re-validation on change, corrected failure rates, a drift schedule.",
+    "Turns subjective quality into dimensions, pairwise preferences and per-segment win rates tied to user behaviour.",
+  ]}
+/>
+
+In plain words: a Senior answer measures the judge properly and knows its biases. A Staff answer also sets the
+bar from human agreement, runs the judge like versioned infrastructure, and knows what to do when there is no
+right answer at all.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="(techinterview.org applied-AI guide) Would you trust the judge's output before testing it against people?">
+No. Report its agreement with human labels on held-out data first, with TPR, TNR and kappa, and say how
+many labels that rests on.
+  </FollowUp>
+  <FollowUp q="(Reported title, Apple, PracHub) What is inter-annotator agreement and why does it matter for judges?">
+The agreement between people labelling the same items independently, usually chance-corrected with Cohen's
+kappa. It is the ceiling for a judge and a test of the rubric: low agreement means the label is ill-defined.
+  </FollowUp>
+  <FollowUp q="(Reported, Amazon) Users have subjective standards for generated videos. How do you evaluate?">
+Pairwise preferences per dimension, agreement measured to separate error from taste, Bradley–Terry rankings,
+per-segment win rates, and behavioural signals such as regenerate and share rates.
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) The provider deprecates your judge model. Now what?">
+Run old and new judges side by side on the held-out labels and one suite version, re-validate TPR and TNR, and
+record the offset so historical scores stay comparable.
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) Your judge has 95% accuracy. Is it good?">
+Depends on the base rate. With 5% failures, a judge that passes everything is 95% accurate. Ask for TPR on the
+failures and kappa.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Trusting the judge before testing it.** The guide's answer is "no" (<Cite id="s-7d03a572e0" />).
+- **Reporting accuracy alone.** It hides class balance and chance agreement; report TPR, TNR and kappa.
+- **Tuning and reporting on the same labels.** The judge overfits them; keep a test split you never looked at
+  while tuning (FAQ).
+- **One judge for everything.** The FAQ calls it the most common mistake; split by failure mode.
+- **Ignoring human disagreement.** Without inter-annotator agreement you don't know the ceiling.
+- **Averaging taste.** One average hides user groups that want opposite things; report per-segment preferences.
+
+## Prove it with a lab
+
+<LabRef lab="llm-eval" role="proof" note="Feed the judge-agrees-with-human flags to bootstrap_ci for an interval on agreement, then add kappa, TPR and TNR yourself: the lab lists model-graded evaluation and Cohen's kappa among what it misses." />
+
+The `llm-eval` lab gives you a **bootstrap** interval: it resamples your list of agree/disagree flags many times
+to see how much the agreement rate moves. That is another way to get the uncertainty ranges on this page.
+
+<LabRef lab="rag" role="background" note="Generate answers over its BEIR corpora and label 100 for faithfulness against the retrieved chunks to get a real calibration set." />
+
+No lab yet covers LLM-as-judge calibration end to end; one is planned.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-7d03a572e0" />
+- <Cite id="s-0630fd2aff" />
+- <Cite id="s-2ec7fd48b0" />
+- [AI Evals: everything you need to know (FAQ)](https://hamel.dev/blog/posts/evals-faq/), Hamel Husain and Shreya Shankar, modified 2026-09-21 (practitioner; fetched 2026-10-12)
+- [Demystifying evals for AI agents](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents), Anthropic, 2026-01-09 (official)
+- [Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena](https://arxiv.org/abs/2306.05685), Zheng et al., 2023 (research)
+- [Chatbot Arena: an open platform for evaluating LLMs by human preference](https://arxiv.org/abs/2403.04132), Chiang et al., 2024 (research)
+- [Towards accurate generative models of video (FVD)](https://arxiv.org/abs/1812.01717), Unterthiner et al., 2018 (research)
+- [VBench: comprehensive benchmark suite for video generative models](https://arxiv.org/abs/2311.17982), Huang et al., 2023 (research)
+- [CLIPScore](https://arxiv.org/abs/2104.08718), Hessel et al., 2021 (research)
+- [Claude API pricing](https://platform.claude.com/docs/en/about-claude/pricing), Anthropic (official; fetched 2026-10-11)
+- [Software developers: pay](https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm) and [Employer costs for employee compensation](https://www.bls.gov/news.release/ecec.nr0.htm), US Bureau of Labor Statistics (official; fetched 2026-10-11)

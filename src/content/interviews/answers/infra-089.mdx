@@ -1,0 +1,176 @@
+---
+question: infra-089
+family: distributed-training
+status: published
+labs: [transformer, observability]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "A trillion parameters need about 16 TB of training state, so at least 200 GPUs' worth of memory before any
+> working data. I'd split each layer 8 ways inside a machine, split the layers into 16 stages across machines, and
+> run 32 copies of that, with the optimizer's memory spread across the copies: about 34 GB per GPU on 4,096 H100s.
+> Then I'd judge the cluster by model FLOPs utilization, not by nvidia-smi, and debug low utilization as a ladder:
+> step times per GPU, then a timeline profile, then network baselines. And I'd only name tools I've actually used."
+>
+> The rest of this page explains each part of that answer.
+
+The round has two halves. First, can you lay out a trillion-parameter training job from memory arithmetic? Second,
+and this is where the reported round turned, have you actually benchmarked and debugged GPU utilization yourself?
+
+### What makes this different from sizing a service
+
+When you size a service, you add machines until latency and throughput are fine, and each machine is independent.
+Here the model itself doesn't fit on one GPU, so the first problem is how to cut it up. Every cut creates network
+traffic, and every GPU waits for the slowest one at the end of each step. And "busy" is a misleading signal: a GPU
+can look 100% busy while doing a fraction of the work it could.
+
+### Words you need first
+
+- **Parameter**: one learned number. Each takes 2 bytes in the usual 16-bit format, **bf16**.
+- **Training step**: a forward pass over a batch, a backward pass that produces **gradients** (which way each
+  parameter should move), then an **optimizer** update (Adam).
+- **FLOPs**: floating-point operations, the unit of training work.
+- **MFU** (model FLOPs utilization): the share of the GPUs' peak FLOPs spent on useful model math. 40% is a good,
+  realistic figure.
+
+The question was reported by an NVIDIA candidate, who says the interviewers wanted "hands-on familiarity with
+specific Nvidia tools, and that was where I felt weaker" (<Cite id="s-7dd221b925" />).
+
+## Clarify first
+
+- **Dense or Mixture of Experts?** A dense model uses every parameter for every token; a Mixture of Experts uses
+  only a few parts of the model per token. "I'll assume a dense 1T model, to make the memory problem explicit."
+- **GPU?** "H100 SXM, 80 GB, 8 per machine. I'll use the dense bf16 peak of 989.5 TFLOPS. NVIDIA's page prints
+  1,979, but that assumes a sparse format training doesn't use."
+- **Data and deadline?** "I'll assume 1T tokens. What's the deadline and the validated batch size?"
+- **Network and framework?** "How fast is the network between machines per GPU? Megatron-Core, DeepSpeed or
+  PyTorch FSDP?"
+
+## Answer
+
+### Memory: how to cut the model
+
+Training needs **16 bytes per parameter**: 2 for the weight, 2 for the gradient, and 12 for the optimizer's
+bookkeeping (a 32-bit master copy and Adam's two running averages). The figure comes from the ZeRO paper. For 1T
+parameters that is **16 TB**, at least 200 GPUs of memory before anything else.
+
+Three cuts, each with its own name:
+
+1. **Tensor parallelism (TP = 8)**: split each layer's matrix math across the 8 GPUs of one machine. It needs
+   exchanges inside every layer, so it stays on the fast in-machine links (NVLink).
+2. **Pipeline parallelism (PP = 16)**: split the layers into 16 consecutive stages on different machines, like an
+   assembly line. Now each GPU holds 1/128 of the model, about **7.8B parameters**.
+3. **Data parallelism (DP = 32)**: run 32 copies of that 128-GPU arrangement, each on different data.
+
+Unsplit, 7.8B parameters per GPU is still **125 GB**. So add **ZeRO-1**: the 32 copies each keep only 1/32 of the
+optimizer state. That brings it to **about 34 GB** per GPU. Total: 128 × 32 = **4,096 GPUs**.
+
+**Compute.** About 6 FLOPs per parameter per token, so the run is about **43 days and 4.2M GPU-hours** at an
+assumed 40% MFU.
+
+### The pipeline bubble
+
+An assembly line has idle time: at the start of each step later stages wait, and at the end earlier ones wait. That
+idle share is the **bubble**. To shrink it, each step's batch is cut into **micro-batches** that follow each other
+down the line. The bubble is about (stages − 1) ÷ micro-batches
+([Narayanan et al., 2021](https://arxiv.org/abs/2104.04473)).
+
+Here is the catch. Data parallelism and the pipeline compete for the same batch. With a 4M-token batch split over 32
+copies, and one 4,096-token sequence per micro-batch, each copy has only **32 micro-batches**, so the bubble is **47%**. Giving each GPU 4 smaller chunks of
+layers (an **interleaved** schedule) cuts it to **12%**. A 16M-token batch cuts it to **3%**.
+
+Say it like this: "Pipeline depth and data parallelism compete for the batch. With 32 micro-batches per copy, almost
+half the pipeline is idle unless I interleave or the batch grows."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Memory: 16 × 10¹² = 16 TB ÷ 80 GB = 200 GPUs. Per GPU: 10¹² ÷ 128 = 7.8B parameters. Unsplit: 15.6 GB weights +
+  15.6 GB gradients + 93.8 GB optimizer = 125 GB. ZeRO-1 over 32: 31.3 + 93.8 ÷ 32 ≈ 34 GB.
+- Compute: 6 × 10¹² × 10¹² = 6 × 10²⁴ FLOPs. 4,096 × 989.5 × 10¹² × 0.4 = 1.62 × 10¹⁸ FLOP/s → about 43 days,
+  4.2M GPU-hours.
+- Bubble: (p − 1) ÷ m = 15 ÷ 32 = 47%; interleaved (p − 1) ÷ (v·m) = 15 ÷ 128 = 12%; with a 16M batch,
+  m = 128: 15 ÷ 512 = 3%.
+
+</details>
+
+### Benchmark utilization
+
+The success metric is MFU. For this job, 40% MFU means the cluster must process about **270,000 tokens per second**.
+Measure that directly. Pair it with **goodput**: the share of wall-clock time spent on useful training rather than
+on restarts and lost work.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Model FLOPs utilization"
+  expr="MFU = 6 × N × tokens_per_second ÷ (GPUs × dense peak)"
+  vars={[
+    { sym: 'N', meaning: 'parameters (active parameters for MoE)' },
+    { sym: 'dense peak', meaning: 'bf16 dense FLOP/s per GPU' },
+  ]}
+  example="40% MFU for 1T on 4,096 H100s needs 0.4 × 4,096 × 989.5 × 10¹² ÷ 6 × 10¹² ≈ 270,000 tokens/s"
+/>
+
+</details>
+
+Don't use the `nvidia-smi` utilization number. NVIDIA defines it as the share of time any **kernel** (one program
+on the GPU) was running. A GPU running one tiny kernel all the time shows 100%.
+
+Say it like this: "nvidia-smi tells me the GPU is awake, not that it's working hard. I measure tokens per second
+against the dense peak."
+
+### Debug low utilization, as a ladder
+
+Each rung finds a different cause. Fix the biggest gap first, then measure again.
+
+1. **MFU and tokens per second**: how far from 40% are we?
+2. **Per-GPU step times**: is one GPU a straggler that everyone waits for?
+3. **A timeline profile** (Nsight Systems or the PyTorch profiler): gaps between kernels mean the data loader or
+   the CPU can't keep up; exchanges that don't overlap with the backward pass show as idle compute; pipeline
+   bubbles show as idle stages.
+4. **nccl-tests**: NVIDIA's benchmark for the collective library, giving a bandwidth baseline to compare with the
+   link's spec.
+5. **DCGM** (NVIDIA's data-center GPU manager): fleet counters that show GPUs slowing down from heat or power
+   limits.
+
+### Tools you have used
+
+Answer only with what you have run, and describe one real trace you read: what it showed and what you changed. If
+you haven't used a tool, say which one you would start with and why. This is where the reported candidate felt
+weakest.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Trillion-parameter environment"
+  senior={["Derives TP 8 × PP 16 × DP 32 with ZeRO-1 from 16 bytes per parameter and computes the bubble."]}
+  staff={["Defines MFU and goodput as the success metrics, shows the batch–bubble–DP tension, and asks whether a dense 1T model is the right target for the budget."]}
+/>
+
+## Small-team version
+
+No small team trains a 1T model. The transferable skill is the utilization ladder. When a rented fine-tuning
+machine or an inference GPU looks busy but throughput is poor, measure tokens per second against the GPU's dense
+peak and profile before buying more GPUs.
+
+The money is in MFU. The family walkthrough's LoRA fine-tune of an 8B model (150M training tokens) takes about
+**6.8 hours** on one H100 at 20% MFU and **3.4 hours** at 40%. Finding one idle gap can halve the rental bill before
+you consider a second GPU.
+
+## Pitfalls
+
+- **Quoting the sparse 1,979 TFLOPS.** It doubles every utilization figure you compute; use 989.5.
+- **Treating nvidia-smi at 100% as fully used.** It only means some kernel was running.
+- **Picking pipeline depth without counting micro-batches per copy.** The bubble can eat half the cluster.
+- **Listing tools you haven't used.** It is the part of this round the reported candidate felt weakest on.
+
+## Go deeper
+
+- Family walkthrough: [Distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/), its parallelism deep dive and evals section.
+- Kernel-level causes of low utilization: [GPU kernel performance](/system-design-labs/interviews/walkthroughs/gpu-kernel-perf/).
+- A training loop to profile: <LabRef lab="transformer" inline />. Metric shapes: <LabRef lab="observability" inline />.

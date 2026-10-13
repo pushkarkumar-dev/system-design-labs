@@ -1,0 +1,174 @@
+---
+question: infra-104
+family: project-deep-dive
+status: published
+labs: [rag, embedding-pipeline]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "We chose A over B because B was simpler but would stop working at the scale we expected within a year, and a
+> load test showed it. To go multi-region, I'd keep the documents and the eval set global, give each region its own
+> read-only copy of the index, and call the model provider's regional endpoint. I'd shard the index by tenant,
+> because no query crosses tenants. To keep it operable I'd add a quality signal next to error rate, since model
+> regressions don't throw errors. The first thing to break at 10× is our model quota, not our servers."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer is asking: do you understand your own system well enough to extend it? The Staff candidate's deep
+dive asked for the high-level design and "why you chose decision A over decision B", then how to take it to
+multiple regions, how to shard it, and how to make it "operationally sustainable and reliable"
+(<Cite id="s-2348518c66" />). The candidate felt this round went well because they had built the system and could
+answer concretely. The test is system-design depth applied to something you own, not a textbook design.
+
+### What changes when the system calls an LLM
+
+You already know how to take a normal service multi-region: replicate the database, put a load balancer in each
+region, decide where writes go. An AI system has the same parts plus two that behave differently:
+
+1. **The model is someone else's service with its own limits.** Most teams call a hosted large language model (an
+   **LLM**) through a provider's API. The provider decides which regions serve which models, and gives you a
+   **quota** (a cap on tokens or requests per minute; a **token** is a piece of text about ¾ of a word). At 10×
+   traffic, that quota can run out before your own servers do.
+2. **Failures can be silent.** A database bug throws errors. A model or prompt change that makes answers worse
+   usually doesn't: every request still returns 200 OK. So operability needs a measure of answer quality, not
+   only error rate and latency.
+
+There is often a third part: an **index** of your own documents, stored as **embeddings** (lists of numbers that
+represent each passage's meaning) so the system can find relevant passages before asking the model. That index is
+data, so it has to be replicated and sharded like any other data.
+
+## Clarify first
+
+- **What scale should the extension target?** Assume 10× today's load or a specific new requirement (a new region
+  for data residency, a latency target), and say which.
+- **Why multi-region: latency, availability or data residency?** **Data residency** means a rule that some data
+  must be stored and processed inside a given country or region. Each goal leads to a different design.
+- **What can change?** The data model, the providers, the budget?
+
+Say it like this: "Is the multi-region goal lower latency, surviving a region outage, or keeping EU data in the EU?
+The design is different for each."
+
+## Answer
+
+The example is illustrative: a help-desk assistant that answers customer questions from a product's help-center
+articles, for many customer companies (**tenants**). Replace it with your own system.
+
+### Why A over B
+
+State B fairly, the criterion that decided it, and the evidence. The shape: "B was simpler and fine below N; we
+expected to pass N within a year; a load test showed B's p99 at X there." If the evidence was thin, say what you
+would test now.
+
+Say it like this: "B was one component instead of two, and it would have been fine at our launch traffic. We
+expected to pass that within a year, and the load test showed B falling over well before then."
+
+### Multi-region
+
+Separate global state from regional state, then decide where writes go: a single primary, per-region ownership,
+or replication that tolerates conflicts. Then decide what consistency users need.
+
+```
+            Global (one copy)                          Per region (one copy each)
+  ┌──────────────────────────────────┐        ┌───────────────────────────────────┐
+  │ Help-center articles (source)    │──────► │ Index replica (passages + vectors)│
+  │ Eval set and release gate        │        │ Retriever                         │
+  │ Prompt and model version config  │──────► │ Gateway to the provider's         │
+  └──────────────────────────────────┘        │   regional endpoint               │
+                                              │ Answer logs (stay in the region)  │
+                                              └───────────────────────────────────┘
+```
+
+**Global**: the articles are written in one place, so writes stay there. The eval set and the prompt and model
+configuration are global too, so every region runs the same tested version. **Per region**: a read-only copy of
+the index, the search service, a gateway that calls the model provider in the same region, and answer logs that
+never leave the region (that is what data residency usually requires).
+
+For systems with model calls or indexes, add four questions: is the model available from the provider in each
+region, what are the provider's data-residency terms, does each region have its own quota, and does each region
+keep its own index replica or only a shard of it?
+
+### Sharding
+
+Choose the shard key from the access pattern: tenant, collection, user or time. Then name the risks:
+
+- **hot tenants**: one large customer overloads its shard;
+- **cross-shard queries**: a query that needs every shard;
+- **rebalancing and resharding**: moving data when shards grow unevenly.
+
+For a vector index (the index of embeddings), sharding by tenant works when queries never cross tenants. Global
+search needs **scatter-gather** (send the query to every shard, then merge the results), which raises tail latency
+because the slowest shard sets the response time.
+
+Say it like this: "Shard by tenant, because no customer ever searches another customer's articles. The risk is one
+huge tenant, so big tenants get their own shard."
+
+### Operational sustainability
+
+- **SLOs** (service-level objectives: the targets you commit to) for availability and latency and, for AI components, a quality signal (for example, the score on a
+  small set of canary questions run every hour).
+- **Observability**: three dashboards you'd build and the alerts behind them.
+- **Runbooks** for the top failures, and who is on call.
+- **Safe change**: canaries, rollback and, for model or prompt changes, an **eval gate** (no change ships unless
+  it scores at least as well as the current version on a fixed test set). Quality regressions can slip past
+  error-rate monitoring; Anthropic's 2025 postmortem describes bugs that standard evals, spot checks and canaries
+  missed ([Anthropic](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues), 2025-09-17).
+- **Cost** at the new scale, and what you would stop doing to pay for it.
+
+Say it like this: "Error rate won't catch a bad prompt change. So every change passes an eval gate, and an hourly
+canary set alerts if answer quality drops."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Extending your own system"
+  senior={["Gives a sound multi-region and sharding plan with clear trade-offs."]}
+  staff={["Starts from what breaks first in their actual system, ties each change to a requirement, and covers on-call load, rollout risk and cost, raising edge cases before the interviewer does."]}
+/>
+
+The last point echoes the candidate's own advice for Staff rounds: raise edge cases before the interviewer does
+(<Cite id="s-2348518c66" />).
+
+## Small-team version
+
+A small team's system often never needed multi-region or sharding. Say so, and answer as a plan:
+
+- the first thing that breaks at 10×;
+- the shard key you would pick;
+- what you would buy instead of build: managed replication, a hosted vector store, a provider's regional endpoint.
+
+Price the regional option. Data-residency endpoints add about **10%** to the token bill, so a **$9,600 a month**
+bill (the family walkthrough's example) becomes about **$10,560**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- About 10% more: OpenAI's regional endpoints for models released on or after 2026-03-05, and Anthropic's `inference_geo: "us"` at
+  1.1× for Claude 4.6+ (pricing pages fetched 2026-10-11).
+- Base bill: $0.0064 a request (Claude Sonnet 5 list prices fetched 2026-10-11; 1,000 uncached input, 2,000 cached
+  input and 400 output tokens, assumed) × 50,000 requests a day (assumed) × 30 ≈ $9,600.
+- With residency: $9,600 × 1.1 = **$10,560 a month**.
+
+</details>
+
+Operability is where small teams can be strongest: one person on call needs few alerts, clear runbooks and
+automatic rollback.
+
+Say it like this: "We never needed a second region. If we did, I'd use the provider's regional endpoint, which
+costs about 10% more, before building anything of our own."
+
+## Pitfalls
+
+- **A generic multi-region answer.** It ignores your system's actual data and write path, which is what the
+  question is about.
+- **A shard key chosen without the access pattern.** The wrong key turns every query into a cross-shard query.
+- **Operability as "add monitoring".** With no SLO or runbook, it is a wish, not a plan.
+- **Error rate as the only health signal.** Model and prompt regressions return 200 OK.
+- **Not knowing why B was rejected in your own project.** It suggests someone else made the decision.
+
+## Go deeper
+
+- Family walkthrough: [Present an AI project you built](/system-design-labs/interviews/walkthroughs/project-deep-dive/#worked-examples) (Outline C).
+- Labs: <LabRef lab="rag" inline /> and <LabRef lab="embedding-pipeline" inline /> as a system to extend on paper.

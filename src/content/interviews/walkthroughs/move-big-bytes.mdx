@@ -1,0 +1,840 @@
+---
+title: "Move big bytes fast: weight distribution, cold starts and bulk transfer"
+summary: "Get a huge model file to every GPU machine, or start one GPU container fast, or move 200 TB once: work out the times from bandwidth first, then design chunked delivery, safe rollout and instant rollback."
+track: ai-infra
+format: design
+family: move-big-bytes
+smallTeamFocus: "Skip swarms and trackers. Keep weights next to the GPU (volume or node NVMe), verify them by hash, keep the last version for rollback, and price one warm replica before engineering faster cold starts."
+rounds: [system-design]
+level: both
+timeboxMin: 45
+order: 200
+status: published
+basedOn: [infra-054, infra-055, infra-056, infra-057, infra-059, r2a-018]
+askedAt: [anthropic, modal, meta, apple]
+labs:
+  - { lab: faas-runtime, role: proof, note: "Warm pool with idle eviction, a snapshot restore path and per-invocation billing. The cold start is a simulated 50 ms sleep, so it teaches pool logic, not load times." }
+  - { lab: feature-flags, role: proof, note: "Percentage rollout by hashed user id, SSE push and an audit log: a model of cohort-by-cohort activation and of A/B assignment for a model store." }
+  - { lab: cdn-edge, role: partial, note: "Request coalescing and a two-level cache: the regional chunk cache in miniature. It caches HTTP responses in memory, not multi-GB files on disk. Its tests pass (stale-if-error and L2-to-L1 promotion were fixed on 2026-10-13)." }
+  - { lab: gossip, role: partial, note: "SWIM membership with indirect probes: the coordinator-free recovery path. It spreads membership, not chunk availability. Its demo doesn't build and its revived-node test fails." }
+  - { lab: service-discovery, role: partial, note: "TTL registry with watches, the tracker's job in miniature. Its watch-expiry, graceful-degradation and cache-refresh tests fail." }
+  - { lab: consistent-hashing, role: partial, note: "Map each chunk hash to one cache node so a region fetches each chunk from origin once. Its virtual-nodes test fails and it has no bounded-load code." }
+gapLabs: []
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "Before I draw anything, I'll work out how long the copy takes and which link or disk sets that time. If
+> every machine downloads the file from one place, that place's bandwidth is shared by everyone and the copy
+> takes minutes. If machines pass pieces of the file to each other, every machine that has a piece becomes a
+> source, and the copy takes about as long as one machine downloading it alone. Then I keep two steps apart:
+> getting the bytes onto the machine, and switching traffic to them. Every piece is checked by hash, old
+> versions stay on disk, and a rollback is a switch back with no download."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+Here is the task as interviewers frame it. You have one very large file that never changes once it is
+published. Usually it is a model's weights (the numbers the model learned, stored as files), tens to hundreds
+of GB. Sometimes it is a one-time dataset of
+hundreds of TB. Get it to where the GPUs are. That may be thousands of machines in several regions, or one
+GPU container starting up from nothing. Do it fast, don't overload the place the file comes from, never serve
+wrong bytes, and make rollback possible without a download.
+
+### What makes this different from a normal deploy
+
+You already know how to ship software to a fleet. A new build of a service is maybe 50 to 500 MB. Every
+machine pulls it from a registry or a bucket, restarts, and passes a health check. The download takes a few
+seconds, so nobody designs around it. The interesting parts are the rollout order and the health checks.
+
+Model files break that habit in three ways:
+
+1. **The file is a thousand times bigger.** A large model's weights are about 150 GB. If 250 machines pull
+   150 GB each from one cache, that cache must send 37.5 TB. The download is no longer a few seconds; it is
+   the main event, and it can take down whatever serves it.
+2. **The file's "health" is not just "it starts".** A model can load perfectly, pass every check that the
+   bytes are correct, and still answer worse than the old one. So the rollout needs a quality check, not only
+   a liveness check.
+3. **The machines are expensive while they wait.** A GPU machine that is waiting for a download, or a spare
+   one kept running "just in case", costs real money every hour. So the time to get a model loaded turns
+   directly into dollars.
+
+The good news is that this is a classic distributed-systems problem in AI clothing. You need no machine
+learning knowledge to answer it well. You need bandwidth arithmetic, chunking, hashing and a careful rollout.
+
+### Words you need first
+
+- **Weights**: the numbers a model learned during training, stored as files. A model with 70 billion
+  parameters (learned numbers) at 2 bytes each is about **140 GB**. The usual 2-byte number format is called
+  **bf16**.
+- **Shard**: one of the files the weights are split into. A big model ships as 8 to 64 shards so that each
+  GPU can load its share.
+- **Host**: one physical machine. A GPU server usually has 8 GPUs. All 8 load from one copy on the host's
+  disk, so you count hosts, not GPUs.
+- **Staging** and **activation**: staging means the new version's bytes are on the host's disk and checked.
+  Activation means the host starts serving traffic from it. Keeping these apart is the main design idea on
+  this page.
+- **Cold start**: the time from "we need one more copy of this model serving" to "it answers its first
+  request". Most of it is loading the weights.
+
+Other terms are defined where they first appear.
+
+### The examples on this page
+
+One example runs through the whole page: **releasing version v5 of a model**. It is 150 GB, the size used in
+one of the reported follow-ups. The fleet is 8,000 GPUs on 1,000 hosts of 8 GPUs each, in 4 regions of 250
+hosts. All bandwidths are assumptions you would state out loud: each host can send and receive about
+**10 GB/s** at the same time, each region's cache can send **50 GB/s** in total, and each host's local SSD
+writes at **4 GB/s**.
+
+Two side cases use the same ideas. **The 40 GB container** is one GPU container that must start fast when
+traffic arrives. **The 200 TB move** is a one-time copy of images and video from an on-premises data centre to
+a cloud GPU cluster.
+
+The six questions this page answers come from reported Anthropic, Meta and Apple loops and from a Modal prep
+article; the next section says what each source reported.
+
+<QuestionRow id="infra-054" />
+<QuestionRow id="infra-055" />
+<QuestionRow id="infra-056" />
+<QuestionRow id="infra-057" />
+<QuestionRow id="infra-059" />
+<QuestionRow id="r2a-018" />
+
+infra-054 and infra-055 are pure fan-out: one file to many hosts. infra-056 adds versions, rollout and
+rollback. infra-057 is one container's cold start. infra-059 is the 2020 version of the same control plane,
+with small models and A/B tests. r2a-018 is the one-time bulk move, then feeding the GPUs from it.
+
+## What is being tested
+
+The interviewer is listening for two things. First, **numbers before boxes**: can you say how long each plan
+takes from the file size, the bandwidth and the machine count, before you draw anything? Second, **one
+structural idea**: getting bytes onto a machine and making them live are separate steps. Most of the
+follow-ups (a rollback halfway through a download, a bad version on healthy machines, a model store with A/B
+tests) test that separation.
+
+### What candidates report
+
+- **Anthropic, Staff infra, first-hand.** The candidate calls the round "another AI-flavored problem that was
+  really just a classic distributed systems question": one huge file, thousands of machines, limited
+  bandwidth in and out of each. The follow-up was whether to send to fewer hosts faster or split bandwidth
+  across many. They covered that and having peers relay the file, and after about 40 minutes the interviewer
+  said he had what he needed (<Cite id="s-e9fee3985a" />).
+- **Anthropic, Senior Staff, Blind.** A chunk-based model download pipeline: chunk size, pipeline versus
+  tree, and recovery first with a coordinator, then without one. The candidate calls it "probably my stronger
+  design round" and thinks "the culture round may have been the reason" the loop failed
+  (<Cite id="s-e98cbef9cd" />).
+- **Apple, AI/ML full-stack, first-hand (edited by PracHub).** Move 200 TB of images and video from on-prem
+  storage to a cloud GPU cluster, once, within "a few days". Bandwidth was not given, so the candidate worked
+  the transfer at 1, 10 and 100 Gbit/s, compared it with shipping disks, then was pushed toward the training
+  input pipeline and named the risk "GPU starvation". The only feedback reported is that asking clarifying
+  questions "was itself a point in my favor" (<Cite id="s-8e08e84623" />).
+- **Meta, 2020, Blind.** A commenter describes their own Facebook ML-infra round (an E6/E7 loop, in their
+  words): design a model store covering versioning, backward compatibility, A/B testing and easy prototyping,
+  then move hourly SparkML batch scoring into the request path. No answer details are given
+  (<Cite id="s-e030bbd728" />).
+
+### What prep sites add
+
+- **PracHub's write-up of an Anthropic-tagged question** (posted 2026-04-19, onsite) adds the constraints:
+  weights of tens to hundreds of GB in about 8 to 64 shards, several releases a day, 10³ to 10⁴ workers across
+  regions and hardware generations, workers that restart or lose the network mid-download, metadata that must
+  stay available during a regional storage incident, and the last few good versions kept ready. Only the
+  title is candidate-reported; the constraints and four follow-ups are PracHub's (<Cite id="s-2d04c3afaf" />).
+- **A Modal prep article** with no first-hand sources asks for a pool of ready GPU containers and a fast
+  second start of a 40 GB model. It calls "just keep instances always on" the weak answer
+  (<Cite id="s-86890a1069" />).
+- An Aced prep guide for Anthropic infra roles lists large-file distribution as a design example
+  (<Cite id="s-e23c30a3c6" />).
+
+## Clarify and scope
+
+Ask these first. If the interviewer doesn't answer, say the assumption you will use and write it down.
+
+1. **The file.** Total size, number of shards, and whether it is fixed after publishing. Say: "I'll assume a
+   150 GB release that never changes once published, so I can name every piece by its hash."
+2. **The fleet.** GPUs or hosts? Say: "1,000 hosts of 8 GPUs in 4 regions of 250. A host needs one copy
+   however many GPUs it has, so I'll count hosts."
+3. **The network.** Say: "Each host sends and receives about 10 GB/s at once, and each region's cache serves
+   50 GB/s in total." Ask what traffic out of the **origin store** (the object storage that holds the published file; traffic out of it is its **egress**) and between regions costs.
+4. **The disk.** Say: "Local NVMe SSD writes at 4 GB/s and reads at 5 GB/s, with room for three versions."
+5. **Activation.** Does the server restart to load a new version, swap it in place, or run old and new side by
+   side (blue/green)? Can two versions sit in memory at once?
+6. **Targets.** How long may it take to reach the whole fleet? Is rollback time a hard SLO?
+7. **Security and hardware groups.** Are the weights sensitive? Assume yes: signed lists of hashes and
+   per-service access. Do different GPU generations need differently split shards? Then they are different
+   files, and each group of identical hardware (a **cohort**) gets its own artifact.
+
+For the 40 GB container, ask where the bytes live now, whether the endpoint is interactive or batch, how long
+the first request may wait, and what an idle GPU costs. For the 200 TB move, ask whether it is one-time or
+recurring, the link speed, the deadline, how many files and how big, and what reads the data afterwards.
+
+**Out of scope:** writing checkpoints during training, the design of the quality tests you gate on (see the
+[eval-system walkthrough](/system-design-labs/interviews/walkthroughs/eval-system/)), and request batching.
+
+## Back-of-envelope
+
+This is the part interviewers grade first. Every bandwidth below is an assumption from the list above. Units
+are decimal: GB = 10⁹ bytes. Each subsection explains what the number means first; the arithmetic is in the
+boxes.
+
+### Fan-out to a fleet
+
+**Fan-out** means one file going to many machines. Take one region of v5's release: 250 hosts, each needing
+150 GB.
+
+**Plan 1: everyone downloads from the regional cache.** The cache can send 50 GB/s in total, and 250 hosts
+share it. Each host gets only a fifth of a GB per second, far below what its own network card could take.
+The whole region finishes in **750 seconds, 12.5 minutes**, with the cache running flat out the entire time.
+A host alone could have downloaded the file in **15 seconds** (150 GB at 10 GB/s). So the cache is the
+bottleneck, not the hosts.
+
+**Plan 2: a swarm.** In a **swarm** (also called **peer-to-peer**, the BitTorrent idea), every host that has
+received a piece of the file also uploads that piece to other hosts. Each new host adds its own 10 GB/s of
+upload, so the total sending capacity grows with the fleet. No scheme can beat three limits: the source must
+send each byte at least once, the slowest host must receive every byte, and the total bytes delivered can't
+exceed the total upload capacity. For our region the swarm's best case is about **15 seconds**, set by one
+host's own link. It stays near 15 s however many hosts you add, because each new host brings upload capacity
+with it.
+
+**Plans in between: a chain and a tree.** In a **chain** (also called a **pipeline**), host 1 forwards to host
+2, which forwards to host 3, and so on. In a **tree**, each host forwards to k children. Both only work well if
+you cut the file into **chunks**: fixed-size pieces, here assumed **64 MB**. With chunks, host 2 can forward
+chunk 1 while it is still receiving chunk 2, so everyone is busy at once.
+
+| Plan | Time for one region (250 hosts, 150 GB) | Why | What to say in the interview |
+|---|---|---|---|
+| Everyone from the cache | **12.5 min** | 250 hosts share 50 GB/s | "The source's bandwidth is shared N ways. That doesn't scale." |
+| Chain, whole file per hop | **62.5 min** | each host waits for the whole file before forwarding | "Without chunks, a chain is the worst plan." |
+| Chain, 64 MB chunks | **16.6 s** | each hop adds only one chunk's delay | "Fastest on paper, but one slow host slows everyone after it." |
+| Tree with 2 children, chunks | **about 30 s** | each sender splits its upload two ways | "Wider trees are slower: each child gets 1/k of the bandwidth." |
+| Tree with 4 children, chunks | **about 60 s** | upload split four ways | |
+| Tree with 2 children, no chunks | **240 s** | every level waits for whole files | |
+| Swarm | **about 15 s** (lower bound) | every host uploads what it has | "A swarm uses the upload of every host, including the tree's leaves, which upload nothing." |
+
+That table answers the reported follow-up, "fewer hosts faster, or split bandwidth across many?" Say it like
+this: "With whole files, send to fewer hosts at a time, because a finished host can start relaying. With
+chunks, a narrow tree beats a wide one, since width divides each sender's bandwidth and depth only costs a few
+chunk-times. A swarm avoids the choice." In a tree with 2 children, about half the hosts are leaves and upload
+nothing. A swarm puts that idle upload to work.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Symbols: N hosts (250), S file size (150 GB), U cache egress (50 GB/s), B per-host bandwidth (10 GB/s), c chunk
+size (64 MB, so one chunk takes c ÷ B = 6.4 ms to send), k tree fan-out.
+
+- **Everyone from the cache:** T = max(N × S ÷ U, S ÷ B) = max(250 × 150 ÷ 50, 150 ÷ 10) = max(750 s, 15 s) =
+  **750 s**.
+- **Swarm lower bound:** T ≥ max(S ÷ U, S ÷ B_down, N × S ÷ (U + Σ B_up)), where B_down is the slowest host's
+  download rate and Σ B_up the sum of all hosts' upload. S ÷ U = 3 s; S ÷ B_down = 15 s;
+  N × S ÷ (U + Σ B_up) = 37,500 ÷ (50 + 250 × 10) = 37,500 ÷ 2,550 ≈ 14.7 s. Bound ≈ **15 s**.
+- **Chain with chunks:** T ≈ S ÷ B + (N − 1) × c ÷ B = 15 s + 249 × 6.4 ms ≈ **16.6 s**. Whole file per hop:
+  250 × 15 s = 62.5 minutes.
+- **Tree with chunks:** T ≈ k × S ÷ B + depth × k × c ÷ B, depth = ⌈log_k N⌉. k = 2, depth 8:
+  2 × 15 + 8 × 2 × 6.4 ms ≈ **30.1 s**. k = 4, depth 4: ≈ **60.1 s**.
+- **Tree without chunks, k = 2:** depth × k × S ÷ B = 8 × 2 × 15 = **240 s**.
+
+</details>
+
+**Then the disk.** Once the network is fast, the next limit appears. Writing 150 GB to a local SSD at 4 GB/s
+takes **37.5 seconds**, more than twice the 15-second network bound. Say so: "Once the swarm fixes the
+network, the disk is the bottleneck. Either I stream into host memory and load the GPUs from there, or I
+accept about 40 seconds and stop optimizing the network." Noticing the next bottleneck is a Staff signal.
+
+**Chunk size.** Small chunks keep a chain or swarm busy and lose little work when a transfer fails. Large
+chunks mean fewer requests and a smaller list of hashes. At 64 MB, v5 is about **2,344 chunks**, and the list
+of their SHA-256 hashes is about **75 KB**. At 4 MB there are 37,500 chunks and each takes only 0.4 ms to send,
+so a per-request overhead of around a millisecond (an assumption) dominates unless many requests are in
+flight. At 1 GB, a chain needs about 25 seconds just to fill, and one failure throws away up to 1 GB. Say:
+"Tens of MB is the comfortable middle." If the origin is an object store such as S3, line chunks up with the
+parts the file was uploaded in. AWS's S3 guidance recommends parallel byte-range or per-part GETs,
+"aligning requests to the original part boundaries"
+([S3 performance design patterns](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html), fetched 2026-10-12).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- 64 MB chunks: 150 GB ÷ 64 MB ≈ **2,344 chunks**; 2,344 × 32 bytes ≈ **75 KB** of hashes; 6.4 ms per chunk at
+  10 GB/s.
+- 4 MB chunks: 37,500 chunks; 37,500 × 32 B = 1.2 MB of hashes; 4 MB ÷ 10 GB/s = 0.4 ms per chunk.
+- 1 GB chunks: a 250-host chain fills in 249 × 0.1 s ≈ 24.9 s.
+
+</details>
+
+**Protecting the origin.** If the regional cache is empty when v5 starts, every host's request for a chunk misses the cache. If
+each miss goes to the origin separately, the region pulls 250 copies: **37.5 TB**. If the cache instead merges
+identical misses into one fetch, which is called **request coalescing**, the region pulls each chunk once:
+**150 GB**. Say: "Coalescing turns 250 identical misses into one origin fetch per chunk." If peers can't carry
+the load, limit how many hosts start at once. With 5-minute waves and 50 GB/s of cache bandwidth, that is
+**100 hosts per wave**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- No coalescing: 250 × 150 GB = **37.5 TB** from origin. With coalescing: 150 GB.
+- Wave size within an egress budget: hosts per wave ≤ U × T_wave ÷ S = 50 × 300 ÷ 150 = **100 hosts**.
+
+</details>
+
+**A small update on a shared base.** Sometimes a new version changes only a little. A **LoRA adapter** is a
+small add-on that fine-tunes a big model by training a few extra weights instead of all of them. A typical
+adapter for a 70B model is about **131 MB**, roughly a thousandth of the 140 GB base. If every chunk is named
+by its hash (**content-addressed**), hosts that already hold the base's chunks see that only the adapter's
+chunks are new and fetch just those.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+A rank-16 adapter on the q, k, v and o projections (four weight matrices in each attention layer) of Llama-3.1-70B has
+80 × 16 × (16,384 + 9,216 + 9,216 + 16,384) = **65.5M parameters**, about 131 MB in bf16. The base is 140 GB on
+the name basis (70 × 10⁹ × 2 bytes); the exact config parameter count gives 141.1 GB.
+
+</details>
+
+### One container's cold start
+
+Now the second case: one GPU container that has to start serving a **40 GB model**. That is roughly a 70B
+model stored at 4 bits per weight instead of 16, a format called **int4** (it also stores one 16-bit scale
+for every 32 weights, which is why it isn't exactly 35 GB).
+
+A cold start is a sum of steps: place the container on a host, start it, fetch the weights, copy them into
+GPU memory, then start the **inference engine** (the server program that runs the model). Write the steps down, because each has a different fix. For a
+40 GB model, the fetch usually dominates, and its time depends almost entirely on **where the bytes are when
+the container starts**:
+
+| Where the 40 GB are | Load time (assumed bandwidths) | What to say in the interview |
+|---|---|---|
+| Object store, 2 GB/s | **about 20 s** streamed; 22 s if done step by step; 32 s if written to local disk first | "Never write to disk and read it back on the critical path." |
+| Local NVMe SSD, 5 GB/s | **about 8 s** | "Put restarts on hosts that already have the file." |
+| Host memory (the operating system's page cache), 20 GB/s | **about 2 s** | "The fastest second start is one that lands where the bytes already are." |
+
+Here "streamed" means the next stage starts on the first chunk while later chunks are still arriving, so the
+total is set by the slowest stage instead of the sum of all stages.
+
+Don't quote a cold-start number; derive it. Prep guides differ by an order of magnitude. One says a cold
+replica can take "tens of seconds to a couple of minutes" (<Cite id="s-75e82f8882" />); another says GPU cold
+start takes "5–10 min to load model weights" without naming a model size (<Cite id="s-c12521aa7d" />). Both
+fit once you ask where the bytes come from: 140 GB at 2 GB/s is **70 s**, and at 250 MB/s it is **560 s**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- 40 GB model: 70 × 10⁹ weights × 4.5 bits ÷ 8 = **39.4 GB**.
+- Step by step: Σ S ÷ B_i over the stages. Streamed in chunks: about S ÷ min(B_i) plus one chunk's latency.
+- Object store at 2 GB/s, then host-to-GPU at an assumed 20 GB/s: 20 s + 2 s = 22 s step by step, about 20 s
+  streamed. Writing to local disk on the way (40 ÷ 4 = 10 s) makes it 32 s.
+- Local NVMe at 5 GB/s: 8 s + 2 s = 10 s step by step, about 8 s streamed.
+- Page cache at 20 GB/s: 2 s + 2 s = 4 s step by step, about 2 s streamed.
+- 140 GB ÷ 2 GB/s = 70 s; 140 GB ÷ 0.25 GB/s = 560 s.
+
+</details>
+
+**Warm spares.** The usual fix for cold starts is to keep some containers already loaded and idle, ready for
+the next burst. These are **warm spares**, and together a **warm pool**. How many do you need? Enough to
+cover the bursts that arrive while a new container is still starting. This is **Little's law**, the queueing
+rule that the number of things in progress equals their arrival rate times how long each takes. If new
+containers are needed at 0.5 per second and a cold start takes 30 s, you need about **15 spares**, which at an
+assumed $2 per GPU-hour is about **$720 a day** of idle GPUs. Cut the cold start to 4 s and you need about
+**2 spares**, about **$96 a day**.
+
+So "keep a warm pool" and "make cold starts faster" are the same lever. Say: "The pool size is proportional
+to the cold-start time. At these numbers, every second I take off the cold start is worth about $24 a day."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- n_warm ≈ λ_new × T_cold, where λ_new is the rate at which demand needs a new container (bursts above current
+  capacity). Idle cost per day ≈ n_warm × p × 24, where p is the GPU-hour price (assumed $2).
+- λ_new = 0.5/s, T_cold = 30 s: n_warm ≈ 15; 15 × 2 × 24 = **$720 a day**.
+- T_cold = 4 s: n_warm ≈ 2; 2 × 2 × 24 = **$96 a day**.
+- One second of cold start: λ_new × p × 24 = 0.5 × 2 × 24 = **$24 a day**.
+
+</details>
+
+### A one-time bulk move
+
+The third case: copy 200 TB once from an on-prem data centre to a cloud GPU cluster within "a few days". The
+only real question is whether the network link is fast enough. Links are sold in bits per second, so multiply
+bytes by 8. Real copies never reach the link's full speed; the Apple candidate assumed about **70%**
+efficiency. The useful rate you actually get is called **goodput**.
+
+| Link | Time at full speed | Time at 70% | What to say in the interview |
+|---|---|---|---|
+| 1 Gbit/s | 18.5 days | **26 days** | "Never makes a few-day window." |
+| 10 Gbit/s | 1.85 days | **2.6 days** | "Barely makes a three-day window." |
+| 100 Gbit/s | 4.4 hours | **6.3 hours** | "Easy, if we really have it to ourselves." |
+
+To finish in three days you need about **6.2 Gbit/s of goodput**, or about 8.8 Gbit/s of link at 70%. Below
+about 10 Gbit/s, shipping disks wins for a one-time move. These match the candidate's own figures in the
+Apple report (<Cite id="s-8e08e84623" />).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- T = bytes × 8 ÷ (link rate × efficiency). 200 TB = 1.6 × 10¹⁵ bits.
+- 1 Gbit/s: 1.6 × 10⁶ s ≈ 18.5 days; ÷ 0.7 ≈ 26 days.
+- 10 Gbit/s: 160,000 s ≈ 1.85 days; ≈ 2.6 days at 70%. 100 Gbit/s: 4.4 hours; 6.3 hours at 70%.
+- Three days: 200 × 10¹² bytes ÷ 259,200 s ≈ 0.77 GB/s = 6.2 Gbit/s of goodput; ÷ 0.7 ≈ 8.8 Gbit/s of line.
+
+</details>
+
+## High-level design
+
+Here is the system for v5's release, top to bottom. Bytes flow down; decisions flow from the control plane.
+
+```
+Publisher ── splits v5 into 64 MB chunks, hashes each, signs the list of hashes
+   │  uploads chunks + signed manifest (never changed again)
+   ▼
+Origin store (object storage, immutable)
+   │  one fetch per chunk per region (coalesced misses)
+   ▼
+Regional chunk cache (one per region; chunks spread across cache nodes by hash)
+   │  fallback source
+   ▼
+Host agent on each of the 250 hosts ◄──── peers swap verified chunks ────► other host agents
+   │  "staged v5" report
+   ▲
+   │  desired version + epoch number
+Control plane (replicated across regions; runs the rollout)
+```
+
+**Publisher.** When v5 is final, it splits each shard into chunks, computes each chunk's SHA-256 hash, and
+writes a **manifest**: the version, the hardware cohort it is for, the shard layout and the ordered list of
+chunk hashes. It signs the manifest and uploads everything. Nothing changes after that.
+
+**Origin store.** Plain object storage holding immutable chunks and manifests. Hosts never serve traffic from
+it, so an origin outage stops new releases but never affects the version that is live.
+
+**Control plane.** It stores versions and manifests, and the desired version for each (service, region,
+cohort). It runs the rollout: which wave of hosts gets v5 next. It is replicated across regions, so hosts can
+still find out what to run during one region's storage incident. Every decision it makes carries an
+**epoch**: a number that only goes up. Hosts use it to ignore stale instructions (explained below).
+
+**Regional chunk cache.** A cache keyed by chunk hash. Chunks are spread across cache nodes by hash, so each
+chunk has one home node. Misses are coalesced, and fills from origin pass through a **token bucket** (a rate
+limiter) that keeps origin traffic within budget.
+
+**Host agent.** A small daemon on every host. It watches its desired version and works toward it, the way a
+Kubernetes controller reconciles toward desired state. It fetches missing chunks from peers first and the
+cache second, checks each chunk's hash before writing or forwarding it, and records which chunks it has in a
+**bitmap** on disk so a restart resumes. When the whole manifest checks out, it reports "staged". It activates
+only when told to, and keeps the last two known-good versions on disk.
+
+**Peer discovery** (not drawn as a box). Hosts in a region need to learn who is alive and who holds which
+chunks. That comes either from a **tracker**, a small service that keeps that list, or from **gossip**, where
+hosts tell each other directly.
+
+Say the key separation out loud: **"Staging and activation are different steps."** Staging v5 on a wave of
+hosts is slow, cheap to undo and invisible to users. Activating it is fast, visible and gated by checks.
+Rollback is simply activating a version that is already on disk.
+
+## Deep dives
+
+### Chunked fan-out, with and without a coordinator
+
+**Swarm by default.** Each host downloads chunks in any order from several peers at once. It prefers the
+chunks that fewest peers have ("rarest first"), so every chunk spreads, and it uploads every chunk it has
+verified. The arithmetic says this approaches the 15-second bound, while trees and chains leave upload idle.
+Keep peers inside a region, ideally inside one rack or switch, so the swarm doesn't fill expensive
+cross-region links.
+
+**With a coordinator.** A tracker per region and version knows which chunks each host holds and hands out
+lists of peers to fetch from. It drops a host that misses heartbeats. Hosts that were fetching from it time
+out on those chunks and ask for other peers. The tracker holds only information hosts can report again, so
+losing it slows new joiners but doesn't stop transfers in flight. Hosts can always fall back to the cache.
+
+**Without a coordinator.** Hosts learn who is alive by gossip. A common protocol for this is **SWIM**: each host
+pings a random peer, and if it gets no answer, it asks a few other hosts to try (an indirect probe) before
+declaring the peer dead. Each host's chunk bitmap rides on the gossip messages. For v5 it is 2,344 bits, about
+293 bytes, so it is cheap to send. A host picks sources at random among peers that advertise a chunk.
+
+Why is a chunk from a stranger safe? Because of content addressing. A chunk is valid if its hash matches the
+signed manifest, whoever sent it. No coordinator has to vouch for a peer. Say: "I trust hashes, not peers."
+
+**Recovery details interviewers probe.** A restarted host reads its bitmap and resumes. A corrupt chunk fails
+its hash check, is thrown away and fetched from someone else, and the sender's score drops. No host forwards a
+chunk it hasn't verified, so corruption can't spread. A slow peer costs at most one chunk's worth of time,
+because each host keeps several requests in flight to different peers, each with its own timeout.
+
+### Integrity, staged rollout and rollback by epoch
+
+**Integrity in three layers.** Per-chunk hashes catch corruption before a chunk is written or forwarded. The
+signed manifest ties those hashes to one version, so neither a cache node nor a peer can slip in a chunk of
+its own. A whole-version check runs before the agent reports "staged". On top of that, service identities
+limit who can fetch a model at all.
+
+**Waves and gates.** Follow v5 through its rollout:
+
+1. A few **canary** hosts per cohort stage v5, activate it and take a little traffic.
+2. Gates check two things. Infra health: did the model load, are errors and latency normal? And quality: a
+   fixed set of test prompts runs on the canaries and is compared with a reference run of the same version,
+   answer by answer or by the model's **log probabilities** (its confidence in each word it wrote).
+3. If both gates pass, one whole region stages and activates. Then the rest.
+4. If a gate fails, the rollout pauses on its own, without waiting for a human.
+
+The quality gate answers the follow-up about a version that passes every checksum but answers worse. Say:
+"A checksum proves the bytes match what was published. It doesn't prove that what was published suits this
+hardware, or ships the right tokenizer and config." The **tokenizer** is the component that turns text into
+the numbers the model reads; ship the wrong one and the model gets nonsense input without any error. Run the
+gate per cohort, because a shard layout can be right for one GPU generation and wrong for another.
+
+**Rollback while a worker is mid-download.** Suppose v5 is half-downloaded on a host when someone orders an
+emergency rollback to v3. The desired version flips from v5 back to v3. The agent works toward whatever is
+desired now: it stops fetching v5, keeps v5's verified chunks for later garbage collection, and activates v3
+from its own disk. No bytes move.
+
+Then it must ignore late messages. Every control-plane decision carries an epoch, and the agent drops any
+instruction older than the last one it applied. Without this, an "activate v5" that was stuck in a queue could
+arrive after the rollback and undo it. Say: "It's the same fencing idea as a lease token: the agent only
+accepts an instruction with a higher epoch than the last one it applied."
+
+**The 2020 version of the same control plane.** Meta's model store question has small files and the same
+shape. Versions are immutable, with metadata (the training data snapshot, the feature schema, the evaluation
+results). Names such as `prod` point at versions. Traffic is split by a hash of the user id for A/B tests. A
+version declares the input features it needs, and serving refuses to activate one whose features it can't
+produce. Moving hourly batch scoring online trades staleness for a per-request latency budget. It also adds
+**training/serving skew**: features computed at request time that differ from the ones the model was trained
+on. Ship it in **shadow mode** first (score real traffic and log the results without using them), and keep the last batch score as the fallback.
+
+### Cold start anatomy and the warm pool
+
+Back to the 40 GB container. The second start is fast when it lands **where the bytes already are**. Prefer
+hosts that hold the model in page cache or on local NVMe, and hash each model to a few preferred hosts so that
+is likely. Elsewhere, stream from a peer or the cache straight into GPU memory, instead of writing a file and
+reading it back.
+
+**Lazy loading** (fetching file contents only when first read) helps the container image and its libraries.
+It doesn't help the weights: a typical model, called a **dense** model, reads every weight to produce its very
+first word. The Modal article's third idea, a **GPU memory snapshot** (saving the loaded GPU state and
+restoring it later), needs care. Modal's own documentation lists GPU memory snapshots as an alpha feature,
+under a heading that says they "do not speed up model loading from storage". Its examples aim snapshots at
+work that isn't limited by storage bandwidth, such as imports and compilation
+([Modal memory snapshots](https://modal.com/docs/guide/memory-snapshot), fetched 2026-10-12). A snapshot is
+also tied to the code, configuration and GPU type that made it. Treat it as a cache with an invalidation rule
+and a fallback path.
+
+**Run the pool as a control loop.** Measure how often new containers are needed over a sliding window, size
+the pool with Little's law plus a margin, and shrink it slowly so a dip followed by a burst doesn't find it
+empty. Merge concurrent cold starts of the same model, so a burst starts one load, not fifty. The serving
+guide's advice is to keep "a warm pool of spare replicas sized to your expected burst" and to avoid scaling to
+zero for interactive endpoints (<Cite id="s-75e82f8882" />).
+
+### The one-time bulk move and feeding the GPUs
+
+Once you have picked the network or disks for the 200 TB:
+
+- **Land in object storage near the cluster.** Use many parallel streams, a checksum per chunk, and a
+  manifest of what has landed so the copy resumes after failures. S3's guidance is to start with one request,
+  measure, and add concurrency until another resource saturates (S3 design patterns, linked above).
+- **Count objects, not only bytes.** If half the bytes are images averaging an assumed 1 MB, that is **100
+  million objects**. S3's guidance treats more than 3,500 PUT or 5,500 GET requests per second per prefix as a
+  high request rate that may see 503 Slow Down errors while S3 scales. At 3,500 PUTs a second, 10⁸ objects take
+  about **7.9 hours** on one prefix. Spread the keys across prefixes, or better, pack small files into
+  **shards of about 1 GB** (200,000 shards for 200 TB). The candidate proposed doing this with WebDataset or
+  TFRecord, two common formats that bundle many training examples into one large file.
+- **Feed the GPUs from shards.** The **data loader** is the code that reads, decodes and batches examples for
+  training. Stream shards into it with prefetching and a shuffle buffer, which mixes examples from several
+  shards so training doesn't see them in file order. Then measure, in order: how busy the GPUs are, how long
+  each training step waits on the loader, read throughput, and decode rate. At an assumed 20,000 images a
+  second of 1 MB each, reads are **20 GB/s**. At an assumed 200 decodes per core per second, decoding needs
+  **100 CPU cores**. Either one starves the GPUs before the GPUs are the limit.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- 100 TB of 1 MB images = 10⁸ objects; 10⁸ ÷ 3,500 per second ≈ 28,600 s ≈ **7.9 hours**.
+- 200 TB ÷ 1 GB = 200,000 shards.
+- 20,000 × 1 MB = 20 GB/s; 20,000 ÷ 200 = 100 cores.
+
+</details>
+
+## Failure modes and overload
+
+| Failure | How you notice | What happens |
+|---|---|---|
+| Cold regional cache during a release | Miss rate jumps; origin traffic hits its budget | Coalescing turns 250 identical misses into one fetch per chunk; the token bucket caps origin traffic; peers carry most bytes; waves pause if the budget runs out |
+| Origin outage | Cache fill errors | Hosts and caches that hold chunks keep serving them; new versions wait; live versions are untouched because serving never reads origin |
+| Regional control-plane outage | Agents can't reach the local replica | Agents read another region's replica or keep their current desired state; serving continues |
+| Host dies mid-download | Tracker heartbeats or gossip probes | Peers switch sources; on restart it resumes from its bitmap |
+| Corrupt chunk | Hash mismatch | Throw away, fetch elsewhere, lower the sender's score; repeated failures quarantine it |
+| Disk full | Agent can't stage | Delete versions older than the kept ones; never delete the active or rollback version; report instead |
+| Bad version | Quality gate fails on canaries | Pause automatically, roll back by epoch; staged hosts keep the bytes and never activate them |
+| Whole region restarts at once | Thousands of agents start together | Randomized backoff on control-plane reads; versions on disk reactivate with no download |
+| Burst on a cold-start endpoint | Queue depth and time to first response rise | Warm spares absorb the burst; extra requests wait in a queue with deadlines instead of starting dozens of cold containers |
+
+<Pitfall title="Measuring only bytes delivered">
+A rollout that delivered every byte and passed every checksum can still ship a worse model, which is exactly
+PracHub's third follow-up. Put a quality gate per hardware cohort between "staged" and the next wave, and let it
+pause the rollout without waiting for a human.
+</Pitfall>
+
+## Evals and observability
+
+What would you put on the dashboard for v5's release? Five groups:
+
+- **Distribution:** time to "staged" and to "active" per wave, at the median, the 99th percentile and the
+  maximum. The slowest hosts (the stragglers) are the story. Also bytes from origin versus cache versus peers,
+  origin traffic against its budget, and cache hit ratio per region.
+- **Integrity:** hash failures by peer and cache node; signature failures, which should be zero, so page on
+  any; resumed downloads.
+- **Rollout:** gate results per cohort against the previous version on the same prompts, and the time from a
+  bad-version signal to a finished fleet-wide rollback.
+- **Cold start:** a per-start breakdown (place, container, fetch, copy, engine start); the share of starts that
+  found the model in memory or on NVMe; how often a warm spare was ready; idle warm GPU-hours per day.
+- **Bulk move:** bytes and objects landed per hour against the plan, retry and checksum-failure counts, and,
+  for training, how busy the GPUs are and how long each step waits on the data loader.
+
+Say: "If I could watch only one number during a release, it would be the slowest host's time to staged,
+because a rollout finishes when its last host does."
+
+## Trade-offs
+
+- **Swarm versus cache only.** In the arithmetic the swarm is about 50 times faster (15 s against 750 s) and
+  protects the origin. It costs a more complex agent and peers that must authenticate each other. Cache only
+  is enough when releases are small, rare or reach few hosts.
+- **Staging ahead versus fetching on activation.** Staging ahead uses disk and bandwidth for versions that may
+  never go live. In exchange, activation and rollback are fast, low-risk and need no download.
+- **Warm pool versus faster cold start.** Little's law gives the exchange rate. Spend engineering time on cold
+  starts only when the money saved (λ_new × p × 24 per second removed, $24 a day in the example) beats what
+  the work costs.
+
+<AINative title="The agent writes the downloader; you break it on purpose">
+"Parallelize chunked file download and verify integrity" is a Baseten coding title on PracHub
+(<Cite id="s-fa7d3ae628" />), and a coding agent produces a plausible version in minutes. What it rarely gets
+right unprompted is behavior under failure, which is where these designs fail in production and in follow-ups.
+Write the failure harness yourself: kill a peer mid-chunk, serve a corrupted chunk, delay one message so a stale
+"activate" arrives after a rollback, fill the disk, restart the agent halfway. Assert that the agent resumes,
+never relays an unverified chunk and never applies an older epoch. Then let the agent fix what the harness
+finds. Practise the round without the agent too: Anthropic, where three of these questions come from, allows no
+AI assistance in live interviews unless told otherwise
+(<Dated asOf="2025-07" src="s-b4d190c38f">per Anthropic's candidate guidance</Dated>).
+</AINative>
+
+## Small-team version
+
+You self-host a few models: an embedding model (one that turns text into vectors for search), a speech or
+image model, maybe an 8-billion-parameter model or a 4-bit 70B model. The thousand-host swarm is a provider's problem. What you
+feel is cold starts on every scale-up, and new versions that sometimes need a rollback.
+
+### What changes at small scale
+
+At 5 to 20 GPU nodes, the origin is rarely the bottleneck; each node's own read path is. Twenty nodes each
+pulling 40 GB from object storage in parallel finish in about **20 s** each, at an assumed 2 GB/s per node.
+The crowding problem appears only when the origin sits behind a small fixed pipe. Through an assumed 10 Gbit/s
+(1.25 GB/s) link to an on-prem store or another cloud, 20 × 40 GB takes **640 s, about 11 minutes**, against
+32 s for one node alone. That is the case to fix, and a copy of the bucket in the cluster's own region fixes
+it.
+
+### Build
+
+- **A weights convention, not a distribution system.** Store each model at a path keyed by version and content
+  hash, copied into your own bucket from wherever it came from, pinned to an exact revision. Check the hash
+  after download. Never fetch from a public model hub at request time.
+- **Weights next to the GPU.** On a serverless GPU platform, put them in the platform's volume or in the image.
+  Modal's docs recommend downloading weights ahead of time into the image or a Volume and say this can cut boot
+  "from minutes to seconds" for models in the tens of GB
+  ([Modal cold-start guide](https://modal.com/docs/guide/cold-start), fetched 2026-10-12). On Kubernetes,
+  prefetch by version hash onto node-local NVMe before the pod needs it.
+- **Parallel range reads** from object storage, lined up with part boundaries, with retries on the slowest
+  requests (S3 guidance above).
+- **Rollback as a flag flip.** Keep the previous version on the volume or node, and make the active version a
+  config value. Gate the flip with a small eval set (see the
+  [eval-system walkthrough](/system-design-labs/interviews/walkthroughs/eval-system/)).
+
+### Buy
+
+A serverless GPU platform gives you the warm-pool settings instead of making you build them. Modal exposes
+`min_containers` (a floor that stops scaling to zero), `buffer_containers` (spares while active) and
+`scaledown_window` (idle time before shutdown; default 60 s, range 2 s to 20 minutes), and says you are
+"billed for any resources used while the container is idle" (Modal cold-start guide, fetched 2026-10-12).
+If the model is available on a serverless endpoint priced per **token** (a token is roughly ¾ of a word of text the model reads or writes) and passes your eval, buying tokens removes
+the cold-start problem entirely. One published break-even analysis found that a rented node of 2 H100 GPUs
+can't break even against the same open model on a serverless endpoint when traffic runs only in business
+hours ([Cohorte](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even), 2026-09-20).
+
+### Skip
+
+Peer-to-peer swarms, trackers, gossip, custom chunk caches and per-cohort artifacts. Skip GPU memory snapshots
+for starts limited by loading weights: Modal's docs say they don't speed up loading from storage, and they are
+alpha. Don't bake a 40 GB model into an image that changes with every code push. Put the weights in their own
+layer that rarely changes, or in a volume.
+
+### The warm-replica decision, with dated prices
+
+The real small-team question is: do we keep one GPU warm all the time? Here is what that costs. Modal list
+prices, fetched 2026-10-12 ([pricing](https://modal.com/pricing)), per second, for four NVIDIA GPU types from largest to smallest: H100 $0.001097, A100 80 GB
+$0.000694, L40S $0.000542, L4 $0.000222.
+
+| GPU | Per hour | One always warm, all month (730 h) | One warm in business hours (assumed 220 h) |
+|---|---|---|---|
+| H100 | $3.95 | $2,883 | $869 |
+| A100 80 GB | $2.50 | $1,824 | $550 |
+| L40S | $1.95 | $1,424 | $429 |
+| L4 | $0.80 | $583 | $176 |
+
+An engineer's time costs about $194K a year including benefits, about **$3,700 a week** (BLS median wage
+$135,980 ÷ 0.70; see Sources).
+
+1. **A cold start costs latency, not money.** A 60 s cold start on an H100 is 60 × $0.001097 = **$0.066** of
+   GPU time. For batch and background work (embedding backfills, transcription queues), scale to zero: a 60 s
+   start before a 30-minute job is 3% overhead.
+2. **For an interactive endpoint, engineering rarely removes the first warm replica.** From object storage at
+   2 GB/s, 40 GB takes 20 s before the engine even starts. With few bursts, Little's law gives fewer than one
+   spare, so the question is "one or zero", not "how many".
+3. **Break-even.** An always-on A100 costs about half an engineer-week a month ($1,824 ÷ $3,700). If a week of
+   work let you drop it, the work would pay back in about two months; on an L4 it would take more than six.
+   Do the one-hour fixes first (pre-download weights, keep them in a volume, parallel reads), then pay for the
+   warm replica during business hours, and engineer further only when the numbers say so.
+
+Say: "Buy one warm A100 in business hours for about $550 a month; build faster cold starts only when the
+spares cost more than an engineer-week every couple of months."
+
+### Revisit when
+
+- More than a handful of nodes pull the same release through a shared, fixed-size pipe. Compute nodes × size
+  ÷ pipe bandwidth against your rollout window.
+- Cold-start p95 shows up in a user-facing SLO, and spares cost more than an engineer-week every couple of
+  months.
+- Weights become sensitive, for example fine-tuned on customer data. Then add signed manifests, encryption at
+  rest and per-service access.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Moving big bytes"
+  senior={[
+    "Derives the client-server, chain, tree and swarm times from stated bandwidths, and notices the disk becomes the bottleneck.",
+    "Picks a chunk size with reasons, verifies every chunk against a signed manifest, and resumes from a bitmap.",
+    "Separates staging from activation, keeps known-good versions on disk, and handles rollback mid-download by reconciling to the desired state.",
+    "Breaks a cold start into stages and attacks the biggest one; works the bulk move in bits per second before picking network or disks.",
+  ]}
+  staff={[
+    "Counts hosts, not GPUs, and asks which hardware cohorts need different artifacts before sizing anything.",
+    "Adds an epoch to every control-plane decision so a late message can't undo a rollback, and makes a per-cohort quality gate part of the rollout contract.",
+    "Prices the warm pool with Little's law and turns cold-start work into dollars, including the case where one warm replica beats all of it.",
+    "Asks what consumes the bytes next (serving, training) and names the metric that would show the design is wrong: straggler time, origin egress, GPU busy fraction.",
+  ]}
+/>
+
+In plain words: a Senior answer gets the numbers and the mechanisms right. A Staff answer also asks the
+questions that change the design (hosts or GPUs, which hardware groups), protects the rollout against
+message-ordering bugs, and puts a dollar figure on each choice.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="(Reported, Anthropic) Is it better to send to fewer hosts faster or split bandwidth across many?">
+    With whole-file transfers, fewer at a time wins, because a finished host can start relaying. With chunks,
+    the question becomes tree width: each child of a node with k children receives at B ÷ k, so a narrow tree
+    is faster and depth costs only a few chunk-times. A swarm avoids the choice by letting every host upload
+    what it has. Give the numbers: about 30 s with 2 children, 60 s with 4, a 15 s bound for a swarm, and
+    37.5 s of disk writes.
+  </FollowUp>
+  <FollowUp q="(Reported, Anthropic) How does recovery work with a coordinator, and then without one?">
+    With a tracker, hosts get peer lists from it, it drops dead hosts on missed heartbeats, and it can be
+    rebuilt from host reports. Without one, membership and chunk bitmaps travel by gossip, failures are found
+    with indirect probes, and any peer's chunk is acceptable once its hash matches the signed manifest. Either
+    way, the cache tier is the fallback source.
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page, Anthropic) A region's cache goes cold just as a 150 GB release ramps there. How does origin survive?">
+    Coalesce misses so each chunk is fetched once per region (150 GB instead of 37.5 TB), spread chunks across
+    cache nodes by hash so only one node fetches each, rate-limit fills with a token bucket, and let peers
+    carry most bytes. Without peers, size the waves: 100 hosts per 5-minute wave at 50 GB/s.
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page, Anthropic) An emergency rollback to v3 starts while a worker is mid-download of v5.">
+    The agent works toward the new desired state: stop fetching v5, keep its verified chunks for later garbage
+    collection, activate v3 from disk. Every decision carries an epoch, so a delayed "activate v5" is dropped
+    when it arrives.
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page, Anthropic) The new version passes checksums but answers worse, and infra looks healthy.">
+    Checksums prove the bytes match what was published, nothing more. Gate each wave on a quality check per
+    hardware cohort against a reference run of the same version, let it pause the rollout automatically, and
+    look for causes such as a shard layout wrong for the cohort or a mismatched tokenizer or config.
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page, Anthropic) Two versions share most shards, as with a LoRA on a shared base.">
+    Content-addressed chunks make deduplication automatic: hosts holding the base fetch only the adapter's
+    chunks, about 131 MB for a rank-16 adapter on q, k, v and o of a 70B base, against 140 GB for the base. Pin
+    base chunks while any active version references them.
+  </FollowUp>
+  <FollowUp q="(Modal prep guide) Ten thousand short tasks land in one second. How does the scheduler place them?">
+    One placement decision per millisecond in a central loop would take 10 s for the burst. Place in batches,
+    shard the scheduler by function or tenant, or let hosts pull from per-pool queues. Prefer hosts that already
+    hold the image and weights, and admit the excess into a queue with deadlines instead of starting thousands of
+    cold containers at once.
+  </FollowUp>
+  <FollowUp q="(Reported, Apple) The data has landed. How do you keep the GPUs from starving during training?">
+    Pack small files into large shards, stream them with prefetch and a shuffle buffer, and measure before
+    tuning: how busy the GPUs are, data-loader wait per step, read throughput, decode rate per core. Whichever
+    saturates first is the bottleneck. At an assumed 20,000 images a second, reads are 20 GB/s and decoding
+    needs about 100 cores at an assumed 200 per core per second.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Boxes before numbers.** The question bank's Staff signal for infra-054 is to start from file size,
+  bandwidth and machine count, and the Apple candidate reports that clarifying first counted in their favor
+  (<Cite id="s-8e08e84623" />). Work out the cache-only and swarm times before drawing.
+- **Forgetting the disk.** Once the network is fast, writing 150 GB is the slowest step. Stream to memory or
+  accept the disk time out loud.
+- **Counting GPUs instead of hosts.** That multiplies every byte by eight.
+- **Tying activation to download.** A rollout that goes live as bytes arrive can't roll back quickly. Stage,
+  then activate, and keep known-good versions on disk.
+- **No ordering on control messages.** A late "activate" undoes a rollback. Put an epoch on every decision.
+- **"Keep everything warm."** The Modal article calls this the weak answer (<Cite id="s-86890a1069" />). The
+  opposite is just as wrong for interactive endpoints: scaling to zero with a 40 GB model means a user waits
+  for the load. Size spares with Little's law.
+- **Expecting snapshots to fix weight loading,** or quoting a cold-start number. Fix where the bytes live,
+  and derive the time from bytes and bandwidth.
+- **Treating this round as the whole loop.** In both first-hand Anthropic accounts this round went reasonably
+  well: one ended after about 40 minutes, and the other candidate calls it their stronger design round. The
+  first was still rejected with no feedback (<Cite id="s-e9fee3985a" />), and that candidate felt worst about
+  the coding round; the second thinks the culture round may have been the reason
+  (<Cite id="s-e98cbef9cd" />). Prepare the values and behavioral rounds as seriously as the bandwidth math.
+
+## Prove it with a lab
+
+The site has no weight-distribution lab. Several labs build pieces of one, and none moves gigabytes, so claim
+the mechanisms, not throughput. Only faas-runtime and feature-flags pass their own tests; the other four have
+failing tests as of 2026-10-11, and each card says which.
+
+<LabRef lab="faas-runtime" role="proof" note="Its warm pool keeps up to 3 idle instances per function and evicts after 5 minutes idle; the cold start is a 50 ms sleep. Add single-flight so concurrent cold starts of one function share a start, then replace the fixed cap with a pool sized from λ_new × T_cold." />
+
+<LabRef lab="feature-flags" role="proof" note="Percentage rollout by a hash of user id and flag name, plus an audit log: use it as the activation layer (which cohort runs which version) and as the A/B assignment for a model store." />
+
+<LabRef lab="cdn-edge" role="partial" note="Run its request-coalescing test (it passes) to see many concurrent misses become one origin fetch, then key the cache by content hash and add a token bucket on origin fills." />
+
+<LabRef lab="gossip" role="partial" note="Its SWIM stages give failure detection with indirect probes. Add a chunk bitmap to each member's state and pick download sources from it." />
+
+<LabRef lab="service-discovery" role="partial" note="TTL heartbeats and watches are a tracker's job in miniature. Its failing watch-expiry test is the dead-peer path, so start there." />
+
+<LabRef lab="consistent-hashing" role="partial" note="Spread chunk hashes across cache nodes and count how many chunks move when a node joins or leaves." />
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-e9fee3985a" />
+- <Cite id="s-e98cbef9cd" />
+- <Cite id="s-2d04c3afaf" />
+- <Cite id="s-3650fe20d8" />
+- <Cite id="s-86890a1069" />
+- <Cite id="s-8e08e84623" />
+- <Cite id="s-e030bbd728" />
+- <Cite id="s-e23c30a3c6" />
+- <Cite id="s-75e82f8882" />
+- <Cite id="s-c12521aa7d" />
+- <Cite id="s-fa7d3ae628" />
+- <Cite id="s-b4d190c38f" />
+- Modal, [Pricing](https://modal.com/pricing): per-second GPU list prices, fetched 2026-10-12.
+- Modal, [Cold start guide](https://modal.com/docs/guide/cold-start): `min_containers`, `buffer_containers`, `scaledown_window`, idle billing, pre-downloading weights; fetched 2026-10-12.
+- Modal, [Memory snapshots](https://modal.com/docs/guide/memory-snapshot): GPU snapshots are alpha and don't speed up loading from storage; fetched 2026-10-12.
+- Cohorte, [Self-hosted LLM cost vs API: the second break-even](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even) (C. Mouzouni, 2026-09-20): break-even of a rented 2× H100 node against APIs and serverless endpoints (fetched 2026-10-11).
+- AWS, [Performance design patterns for Amazon S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html): parallel byte-range GETs, part alignment, per-prefix request rates; fetched 2026-10-12.
+- U.S. Bureau of Labor Statistics, [Software developers](https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm) (median pay, May 2025) and [Employer costs for employee compensation](https://www.bls.gov/news.release/ecec.nr0.htm) (wages 70.0% of compensation, June 2026), fetched 2026-10-11.

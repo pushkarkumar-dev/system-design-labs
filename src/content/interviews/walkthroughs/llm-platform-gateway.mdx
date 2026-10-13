@@ -1,0 +1,850 @@
+---
+title: "Internal LLM platform: provider gateway, routing, budgets and prompt versions"
+summary: "Design the shared layer every service uses to call models: failover between providers, limits and budgets counted in tokens, a cost record per call, a safe result cache, routing by tier and prompts kept as fixed versions."
+track: cross
+format: design
+family: llm-platform-gateway
+smallTeamFocus: "Start with a thin client library or an off-the-shelf proxy, one fallback provider per tier, a feature tag on every call and provider spend caps. Build your own gateway only when a second team, a residency rule or a budget forces it."
+rounds: [system-design, practical-coding, project-presentation]
+level: both
+timeboxMin: 45
+order: 118
+status: published
+basedOn: [eng-058, eng-068, eng-069, infra-044, r2a-020]
+askedAt: [anthropic, linkedin, openai, perplexity]
+labs:
+  - { lab: load-balancer, role: proof, note: "Health checks, a three-state circuit breaker and a 20% retry budget. Known bug: its v2 retry runs after the first 5xx has already been written to the client, and a retried POST goes out with an empty body; both are mistakes a gateway must avoid." }
+  - { lab: rate-limiter, role: proof, note: "Token bucket, sliding window and a Redis-backed per-tier limiter. It counts requests, not tokens, and fails open when Redis errors; changing both is the exercise." }
+  - { lab: feature-flags, role: proof, note: "Percentage rollout, push updates and an audit log: how a route, fallback or price change reaches every gateway replica safely." }
+  - { lab: crdt, role: proof, note: "Conflict-free replicated types: the background for live co-editing of prompt drafts in the playground variant." }
+  - { lab: observability, role: partial, note: "Metrics, structured logs and trace propagation, but its Go package does not compile, and it has no token, cost or time-to-first-token attributes." }
+  - { lab: kv-cache, role: background, note: "A Redis-style store with TTL and LRU, usable behind an exact-match result cache or shared counters. It is not an LLM KV cache." }
+gapLabs: [llm-gateway, llm-observability]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'd put one gateway between our services and the model providers. Services ask for a named route, like
+> 'support-answer', never a specific model, so the platform can move traffic without code changes. The gateway
+> picks a model that can serve the request and fails over to a second provider, but only before the first word
+> has been streamed back, because after that a retry would glue two different answers together. Limits and
+> budgets count tokens, not requests, because one request can cost a thousand times more than another: reserve
+> the worst case when a request starts and refund the unused part when it ends. Every call writes one cost record
+> tagged with its team and feature, and prompts are fixed, numbered versions, so any output can say exactly which
+> prompt and model produced it."
+>
+> The rest of this page explains each part of that answer.
+
+### Why this is not an ordinary API gateway
+
+You have built or run API gateways before. A gateway in front of your own services authenticates the caller,
+counts requests against a rate limit, picks a healthy backend and retries on a 503. Every request costs roughly
+the same, takes milliseconds, and any healthy backend gives the same answer. A gateway in front of large language
+model (LLM) providers, such as Anthropic, OpenAI or a model you host yourself, breaks all four of those habits.
+
+1. **Requests differ in cost by a factor of a thousand.** A model API bills by the amount of text it reads and
+   writes, not by the call. One request reads a sentence; another reads a 300-page contract. A limit that counts
+   requests treats them as equal, so it protects neither your budget nor the provider's limits.
+2. **Requests are slow and stream.** A reply takes seconds, and it is sent to the user word by word as the model
+   writes it. Once the first words have reached the user, you cannot quietly retry somewhere else.
+3. **Backends are not interchangeable.** Two providers' models give different answers to the same request. They
+   format differently, refuse different things and make different mistakes. "Fail over to a healthy backend"
+   becomes a product decision, not only a reliability one.
+4. **Part of the program lives outside the code.** The instructions you send the model (the prompt) decide how
+   your feature behaves. Product people want to change them without a deploy, and when an output is wrong someone
+   has to find out exactly which prompt produced it.
+
+If you explain those four things and give each one a mechanism, you have the core answer: token-based limits and
+cost records for the first, a commit point for retries for the second, fallback rules backed by tests for the
+third, and fixed prompt versions for the fourth.
+
+### Words you need first
+
+- **Token.** Models read and write text in small pieces called tokens, roughly ¾ of a word each. Providers price
+  and limit everything in tokens. **Input tokens** are what you send (instructions, context, the user's message);
+  **output tokens** are what the model writes back. Output tokens cost more than input tokens.
+- **Provider.** A company that runs models and sells access through an API, priced per million tokens. Each
+  customer account gets **API keys**, and each key has limits, most importantly **tokens per minute (TPM)**.
+- **Streaming and time to first token.** With streaming on, the provider sends each piece of the reply as soon as
+  it exists, usually over **server-sent events (SSE)**, one long HTTP response the server keeps writing to. The
+  delay before the first piece arrives is the **time to first token (TTFT)**; it is the delay users feel most.
+- **Prompt.** Everything sent to the model for one request. A fixed block of instructions that every request on a
+  feature starts with is the **system prompt**.
+
+Other terms are defined where they first appear.
+
+### The prompt as an interviewer might give it
+
+Several backend services call model APIs. Design the shared layer they call instead. It holds the provider
+keys, routes each request to a model that can serve it, fails over when a provider is degraded, enforces limits
+and budgets measured in tokens, attributes every dollar to a team and feature, caches results where that is
+safe, and keeps prompts as immutable, versioned artifacts that can be run against a model with a record of
+exactly what ran.
+
+### Where it was asked
+
+Five reported questions share this problem, and each stresses a different corner of it.
+
+<QuestionRow id="eng-058" />
+<QuestionRow id="infra-044" />
+<QuestionRow id="eng-068" />
+<QuestionRow id="eng-069" />
+<QuestionRow id="r2a-020" />
+
+- **Perplexity (eng-058)** is the provider pool written as a client library with failover. PracHub lists it as a
+  technical screen from August 2025, with a long requirements list and no numbers (<Cite id="s-a90c8401d4" />).
+- **Anthropic (infra-044)** is a router between an API tier and mixed GPU and CPU backends, with tenant
+  priority, batching, a result cache and credit-based fairness. PracHub's page (posted 2025-09-06) notes that
+  "Determinism is achievable for specific settings (e.g., temperature=0), enabling a query result cache", and
+  gives no traffic, latency or fleet numbers (<Cite id="s-f6f4e54967" />).
+- **Anthropic (eng-068)** is a collaborative prompt playground: co-edited drafts, fixed versions, and runs tied to
+  a version with a record of what ran and how retries behave. Only the title is the candidate's report; the
+  parts, hints and follow-ups are PracHub's write-up (posted 2026-10-05, <Cite id="s-f40d0eed6e" />).
+- **OpenAI (eng-069)** is "Design the OpenAI Playground", a title on an aggregator list with no answer guidance
+  (<Cite id="s-d7a8e88bf0" />). Confidence is low; treat it as the same problem as eng-068.
+- **LinkedIn (r2a-020)** is a project deep dive, not a design round. A Senior candidate describes presenting a
+  framework that let customers call external LLMs, followed by "a long conversation about token handling and how
+  usage gets assigned correctly" and the question "How was pricing thought about, per query or per token?"
+  (<Cite id="s-1980a339c0" />).
+
+## What is being tested
+
+**Covering a requirements list, then going deep where the interviewer leans.** The Perplexity statement asks for a
+capability map per model (a table of what each model supports), rate limits per provider and key, quotas per provider, model and tenant, active and
+passive health checks, separate timeouts, circuit breakers, cost- and latency-aware balancing, retries and
+fallbacks, metrics and tracing, key rotation and redaction, and thread-safe streaming (<Cite id="s-a90c8401d4" />).
+Nothing in that list is exotic for a backend engineer. The test is whether you cover it in the order of what loses
+money or users, and bring your own numbers, labelled as assumptions.
+
+**When a retry is still safe.** Every variant hides a retry question. In the provider pool it is "when can I still
+fail over to another provider?". In the playground it is "which exact prompt did this output run?". PracHub's hint
+for eng-068 says to decide that because "Two collaborators can change the draft while a model request is running"
+(<Cite id="s-f40d0eed6e" />).
+
+**Money counted in tokens.** The LinkedIn deep dive turned into allocation and pricing (<Cite id="s-1980a339c0" />).
+Expect a cost question even when the prompt is about reliability.
+
+**Fairness and scheduling** in the Anthropic router variant: priority between customers and between kinds of
+request, and credits so a heavy customer cannot starve a light one (<Cite id="s-f6f4e54967" />).
+
+**Designing to the stated requirements.** A rejected Stripe Staff candidate relays design-round feedback that they
+were "trying to force-fit a template from somewhere else instead of designing around the actual requirements"
+(<Cite id="s-8e0784406e" />). Here the tempting template is a learned router and a semantic cache (both explained
+later) before timeouts, breakers and budgets work.
+
+## Clarify and scope
+
+Spend two or three minutes on these. Say your assumptions out loud, and label them as assumptions.
+
+1. **Library or service?** The Perplexity framing is a client library linked into each service. That adds no
+   network hop, but breaker state, counters and budgets live in each process unless you put them in a shared
+   store. A gateway service puts keys, quotas and logs in one place, at the cost of a hop and a service someone
+   must run. Ask which. This page designs a service with a thin SDK (the small client library each service links)
+   and says where the library version differs.
+2. **Who are the tenants?** A **tenant** is whoever gets limited and charged: internal teams, or external
+   customers who are billed. Billing raises the accuracy bar for counting tokens.
+3. **Which models are interchangeable?** Falling back to another provider's model changes the output. Ask whether
+   each route accepts that.
+4. **Traffic and token shape.** "Assume 2,000 requests per second at peak and 500 on average, about 1,500 input
+   and 300 output tokens per request, mostly streamed." All assumed.
+5. **Latency.** Time to first token matters most for streamed calls. "Assume the gateway may add a few
+   milliseconds at p99."
+6. **Data rules.** Retention, residency and providers that must not see certain data become routing constraints.
+7. **Self-hosted models?** If yes (the Anthropic variant), the router also has to batch and schedule work on
+   your own GPUs. If no, the provider does that for you.
+8. **Prompts.** "Do product people edit prompts without a deploy?" If so, the platform needs a prompt registry with
+   fixed versions, which is the playground variant.
+
+**Out of scope:** the content of eval suites, the fixed sets of graded examples run before a change ships (you use them to approve fallbacks and prompt versions, not design them
+here), agent orchestration, and the provider's own serving stack.
+
+### The example we follow through this page
+
+One request runs through every section. A customer types a question into a help widget. The support service calls
+the gateway on the route `support-answer` for the tenant `support-team` and the feature tag `help-widget`, with
+streaming on. The prompt is about **1,500 input tokens** (a system prompt, a few help articles and the question).
+The caller caps the reply at **1,000 output tokens**; this cap is a request parameter called **`max_tokens`**. The
+model actually writes **300 tokens**. The primary model is Claude Sonnet 5 on provider A, at list prices of $2 per
+million input tokens and $10 per million output tokens (fetched 2026-10-11 from
+[Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing)). The fallback is a model in
+the same quality tier on provider B. The timings are assumptions: about 0.5 s to the first token and 50 tokens per
+second after that.
+
+## Back-of-envelope
+
+Before drawing boxes, put six numbers on the board. Each one changes a design decision, so say what it means before
+you compute it. All traffic figures are the assumptions above; prices are list prices fetched 2026-10-11 (re-check
+them). The full arithmetic is in the box at the end of this section.
+
+**1. How many provider keys you need.** Providers cap each key or account in tokens per minute. Your peak traffic,
+converted to tokens per minute, tells you how many keys (or how high a limit) you must arrange before launch.
+At 2,000 requests per second of 1,800 tokens each, the peak is **216 million tokens per minute**. If each key
+allowed an assumed 40 million, you would need **6 keys**, before any headroom for failover.
+
+**2. What a day costs.** Our example request costs **$0.006**: half for its input, half for its output. At 500
+requests per second on average, that is about **$259K a day**. The useful way to say it: "a routing or caching
+change worth 1% is about $2.6K a day". At this scale a small policy change is a budget decision, so the cost
+ledger needs the same care as a billing system.
+
+**3. How many streams are open at once.** A request lives for seconds, not milliseconds. Little's law (the number
+of things in a system equals arrival rate times how long each stays) turns that into open connections. Our example
+stays about 6.5 seconds (0.5 s to the first token plus 300 tokens at 50 per second), so the peak has about
+**13,000 streams open at once**. At an assumed 64 KB of buffers each, that is about 832 MB across the fleet. This
+sizes connection pools, file descriptors and memory, and it is why an LLM gateway is not a normal request proxy.
+
+**4. What retries do to a failing provider.** If every request may try three times, a provider that starts failing
+receives three times its normal load exactly when it can least take it. A **retry budget** caps retries at a
+fraction of normal requests. With a budget of 20% (the load-balancer lab's value), the failing provider sees **at
+most 1.2×** its normal load. The Google SRE book makes the same argument for a 10% budget, and for retrying only at
+the layer immediately above the failing one ([Handling Overload](https://sre.google/sre-book/handling-overload/)).
+
+**5. Why the gateway refunds tokens.** When a request starts, nobody knows how long the reply will be, so the
+gateway reserves the worst case: input plus `max_tokens`. When it ends, it gives back what was not used. Our example
+reserves 2,500 tokens, refunds 700 and is charged 1,800. Without the refund, the same 40-million-per-minute limit
+admits **28% fewer requests**, because every request is counted at its cap.
+
+**6. What a second provider buys.** Assembled, a company whose product runs on LLM providers, measured 99.80% availability
+for OpenAI and 99.58% for Anthropic from status pages over recent months. On its own, the weaker number means about
+**3 hours down a month**. If the two failed independently, both would be down together for **less than half a minute
+a month**. Independence is the optimistic assumption: shared regions, shared upstream incidents and your own gateway
+bugs fail together. Assembled reports 99.97% effective uptime after building fallback
+([Assembled, 2025-06-12](https://www.assembled.com/blog/your-llm-provider-will-go-down-but-you-dont-have-to)).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Token throughput against provider limits"
+  expr="tokens per minute = requests per second × (input + output tokens) × 60;  keys needed = ⌈TPM ÷ per-key TPM limit⌉"
+  vars={[
+    { sym: 'TPM limit', meaning: 'tokens-per-minute limit on one key or organisation (assumed 40 M)' },
+  ]}
+  example={[
+    "Peak: 2,000 × 1,800 × 60 = 216 M tokens per minute",
+    "At an assumed 40 M TPM per key: ⌈216 ÷ 40⌉ = 6 keys, before any headroom for failover",
+  ]}
+/>
+
+<Formula
+  title="Cost per request and per day"
+  expr="cost = input_tokens × input_price + output_tokens × output_price"
+  vars={[
+    { sym: 'input_price', meaning: 'Claude Sonnet 5 list price, $2 per million input tokens (fetched 2026-10-11)' },
+    { sym: 'output_price', meaning: 'same model, $10 per million output tokens' },
+  ]}
+  example={[
+    "Per request: 1,500 × $2 ÷ 10⁶ + 300 × $10 ÷ 10⁶ = $0.003 + $0.003 = $0.006",
+    "Per day at 500 requests per second average: 500 × 86,400 = 43.2 M requests × $0.006 ≈ $259K",
+    "A routing or caching change worth 1% is about $2.6K a day",
+  ]}
+/>
+
+<Formula
+  title="Open streams (Little's law)"
+  expr="open streams = requests per second × (TTFT + output_tokens ÷ decode_rate)"
+  vars={[
+    { sym: 'TTFT', meaning: 'time to first token (assumed 0.5 s)' },
+    { sym: 'decode_rate', meaning: 'tokens per second per stream (assumed 50)' },
+  ]}
+  example="2,000 × (0.5 + 300 ÷ 50) = 2,000 × 6.5 = 13,000 concurrent streams at peak; at an assumed 64 KB of buffers each, about 832 MB across the fleet"
+/>
+
+<Formula
+  title="Retry amplification"
+  expr="load on a failing provider = base × max_attempts (no budget)  or  ≤ base × (1 + b) (retry budget b)"
+  vars={[
+    { sym: 'max_attempts', meaning: 'tries per request, including the first' },
+    { sym: 'b', meaning: 'retries allowed as a fraction of requests (the load-balancer lab uses 0.2)' },
+  ]}
+  example="3 attempts with no budget: a provider that starts failing sees 3× its normal load exactly when it can least take it. With b = 0.2 it sees at most 1.2×."
+/>
+
+<Formula
+  title="Token reservations"
+  expr="reserve = input_tokens + max_tokens at admission;  refund = max_tokens − actual_output at completion"
+  vars={[
+    { sym: 'max_tokens', meaning: 'the output cap the caller set' },
+  ]}
+  example={[
+    "Input 1,500, max_tokens 1,000, actual output 300: reserve 2,500, refund 700, charge 1,800",
+    "Under a 40 M TPM limit, never refunding admits 40 M ÷ 2,500 = 16,000 requests per minute instead of 40 M ÷ 1,800 ≈ 22,200: 28% fewer",
+  ]}
+/>
+
+<Formula
+  title="What a second provider buys"
+  expr="unavailability with failover ≈ (1 − A₁) × (1 − A₂)   (only if failures are independent)"
+  vars={[
+    { sym: 'A₁, A₂', meaning: 'availability of the primary and fallback provider' },
+  ]}
+  example={[
+    "Assembled measured 99.80% (OpenAI) and 99.58% (Anthropic) from status pages over recent months",
+    "Alone: 0.42% × 720 h = 3.0 h a month down for the weaker one; 0.20% × 720 h = 1.4 h for the stronger",
+    "Both at once, if independent: 0.0042 × 0.0020 = 8.4 × 10⁻⁶ × 720 h ≈ 0.4 minutes a month",
+  ]}
+  note="Independence is the optimistic assumption. Shared regions, shared upstream incidents and your own gateway bugs are correlated. Assembled reports 99.97% effective uptime after building fallback."
+/>
+
+</details>
+
+## High-level design
+
+Draw this, top to bottom, and then walk one request through it.
+
+```
+  Service code  (support service, search service, ...)
+      │  call(route="support-answer", tenant, feature, deadline, stream)
+      ▼
+  SDK  ── adds tenant, feature tag, route, deadline, trace id
+      │
+      ▼
+  Gateway replica  (stateless; many behind a load balancer)
+      ├─ Policy ────── route → ordered list of models that can serve it
+      ├─ Admission ─── reserve tokens and dollars ───────────►  Counter store
+      ├─ Cache ─────── only on routes that opted in              (shared, fast)
+      ├─ Router ────── skip broken models and empty keys; score the rest
+      └─ Adapter ───── speak provider A's or B's API; classify failures
+      │                    │                │                 │
+      ▼                    ▼                ▼                 ▼
+  Cost ledger          Provider A       Provider B      Self-hosted pool
+  (one record per                                       (only in the
+   attempt)                                              infra-044 variant)
+
+  Config service ── pushes routes, prices and prompt versions to every replica
+```
+
+**SDK.** Each service links a thin client. It attaches the tenant, the feature tag, the route name and a deadline,
+and it passes the trace context so one request can be followed across services. Callers name a route such as
+`support-answer`, never a provider's model id. That one rule is what lets the platform move traffic, add a fallback
+or change models without anyone changing code.
+
+**Policy.** Turns the route into an ordered list of acceptable models. It filters that list with the **capability
+map**, a table of what each model supports: maximum prompt length, tool calling, a JSON output mode, streaming, the
+regions it runs in and the provider's data-retention terms.
+
+**Admission.** Checks and reserves every limit that applies, all at once: the tenant's requests per minute, the
+tenant's tokens per minute, its number of open streams, the feature's daily dollar budget, and the provider key's
+own limits. The reservations live in a shared counter store (Redis or similar) so every replica sees the same
+numbers.
+
+**Cache.** Looks up a stored answer, but only on routes that opted in. Most routes should not; the deep dive on
+routing explains why.
+
+**Router.** Drops models whose circuit breaker is open and keys marked exhausted, then scores what is left on price,
+recent latency and health, and picks one.
+
+**Adapter.** Translates the request into that provider's API, streams the reply back, and classifies any failure
+so the gateway knows whether a retry is allowed.
+
+**Cost ledger.** An append-only record, one row per provider attempt, shipped to the data warehouse. It is the
+source for budgets, chargeback and the daily check against provider invoices.
+
+**Config service.** Routes, fallback lists, prices and prompt versions are configuration, pushed to every replica
+with an audit trail, so a change takes effect without a deploy and can be rolled back in one step.
+
+**Where state lives.** Counters and reservations live in the fast shared store. Breaker state can stay local to
+each replica. Config and prompt versions are pushed. The cost ledger is append-only. In the **library** variant,
+everything inside the gateway box runs in each service's process. Breakers stay local; counters and budgets must
+still live in a shared store, or each process enforces its own copy of the limit.
+
+### The example request, step by step
+
+Here is our `support-answer` request on a normal day. Gateway timings are illustrative; the model timings are the
+assumptions from the scope section.
+
+| Clock | Step | What happens | Running total | What to say in the interview |
+|---|---|---|---|---|
+| 0 ms | **SDK** | Adds tenant `support-team`, feature `help-widget`, route, deadline, trace id. | — | "Callers name a route, never a model." |
+| ~1 ms | **Policy** | Route resolves to Sonnet 5 on A, then the same-tier model on B. Both pass the capability map. | — | "The capability map stops us sending a request to a model that can't take it." |
+| ~2 ms | **Admission** | Reserves 1,500 + 1,000 = 2,500 tokens against every limit in one atomic step. | 2,500 tokens reserved | "Reserve the worst case, refund the rest." |
+| ~3 ms | **Cache** | Route has not opted in, so no lookup. | — | "Caching is opt-in per route." |
+| ~3 ms | **Router** | A's breaker is closed and its key has room, so A is chosen. | — | "Filter, then score. Keep the score visible in the trace." |
+| ~0.5 s | **Adapter** | First token arrives from A and is forwarded. | — | "This first forwarded byte is the commit point. No silent failover after it." |
+| 0.5–6.5 s | **Stream** | 300 tokens at about 50 per second, relayed as they arrive. | — | "The connection is open for seconds; size pools for that." |
+| ~6.5 s | **Completion** | Provider reports 1,500 in and 300 out. Gateway refunds 700 and writes one cost record. | 1,800 tokens, **$0.006** | "Refund on every exit path, from the provider's own counts." |
+
+The rest of the page reuses this request. The failover deep dive breaks provider A; the budgets deep dive follows
+its reservation; the prompt-versions deep dive asks which prompt it ran.
+
+## Deep dives
+
+### Failover, and what counts as retryable
+
+Start with a table that classifies every failure. Everything else in the failover design follows from it, so
+write it on the board early.
+
+| Signal | Usual meaning | Action |
+|---|---|---|
+| Connect error, or no first byte before the TTFT timeout | Provider or network trouble | Next candidate if the retry budget allows; counts toward that model's breaker |
+| 429 with Retry-After | Your key or organisation is out of quota | Don't open the breaker. Mark the key exhausted until reset; try another key or provider |
+| 5xx before the first byte | Provider error | Retry within budget on another candidate; counts toward the breaker |
+| Context too long | This model can't take the request | Reroute only to a longer-context model the route allows |
+| Validation error or refusal | The request itself | Don't retry; return to the caller |
+| Error after tokens have streamed | Partial output already delivered | No transparent retry; send an error event |
+
+Two rows need a word for a backend reader. A **429** is HTTP's "too many requests"; from a model provider it
+usually means *your* key ran out of its per-minute allowance, not that the provider is sick, and
+**Retry-After** is the header that says when to try again. A **refusal** is the model declining to answer; another
+model may answer, but silently swapping models to get around a refusal is not the gateway's call.
+
+**Now break our example.** Provider A returns a 503 forty milliseconds after the request is sent, before any token.
+Nothing has reached the user. The adapter classifies it as "5xx before the first byte", the retry budget has room,
+and the router sends the same request to the same-tier model on provider B. B's first token arrives, it is
+forwarded, and from this moment the request is committed to B. The cost ledger gets two rows: attempt 1 on A
+(failed, with its failure class) and attempt 2 on B. The user sees one answer, a little later than usual.
+
+Now break it differently. A streams 120 tokens, then the connection drops. The user has already seen those 120
+tokens. Sending the request to B would produce a different answer, and splicing B's text onto A's is a
+correctness bug: the user sees two answers glued together. So the gateway sends an error event on the stream and
+lets the caller decide whether to retry the whole request.
+
+That is the most important sentence in this design. Say it like this: **"The first forwarded byte is the commit
+point. Before it, retry freely within budget. After it, another model, or even the same model asked again,
+produces different text."** Assembled's fallback works the same way: it tries the next model only if streaming
+has not begun, and the team found most outages happen before the first token
+([Assembled](https://www.assembled.com/blog/your-llm-provider-will-go-down-but-you-dont-have-to), 2025-06-12).
+
+**Breakers per provider, model and region.** A **circuit breaker** stops sending traffic to something that keeps
+failing, then lets a few test requests through later (the half-open state). Key it on the provider, the model and
+the region together, because one model can be down while the provider's others are fine. Trip it on latency as
+well as errors: a model whose time to first token goes from 1 s to 20 s is down for an interactive caller, even
+with zero errors. When it half-opens, send a few probes and ramp traffic back gradually.
+
+**Four timeouts, not one.** The first is connect. The second is time to first byte, set per model and per
+prompt-size bucket from the observed p99, because a 100K-token prompt legitimately takes longer to start. The third
+is the idle gap between tokens, which catches a stream that stalls halfway. The fourth is the caller's total
+deadline.
+
+**Fallback is a product decision.** A different model is a different product: it formats, refuses and reasons
+differently. So group models into **capability tiers** (models of similar quality and features), fall back only
+within a tier, and enable each fallback pair only after the route's **eval set** passes on it. An eval set is a
+fixed collection of real example inputs with a way to grade the outputs, run before a change ships, the way a test
+suite is. Assembled evaluates every prompt change on at least the first two providers in its fallback order and
+reports that this adds 20–30% to prompt development time. Budget for it.
+
+**Failover capacity in tokens.** Suppose the primary carries 70% of peak and fails. The fallback must now absorb its
+own 30% plus that 70%, inside its keys' tokens-per-minute limits. If it can't, fail over the highest-priority tiers
+and shed the rest with 429 and Retry-After, rather than tripping the fallback's limits too.
+
+### Token limits, budgets and attribution
+
+Providers bill and limit in tokens, so the gateway must too. A limiter that counts requests treats a 100-token call
+and a 100,000-token call the same.
+
+**Reserve and refund.** Our example reserved 2,500 tokens at admission (its 1,500 input plus its 1,000 cap) and
+refunded 700 at completion, using the token counts the provider reported. Refund on every exit path: success,
+provider error, client disconnect and timeout. Give every reservation a time-to-live so that if a gateway replica
+crashes mid-request, its reservations expire instead of leaking forever.
+
+**Check compound rules atomically.** Our request touches five limits: tenant requests per minute, tenant tokens per
+minute, open streams, the feature's daily budget and the key's limit. Check and reserve all of them in one script
+on the shared store, all or nothing. If you check them one by one, a failure on the fourth leaves the first three
+reserved and nobody gives them back.
+
+**Accuracy versus latency.** A round trip to the shared store on every request costs latency. The usual middle
+ground is a **lease**: the store hands each replica a small slice of a tenant's budget, and the replica spends it
+locally and renews it often. Overshoot is bounded by the number of replicas times the lease size.
+
+**Fail open or closed when the store is down.** The rate-limiter lab fails open (lets everything through). Fail
+closed for free tiers and hard budgets. Fail open for paid traffic, but with a local cap on each replica, and alert.
+
+**Attribution.** Every cost record carries: tenant, team, feature tag, route, prompt version, provider, model,
+attempt number, fallback reason, cache result, input, cached-input and output tokens, price-table version and
+cost. Prices live in versioned config, so any past record can be recomputed after a price change. Reconcile the
+ledger against provider invoices every day. When they disagree, it usually means a missed exit path or retries
+that were never counted. For our example, the two-attempt version writes two records: the failed attempt on A and
+the successful one on B, each priced at its own provider's rates.
+
+**Per query or per token (r2a-020).** Meter and allocate in tokens, because that is what you pay and request sizes
+vary by orders of magnitude. A per-query price is a way to present cost to internal customers whose usage is
+predictable, or an external pricing decision that needs a per-user cap behind it. TechCrunch reported
+Cursor's 2025 apology after a move from request-based to usage-based pricing surprised users
+([TechCrunch, 2025-07-07](https://techcrunch.com/2025/07/07/cursor-apologizes-for-unclear-pricing-changes-that-upset-users/)).
+Say it like this: "Pricing that hides token variance moves the risk to whoever holds the cap."
+
+### Routing by tier, and the scheduler variant
+
+**Routing for a pool of providers** is a filter, then a score. Filter on capability, region, retention terms,
+breaker state and key exhaustion. Score on price per expected token, recent p95 time to first token, and error
+rate. Keep the scoring simple and write it into the trace, so anyone can see why a request went where it went. A
+**learned router** (a model trained to predict which model will answer best) is a later optimisation, and it needs
+an eval to prove it does not lose quality.
+
+**Routing by model tier** is the cheapest large lever: send easy requests to a cheaper, smaller model. It needs a
+decision rule (a plain rule, a classifier or a small model) and an eval that compares quality per tier on that
+route's real traffic. The [cost and latency walkthrough](/system-design-labs/interviews/walkthroughs/llm-cost-latency/)
+works the arithmetic.
+
+**The Anthropic variant (infra-044)** puts self-hosted models, running on your own GPU and CPU machines, behind the
+router. Now the router also schedules, because nobody else will. A few words first:
+
+- **Batching.** A GPU running a model is far more efficient when it works on many requests in the same step. The
+  serving engine (the program that runs the model, such as vLLM) groups requests for the same model into a batch.
+  Modern engines do **continuous batching**: requests join and leave the batch between steps.
+- **KV memory.** While a request is being answered, the GPU keeps a saved summary of every token so far for that
+  request, called the **KV cache**. It grows with every token and is freed when the request ends. This memory, not
+  raw compute, usually limits how many requests one GPU can hold at once.
+
+With those in hand, the scheduler has three jobs.
+
+- **Priority classes.** Interactive streaming goes ahead of batch work; within a class, tenants are ordered by
+  contract tier. Strict priority starves the low class forever, so cap the high class's share or **age** waiting
+  requests (raise their priority the longer they wait).
+- **Credit-based fairness.** Give each tenant credits per second in proportion to its weight. Charge each request
+  its estimated cost in tokens: the prompt tokens plus the expected output, weighted by model size. Serve the
+  tenant with the most remaining credit next. This is deficit-style **weighted fair queuing**. It is
+  **work-conserving**: when one tenant is idle, its share goes to the others instead of being wasted.
+- **Pools per model.** Route all requests for one model to that model's pool of machines, so its engine can batch
+  them. Route by hardware tier too: small models on CPUs or small GPUs, large models on large GPUs. Admission to a
+  pool is bounded by tokens and KV memory, not by request count.
+
+A two-tenant example makes fairness concrete. Tenant A has weight 3 and tenant B weight 1, on a pool that does an
+assumed 40,000 weighted tokens per second. While both are busy, **A gets 30,000 and B 10,000 tokens per second**.
+When B goes idle, A may use all 40,000 until B returns.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Weighted fair share"
+  expr="share_i = w_i ÷ Σ w_active × capacity"
+  vars={[
+    { sym: 'w_i', meaning: 'tenant weight (contract tier)' },
+    { sym: 'capacity', meaning: 'backend throughput in weighted tokens per second (assumed 40,000)' },
+  ]}
+  example={[
+    "Tenants A (w = 3) and B (w = 1) both busy: A gets 30,000 and B 10,000 tokens per second",
+    "B goes idle: A may use all 40,000 until B returns",
+  ]}
+/>
+
+</details>
+
+**The temperature-0 result cache.** **Temperature** is the sampling setting that controls randomness; at
+temperature 0 the model is asked to pick its most likely next token every time, so the same request should give the
+same answer. The PracHub page assumes that determinism (<Cite id="s-f6f4e54967" />). Say the caveat: Thinking
+Machines showed that served outputs vary at temperature 0 mainly because the GPU's arithmetic results change with
+batch size, which changes with server load
+([Horace He, 2025-09-10](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/)). So a cache
+hit is a policy decision ("we accept any valid temperature-0 answer"), not a guarantee of the same answer.
+
+The cache key must include the tenant, the model id and version, the normalised messages, the system prompt, the
+tools and every sampling parameter. Leave out the tenant and you have a cross-tenant leak. Leave out the version and
+you serve answers from a model you no longer run. Never cache calls whose tools act on the world (send an email,
+issue a refund). Our `support-answer` route did not opt in, and that is the usual answer for chat: real questions
+rarely repeat exactly.
+
+### Prompt versions and the playground variant
+
+Treat a prompt like code: drafts can change, versions cannot, and every run names exactly what ran.
+
+- **Draft** (changeable, per project): the text, template variables, tool definitions and model settings. Saves use
+  compare-and-swap on a revision number, so two editors who both edit revision 41 get a conflict instead of a
+  silent overwrite. Live co-editing can come later, with a **CRDT** (a data type whose copies merge without
+  conflicts) or operational transform (the older technique behind collaborative editors). Presence and cursors are
+  short-lived state and are never stored with the content.
+- **Version** (fixed): created when someone presses "publish". Its id is a content hash of everything that affects
+  the output, so identical content gets the same id and nothing can change it afterwards.
+- **Run**: `{run_id, version_id, inputs, model, provider, sampling params, operation_id}` plus a state machine:
+  queued → running → succeeded | failed | **unknown**. The client sends an idempotency key, so a retried "run"
+  after a lost response returns the same run instead of paying twice. "Unknown" exists because a provider call can
+  time out after the provider has billed and produced output; show it as unknown rather than pretending it failed.
+- **Retries** create a new *attempt* under the same run, never a new run. Each attempt has its own cost record,
+  exactly like our example's two attempts on A and B.
+- **Provenance.** Outputs claim the version they ran, not the draft. That answers PracHub's hint: a collaborator
+  who edits the draft mid-run changes nothing about the running output (<Cite id="s-f40d0eed6e" />).
+- **Separation.** Collaboration traffic (websocket edits) and model execution (a queue of runs) are separate paths,
+  and the browser never sees provider keys; runs go through the gateway with the project's budget.
+- **Access lost mid-run** (a PracHub follow-up): the run completes, because it was authorised when it started, but
+  the result is visible only to members who still have access.
+
+The same registry serves production. Our support service could ask for `support-answer@v17`, or for a label such as
+`@prod` that points at a version. Moving a label is a reviewed change with an eval run attached. When a customer
+complains about an answer, the cost record says which version and model produced it, and the version says exactly
+what the prompt was.
+
+## Failure modes and overload
+
+- **Primary outage at peak.** Breakers open. Routes that opted in fail over within their tier, up to the fallback's
+  token capacity. The rest are shed by priority tier with 429 and Retry-After.
+- **Slow, not failing.** Latency-tripped breakers help. So does **hedging** on chosen routes: send a second request
+  when the first has produced no byte by its p95, and use whichever starts first. The hedged share pays for its input
+  twice.
+- **Retry storm.** The retry budget caps the extra load at (1 + b) times normal, and retries respect Retry-After.
+- **Spend cap hit.** Anthropic's API documents monthly spend caps per usage tier. At the cap it returns 429 without
+  a retry-after, and retries keep failing until the next month
+  ([rate limits doc](https://platform.claude.com/docs/en/api/rate-limits), fetched 2026-10-11). Treat that 429 as
+  "key exhausted for the period", route around it, and alert a human.
+- **Counter store down.** Fall back to local per-replica caps under the per-tier fail-open rule; reservations expire
+  by their time-to-live.
+- **Recovery stampede.** Ramp traffic back through half-open probes rather than restoring the full share at once.
+- **Bad config push.** A wrong fallback list or price moves or misprices all traffic. Roll config out by percentage,
+  with an audit log and a one-step revert.
+- **Key leak.** Keep keys in a secret store, scoped per route or tenant. Rotate by adding the new key, shifting
+  traffic, then revoking the old one. Redact keys from every log and trace.
+- **Silent quality loss.** Every infrastructure metric is green while answers get worse, for example after a
+  fallback or a provider-side model change. Only per-route quality signals, split by the model that served each
+  request, catch it.
+
+<Pitfall title="Retrying after the first byte">
+The most common bug in a homemade provider pool: on an error, retry on the next provider even though part of the
+first answer already reached the user, who sees two answers glued together. Treat the first forwarded byte as the
+commit point. The load-balancer lab has the same shape of bug: its retry starts after the first 5xx was already
+written to the client.
+</Pitfall>
+
+## Evals and observability
+
+**One trace per request**, with a child span per provider attempt. Each span carries: tenant, feature, route,
+prompt version, model, provider, attempt, fallback reason, breaker state at decision time, cache result, time to
+first token, total time, input, cached and output tokens, cost and finish reason. Generic tracing gives you spans
+but not these attributes; that gap is what the planned LLM-observability lab would cover. For our two-attempt
+example, the trace shows A's 503 at 40 ms, the retry-budget decision, and B's attempt with its tokens and cost.
+
+**Metrics per provider, model and region:** errors by class from the failure table, TTFT p50 and p99, tokens per
+second, 429s per key, breaker transitions and retry-budget use. **Per feature and tenant:** tokens and dollars per
+hour against budget, outstanding reservations, requests shed and cache hit rate.
+
+**Quality gates.** Reliability metrics cannot tell you that answers got worse. These can:
+
+- Before enabling a fallback pair, a cheaper tier or a new prompt version, run the route's eval set on both and
+  compare.
+- After enabling, track task success, user feedback and format errors (for example invalid JSON), split by the model
+  and prompt version that actually served the request.
+- For a new model, use **shadow traffic**: send it a sample of real requests, throw its answers away, and compare
+  them offline.
+- Report **cost per successful task**, not cost per call. That is the number leadership should see.
+
+**Decide the logging rules before you store logs:** what is redacted, who can read prompts and outputs, and how
+long they are kept. Prompts often contain customer data.
+
+## Trade-offs
+
+| Decision | Gain | Cost | Choose differently when |
+|---|---|---|---|
+| Gateway service vs library | One place for keys, limits, logs, config | A hop and a service to run | One or two services and low traffic: start with a library |
+| Global token limits in a shared store | Accurate limits across replicas | A round trip or lease logic per request | Approximate per-replica limits are good enough |
+| Automatic cross-provider failover | Availability | Output consistency; evals per fallback pair (+20–30% prompt work, per Assembled) | Routes where a different answer is worse than an error |
+| Hedging | Lower tail latency | Duplicate input tokens on the hedged share | Cost-sensitive or batch routes |
+| Temperature-0 result cache | Spend and latency on repeats | Stale or cross-version answers if the key is incomplete | Requests rarely repeat exactly |
+| Content-hash prompt versions | Reproducibility, dedupe | Every label move is a reviewed change | Prompts are code-reviewed and shipped with the service |
+| Fail open on store outage | Availability | Possible overspend | Free tiers and hard budgets: fail closed |
+
+<AINative title="Agents write the adapters; you own what costs money">
+Perplexity's official interview page lists an Agentic Coding round that requires frontier coding agents
+(<Cite id="s-2b79c76453" />); whether agents are allowed in the provider-pool screen is not stated. Either way the
+split of labour is the same. An agent is good at the volume: adapters for each provider's request and streaming
+format, config parsing, the SDK surface. What you check yourself is what loses money or data: the retryable-error
+table, the first-byte commit point, refunds on every exit path, tenant and model version in the cache key, and
+reported token counts against your own. Have the agent build a fake provider that returns 429 with Retry-After,
+fails mid-stream, stalls before the first byte and over-reports usage, then run the gateway against it. A Snowflake
+candidate describes an AI-augmented round on similar material: the AI may write the rate limiter, but you explain
+the algorithm and how you instructed, reviewed and tested it (<Cite id="s-5b59630431" />).
+</AINative>
+
+## Small-team version
+
+Picture the job: you own AI at a 50–500 person company, with a few engineers and coding agents. The gateway is
+usually the first platform piece you need, and the moment is specific: a second team starts calling models, or the
+first surprise bill arrives. Surveyed teams most often buy the inference layer (45%) and least often build it
+(23%), while 61% build their own prompt management ([Amplify Partners 2026 AI Engineering Report](https://amplifypartners.com/blog-posts/the-2026-ai-engineering-report)).
+
+### Build, buy or skip
+
+- **Week one: a thin client library, not a service.** It sets a feature tag and deadline on every call, retries
+  within a budget only before the first byte, falls back to one model in the same tier on a second provider, and
+  logs tokens and cost per call. An agent writes most of it in a day; you write the failure tests.
+- **Buy the proxy when a second team arrives.** LiteLLM's self-hosted proxy documents per-key, per-user and
+  per-team `max_budget` with a `budget_duration` reset, plus `tpm_limit`, `rpm_limit` and `max_parallel_requests`
+  on keys, and says budgets need a Postgres database to be enforced
+  ([LiteLLM docs](https://docs.litellm.ai/docs/proxy/users), fetched 2026-10-12). Hosted aggregators such as
+  OpenRouter offer a fallback model list without running anything; check their fee and data terms before routing
+  customer data through them.
+- **Use the provider's own controls as the outer fence.** Anthropic documents monthly spend caps per usage tier
+  (Start $500, Build $1,000, Scale $200,000 as fetched 2026-10-11) and workspace limits
+  ([rate limits doc](https://platform.claude.com/docs/en/api/rate-limits)). Know your tier before launch day.
+- **Prompt versions:** keep them in git next to the code, with an eval run in CI, until non-engineers need to edit
+  prompts without a deploy. Then a small registry table with content-hash versions and a `prod` label is enough.
+- **Skip:** a learned router, a semantic cache (one that returns a stored answer for a question that merely looks
+  similar), multi-region active-active, and a custom scheduler. You have no self-hosted fleet to schedule.
+
+### A worked monthly estimate (list prices fetched 2026-10-11)
+
+Here is what three features cost at an assumed company, priced from Anthropic's and OpenAI's pricing pages
+([Anthropic](https://platform.claude.com/docs/en/about-claude/pricing), [OpenAI](https://developers.openai.com/api/docs/pricing)).
+Two discounts appear. **Prompt caching** lets the provider reuse the part of a prompt it saw recently (usually the
+system prompt), and charges those **cached input tokens** much less (here, a tenth of the normal input price). The **batch API**
+takes work that nobody is waiting on, runs it later, and charges half. Cache-write surcharges and tokenizer
+differences are ignored here, and quality is not compared.
+
+| Feature (assumed volume) | Model and mode | Per call | Per 30 days |
+|---|---|---|---|
+| Support answers: 50,000/day, 3,000 input (2,000 a cached prefix), 400 output | Claude Sonnet 5, prompt caching | 1,000 × $2/M + 2,000 × $0.20/M + 400 × $10/M = $0.0064 | 1.5 M × $0.0064 = **$9,600** |
+| Nightly document summaries: 20,000/day, 6,000 input, 500 output | Claude Sonnet 5, batch API (50% off) | (6,000 × $2/M + 500 × $10/M) × 0.5 = $0.0085 | 600,000 × $0.0085 = **$5,100** |
+| Ticket tagging: 30,000/day, 800 input, 20 output | gpt-5-nano | 800 × $0.05/M + 20 × $0.40/M = $0.000048 | 900,000 × $0.000048 = **$43** |
+
+The total is about **$14,743 a month**, and one feature is 65% of it. Without feature tags the bill is a single
+number and nobody knows which lever to pull. With them, the levers are visible:
+
+- **Prompt caching saves about $5,400 a month** on support answers.
+- **The batch API saves about $5,100 a month** on summaries nobody waits for.
+- **A cheaper tier could cut support to about $3,220 a month**, if an eval showed that 70% of support questions
+  could go to Claude Haiku 5.5. The 70% is an assumption only your eval can confirm.
+
+Against that, the gateway's own cost is mostly people: about **$1,620 a month for 10% of one engineer**. A proxy
+that makes the caching or routing savings visible pays for that many times over; a hand-built scheduler does not.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Total:** $9,600 + $5,100 + $43 ≈ $14,743. Support's share: 9,600 ÷ 14,743 ≈ 65%.
+- **Without prompt caching**, support would cost 3,000 × $2/M + 400 × $10/M = $0.010 a call, × 1.5 M = $15,000 a
+  month: caching saves $5,400.
+- **Without the batch API**, summaries would cost $0.017 a call × 600,000 = $10,200: batching saves $5,100.
+- **Cheaper tier:** Claude Haiku 5.5 lists $0.10 input, $0.01 cached input and $0.50 output per million, for prompts
+  up to 100K tokens. Per call: 1,000 × $0.10/M + 2,000 × $0.01/M + 400 × $0.50/M = $0.00032. Blend at an assumed
+  70% on Haiku: 0.7 × $0.00032 + 0.3 × $0.0064 = $0.00214 a call, × 1.5 M ≈ $3,220 a month.
+- **Engineer time:** a loaded cost of the BLS median developer wage of $135,980 (May 2025) ÷ 0.70 (wages are about
+  70% of total compensation) ≈ $194K a year; 10% of that ÷ 12 ≈ $1,620 a month
+  ([BLS](https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm)).
+
+</details>
+
+### What you still own and verify
+
+- The failure tests: a fake provider that stalls, returns 429s, fails mid-stream and over-reports tokens.
+- An eval run for every fallback pair, cheaper tier and prompt version before it serves traffic.
+- Budgets and alerts per feature: a soft alert at 80% of the monthly budget, and a hard cap at 100% that downgrades
+  or blocks the route (only where the route owner agreed to that).
+- Data terms: which providers may see which data, and their retention terms.
+
+### Revisit when
+
+A third team or an external customer needs billing-grade metering; a residency rule forces regional routing; spend
+passes the point where 1% matters more than an engineer's month; or you start hosting models yourself, which turns
+the router into a scheduler (the infra-044 variant).
+
+## Senior vs Staff
+
+<LevelContrast
+  title="LLM platform gateway"
+  senior={[
+    "Covers the requirements list with clean interfaces: route, capability map, adapter, limiter, breaker, ledger, prompt version.",
+    "Writes the retryable-error table and the first-byte commit rule; limits in tokens with reserve and refund, enforced atomically.",
+    "Puts tenant and model version in any cache key, and makes runs reference immutable versions with idempotency keys.",
+    "Emits one trace per request with tokens, cost, TTFT and the serving model.",
+  ]}
+  staff={[
+    "Chooses library or service by ownership: who holds keys, who is paged, who approves a fallback or a prompt promotion.",
+    "Makes failover a per-route contract backed by eval evidence, and plans failover capacity in tokens per minute.",
+    "Treats cost as a product surface: feature tags, versioned prices, budgets, invoice reconciliation, cost per successful task.",
+    "Sequences the rollout: start with a library and provider caps, adopt a proxy when a second team arrives, and names the metric that would justify building more.",
+  ]}
+/>
+
+In plain words: a Senior answer gets every mechanism right. A Staff answer also says who owns each decision, what
+evidence turns a fallback on, and what number would justify building the next piece.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="From the Perplexity requirements on PracHub: how do you support streaming and still fail over?">
+    Fail over only before the first byte is forwarded. Set a time-to-first-byte timeout per model and prompt-size
+    bucket, and optionally hedge within the retry budget. After the first byte, a failure becomes an error event and
+    the caller decides whether to retry the whole request.
+  </FollowUp>
+  <FollowUp q="Reported (LinkedIn, first-hand): how were tokens allocated, and was pricing per query or per token?">
+    Meter and allocate in tokens with reserve and refund, attributed to tenant and feature, with versioned prices.
+    Present a per-query price only where usage is predictable, and keep a per-user cap behind any flat price.
+  </FollowUp>
+  <FollowUp q="Listed on the PracHub page (Anthropic): how would you add live co-editing to a compare-and-swap save design?">
+    Keep compare-and-swap for publishing versions; move the draft to a CRDT or operational-transform document synced
+    over websockets, with presence as short-lived state. Publishing snapshots the merged draft into a fixed,
+    content-hashed version, so runs still reference something that cannot change.
+  </FollowUp>
+  <FollowUp q="Listed on the PracHub page (Anthropic): a user loses project access during an active run. What happens?">
+    The run was authorised at start, so it completes and is billed to the project. Reads are authorised at read
+    time, so the user can no longer see the output. Log both decisions.
+  </FollowUp>
+  <FollowUp q="From the Anthropic requirements on PracHub: how do you keep one tenant from starving the others?">
+    Credit-based weighted fair queuing on estimated token cost, work-conserving so an idle tenant's share is reused,
+    plus a cap or aging on strict priority classes. Admission is bounded by tokens and KV memory per backend pool.
+  </FollowUp>
+  <FollowUp q="Not reported; a natural next push: the primary fails at peak and the fallback has half the token limit you need.">
+    Don't fail everything over; that trips the fallback too. Move the highest tiers up to its capacity, shed the rest
+    with 429 and Retry-After, and record in the trace who was shed and why.
+  </FollowUp>
+  <FollowUp q="Not reported; a natural next push: someone proposes a semantic cache to cut spend by 10%.">
+    Ask what share of hits would be wrong for the new request, measured on labelled pairs from real traffic, and what
+    a wrong answer costs on that route. Then ask whether it is scoped per tenant, how the similarity threshold was
+    chosen, how hits are sampled for review, and how to turn it off.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Limiting by request count.** Costs and provider limits are in tokens, so a request limit protects neither; reserve
+  and refund tokens instead (the rate-limiter lab counts requests, so it is a starting point).
+- **Retrying after the first byte.** The user has already seen part of one answer, and a retry glues a second one
+  onto it; Assembled restricts fallback to before streaming begins for the same reason
+  ([Assembled](https://www.assembled.com/blog/your-llm-provider-will-go-down-but-you-dont-have-to)).
+- **Opening the breaker on 429s.** A 429 means your key ran out of quota, not that the provider is down, so mark the
+  key exhausted until its reset instead.
+- **No retry budget.** Unlimited retries triple the load on a provider that is already failing; cap retries as a
+  fraction of requests, at one layer only ([SRE book](https://sre.google/sre-book/handling-overload/)).
+- **Treating failover as free.** A fallback model is a different product, so fall back within a tier, opt in per
+  route and run an eval per pair.
+- **Runs that point at a draft.** Nobody can then say which prompt produced an output; runs must reference fixed
+  versions, as PracHub's hint for the playground question points out (<Cite id="s-f40d0eed6e" />).
+- **One bill, no attribution.** Without a feature tag on every call and a ledger checked against invoices, nobody
+  knows which lever to pull.
+- **Fitting a template instead of the requirements.** The relayed Stripe feedback (<Cite id="s-8e0784406e" />); here
+  it looks like a learned router and a semantic cache with no timeouts or refunds.
+
+## Prove it with a lab
+
+There is no gateway lab yet. The proof labs below implement its building blocks, each with a gap that makes a good
+exercise. The observability lab doesn't compile as of 2026-10-11, and kv-cache is a generic store, not an LLM
+component.
+
+<LabRef lab="load-balancer" role="proof" note="Fix its v2 retry: buffer the request body and non-streamed responses, refuse to retry after the first byte, and add a latency trip to the breaker." />
+
+<LabRef lab="rate-limiter" role="proof" note="Change the bucket cost from 1 per request to the request's tokens, add reserve and refund, and check several limits in one atomic Redis script. Decide whether failing open is right per tier." />
+
+<LabRef lab="feature-flags" role="proof" note="Model routes, fallbacks and prompt labels as flags: percentage rollout, push to every replica, and an audit log of who changed what." />
+
+<LabRef lab="crdt" role="proof" note="The merge semantics behind live co-editing of prompt drafts; versions stay immutable snapshots on top." />
+
+<LabRef lab="observability" role="partial" note="Fix span.go so the package compiles, then add token, cost, model, attempt and time-to-first-token attributes." />
+
+<LabRef lab="kv-cache" role="background" note="Storage only: TTL and LRU for exact-match result entries or counters." />
+
+Two planned labs would cover the rest: an LLM gateway (routing, fallbacks, token limits, budgets) and LLM
+observability (traces with tokens, cost and quality signals). The sibling family on
+[latency and cost](/system-design-labs/interviews/walkthroughs/llm-cost-latency/) covers what to do with the
+numbers this gateway records.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-a90c8401d4" />: PracHub, Perplexity provider-pool requirements
+- <Cite id="s-161b75eab8" />: PracHub Perplexity company page (titles)
+- <Cite id="s-f6f4e54967" />: PracHub, Anthropic routing and scheduling layer (posted 2025-09-06)
+- <Cite id="s-f40d0eed6e" />: PracHub, Anthropic collaborative prompt playground (posted 2026-10-05; parts and follow-ups are PracHub's write-up)
+- <Cite id="s-d7a8e88bf0" />: Aced question list (OpenAI Playground title)
+- <Cite id="s-1980a339c0" />: LinkedIn Senior candidate account (tokens and pricing)
+- <Cite id="s-8e0784406e" />: Stripe Staff account (relayed design feedback)
+- <Cite id="s-2b79c76453" />: Perplexity interview resources (Agentic Coding round)
+- <Cite id="s-5b59630431" />: Snowflake AI-augmented rate-limiter round
+- [Assembled: Your LLM provider will go down, but you don't have to](https://www.assembled.com/blog/your-llm-provider-will-go-down-but-you-dont-have-to) (2025-06-12)
+- [Google SRE book, Handling Overload](https://sre.google/sre-book/handling-overload/)
+- [Thinking Machines: Defeating nondeterminism in LLM inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) (2025-09-10)
+- [LiteLLM proxy budgets and rate limits](https://docs.litellm.ai/docs/proxy/users) (fetched 2026-10-12)
+- [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing), [Anthropic rate limits](https://platform.claude.com/docs/en/api/rate-limits), [OpenAI pricing](https://developers.openai.com/api/docs/pricing) (fetched 2026-10-11)
+- [Amplify Partners 2026 AI Engineering Report](https://amplifypartners.com/blog-posts/the-2026-ai-engineering-report); [BLS software developers](https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm); [TechCrunch on Cursor pricing](https://techcrunch.com/2025/07/07/cursor-apologizes-for-unclear-pricing-changes-that-upset-users/) (2025-07-07)

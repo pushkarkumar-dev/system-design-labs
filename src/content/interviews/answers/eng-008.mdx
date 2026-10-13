@@ -1,0 +1,178 @@
+---
+question: eng-008
+family: rag-system-design
+status: published
+labs: [rag, embedding-pipeline, vector-index]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Each part of a retrieval system trades something. Embeddings find passages by meaning, but they blur exact names and codes,
+> so I pair them with keyword search and merge the two ranked lists by position. Chunks follow the document's
+> headings and stay within what the embedding model can read. A reranker rereads the top candidates with the
+> question and orders them better, but it costs time and can only reorder what search found. I pick each one by
+> measuring it on questions with known answers, and I can show the table that justified each choice."
+>
+> The rest of this page explains each part of that answer.
+
+This is a deep-dive round, not a design round. The interviewer wants the reasoning behind each choice, ideally
+from something you built.
+
+Some background. **RAG** (retrieval-augmented generation) means: search your documents for passages that answer
+the question, then hand those passages to a large language model (**LLM**, such as Claude or GPT) to write the
+answer. Three things make it different from the search features most backend engineers know:
+
+1. **The model, not a person, reads the results.** A miss doesn't show up as a bad link; it shows up as a fluent,
+   wrong answer.
+2. **Each stage can fail on its own.** Parsing, chunking, search and ranking each lose information in different
+   ways, so "why this, not that" has an answer per stage.
+3. **Choices are measurable.** With a set of questions whose answers you know, every claim like "hybrid helps"
+   becomes a number you can check.
+
+A first-hand OpenAI forward-deployed engineer account (year not shown) describes a technical deep dive with "Deep
+questions on RAG architecture (embedding selection, chunking, retrieval methods, reranking)". The same
+candidate's take-home was probed with "why this chunking strategy, why not a different retrieval method" and
+"what would I change if the dataset was 100x larger." (<Cite id="s-812dbc9385" />).
+
+## Clarify first
+
+- **Anchor on a system you built, or a hypothetical?** If you have one, use it: the take-home follow-ups were
+  about the candidate's own choices.
+- **What documents and question types?** The right answer for each stage depends on them.
+- **Hosted or self-hosted models allowed?**
+
+## Answer
+
+### Words you need first
+
+- **Token**: a piece of a word, about ¾ of a word. Models read and bill text in tokens.
+- **Chunk**: one passage cut from a document; the unit you search and cite.
+- **Embedding**: a list of numbers (a vector) computed from text by a small model, so that texts with similar
+  meaning get vectors that point in similar directions.
+- **recall@k**: the share of test questions where the passage holding the answer is among the top k results.
+
+### The stages, and what each one decides
+
+Here is the whole path. Each labelled box is explained, in order, below the picture.
+
+```
+Document ── parse (keep headings, tables)
+   │
+   ▼
+Chunk ── split on headings; heading path on each chunk; within the embedder's limit
+   │
+   ▼
+Embed (bi-encoder) ── one vector per chunk, computed once, in advance
+   │
+   ▼  (per question)
+Keyword search (BM25) ─┐
+                       ├─ merge by rank (RRF) ── top 20–50
+Vector search ─────────┘
+   │
+   ▼
+Rerank (cross-encoder) ── rereads each candidate with the question
+   │
+   ▼
+Top k → LLM
+```
+
+**Embeddings.** The embedding model is a **bi-encoder**: it turns the question and each chunk into vectors
+*separately*. That is why chunk vectors can be computed once, in advance, and search becomes a nearest-neighbour
+lookup. Choose the model on your labelled questions (recall@k, compared on the same questions with a paired
+test). Then weigh four things: vector size (600,000 chunks × 1,536 numbers × 4 bytes ≈ **3.69 GB**), the input
+limit, the price, and whether the data may leave your environment.
+
+Changing the model later means re-embedding everything. The embedding-pipeline lab compared two closely related
+models, MiniLM-L6 and MiniLM-L12, and found that only
+<LabNumber lab="embedding-pipeline" metric="Neighbour overlap@10" /> of each text's 10 nearest neighbours stayed
+the same. A third of the neighbours move, even between sibling models. So swap through a **shadow index** (a
+second index built alongside the first) and switch an alias once the new one passes.
+
+**Chunking.** Split on the document's headings, keep tables intact, put the heading path on every chunk, size the
+chunk for the question type (a paragraph for facts, a section for procedures), and stay within the embedder's
+input limit. Justify it with a sweep on labelled questions.
+
+**Retrieval methods.** Embedding search, also called **dense retrieval**, finds paraphrases. Keyword search with
+**BM25** (the standard keyword-ranking formula) finds exact names and codes. Merge the two with **reciprocal rank
+fusion** (RRF): each chunk scores 1 ÷ (60 + its rank) in each list, summed. Because it uses ranks, you never have
+to put BM25 scores and vector similarities on the same scale.
+
+The keyword side has to be decent, though. The rag lab measured **hit@3** (the share of questions with a correct
+document in the top 3) on SciFact, a public benchmark of scientific claims. Hybrid scored no better than dense
+alone while BM25 split text on spaces, so "cells," and "cells" counted as different words. With a tokenizer that
+splits on word characters (`\w+`), hybrid reached <LabNumber lab="rag" metric="BM25 tokenizer (SciFact)" /> hit@3.
+**Metadata filters** (date, product, document type) are often the cheapest quality win of all.
+
+**Reranking.** A **cross-encoder** reads the question and one chunk *together* and outputs a relevance score. It
+orders candidates better, at one model call per pair. It only reorders what search found: in the lab, hit@20 didn't
+change, and the gains came from promoting relevant chunks into the top 3. And it costs latency:
+<LabNumber lab="rag" metric="Cross-encoder rerank, 20 candidates" /> for 20 candidates (CPU / Apple GPU). Use it
+when the right chunk is in the top 50 but not the top 5.
+
+### Follow one question through it
+
+Take an employee handbook (an invented example) and the question *"What is the notice period for contractors?"*
+
+| Stage | What happens | The "why this, not that" answer |
+|---|---|---|
+| Chunk | The answer lives in "Contractors > Ending a contract", one ~300-token chunk with its heading path. | "A fixed window would have mixed it with the benefits section." |
+| Keyword search | Ranks the general employee notice section 1st ("notice period" repeated); the contractor chunk 3rd. | "Keywords can't tell which notice period I mean." |
+| Vector search | Ranks the contractor chunk 3rd, the employee section 10th. | "Meaning search catches 'ending a contract'." |
+| RRF | Contractor chunk 0.0317 (3rd + 3rd) beats the employee section 0.0307 (1st + 10th). | "Agreement beats one search's favourite." |
+| Rerank | Reads both with the question; contractor chunk goes to 1st. | "Worth about 0.4 s only if the eval shows chunks stuck at ranks 4–20." |
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- RRF with constant 60 (the rag lab's value, after Cormack et al. 2009): 1st + 10th → 1/61 + 1/70 ≈ **0.0307**;
+  3rd + 3rd → 2/63 ≈ **0.0317**.
+- Vector storage: 600,000 × 1,536 × 4 B = **3.69 GB** float32.
+
+</details>
+
+### 100 times the data
+
+Ingestion and storage change; query cost doesn't. Each question still sends the same few chunks. What changes is a
+vector store split across machines, vectors stored as 1-byte integers (int8) or half precision instead of 4-byte
+floats, parallel re-embedding, re-indexing by content hash (only changed chunks), and fair ingestion queues so a
+bulk import doesn't starve daily edits. Say it like this: "At 100× I'd redo the storage and ingestion envelope; the
+per-question path stays almost the same."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="RAG internals"
+  senior={["Explains each component's mechanism and trade-off, with a reason tied to the corpus."]}
+  staff={["Backs each choice with a measurement from a system they built, and says which result would make them change it."]}
+/>
+
+## Small-team version
+
+The best preparation is the thing you will do on the job anyway. Build a small RAG over real documents, keep a
+labelled set, and record why each choice won: a table of recall@k per variant. That table answers every "why this,
+not that" follow-up.
+
+**The defaults** at a small company: a hosted embedding model, hybrid search in Postgres (full-text search plus
+the pgvector extension), and no reranker until the eval asks for one.
+
+**What it costs**, for the walkthrough's assumed corpus: about **$5** to embed 600,000 chunks and **3.7 GB** of
+float32 vectors in the database you already run. The recurring bill is generation: about **$1,800 a month** at
+5,000 questions a day on Claude Sonnet 5, or **$270** on gpt-5-mini (prices fetched 2026-10-11).
+
+**When to change.** Add a reranker when the eval shows answers at ranks 4–20. Move off Postgres at millions of
+vectors with heavy filtering.
+
+## Pitfalls
+
+- **Textbook definitions with no trade-off or number.** The round asks "why", and a definition doesn't answer it.
+- **Claiming hybrid or reranking always helps.** The lab shows hybrid adding nothing with a weak tokenizer; measure
+  it.
+- **Forgetting that a new embedding model means re-embedding everything.** Vectors from two models can't share an
+  index.
+
+## Go deeper
+
+- Family walkthrough: [Design a RAG system end to end](/system-design-labs/interviews/walkthroughs/rag-system-design/#deep-dives).
+- Build all three stages and measure them: <LabRef lab="rag" inline />; model swaps: <LabRef lab="embedding-pipeline" inline />.

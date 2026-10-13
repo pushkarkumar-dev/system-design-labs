@@ -1,0 +1,169 @@
+---
+question: infra-087
+family: quant-specdec-moe
+status: published
+labs: [speculative-decoding]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "If each draft token is accepted independently with probability α, the k-th draft token counts only if all the
+> ones before it were accepted, which has probability α to the k. The big model always adds one token of its own. So
+> the expected tokens per big-model pass is 1 + α + α² + … + α^K, which is (1 − α^(K+1)) ÷ (1 − α). That is not the
+> speedup: the draft costs time too, so I divide by 1 + K × c, where c is a draft step's cost relative to a big-model
+> step. That gives the best K, and it only holds while the big model has spare compute."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see you derive a formula from a probability model, state its assumption, and then refuse
+to call the result a speedup.
+
+Some background. A large language model writes its reply one **token** (roughly ¾ of a word) at a time, and each
+token needs a full pass through the model. This phase is called **decode**. At small batch sizes, each pass is
+limited by how fast the GPU can read the model's weights from memory, not by its math. The math units sit mostly
+idle.
+
+**Speculative decoding** uses that idle math. A small, cheap model, the **draft**, guesses the next K tokens. The big
+model, the **target**, checks all K guesses in one pass, the **verify pass**. Because the verify pass reads the
+weights once, it costs about the same as producing one token. The target keeps the guesses up to the first one it
+rejects, then adds one token of its own.
+
+For a backend engineer, this is speculative execution, like a CPU's branch predictor: do cheap work on a guess,
+check it in bulk, throw away wrong guesses. It pays when checks are cheap and guesses are usually right.
+
+The prompt is from a techinterview.org prep guide <Cite id="s-4525fcd815" />, not a candidate report.
+
+## Clarify first
+
+- **What α means:** "Is α the chance that one draft token is accepted, or the accepted ÷ proposed number from a
+  dashboard?" They differ; see below.
+- **The assumption:** "I'll assume each draft token is accepted independently with the same α." Say it out loud;
+  in reality, acceptance can vary by position and by workload.
+- **What counts:** "Does 'committed per pass' include the target's own token?" Yes, by convention.
+- **Load:** "Small batch, so the target is limited by memory reads, unless you tell me otherwise?"
+
+## Answer
+
+### The worked example: one round with K = 5
+
+Say the draft guesses five tokens: "the cat sat on a". The target scores all five positions plus one more in a
+single pass. It accepts "the", "cat" and "sat", rejects "on", and writes its own token ("in") in its place. This
+round committed 4 tokens for one target pass. If all five guesses had been accepted, the extra position would give a
+**bonus token**, for 6. So one round commits between 1 and K + 1 tokens.
+
+### The derivation
+
+Draft token i (counting from 1) is committed only if tokens 1 through i were all accepted, which happens with
+probability α^i. The target always commits one token: the correction at the first rejection, or the bonus token if
+all K pass. Add up the probabilities:
+
+<Formula
+  title="Expected tokens per target pass"
+  expr="E = 1 + α + α² + … + α^K = (1 − α^(K+1)) ÷ (1 − α)"
+  vars={[
+    { sym: 'α', meaning: 'per-token acceptance probability, independent and equal' },
+    { sym: 'K', meaning: 'draft tokens proposed per round' },
+  ]}
+  example={[
+    'α = 0.6, K = 4: 0.92224 ÷ 0.4 = 2.31 (the guide says about 2.3)',
+    'α = 0.82, K = 5: 0.69599 ÷ 0.18 = 3.87; limit as K grows: 1 ÷ (1 − α) = 5.56',
+  ]}
+/>
+
+Two sanity checks to say out loud: E is never more than K + 1, and as K grows it approaches 1 ÷ (1 − α). A
+simulation with independent acceptance (200,000 rounds, run 2026-10-12) gave 3.868 against the formula's 3.867.
+
+### Then correct it for cost
+
+Each round also runs K draft steps. Call **c** the cost of one draft step as a fraction of one target step. At small
+batch both models are limited by memory reads, so c is roughly the ratio of their weight sizes per GPU.
+
+<Formula
+  title="Net speedup at small batch"
+  expr="speedup ≈ E ÷ (1 + K × c)"
+  vars={[{ sym: 'c', meaning: 'draft step time ÷ target step time; at small batch, about the ratio of weight bytes per GPU' }]}
+  example="α = 0.82, K = 5, c = 0.10: 3.867 ÷ 1.5 = 2.58×. K = 6: 4.171 ÷ 1.6 = 2.61×. K = 10: 2.47×"
+/>
+
+| K | Tokens per pass (E) | Net speedup | What to say in the interview |
+|---|---|---|---|
+| 5 | 3.87 | 2.58× | "3.87 tokens per pass is not 3.87× faster." |
+| 6 | 4.17 | 2.61× | "This is the best K for α = 0.82, c = 0.10." |
+| 10 | 4.93 | 2.47× | "More guesses past the optimum cost more than they add." |
+
+The best K is flat between 5 and 8, which fits the guide's "somewhere between 3 and 8". The reason: the K-th guess
+adds only α^K expected tokens, which shrinks fast, while its cost stays at c. Stop when the gain falls below the
+cost.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Stopping rule:** the K-th draft token pays only while α^K exceeds c × the net speedup so far. At α = 0.82,
+  c = 0.10, the 7th adds 0.82⁷ = 0.249, less than 0.10 × 2.61 = 0.261, so stop at K = 6.
+- **E at K = 6:** (1 − 0.82⁷) ÷ 0.18 = 4.171; ÷ 1.6 = 2.61×.
+- **Dashboard ratio:** accepted ÷ proposed = (E − 1) ÷ K = 2.867 ÷ 5 = 0.573 at α = 0.82, K = 5.
+
+</details>
+
+### Why the verify pass is nearly free, and when it isn't
+
+A GPU's math-to-memory balance is captured by the **ridge point**: the number of math operations it can do per byte
+it reads. For an A100 in bf16 that is about 153. In decode, the operations per byte, called **arithmetic
+intensity**, is roughly the number of tokens processed together. A 6-token verify pass is far below 153, so it
+costs about one normal step. At large batch, many sequences' verify passes add up past the ridge, and that stops
+being true; see [infra-088](/system-design-labs/interviews/questions/infra-088/).
+
+Say it like this: "The formula counts tokens per big-model pass. The speedup divides that by the draft's cost, and
+the whole thing assumes the big model has idle compute, which holds at small batch."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Tokens per pass"
+  senior={["Derives E, checks it against a limit (E ≤ K + 1, E → 1 ÷ (1 − α)), and corrects for draft cost to pick K."]}
+  staff={["Asks how α is measured in production, notes it varies by workload and position, and ties the policy to batch size."]}
+/>
+
+## Small-team version
+
+In vLLM, a widely used open-source serving engine, speculative decoding is a configuration setting
+(`--speculative-config` with a method and `num_speculative_tokens`). Its docs pitch it at "medium-to-low QPS
+(queries per second), memory-bound workloads"
+([vLLM docs](https://docs.vllm.ai/en/latest/features/speculative_decoding/), dated 2026-09-25). Turn it on, measure
+**inter-token latency** (the gap between words the user sees) and throughput at your real number of concurrent
+users, and keep it only where it wins.
+
+Two practical checks:
+
+- **Convert the dashboard number.** If a counter reports accepted ÷ proposed, it isn't α. Under this model that
+  ratio is (E − 1) ÷ K: **0.573** at α = 0.82, K = 5.
+- **Count the draft's memory.** A Llama-3.2-1B draft is 2.47 GB in bf16. If each of 4 GPUs holds a copy, that is
+  9.9 GB, about **4 of the 59** 8K-token conversation slots on a 4×A100 box serving Llama-3.1-70B.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Slots:** each 8K-token conversation keeps a saved summary of its tokens (the KV cache) of 327,680 bytes per
+  token × 8,192 = 2.68 GB. 4 × 80 GB − 141.1 GB of weights − 20 GB overhead (assumed 5 GB per GPU) = 158.9 GB ÷
+  2.68 ≈ 59 slots.
+- **Draft:** 4 × 2.47 GB = 9.9 GB ÷ 2.68 ≈ 4 slots.
+
+</details>
+
+Default: off, until the load test at your peak concurrency shows a latency win worth those slots.
+
+## Pitfalls
+
+- **Calling E a speedup.** It ignores the draft's K steps per round.
+- **Forgetting the bonus token, or counting it twice.** The target adds exactly one token per round.
+- **Using accepted ÷ proposed as α.** At α = 0.82 and K = 5 that ratio is 0.573.
+- **Assuming acceptance is the same for code, chat and other languages.** It varies by workload, so measure it on
+  yours.
+
+## Go deeper
+
+- Family walkthrough: [Quantization, speculative decoding and MoE](/system-design-labs/interviews/walkthroughs/quant-specdec-moe/), core concepts and worked example 4.
+- The lab's formula gives <LabNumber lab="speculative-decoding" metric="Expected tokens per target call" />; its `optimal_K` and `implied_alpha` are worth reading: <LabRef lab="speculative-decoding" inline />.
+- Roofline background: [infra-070](/system-design-labs/interviews/questions/infra-070/).

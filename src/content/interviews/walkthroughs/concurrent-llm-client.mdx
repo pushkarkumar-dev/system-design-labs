@@ -1,0 +1,1197 @@
+---
+title: "Code a concurrent LLM API client: retries, 429s, pagination, batching and streaming"
+summary: "A practical coding round reported at Sierra, PromptLayer and Cursor: build an async client that sends many calls at once, retries the right failures, obeys rate limits, pages, batches and parses a stream."
+track: ai-engineer
+format: coding
+family: concurrent-llm-client
+smallTeamFocus: "Use the provider SDK's retries and add what it lacks: a cap or pacer at your known limit, deadlines, the batch API for offline work, and a tested stream parser. Write a gateway only when a second team needs it."
+rounds: [practical-coding]
+level: both
+timeboxMin: 60
+order: 231
+status: published
+basedOn: [eng-055, eng-056, eng-057, eng-063, eng-066]
+askedAt: [sierra, promptlayer, cursor]
+labs:
+  - { lab: rate-limiter, role: proof, note: "The server side of stage 3: a token bucket, a sliding window and a Redis-backed limiter. Port its token bucket to the client as the Pacer. Its 429 handler hard-codes Retry-After: 60." }
+  - { lab: embedding-pipeline, role: proof, note: "Dynamic batching of single-text callers into model batches, measured: the same idea as the MicroBatcher in stage 5, on the server side." }
+  - { lab: load-balancer, role: proof, note: "A 20% retry budget and a circuit breaker in Go. Its retry fires after the first 5xx has already been written to the client, which is the stream rule from stage 6 in another form." }
+  - { lab: rpc-framework, role: partial, note: "Client-side cancellation of a pending call through a context. The package doc says deadlines cross the wire, but the client never sends them." }
+  - { lab: io-model, role: background, note: "Blocking, threaded, epoll and io_uring servers in C: why one event loop can hold thousands of sockets. Linux-only; not built for this guide." }
+gapLabs: [llm-gateway]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll build one client where every call goes through a single retry function. That function decides, from a
+> small table, which failures to retry, how long to wait, and when to give up. Around it I'll cap how many
+> calls are in flight at once, set to the provider's known limit, because pacing to a known limit is much
+> faster than reacting to 'too many requests' errors. Pagination, fallback ids and batching all reuse that one
+> function. A stream is the exception: once words have reached the user, I don't retry it."
+>
+> The rest of this page explains each part of that answer, and builds it in code, stage by stage.
+
+### What makes this different from the API clients you already write
+
+You have written HTTP clients before. This round looks like that, and most of the code is ordinary. Three
+things about calling a large language model (an **LLM**, the kind of model behind ChatGPT or Claude) change the
+details.
+
+1. **Each call is expensive.** You pay per **token**, a chunk of text of roughly ¾ of a word, for both the
+   prompt you send and the reply you get. A call that is retried by mistake is a call you pay for twice.
+2. **The provider limits you hard.** Every account has a **rate limit**: a cap on requests per minute, tokens
+   per minute, or calls in flight at once. Go over it and the API answers with HTTP status **429** ("Too Many
+   Requests"), often with a **Retry-After** header saying how many seconds to wait. In this round, 429s are
+   not a rare edge case. They are the normal state of a busy batch job.
+3. **Replies often arrive as a stream.** Instead of one response body, the server sends the reply in small
+   pieces as the model writes it, so the user sees text appear. Those pieces are split wherever the network
+   splits them, which can be in the middle of a line or even in the middle of a character.
+
+So the interviewer is not testing whether you know what a retry is. They want to see whether you retry the
+**right** things, wait the **right** amount, and stay inside the limit, under time pressure.
+
+### The prompt as it is given
+
+You get an LLM or REST API, or a mock of one. Write a client that sends many requests at once with bounded
+parallelism and returns the answers in input order. Then the interviewer adds requirements one at a time:
+some calls fail intermittently, so add retries with backoff and timeouts; the API starts returning 429 with a
+Retry-After header; a list endpoint is paginated, so fetch every page and compute something over the JSON;
+products must be resolved through fallback ids; many small calls should be batched; and a streamed response
+arrives in chunks that can be split mid-line or malformed.
+
+No company is reported to ask all of this in one sitting. The pieces come from five reports:
+
+<QuestionRow id="eng-055" />
+<QuestionRow id="eng-056" />
+<QuestionRow id="eng-057" />
+<QuestionRow id="eng-063" />
+<QuestionRow id="eng-066" />
+
+The two Sierra rounds (eng-055, eng-056) are first-hand accounts. The Sierra retries item (eng-057) comes from
+an Aced question list and was no longer visible there on 2026-10-12. PromptLayer's batching item (eng-063) is
+a suggested exercise in a guide for interviewers. The Cursor stream item (eng-066) comes from an unattributed
+prep guide, so its confidence is low.
+
+### Words you need first
+
+- **Concurrency** here means how many calls are *in flight* at the same moment. "Cap concurrency at 4" means
+  a fifth call waits until one of the first four finishes.
+- **Backoff** is waiting longer after each failed attempt (0.1 s, then 0.2 s, then 0.4 s). **Jitter** is
+  making that wait random, so a thousand clients that failed together don't all retry on the same tick.
+- An **idempotent** call is one you can safely repeat: doing it twice has the same effect as doing it once.
+  An **idempotency key** is an id you send with a call so the server can recognise a repeat and skip it.
+- **asyncio** is Python's way of running many network calls on one thread. Each call is a **coroutine** that
+  pauses while it waits on the network, and one **event loop** switches between them. A **semaphore** is a
+  counter of permits: a coroutine must take a permit before it calls the API, which is how the cap works.
+
+### The worked example that runs through this page
+
+Every stage below is tested against one small **fake server**, about 180 lines, that behaves like a strict LLM
+provider. Picture one nightly job that has to process 40 prompts. The fake server answers each prompt in about
+50 ms, but it allows only **4 calls in flight**. A fifth concurrent call gets a 429 with `Retry-After: 1`.
+
+| Stage | What the job meets on the fake server | What to say in the interview |
+|---|---|---|
+| 1. Fan-out | 40 prompts, at most 4 allowed in flight | "I cap in-flight calls with a semaphore and return results in input order." |
+| 2. Retries | `flaky-1` fails twice with 503, then succeeds; `slow-1` takes 3 s once | "Retry with jittered backoff, and put one deadline around the whole attempt." |
+| 3. 429s | a client that sends 12 at a time against the limit of 4 | "Honour Retry-After, but the real fix is to stop exceeding the limit." |
+| 4. Pages | 23 items, 5 per page, one page fails once | "Every page goes through the same retry function." |
+| 4. Fallback ids | some product ids are gone (404) | "A 404 means try the next id. It is not a retry." |
+| 5. Batching | 200 callers each want one embedding (a list of numbers that stands for a text) | "Pack callers into one request per 32, and make sure every caller hears back." |
+| 6. Stream | a reply split into 7-byte pieces, with one bad line | "Parse bytes, then lines, then events, and test every split point." |
+
+The punchline of the example, which you will see measured in Verification: sending the 40 prompts with a cap
+of 4 took about **0.55 s**. Sending 12 at a time and retrying each 429 took about **2.1 s**, nearly four times
+longer. Knowing the limit beat reacting to it.
+
+## What is being tested
+
+**Speed on a long, multi-part problem.** The code here is not hard, but there is a lot of it. The Sierra L5
+candidate who got pagination plus "some computation with the JSON response" was rejected. They advise
+practising "API calls, error handling, retries, pagination" and JSON wrangling (<Cite id="s-aa5a42ddc5" />).
+The account gives no rejection reason. A Harvey L5 candidate with a similar long practical problem gives
+blunter advice: "You need to be really fast at coding" (<Cite id="s-956f0bbc95" />). A Staff OpenAI candidate
+called the coding question "rather long" and suggested using the interviewer to focus on the important parts
+(<Cite id="s-4d55d9b987" />). You lose this round if stage 1 takes 25 minutes.
+
+**Code that survives the next requirement.** The Sierra account describes a "practical multi-part problem that
+builds progressively", where "each follow-up adds new requirements on top of your existing code". It says this
+"tests whether you write flexible, extensible code from the start" (<Cite id="s-6c08b2d69e" />). In practice
+that means one function owns the retry policy. When the 429 requirement arrives, you change one place.
+
+**Error handling as a first-class requirement.** PromptLayer's guide tells interviewers to "focus on clean
+code, error handling, and understanding trade-offs" (<Cite id="s-1205b0cc50" />). The signal is whether you
+sort outcomes into "retry", "don't retry" and "give up" *before* you write the loop.
+
+**Tests where the bugs hide.** The stream parser is where a small test pays for itself. A prep guide on
+Cursor's loop describes candidates who paste model output, paste the error back, and lose twenty minutes. It
+calls that loop "the fastest rejection in the building" (<Cite id="s-c29d429c3c" />). That is a prep site's
+description, not a reported rejection reason. The cure is the same either way: test the parser, don't keep
+re-prompting an assistant to fix it.
+
+Whether an AI assistant is allowed depends on the company and the round. Anthropic's published guidance is no
+AI in live interviews unless told otherwise (<Cite id="s-b4d190c38f" />). Practise this one without an
+assistant, so the skeleton comes from your own hands.
+
+## Clarify and scope
+
+Ask these before writing code. Each answer changes the code.
+
+1. **What does failure look like?** Status codes, an error body, a Retry-After header? Is there a mock?
+2. **Is the call idempotent?** If you retry after a timeout, does the server do the work twice and bill it
+   twice? Does it accept an idempotency key?
+3. **Is the limit known?** Requests per second, tokens per minute, or concurrent requests? This matters more
+   than any retry logic (see Verification). Say it like this: "Do we know the rate limit? If we do, I'll pace
+   to it, and the 429 handling becomes a safety net."
+4. **Partial failure.** If one of 1,000 items is invalid, does the batch fail, or do you return per-item errors?
+5. **Deadlines.** Is there a total time budget for the batch, or only per call?
+6. **Order.** Results in input order, or as they complete?
+7. **Stream format.** Server-sent events (one long HTTP response the server keeps writing small events to)?
+   What marks the end of the stream?
+
+Then write your assumptions at the top of the file, where the interviewer can see them: Python 3.11+ (for
+`asyncio.TaskGroup` and `asyncio.timeout`), `httpx` allowed, results in input order, fail-fast by default (the first hard error stops the
+whole batch) with a per-item variant as a follow-up, streams as server-sent events ending in a `[DONE]` marker.
+
+**Out of scope:** failing over between providers (a design question in its own right, eng-058, in the
+[provider gateway family](/system-design-labs/interviews/questions/eng-058/)), budgets counted in tokens
+rather than requests, and resuming a half-finished batch after a crash.
+
+## Plan before code
+
+Say the plan out loud in two minutes, then follow it. Start with a picture of the client, because every later
+stage hangs off the same boxes.
+
+```
+Your code (40 prompts, a list of product ids, 200 texts, one chat reply)
+   │
+   ▼
+Fan-out ── complete_all: a semaphore lets at most c calls run; results kept in input order
+   │
+   ▼
+Optional pacing ── a Pacer (token bucket) or a shared pause, off by default
+   │
+   ▼
+_request ── THE one retry loop: outcome table, jittered backoff, Retry-After, deadline per attempt
+   │
+   ▼
+httpx.AsyncClient ── connection pool, keeps sockets open between calls
+   │
+   ▼
+LLM API (here: the fake server)
+
+Side paths that reuse _request:  iter_items (pages) · resolve_products (fallback ids) · MicroBatcher
+Side path that does NOT:         stream_completion (a stream can't be retried after the first word)
+```
+
+**Fan-out** is the top of the client. It starts one coroutine per prompt, but the semaphore lets only `c` of
+them call the API at once. It also puts the answers back in the order the prompts came in.
+
+**Optional pacing** sits in front of every attempt. A **pacer** spends from a bucket of permits that refills
+at a fixed rate, so the client never sends faster than the provider allows. This idea is called a **token
+bucket** (the "tokens" here are permits, not text tokens). A **shared pause** is the alternative: when any
+call sees a 429, every call waits. Both are off by default, for reasons Verification shows with numbers.
+
+**`_request`** is the heart of the design. Every call that returns a whole response goes through it. It owns
+one decision table and one loop. When the interviewer adds a requirement about failures, this is the only
+function that changes.
+
+**The connection pool** is httpx's. It reuses open connections so each call doesn't pay for a new TCP and TLS
+handshake. Its size matters only when `c` is larger than the pool.
+
+**The side paths** are the later stages. Pagination, fallback ids and micro-batching are all just callers of
+`_request`. The stream is different: once the first words have been shown to a user, a retry would show them
+again. So the stream has its own, smaller error rules.
+
+### The time box
+
+A 60-minute round that reaches every stage might split like this. Most rounds stop after three or four.
+
+| Minutes | Stage | Done when |
+|---|---|---|
+| 0–5 | Clarify, write assumptions | the questions above have answers |
+| 5–13 | 1: bounded fan-out | order kept, in-flight count capped |
+| 13–25 | 2–3: retries, timeouts, 429 | a flaky call succeeds, a 400 is not retried |
+| 25–35 | 4: pagination and fallback ids | a sum over every page matches; a missing id falls through |
+| 35–45 | 5: micro-batching | 200 callers, 7 requests, each caller gets its own result |
+| 45–57 | 6: streaming parser | the split-at-every-byte test passes |
+| 57–60 | cancellation, complexity, what's missing | you named what you'd do next |
+
+### Classify outcomes before you write the loop
+
+Write this table first, on screen. It is the retry policy in plain words, and the loop in stage 3 is a direct
+translation of it. Say it like this: "Before I write the loop, here is what I retry and what I don't."
+
+| Outcome | Retry? | How long to wait |
+|---|---|---|
+| 2xx | no | |
+| 400, 401, 403, 404, 422 | no: raise (404 may mean "try the next id") | |
+| 408, 500, 502, 503, 504 | yes | full-jitter backoff; if Retry-After is present, the larger of the two |
+| 429 | yes | Retry-After if present, otherwise backoff; capped |
+| connect error, timeout | yes | backoff (the server may have done the work) |
+| cancelled by the caller | never | let it propagate |
+
+The logic is simple. A 4xx other than 408 and 429 means *your request* is wrong, so sending it again gives the
+same answer. A 5xx, a timeout or a dropped connection means *the server* had a bad moment, so a later attempt
+may work. A cancellation means the caller no longer wants the answer, so retrying it would be doing work for
+nobody.
+
+## Solution in stages
+
+The error types come first. They carry the HTTP status, so a caller can tell a 404 ("this id is gone") from a
+400 ("this request is invalid"):
+
+```python
+RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+
+class FatalError(Exception):
+    """A response that retrying cannot fix (400, 401, 403, 404, 422 ...)."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(f"{status}: {message}")
+        self.status = status
+
+
+class RetriesExhausted(Exception):
+    """Every attempt failed with a retryable error."""
+
+
+class IncompleteStream(Exception):
+    """The stream closed before the server sent [DONE]."""
+```
+
+### Stage 1: bounded fan-out, results in order
+
+The first requirement: send all 40 prompts concurrently, but never more than `c` at once, and return the
+answers in the same order as the prompts. Each prompt gets a fresh idempotency key, which every retry of that
+prompt reuses.
+
+```python
+    async def complete(self, prompt: str) -> str:
+        key = str(uuid.uuid4())  # same key on every retry of this one prompt
+        resp = await self._request(
+            "POST", "/v1/complete", json={"prompt": prompt}, headers={"Idempotency-Key": key}
+        )
+        return resp.json()["text"]
+
+    async def complete_all(self, prompts: list[str], concurrency: int = 8) -> list[str]:
+        sem = self.adaptive or asyncio.Semaphore(concurrency)
+
+        async def one(prompt: str) -> str:
+            async with sem:
+                return await self.complete(prompt)
+
+        # TaskGroup: if one task fails, the rest are cancelled and the error is raised.
+        async with asyncio.TaskGroup() as tg:
+            tasks = [tg.create_task(one(p)) for p in prompts]
+        return [t.result() for t in tasks]
+```
+
+Three choices to say out loud:
+
+- **The semaphore bounds in-flight requests, not tasks.** All `n` tasks (an asyncio **task** is a coroutine
+  the event loop is running) exist at once, but at most `concurrency` hold a permit. That's fine for
+  thousands of prompts. For millions, use a fixed pool of workers fed from a bounded queue.
+- **The task list keeps input order**, whatever order the tasks finish in.
+- **`TaskGroup` rather than `gather`.** With default arguments, `gather` passes the first exception to the
+  caller but leaves the other tasks running. `TaskGroup` cancels the siblings, which is what fail-fast should
+  mean. It raises an `ExceptionGroup`, so the caller writes `except* FatalError`.
+
+In the worked example, 40 prompts at a cap of 4 is 10 "waves" of 4 calls, each wave about 55 ms. That is why
+the measured time is about **0.55 s**, and why it took about **2.2 s** with a cap of 1.
+
+### Stage 2: retries with jittered backoff and a whole-attempt timeout
+
+Now `flaky-1` fails twice with 503 before it succeeds, and `slow-1` hangs for 3 seconds on its first attempt.
+You need two things: a wait between attempts, and a deadline on each attempt.
+
+```python
+def backoff_delay(attempt: int, base: float = 0.1, cap: float = 5.0) -> float:
+    """Full jitter: a uniform draw from [0, min(cap, base * 2**attempt)]."""
+    return random.uniform(0.0, min(cap, base * 2 ** attempt))
+```
+
+**Why full jitter.** "Full jitter" means the wait is a random number between zero and the backoff ceiling,
+not the ceiling itself. Without jitter, clients that failed together retry together, and hit the server in
+the same instant again. Marc Brooker's AWS analysis compared jitter variants and found "Full Jitter" uses less
+work but slightly more time than the decorrelated variant
+([AWS Architecture Blog, 2015](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)).
+Either is defensible. No jitter is not.
+
+**Why `asyncio.timeout` around the call.** You might expect `httpx.Timeout(2.0)` to mean "give up after 2
+seconds". It doesn't. It sets 2 s for each phase separately: connecting, each read, each write, and waiting
+for a pool connection. A server that sends one byte per second never trips the read timeout, because each
+read gets its byte in time. Wrapping the whole attempt in `asyncio.timeout` gives one deadline for the whole
+attempt. Say it like this: "httpx's timeout is per phase. I want a deadline per attempt, so I wrap it."
+
+**How long can one call take in the worst case?** With 5 attempts, a 2-second deadline each, and backoff
+starting at 0.1 s, the answer is about **11.5 s** when every attempt times out. If the caller only has 5
+seconds, that is a problem you should name: lower the attempts, or wrap the whole batch in its own deadline.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Worst-case latency of one logical call"
+  expr="T_max = A × t_attempt + Σ (n = 0 … A − 2) min(cap, base × 2^n)"
+  vars={[
+    { sym: 'A', meaning: 'max attempts (max_attempts)' },
+    { sym: 't_attempt', meaning: 'per-attempt deadline (attempt_timeout)' },
+    { sym: 'base, cap', meaning: 'backoff base and cap, in seconds; the sum is the largest possible jittered sleep between attempts' },
+  ]}
+  example="A = 5, t_attempt = 2 s, base = 0.1 s, cap = 5 s: 5 × 2 + (0.1 + 0.2 + 0.4 + 0.8) = 11.5 s. With full jitter the expected sleep is half the maximum, so about 10.75 s when every attempt times out."
+  note="Retry-After hints replace the backoff term: with max_retry_after = 30 s, four capped hints add 4 × 30 = 120 s. If the caller has a 5-second budget, wrap the batch in asyncio.timeout or lower A."
+/>
+
+</details>
+
+**Retries multiply across layers.** This is the point Staff candidates raise without being asked. If your
+client makes up to 3 attempts, the gateway behind it 3, and the provider's front end 3, one user request can
+become 27 calls at the bottom when the bottom is down. Google's SRE book recommends retrying only at the layer
+immediately above the one that is rejecting, plus a per-client **retry budget** (a cap on retries as a share
+of all requests). Its worst case grows load to "just below 3X", and the budget cuts that "to just 1.1x"
+([Site Reliability Engineering, "Handling Overload"](https://sre.google/sre-book/handling-overload/)).
+
+The same trap applies to the provider's own client library (its **SDK**). The official OpenAI and Anthropic
+Python SDKs already retry 2 times by default on connection errors, 408, 409, 429 and 5xx (their
+documentation, fetched 2026-10-12; links in Sources). Wrap them in your own five-attempt loop and one call can become 15
+requests. Say it like this: "The SDK already retries twice, so I either use its retries or mine, not both."
+
+### Stage 3: 429 and Retry-After
+
+Now the client sends 12 calls at a time, the server allows 4, and the extra calls come back as 429 with
+`Retry-After: 1`. The header has two legal forms: a whole number of seconds, or an HTTP date. RFC 9110 defines
+the seconds form as "a non-negative decimal integer"
+([RFC 9110 §10.2.3](https://www.rfc-editor.org/rfc/rfc9110#section-10.2.3)), and RFC 6585 says a 429 "MAY
+include a Retry-After header" ([RFC 6585 §4](https://www.rfc-editor.org/rfc/rfc6585#section-4)). So parse both
+forms, and treat anything else as if the header were missing:
+
+```python
+def parse_retry_after(value: str | None, now: float | None = None) -> float | None:
+    """Seconds to wait, from delay-seconds ("3") or an HTTP-date. None if absent or garbage."""
+    if value is None:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    now = time.time() if now is None else now
+    return max(0.0, when.timestamp() - now)
+```
+
+Here is the full retry loop. It is the outcome table, written as code. By default only the worker that got the
+429 waits. Three behaviours are opt-in hooks, each switched off unless you pass it in:
+
+- `cooldown`, a **shared pause**: one 429 makes every worker wait.
+- `adaptive`, an **AIMD** limit. AIMD stands for additive increase, multiplicative decrease, the rule TCP uses
+  for congestion: grow the concurrency limit slowly while calls succeed, and cut it sharply on a 429.
+- `pacer`, the client-side token bucket from the plan.
+
+Verification shows why the default is the simple per-worker wait.
+
+```python
+    async def _request(self, method: str, url: str, **kw) -> httpx.Response:
+        last: BaseException | None = None
+        for attempt in range(self.max_attempts):
+            if self.cooldown:
+                await self.cooldown.wait()
+            if self.pacer:
+                await self.pacer.acquire()
+            self.stats["attempts"] += 1
+            try:
+                async with asyncio.timeout(self.attempt_timeout):
+                    resp = await self.http.request(method, url, **kw)
+            except (TimeoutError, httpx.TransportError) as exc:  # not CancelledError
+                last, delay = exc, backoff_delay(attempt)
+            else:
+                if resp.status_code < 400:
+                    if self.adaptive:
+                        self.adaptive.on_success()
+                    return resp
+                if resp.status_code not in RETRYABLE_STATUS:
+                    raise FatalError(resp.status_code, f"{method} {url}: {resp.text[:200]}")
+                last, delay = RuntimeError(f"status {resp.status_code}"), backoff_delay(attempt)
+                hint = parse_retry_after(resp.headers.get("retry-after"))
+                if hint is not None:  # honour the server's hint, up to a ceiling
+                    delay = min(max(hint, delay), self.max_retry_after)
+                if resp.status_code == 429:
+                    self.stats["429s"] += 1
+                    if self.adaptive:
+                        self.adaptive.on_429()
+                    if self.cooldown:  # opt-in: every worker waits, not just this one
+                        self.cooldown.push(delay)
+                        delay = 0.0
+            if attempt + 1 < self.max_attempts:
+                self.stats["retries"] += 1
+                await asyncio.sleep(delay)
+        raise RetriesExhausted(f"{method} {url}: {self.max_attempts} attempts failed") from last
+```
+
+Points an interviewer will probe:
+
+- **Cancellation is never retried.** `except (TimeoutError, httpx.TransportError)` never catches
+  `asyncio.CancelledError`, which derives from `BaseException`, not `Exception`. A bare `except:` or
+  `except BaseException` would turn "the caller left" into a retry.
+- **httpx's own timeouts are covered.** `httpx.TimeoutException` is a subclass of `httpx.TransportError`, so
+  the tuple covers httpx's timeouts as well as the `asyncio.timeout` deadline.
+- **The wait is capped.** `max_retry_after` limits how long one hint can park a worker. A buggy header
+  shouldn't park a batch job for an hour.
+- **Not every 429 is a rate limit.** Anthropic's rate-limit documentation (fetched 2026-10-12) says a request
+  over an organization's spend limit gets the same `rate_limit_error` type but **no retry-after header**. It
+  says retrying, including the SDK's automatic retries, fails until access resumes, and the error carries
+  `enforced_spend_limit_reached`. Check that error code and fail fast, or this loop burns its attempts and the
+  batch stalls ([Anthropic rate limits](https://platform.claude.com/docs/en/api/rate-limits)). Say it like
+  this: "A 429 that means 'you're out of budget' is an incident, not a retry."
+
+### Stage 4: pagination, then fallback ids
+
+**Pagination** is how an API returns a long list a few items at a time. The fake server has 23 items and
+returns 5 per page. Each page includes a **cursor**, an opaque string that says "continue from here". You send
+it back to get the next page, and the last page has none. The interviewer usually adds "compute something over
+the JSON", here a sum of one field.
+
+```python
+    async def iter_items(self, page_size: int = 5) -> AsyncIterator[dict]:
+        cursor: str | None = None
+        seen: set[str] = set()
+        while True:
+            params = {"limit": page_size} | ({"cursor": cursor} if cursor else {})
+            page = (await self._request("GET", "/v1/items", params=params)).json()
+            for item in page["items"]:
+                yield item
+            cursor = page.get("next_cursor")
+            if not cursor:
+                return
+            if cursor in seen:
+                raise RuntimeError(f"server returned cursor {cursor!r} twice")
+            seen.add(cursor)
+```
+
+The computation keeps a running total, so only one page is in memory at a time:
+
+```python
+async def total_tokens(client: LLMClient) -> int:
+    """Stage 4's "compute over the JSON": sum one field across every page."""
+    total = 0
+    async for item in client.iter_items():  # one page in memory at a time
+        total += item["tokens"]
+    return total
+```
+
+Each page goes through `_request`, so the 503 on the third page is retried like any other call. The `seen`
+set turns a server bug (a repeated cursor) into an error instead of an infinite loop.
+
+Then ask the question that separates levels: **what if items are inserted while you page?** With **offset
+pagination** ("give me items 10 to 14"), an insert before your offset makes you see an item twice, and a
+delete makes you skip one. An opaque cursor tied to a sort key avoids that. With offsets only, deduplicate by
+id. Say it like this: "With offsets I'd dedupe by id, because the list can shift under me."
+
+**Fallback ids.** The Sierra variant then hands you a product list with fallback ids and asks you to resolve
+"each product's eventual set of IDs into the product objects" (<Cite id="s-6c08b2d69e" />). The report
+doesn't define "eventual", so ask. This version reads it as an ordered list of candidate ids where the first
+id that exists wins. In the fake server, ids p7, p8 and p9 return 404, and p4 fails once with 503.
+
+```python
+    async def resolve_products(self, concurrency: int = 8) -> dict[str, dict | None]:
+        products = (await self._request("GET", "/v1/catalog")).json()["products"]
+        sem = asyncio.Semaphore(concurrency)
+        lookups: dict[str, asyncio.Task] = {}  # one lookup per id, shared by every product
+
+        async def fetch(pid: str) -> dict | None:
+            async with sem:
+                try:
+                    return (await self._request("GET", f"/v1/products/{pid}")).json()
+                except FatalError as exc:
+                    if exc.status == 404:
+                        return None  # this id is gone: the caller tries the next one
+                    raise
+
+        async def resolve(ids: list[str]) -> dict | None:
+            for pid in ids:  # in order: the first id that exists wins
+                if pid not in lookups:
+                    lookups[pid] = tg.create_task(fetch(pid))
+                if (found := await lookups[pid]) is not None:
+                    return found
+            return None  # every id is gone: report it, don't guess
+
+        async with asyncio.TaskGroup() as tg:
+            tasks = {p["sku"]: tg.create_task(resolve(p["ids"])) for p in products}
+        return {sku: t.result() for sku, t in tasks.items()}
+```
+
+Three outcomes stay separate: a 404 means "try the next id now", a 5xx is retried inside `_request`, and a
+400 stops the batch. This is where carrying the status on `FatalError` pays off.
+
+The `lookups` dict is a **single-flight** cache: if two callers want the same id at the same time, only one
+request goes out, and both wait for its result. Two products that share a missing id cause one lookup, not
+two. The check and the insert have no `await` between them, so no other coroutine can run in between, and the
+dict is safe on one event loop. If the ids can chain (an id that redirects to another), add a visited set
+before following it.
+
+### Stage 5: batching many small calls
+
+"Batch API calls to an LLM efficiently" (<Cite id="s-1205b0cc50" />) has three readings, so name them before
+you code. Say it like this: "Batching can mean three things. Which one do you want?"
+
+1. **Bounded concurrency** (stage 1): many requests in flight, each with one item.
+2. **Micro-batching**: pack many items into one request, for endpoints that accept a list. This cuts request
+   count and per-request overhead, not token cost.
+3. **The provider's asynchronous batch API**: upload a file of requests, collect the results hours later, at a
+   discount. It cuts the bill, not the latency (see Small-team version).
+
+Micro-batching is the one to code, and the classic case is embeddings. An **embedding** is a list of numbers
+that represents a text's meaning, which search and retrieval systems compare. Embedding endpoints accept many
+texts in one request. In the worked example, 200 callers each ask for one embedding. A batcher collects them
+and sends one request when it has `max_batch` items, or when `max_wait` has passed since the first item
+arrived, whichever comes first.
+
+Each caller gets a **future**: a placeholder object that will hold the result later. The caller awaits it; the
+batcher fills it in when the response arrives.
+
+```python
+class MicroBatcher:
+    """Callers ask for one embedding each; requests carry up to max_batch inputs."""
+
+    def __init__(self, client: LLMClient, max_batch: int = 32, max_wait: float = 0.01) -> None:
+        self.client, self.max_batch, self.max_wait = client, max_batch, max_wait
+        self._pending: list[tuple[str, asyncio.Future]] = []
+        self._timer: asyncio.TimerHandle | None = None
+        self._sending: set[asyncio.Task] = set()  # keep references so tasks aren't collected
+        self.requests = 0
+
+    async def embed(self, text: str) -> list[float]:
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._pending.append((text, fut))
+        if len(self._pending) >= self.max_batch:
+            self._flush()  # full: send now
+        elif self._timer is None:
+            self._timer = loop.call_later(self.max_wait, self._flush)  # or when the wait ends
+        return await fut
+
+    def _flush(self) -> None:
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+        batch, self._pending = self._pending, []
+        if batch:
+            task = asyncio.create_task(self._send(batch))
+            self._sending.add(task)
+            task.add_done_callback(self._sending.discard)
+
+    async def _send(self, batch: list[tuple[str, asyncio.Future]]) -> None:
+        self.requests += 1
+        try:
+            resp = await self.client._request(
+                "POST", "/v1/embed", json={"inputs": [text for text, _ in batch]}
+            )
+            vectors = resp.json()["vectors"]
+            if len(vectors) != len(batch):
+                raise RuntimeError(f"sent {len(batch)} inputs, got {len(vectors)} vectors")
+        except FatalError as exc:
+            if exc.status == 400 and len(batch) > 1:  # one bad input: split to find it
+                mid = len(batch) // 2
+                await asyncio.gather(self._send(batch[:mid]), self._send(batch[mid:]))
+            else:
+                _fail(batch, exc)
+            return
+        except Exception as exc:  # retries exhausted, bad response: every caller hears
+            _fail(batch, exc)
+            return
+        except asyncio.CancelledError:
+            for _, fut in batch:
+                fut.cancel()
+            raise
+        for (_, fut), vec in zip(batch, vectors):
+            if not fut.done():  # the caller may have given up already
+                fut.set_result(vec)
+
+
+def _fail(batch: list[tuple[str, asyncio.Future]], exc: Exception) -> None:
+    for _, fut in batch:
+        if not fut.done():
+            fut.set_exception(exc)
+```
+
+What to say about it:
+
+- **Every caller must hear back.** Success, a failed batch and a cancelled send each resolve every future.
+  A batcher that drops one future leaves a caller hanging until its own deadline.
+- **The length check** catches a server that returns fewer vectors than inputs. Zipping silently would hand
+  caller 7 the vector for caller 8.
+- **Poison inputs.** A **poison input** is one bad item that makes the whole request fail. One bad input fails
+  the batch with a 400. Splitting the batch in half, and halving again on the failing side, isolates it. With
+  one bad input in 16, the test took 9 requests (1 + 2 + 2 + 2 + 2, one split per level). Split only on input
+  errors: a 401 split in half is just twice the failure.
+- **`max_wait` is a latency tax** on light traffic and nearly free under load. When traffic is light, a lone
+  caller waits up to 10 ms for company. Under load, full batches flush at once, so the wait never happens.
+  The busier the system, the fuller each batch: batching regulates itself.
+
+In the worked example, the 200 callers became **7 requests**, the largest carrying 32 texts, and every caller
+got its own vector.
+
+### Stage 6: streaming chunks that arrive partial or malformed
+
+The Cursor prep guide's version: "Parse and render a stream of tokens from an LLM as they arrive, handling
+partial and malformed chunks" (<Cite id="s-c29d429c3c" />).
+
+Assume the stream uses **server-sent events (SSE)**: one long HTTP response that the server keeps writing to.
+Each event is a few lines such as `data: {"delta": "Caf"}`, where the **delta** is the next piece of text,
+and a blank line ends the event. The WHATWG spec sets the rules
+([HTML Living Standard, server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html)):
+
+- lines end with CRLF, LF or CR (the three line-ending conventions: `\r\n`, `\n` and `\r`);
+- a line starting with a colon is a comment, which servers use as keep-alives;
+- one leading space after `data:` is removed;
+- several `data:` lines in one event are joined with a newline;
+- a blank line dispatches the event;
+- the stream is UTF-8, and one leading **byte-order mark** (BOM, three invisible bytes some tools put at the
+  start of a text file) is stripped.
+
+Network **chunks** (the pieces of bytes as they come off the socket) respect none of these boundaries. In the
+worked example the fake server sends the reply in 7-byte chunks, so a line, and even a character, can be cut
+in two. So the parser works in three layers: bytes to text, text to lines and events, events to deltas.
+
+```python
+_EOL = re.compile(r"\r\n|\n|\r")
+
+
+class SSEParser:
+    """Feed raw bytes in any split; get back the data of each complete event."""
+
+    def __init__(self) -> None:
+        # Incremental decoding keeps a multi-byte character that is split across
+        # two chunks; utf-8-sig drops a leading byte-order mark.
+        self._decoder = codecs.getincrementaldecoder("utf-8-sig")(errors="replace")
+        self._buf = ""
+        self._data: list[str] = []
+
+    def feed(self, chunk: bytes) -> list[str]:
+        self._buf += self._decoder.decode(chunk)
+        events: list[str] = []
+        while m := _EOL.search(self._buf):
+            if m.group() == "\r" and m.end() == len(self._buf):
+                break  # may be the first half of "\r\n": wait for the next chunk
+            line, self._buf = self._buf[: m.start()], self._buf[m.end():]
+            if line == "":  # a blank line ends the event
+                if self._data:
+                    events.append("\n".join(self._data))
+                    self._data = []
+            elif not line.startswith(":"):  # ":" lines are comments / keep-alives
+                name, _, value = line.partition(":")
+                if name == "data":
+                    self._data.append(value[1:] if value.startswith(" ") else value)
+        return events
+```
+
+Two traps hide in that code, and each is a follow-up an interviewer can spring:
+
+- **A character split across chunks.** In UTF-8, `é` takes 2 bytes, so `"Café".encode()` is 5 bytes. Cut it
+  after byte 4 and `chunk.decode()` raises `UnicodeDecodeError`. Decoding each chunk with `errors="replace"`
+  gives `Caf` plus two replacement characters, one per half of the `é`. The incremental decoder holds the partial byte until the next chunk.
+- **A CR at the end of a chunk.** If a chunk ends in `\r` and the next starts with `\n`, a naive parser sees
+  a line and then an empty line, which dispatches an event early. The `break` waits for one more byte.
+
+Then the client turns events into deltas. It counts malformed JSON instead of crashing. It treats a stream
+that closes without the `[DONE]` marker as an error, because a cut-off answer that looks finished is the worst
+outcome.
+
+```python
+    async def stream_completion(self, prompt: str, truncate: bool = False) -> AsyncIterator[str]:
+        parser = SSEParser()
+        params = {"truncate": "1"} if truncate else {}
+        # httpx's timeout here is per read: an idle stream fails, a long healthy one doesn't.
+        async with self.http.stream(
+            "POST", "/v1/stream", json={"prompt": prompt}, params=params,
+            timeout=self.attempt_timeout,
+        ) as resp:
+            if resp.status_code != 200:
+                raise FatalError(resp.status_code, "stream setup failed")
+            async for chunk in resp.aiter_bytes():
+                for data in parser.feed(chunk):
+                    if data == "[DONE]":
+                        return
+                    try:
+                        delta = json.loads(data)["delta"]
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        self.stats["malformed"] += 1  # count it, keep going
+                        continue
+                    yield delta
+        raise IncompleteStream("stream closed before [DONE]")
+```
+
+Notice what this does not do: retry. Once words have reached the caller, a retry would show the user the
+beginning twice. Retry only before the first word arrives. After that, raise and let the caller decide. Say
+it like this: "I never retry a stream after the first token, or the user sees the start twice."
+
+This version raises for any non-200 at setup, including a 429 or 503. Say in the round that setup failures
+belong in the outcome table too. Here the per-read timeout is the right one, unlike stage 2. A healthy stream
+can run for a minute, so a whole-call deadline would kill it. A stream that goes quiet for 2 seconds is stuck.
+
+## Verification
+
+### What was run
+
+Every code block above was copied from files that ran on 2026-10-12. The fake server is about 180 lines of
+Starlette (a small Python web framework), run by uvicorn in a background thread from a pytest fixture, in a
+scratch directory outside this repo. It injects faults by prompt or path:
+
+| Prompt or endpoint | Behaviour |
+|---|---|
+| any prompt | 50 ms, returns the prompt upper-cased |
+| more than 4 in flight (default mode) | 429 with `Retry-After: 1` |
+| over 20 requests/s, burst 5 (rate mode) | 429 with `Retry-After: 1` |
+| `bad*` / `flaky*` / `slow*` | 400 always / 503 twice then 200 / first attempt takes 3 s |
+| `/v1/items` | 23 items in pages of 5; the page at cursor 10 fails once with 503 |
+| `/v1/catalog`, `/v1/products/{id}` | catalog 503 twice; ids p7, p8, p9 are 404; p4 fails once with 503 |
+| `/v1/embed` | 20 ms + 1 ms per input (an assumed cost model); a `bad*` input or more than 64 inputs is a 400 |
+| `/v1/stream` | SSE in 7-byte chunks: a keep-alive, an `é` split across chunks, CRLF, one malformed JSON line, `[DONE]` |
+
+Environment: Python 3.13.7, httpx 0.28.1, Starlette 1.7.0, uvicorn 0.54.0, Apple M1 Ultra, run on
+2026-10-12. All 15 tests pass in about 15 s.
+
+| Test | What it proves |
+|---|---|
+| fan-out | 40 results in input order; never more than 4 in flight; zero 429s |
+| transient vs fatal | `flaky-1` succeeds on attempt 3; `bad-1` raises after exactly 1 attempt |
+| give up | with `max_attempts=2`, `RetriesExhausted` after 2 attempts |
+| timeout | `slow-1` succeeds on retry, one idempotency key, and **the server did the work twice** |
+| Retry-After parsing | delay-seconds, an HTTP date 5 s ahead, garbage, `None` |
+| 429 recovery | 40 prompts at concurrency 12 against a limit of 4 succeed, with and without the shared pause |
+| pagination | ids 0–22 exactly once, the sum matches, exactly 1 retry |
+| fallback ids | A, B and D resolve, C is reported missing; the shared missing id is fetched once; p4 twice |
+| micro-batching | 200 callers, 7 requests, largest batch 32, every caller gets its own vector |
+| poison input | 1 bad input in 16 isolated in 9 requests; the other 15 callers succeed |
+| stream end to end / truncated | `Café au lait` with 1 malformed line counted; `IncompleteStream` without `[DONE]` |
+| parser boundaries | identical events for every two-way split, byte by byte, with a BOM, and for multi-line data |
+| per-item errors / cancellation | the pool returns a `FatalError` for `bad-x`; an outer timeout leaves no tasks behind |
+
+The parser-boundary test is the one to write first in the round. It feeds the same raw stream split at every
+possible byte position, then one byte at a time, and checks that the events never change. It would have
+caught both traps in stage 6:
+
+```python
+def test_parser_is_independent_of_chunk_boundaries():
+    raw = fake_server.RAW_STREAM
+    whole = events_for([raw])
+    assert whole[0] == '{"delta": "Café"}' and whole[-1] == "[DONE]" and len(whole) == 5
+    for i in range(len(raw) + 1):  # every two-way split, including inside "é" and "\r\n"
+        assert events_for([raw[:i], raw[i:]]) == whole, f"split at byte {i}"
+    assert events_for([raw[i : i + 1] for i in range(len(raw))]) == whole  # byte by byte
+    assert events_for([b"\xef\xbb\xbf" + raw]) == whole  # leading BOM
+    assert events_for([b"data: a\ndata: b\n\n"]) == ["a\nb"]  # multi-line data
+```
+
+The timeout test turned up something worth saying in the interview. The client abandoned the first `slow-1`
+attempt after its deadline and retried. But the fake server finished the first request too: one idempotency
+key, two completed requests. A real provider would bill both unless it deduplicates on the key. Say it like
+this: "A timeout on my side doesn't stop the work on theirs."
+
+### The measurement behind the 429 default
+
+The intuitive answer is that a 429 is about the whole account, so every worker should pause together. That
+was tested, not assumed. Both server modes ran with 40 prompts, client concurrency 12, `max_attempts=10`, five
+runs per row. The table gives the range of medians across two full runs on 2026-10-12.
+
+| Server limit | Client strategy | Median time | Median 429s |
+|---|---|---|---|
+| 4 in flight | shared pause | 4.46–4.54 s | 13–14 |
+| 4 in flight | per-worker wait (default) | 2.08–2.10 s | 12 |
+| 4 in flight | AIMD concurrency + per-worker wait | 3.48–3.52 s | 14 |
+| 4 in flight | **cap concurrency at 4** | 0.55–0.59 s (all ten runs) | 0 |
+| 20/s, burst 5 | shared pause | 4.95–4.97 s | 22–24 |
+| 20/s, burst 5 | per-worker wait (default) | 3.16–4.14 s | 27–29 |
+| 20/s, burst 5 | AIMD concurrency + per-worker wait | 5.59 s | 16 |
+| 20/s, burst 5 | **client token bucket at 20/s** | 1.86 s | 1 |
+| 20/s, burst 5 | **client token bucket at 18/s** | 2.00 s | 0 |
+
+What it shows, on this fake server:
+
+1. **Every reactive strategy was slow.** The best took about 2.1 s for work that took 0.55–0.59 s when the
+   client didn't exceed the limit. Reacting to 429s is a safety net, not a throughput plan.
+2. **The shared pause lost to per-worker waiting in both modes.** With `Retry-After: 1` and 50 ms requests,
+   one 429 parks all 12 workers for a full second, while capacity frees up every 50 ms.
+3. **AIMD cut 429s** compared with per-worker waiting in rate mode (16 against 27–29), but cost time. Choose
+   it when a 429 costs something beyond time, such as a provider that escalates repeat violations. Ask
+   whether yours does.
+4. **Known limits beat discovered limits.** The token bucket at the server's rate came within 0.11 s of the
+   best possible time, **1.75 s** (35 calls at 20 per second, after a free burst of 5).
+
+The limits of this result: a localhost server, 40 short requests and a coarse 1-second Retry-After. Long
+batches and second-scale requests can change it. The habit is the point: **measure the strategy you were
+going to defend.** The pacer is the rate-limiter lab's token bucket, run on the client:
+
+```python
+class Pacer:
+    """Client-side token bucket: at most `rate` requests/s, bursts of `burst`."""
+
+    def __init__(self, rate: float, burst: float) -> None:
+        self.rate, self.burst = rate, burst
+        self.tokens, self.updated = burst, time.monotonic()
+
+    async def acquire(self) -> None:
+        while True:
+            now = time.monotonic()
+            self.tokens = min(self.burst, self.tokens + (now - self.updated) * self.rate)
+            self.updated = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return
+            await asyncio.sleep((1 - self.tokens) / self.rate)
+```
+
+It's safe without a lock: nothing awaits between the check and the decrement, and asyncio runs one coroutine
+at a time. It uses `time.monotonic()`, a clock that never jumps backwards when the system clock is adjusted.
+Anthropic's documentation says its API also uses a token bucket that is "continuously replenished", and that a
+per-minute limit may be enforced over shorter intervals, so bursts can trip it
+([Anthropic rate limits](https://platform.claude.com/docs/en/api/rate-limits), fetched 2026-10-12).
+
+## Complexity and performance
+
+Two numbers describe this client: how long a batch takes, and how many requests it sends.
+
+**Batch time** is set by whichever is slower: the waves of `c` calls at a time, or the server's rate limit.
+In the worked example, 40 calls at a cap of 4 is 10 waves of about 55 ms, so about **0.55 s** (measured
+0.55–0.59 s). Under a 20-per-second limit, the floor is **1.75 s**, and the pacer measured 1.86 s. Raising the
+cap past the server's limit doesn't make it faster. It only adds 429s.
+
+**Micro-batching** saves time only when each request has a large fixed cost. In the fake server each embed
+request costs an assumed 20 ms plus 1 ms per text. For 256 texts, batches of 32 took about **0.065 s**; one
+text per request at concurrency 8 took about **0.78 s**. Even when the fixed cost is small, batching still cuts
+the request count, which matters under a requests-per-minute limit.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Wall time for a batch"
+  expr="T ≈ max( ⌈n / c⌉ × L , (n − b) / R )"
+  vars={[
+    { sym: 'n', meaning: 'requests in the batch' },
+    { sym: 'c', meaning: 'client concurrency (permits)' },
+    { sym: 'L', meaning: 'latency of one call, including the round trip' },
+    { sym: 'b, R', meaning: 'server burst and sustained rate limit (requests per second), if any' },
+  ]}
+  example="n = 40, c = 4, L ≈ 55 ms (50 ms of fake-server work plus overhead): 10 waves × 55 ms ≈ 0.55 s (measured 0.55–0.59 s across ten runs; at c = 1 it took about 2.2 s). Rate-limited at R = 20/s, b = 5: (40 − 5) ÷ 20 = 1.75 s floor (measured 1.86 s with the pacer)."
+  note="Raising c past the server's concurrency limit doesn't lower T; it only adds 429s."
+/>
+
+<Formula
+  title="Micro-batching: requests and time"
+  expr="requests = ⌈n / B⌉;   time per request = a + k × B"
+  vars={[
+    { sym: 'n', meaning: 'items (texts to embed)' },
+    { sym: 'B', meaning: 'items per request (max_batch)' },
+    { sym: 'a, k', meaning: 'fixed and per-item cost of one request; here an assumed 20 ms and 1 ms' },
+  ]}
+  example="n = 256, B = 32: 8 requests of 20 + 32 = 52 ms, sent together, measured 0.064–0.066 s. One item per request at concurrency 8: 256 requests, 32 waves of about 21 ms plus overhead, measured 0.77–0.80 s. Five runs each, 2026-10-12."
+  note="The gain comes from the fixed cost a. When a is small next to k × B, batching saves little time but still cuts request count, which matters under a requests-per-minute limit."
+/>
+
+</details>
+
+Four more points an interviewer may push on:
+
+- **Tasks and memory.** `complete_all` creates `n` tasks up front: memory grows with `n`, which is fine for
+  thousands. For a 10-million-line file, start `c` workers that read from a bounded `asyncio.Queue` filled
+  lazily, and write results as they finish.
+- **Connection pool.** `httpx.AsyncClient` defaults to 100 connections and 20 kept alive in httpx 0.28.1. If
+  `c` exceeds the pool, requests queue inside httpx, and that wait counts against `asyncio.timeout`.
+- **The parser.** Each `feed` appends to the pending text and searches it from the start. So one huge line
+  arriving in tiny chunks costs time proportional to the square of its length. Token streams have short
+  lines. If pushed, keep a scan offset.
+- **CPU on the loop.** `json.loads` on each delta takes microseconds. A 5 MB tool result would block every
+  other request on the event loop. Move large parses to `asyncio.to_thread`.
+
+**Why one thread is enough.** The work is almost all waiting on sockets, and one event loop can watch
+thousands of them at once. That is the idea behind the epoll stage of the io-model lab (epoll is Linux's call for watching many
+sockets with one thread).
+
+<AINative title="Where an assistant helps in this round, and where it hurts">
+When AI is allowed, it is good at the boilerplate: the dataclass, the pytest fixture that starts a server in
+a thread, the outcome table turned into code. It also proposes textbook answers confidently. A shared pause on
+429 sounds right and lost in these measurements. Decoding each chunk with `.decode()` is the default
+suggestion and fails on the first split character. A suggested batcher that zips results without a length
+check hands callers each other's answers. Treat each suggestion as a hypothesis and point a test at it: the
+split-at-every-byte test, the poison-input test, the strategy comparison. Write the test before you accept the
+code, not a better prompt after it fails.
+</AINative>
+
+## Small-team version
+
+Picture a 50–500 person company where you own AI with a few engineers plus coding agents. Every LLM feature you
+ship sits on a client like this one. The question is what to write yourself and what you already have.
+
+### Buy (or use what's in the box)
+
+- **The provider SDK.** The official OpenAI and Anthropic Python SDKs retry 2 times by default with short
+  exponential backoff on connection errors, 408, 409, 429 and 5xx, and time out after 10 minutes by default
+  (SDK documentation, fetched 2026-10-12). Use them. Set `timeout` to your real budget: 10 minutes is far
+  past any user-facing deadline. Don't wrap them in a second five-attempt loop.
+- **The batch APIs for offline work.** Anthropic's Message Batches API cuts cost by 50%, takes up to 100,000
+  requests or 256 MB per batch, finishes most batches within an hour, and expires batches not done within 24
+  hours ([batch processing docs](https://platform.claude.com/docs/en/build-with-claude/batch-processing),
+  fetched 2026-10-12). OpenAI's pricing page lists a similar batch discount (fetched 2026-10-11).
+- **A gateway, later.** A **gateway** is a shared service between your apps and the providers. LiteLLM
+  (self-hosted) or a hosted router gives you keys, budgets and fallbacks in config. Wait until a second team
+  or a second provider needs them; that is the
+  [provider gateway problem](/system-design-labs/interviews/questions/eng-058/).
+
+### Build (it's small)
+
+- A concurrency cap or token bucket set to your account's known limits. The measurements above are the
+  argument: pacing beat every reactive option.
+- Deadlines from the caller's budget, and a per-item result mode for batch jobs.
+- A spend-limit check: a 429 with `enforced_spend_limit_reached` and no retry-after is an incident, not a
+  retry (Anthropic documentation above).
+- The stream parser only if you aren't using the SDK's streaming helpers, plus the boundary test either way.
+- One structured log line per call: model, tokens in and out, attempts, latency, status.
+
+### Skip
+
+AIMD, adaptive concurrency and a shared pause until a measurement shows you need them; a homegrown gateway;
+and any retry logic for streams after the first token.
+
+### What it costs
+
+Take an assumed nightly job of 200,000 calls, each with 1,500 tokens in and 200 tokens out, on gpt-5-mini
+($0.25 per million input tokens and $2.00 per million output tokens, list prices fetched 2026-10-11). Sent
+synchronously, one run costs about **$155**. Through a batch API at half price it costs about **$77.50**. Over
+30 nights that is **$4,650 against $2,325**. So: buy the batch API for anything that can wait a few hours,
+and keep synchronous calls for users who are waiting.
+
+Retries change the bill too. During an outage, five attempts per call can mean five times the calls. A 20%
+retry budget caps that at 1.2 times.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Nightly batch job, synchronous versus batch API"
+  expr="cost = calls × (tokens_in × p_in + tokens_out × p_out) × discount"
+  vars={[
+    { sym: 'calls', meaning: 'requests per run (assumed 200,000)' },
+    { sym: 'tokens_in, tokens_out', meaning: 'per call (assumed 1,500 and 200)' },
+    { sym: 'p_in, p_out', meaning: 'gpt-5-mini list price, $0.25 and $2.00 per 1M tokens' },
+    { sym: 'discount', meaning: '1.0 synchronous; 0.5 with a batch API' },
+  ]}
+  example="Per call 1,500 × 0.25 ÷ 10⁶ + 200 × 2.00 ÷ 10⁶ = $0.000775; × 200,000 = $155 per run, $77.50 with the batch discount. Over 30 nightly runs: $4,650 versus $2,325."
+  note="Retries without a budget can multiply this: at 5 attempts per call during an outage, the worst case is 5× the calls. A 20% retry budget caps it at 1.2×."
+/>
+
+</details>
+
+The engineering cost is about a day for the client and its fake-server tests, which an agent can draft. The
+saving above pays for that day within the first month at these assumed volumes.
+
+### Delivery plan
+
+1. Day 1: SDK with explicit timeouts, a semaphore at the known concurrency, per-call logging, the outcome
+   table as code, and the fake server with flaky, 429, slow and bad modes.
+2. Day 2: pacer at the documented rate limit, per-item results, the batch-API path for nightly jobs, and the
+   spend-limit check.
+3. Week 2: dashboards for 429 rate, attempts per call and tokens per feature; revisit the cap when the
+   provider raises your tier.
+
+### What to verify yourself
+
+Kill a request mid-batch and check that nothing keeps running. Send a 429 without Retry-After. Truncate a
+stream. Feed a poison input to the batcher. Check that retries reuse the idempotency key.
+
+### What small-company interviewers probe
+
+Error handling, retries, fallbacks and timeouts, rather than the happy path. Elicit's hiring manager describes
+a coding exercise that includes converting a sync API to streaming and cancelling async work when the user
+leaves, and says it probes failure handling ([Latent Space, 2024-06-21](https://www.latent.space/p/hiring)).
+
+### Revisit when
+
+A second team or provider needs the client (build or buy a gateway); offline volume grows past what
+synchronous limits allow (move it to batch APIs); or a provider changes its limits or error codes.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Concurrent LLM client"
+  senior={[
+    "Gets the stages working in the time box, with tests, in their own language.",
+    "Writes the retryable-outcome table first and never retries a 400 or a cancellation.",
+    "Uses full jitter, a whole-attempt deadline, a cap on Retry-After and monotonic time.",
+    "Finds the split-character and split-CRLF traps with a boundary test rather than by luck.",
+    "Makes sure every batched caller hears back, including on failure and cancellation.",
+  ]}
+  staff={[
+    "Asks early whether the limit is known, and paces to it, treating 429 handling as the fallback.",
+    "Measures the 429 strategy instead of asserting it, and changes the default when the numbers disagree.",
+    "Raises idempotency: a timed-out attempt may still be billed, so ask for a key or don't retry expensive calls.",
+    "Counts retries across layers, including the SDK's own, and sets the deadline from the caller's budget.",
+    "Separates the three meanings of batching and says which one changes the bill.",
+  ]}
+/>
+
+At Senior, the reported advice is about speed (<Cite id="s-956f0bbc95" />). At Staff, the same code is
+expected, plus judgment about the system the client lives in. A Stripe Staff candidate relays design-round
+feedback that they had "force-fit a template from somewhere else instead of designing around the actual
+requirements" (<Cite id="s-8e0784406e" />). It was a different round, but asking "do we know the limit?" is
+designing around the actual requirements.
+
+## Follow-ups
+
+<FollowUps>
+<FollowUp q="Reported (Sierra, first-hand): the fallback ids can chain. One id points to another.">
+
+Follow the chain with a visited set and a hop limit, so a cycle raises instead of looping. Keep the outcome
+split: 404 moves to the next candidate, 5xx retries the same id, 400 stops. Return which id matched, so the
+caller can log how often fallbacks fire.
+
+</FollowUp>
+<FollowUp q="Reported (PromptLayer, interviewer-side guide): the batched endpoint caps inputs per request and tokens per minute.">
+
+Cap `max_batch` at the endpoint's input limit and also at a token budget per request (the sum of estimated
+tokens). Put the pacer in front in tokens, not requests: acquire `tokens_in_batch` from the bucket before
+sending. A batch that alone exceeds the per-minute budget must be split, or it can never be admitted.
+
+</FollowUp>
+<FollowUp q="Reported (Cursor, prep guide): a chunk arrives malformed mid-stream. Skip it, retry, or fail?">
+
+Count it and skip it if the protocol allows, as the code does, and export the count as a metric. If deltas
+carry sequence numbers or are cumulative, a skipped chunk is detectable and you can fail loudly instead. Never
+retry the stream after tokens have reached the user.
+
+</FollowUp>
+<FollowUp q="Not reported; a natural next push: one invalid prompt kills the whole batch. Fix it.">
+
+Return per-item results instead of fail-fast. A fixed pool of workers pulls indexes from a queue and stores
+either the answer or the exception (this ran in the test suite):
+
+```python
+    async def complete_all_pool(
+        self, prompts: list[str], workers: int = 8
+    ) -> list[str | Exception]:
+        results: list[str | Exception | None] = [None] * len(prompts)
+        queue: asyncio.Queue[int] = asyncio.Queue()
+        for i in range(len(prompts)):
+            queue.put_nowait(i)
+
+        async def worker() -> None:
+            while True:
+                try:
+                    i = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    results[i] = await self.complete(prompts[i])
+                except (FatalError, RetriesExhausted) as exc:
+                    results[i] = exc
+
+        async with asyncio.TaskGroup() as tg:
+            for _ in range(workers):
+                tg.create_task(worker())
+        return results  # type: ignore[return-value]
+```
+
+It catches only the two expected errors. A bug such as a `KeyError` in parsing still fails the batch, which
+is what you want.
+
+</FollowUp>
+<FollowUp q="Not reported; a natural next push: the caller gives up after 300 ms. Prove nothing keeps running.">
+
+Wrap the batch in `asyncio.timeout`. `TaskGroup` cancels every child, the backoff sleep is cancellable, and
+nothing in `_request` catches `CancelledError`. The test checks that no tasks remain after the timeout. The
+server side differs: the fake server kept processing the abandoned requests. Client cancellation frees your
+resources, not the provider's.
+
+</FollowUp>
+<FollowUp q="Not reported; a natural next push: the API ignores Idempotency-Key. Now what?">
+
+Then a retry after a timeout can do the work twice, which the timeout test showed. For cheap calls, accept it
+and count duplicates. For expensive or side-effecting calls, don't retry on timeout: raise, and let a layer
+that can check state decide. Prefer a longer first-attempt deadline over a fast retry.
+
+</FollowUp>
+<FollowUp q="Not reported; a natural next push: the SDK you must use is blocking.">
+
+Use `await asyncio.to_thread(sdk.call, ...)` behind a semaphore, with the same retry policy around each call.
+Blocking socket calls release the GIL (Python's global interpreter lock, which otherwise lets only one thread
+run Python code at a time), so threads work for I/O. The costs are a stack per thread and weaker
+cancellation: a timeout abandons the thread rather than stopping it.
+
+</FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Retrying everything.** A 400 retried five times is five wasted calls and a slower error; write the outcome
+  table first.
+- **No jitter, or no cap.** Without jitter clients retry in sync, and without a cap the backoff reaches
+  minutes by attempt 10.
+- **Stacking retries.** Your loop around an SDK that already retries 2 times multiplies the attempts.
+- **Swallowing cancellation.** `except BaseException:` in the retry loop turns "the user left" into "try
+  again".
+- **Treating every 429 as transient.** A spend-limit 429 without Retry-After won't clear by retrying.
+- **A batcher that loses callers.** With no length check, or a failure path that forgets some futures, a
+  caller gets the wrong answer or none.
+- **`chunk.decode()` per chunk, and splitting only on `\n`.** Both break on real network splits; use an
+  incremental decoder and the three-way line-end rule.
+- **Treating the end of the stream as success.** Without the `[DONE]` check, a dropped connection returns a
+  truncated answer that looks complete.
+- **Unbounded fan-out.** `gather` over 10,000 calls sends 10,000 requests at once, which means 429s and pool
+  timeouts.
+- **Being slow on a long problem.** Neither Senior rejection gives a reason, but the advice in both is
+  practice and speed (<Cite id="s-aa5a42ddc5" />, <Cite id="s-956f0bbc95" />). Type the stage-1 skeleton and
+  the retry loop from memory until each takes under ten minutes.
+
+## Prove it with a lab
+
+None of the labs is this client, but several hold its pieces.
+
+<LabRef lab="rate-limiter" role="proof" note="The server half of stage 3. Read its token bucket and port it to the client as the Pacer. Its /check handler hard-codes Retry-After: 60 and sets Content-Type after WriteHeader, so 429s go out as text/plain." />
+
+<LabRef lab="embedding-pipeline" role="proof" note="Server-side dynamic batching of single-text callers: the mirror image of the MicroBatcher." />
+
+Its measured batching numbers show why batching pays when per-call overhead dominates:
+<LabNumber lab="embedding-pipeline" metric="encode(), 1 vs 32 short texts per call (CPU)" showMetric /> and
+<LabNumber lab="embedding-pipeline" metric="v1 dynamic batching, 32 concurrent callers (CPU)" showMetric />.
+
+<LabRef lab="load-balancer" role="proof" note="Read the v2 retry budget (retries stop past 20% of requests), then read forward: it writes the backend's 5xx to the client before the retry decision, so a retried answer can't replace it. That is the stream rule from stage 6." />
+
+<LabRef lab="rpc-framework" role="partial" note="Its client removes a pending call when the context is cancelled, the same pattern as TaskGroup cancellation. The package doc says deadlines are propagated across the wire, but the client never sends one." />
+
+<LabRef lab="io-model" role="background" note="Four C servers (blocking, thread per connection, epoll, io_uring) showing why one event loop can hold thousands of idle sockets. Linux-only; not built for this guide." />
+
+There is no lab yet for the client-side pieces themselves: a provider pool with budgets, pacing and failover
+is the planned `llm-gateway` lab. Until then, the fastest proof is to rebuild this client against your own
+fake server and keep the boundary and poison-input tests.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-aa5a42ddc5" />
+- <Cite id="s-6c08b2d69e" />
+- <Cite id="s-5f98d711e8" />
+- <Cite id="s-1205b0cc50" />
+- <Cite id="s-c29d429c3c" />
+- <Cite id="s-956f0bbc95" />
+- <Cite id="s-4d55d9b987" />
+- <Cite id="s-b4d190c38f" />
+- <Cite id="s-8e0784406e" />
+- Anthropic, "Rate limits" (spend-limit 429 without retry-after; token bucket), fetched 2026-10-12: https://platform.claude.com/docs/en/api/rate-limits
+- Anthropic, "Batch processing" (50% cost, 100,000 requests or 256 MB, 24-hour expiry), fetched 2026-10-12: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+- Anthropic Python SDK docs (2 retries by default, 10-minute timeout), fetched 2026-10-12: https://platform.claude.com/docs/en/api/sdks/python
+- OpenAI Python SDK README (2 retries by default, 10-minute timeout), fetched 2026-10-12: https://github.com/openai/openai-python
+- OpenAI API pricing (gpt-5-mini; batch discount), fetched 2026-10-11: https://developers.openai.com/api/docs/pricing
+- Latent Space, "Hiring" (Elicit's coding exercise), 2024-06-21: https://www.latent.space/p/hiring
+- Marc Brooker, "Exponential Backoff and Jitter", AWS Architecture Blog, 2015-03-04: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+- Google, *Site Reliability Engineering*, "Handling Overload": https://sre.google/sre-book/handling-overload/
+- RFC 9110 §10.2.3 (Retry-After): https://www.rfc-editor.org/rfc/rfc9110#section-10.2.3 · RFC 6585 §4 (429): https://www.rfc-editor.org/rfc/rfc6585#section-4
+- WHATWG HTML Living Standard, server-sent events: https://html.spec.whatwg.org/multipage/server-sent-events.html

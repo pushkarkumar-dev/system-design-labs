@@ -1,0 +1,175 @@
+---
+question: infra-033
+family: concurrent-io-workers
+status: published
+labs: [rate-limiter, load-balancer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll use a fixed number of worker goroutines reading from a jobs channel. Only the sender closes a
+> channel, and only once; closing it is how workers learn to stop. A WaitGroup counts the workers, and when
+> they're all done, a separate goroutine closes the results channel. Every send also watches the context, so
+> a cancelled caller can't leave goroutines stuck. Then I'll run the tests with the race detector, and say
+> what it can't catch."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see correct concurrent Go under time pressure: goroutines that end, channels closed
+by the right owner, cancellation through `context`, and no data races.
+
+If you come from Java or Python, Go's model feels lighter, and that is the trap. Goroutines are cheap to
+start, so it is easy to start them without a plan for how they stop. A goroutine blocked forever on a channel
+doesn't crash anything; it just leaks, quietly, until the service runs out of memory. Most of what this round
+checks is **ownership**: who closes each channel, who waits for whom, and who stops everything on
+cancellation.
+
+The evidence for this question is thin. Glassdoor snippets mention a Go concurrency challenge in a CoreWeave
+Senior loop (May 2025) and a separate multithreading phone screen (December 2025), without describing the
+task (<Cite id="s-5e2c5b84e0" />). Confidence is low, so prepare the common shapes: a worker pool, a fan-out
+with a limit, a pipeline of stages, and a crawler.
+
+## Clarify first
+
+- **What is the unit of work, and how does it fail?** "I'll assume I/O that can time out."
+- **Bounded concurrency?** "Yes, a fixed number of workers."
+- **Must results keep input order?** If yes, carry an index with each job.
+- **On the first error: cancel everything, or collect all errors?** Ask; both are common.
+- **Can the caller cancel?** "I'll assume a `context.Context` is passed in."
+
+## Answer
+
+### Words you need first
+
+- **Goroutine**: a very cheap thread managed by the Go runtime. Starting thousands is normal.
+- **Channel**: a typed pipe between goroutines. A send waits until someone receives (on an unbuffered
+  channel). Receiving from a **closed** channel returns immediately, and `for x := range ch` ends when the
+  channel is closed.
+- **`select`**: waits on several channel operations and runs whichever is ready first.
+- **`context.Context`**: carries a cancellation signal. When the caller cancels, the channel `ctx.Done()`
+  becomes ready.
+- **`sync.WaitGroup`**: a counter you increment per goroutine and decrement when each finishes; `Wait()`
+  blocks until it reaches zero.
+
+### The worker pool, with ownership said out loud
+
+```
+Producer ── sends jobs, then close(jobs)   ← the sender closes, once
+   │
+   ▼
+jobs channel
+   │
+   ▼
+W worker goroutines ── for j := range jobs { ... }; each send selects on ctx.Done()
+   │  wg.Done() when the range loop ends
+   ▼
+results channel
+   │
+   ▼
+Closer goroutine ── wg.Wait(); close(results)
+   │
+   ▼
+Consumer ── for r := range results { ... } ends when results is closed
+```
+
+**The producer** is the only sender on `jobs`, so it is the one that closes it. Closing from the receiving
+side, or twice, panics.
+
+**The workers** `range` over `jobs` and exit when it is closed. Every blocking send selects on `ctx.Done()`
+too, so a cancelled caller can't leave goroutines stuck on a send nobody will receive.
+
+**The closer goroutine** waits on the WaitGroup and then closes `results`. The workers can't close it
+themselves: none of them knows it is the last one.
+
+**The consumer** ranges over `results`, which ends cleanly when the closer closes it.
+
+Say it like this: "The sender closes, once. The WaitGroup tells me when it's safe to close results."
+
+### When work creates more work
+
+For a crawler, a fixed job list isn't enough, because each page adds new jobs. Keep one **coordinator**
+goroutine that owns the `seen` map and an `inFlight` counter, and loop until the frontier (URLs still to
+fetch) is empty **and** `inFlight` is zero. One trick is worth naming: sending on a `nil` channel blocks
+forever, so inside a `select` that case is never chosen. Setting the send channel to `nil` when there is
+nothing to send switches that case off. The family walkthrough has the full version.
+
+### Prove it
+
+Write a test against `httptest.NewServer` (Go's built-in fake HTTP server) that checks the result set for 1,
+8 and 64 workers, and a test that cancels the context and checks the call returns quickly.
+
+| Check (run 2026-10-12, Go 1.26.9) | Result | What to say in the interview |
+|---|---|---|
+| Same results with 1, 8 and 64 workers | Passed | "The worker count changes speed, never the answer." |
+| Cancel the context after 120 ms | The crawl stopped in well under a second | "Cancellation reaches every goroutine." |
+| `go test -race -count=20` (each test 20 times, race detector on) | Passed | "No data race showed up in twenty runs." |
+| First version of the test | Failed | "The fake server's 'fail once' state was shared across three crawls: my harness had its own shared-state bug." |
+
+### Know what `-race` can't do
+
+A **data race** is two goroutines touching the same memory at the same time, at least one writing. Go's race
+detector finds those, but only on code that actually runs. Go's docs say it "only finds races that happen at
+runtime" ([Go race detector](https://go.dev/doc/articles/race_detector), read 2026-10-12).
+
+It also misses **logic races**, also called check-then-act bugs: code reads a value, decides, then writes,
+and another goroutine changes the value in between. Every single access can be atomic and the result still
+wrong. The rate-limiter lab's flaky test is exactly this: `-race` doesn't report it, while plain runs fail 5%
+to 37% of the time depending on load (run 2026-10-11). Say it like this: "A clean `-race` run means no data
+race ran. It doesn't mean the logic is right."
+
+### Bounded fan-out without a pool
+
+A buffered channel works as a **semaphore** (a counter of permits): `sem <- struct{}{}` before starting a
+goroutine, `<-sem` when it is done, so at most `cap(sem)` run at once. `golang.org/x/sync/errgroup` with
+`SetLimit` adds first-error cancellation. Mention it, but be ready to write the channel version from scratch.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Go concurrency"
+  senior={["Correct channel ownership and closing, WaitGroup or in-flight counting, context cancellation, and a -race test."]}
+  staff={["Explains which bugs -race cannot catch, designs tests that provoke logic races (stress, fault injection), and sizes concurrency from the downstream limit."]}
+/>
+
+In plain words: a Senior answer gets the ownership rules right and tests with `-race`. A Staff answer also
+knows where `-race` is blind, writes tests that provoke those bugs, and sets the concurrency from what the
+downstream service allows.
+
+## Small-team version
+
+Go is a common choice for the small services around an AI feature: an ingestion worker, a webhook fan-out, a
+gateway in front of a model API. The actions:
+
+- **Bound concurrency from the provider's rate limit**, using Little's law: calls in flight ≈ rate × latency.
+- **Put a context deadline on every outbound call.**
+- **Add a retry budget** (a cap on retries as a share of all calls), so failures don't multiply load.
+- **Keep the race detector in CI** for packages with goroutines. It costs time (Go's docs cite 2 to 20 times
+  slower execution), but only in tests.
+
+A sizing example. Anthropic's Start tier lists 1,000 requests a minute for Sonnet 5 (rate-limit docs, fetched
+2026-10-12), about 16.7 a second. At an assumed 2 s per call, about **33 goroutines** in flight reach it. So a
+semaphore of 30 is the default, and 500 only collects 429 ("Too Many Requests") errors.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Rate:** 1,000 requests ÷ 60 s ≈ **16.7** per second.
+- **In flight:** 16.7 × 2 s ≈ **33**.
+
+</details>
+
+## Pitfalls
+
+- **Closing a channel from the receiving side, or twice.** The sender owns the close; a second close panics.
+- **Goroutines blocked forever on a send.** If the consumer returned early, they leak unless the send also
+  selects on `ctx.Done()`.
+- **Ending when a queue looks empty.** A worker may still be about to add work; count in-flight jobs instead.
+- **Treating a clean `-race` run as proof.** It misses logic races and code paths that never ran.
+
+## Go deeper
+
+- Family walkthrough: [Concurrent I/O workers](/system-design-labs/interviews/walkthroughs/concurrent-io-workers/), Stage 4 and "Verification".
+- A real check-then-act race to study: <LabRef lab="rate-limiter" inline />. Retry budgets: <LabRef lab="load-balancer" inline />.
+- Lower-level primitives and race hunting: [Systems concurrency primitives](/system-design-labs/interviews/walkthroughs/systems-concurrency-primitives/).

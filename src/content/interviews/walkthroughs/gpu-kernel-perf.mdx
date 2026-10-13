@@ -1,0 +1,855 @@
+---
+title: "GPU kernel performance: coalescing, tiling, fusion, FlashAttention, CUDA graphs"
+summary: "Why a GPU program runs at 15% of its memory speed, how to write a safe softmax, why FlashAttention is faster, and when CUDA graphs help. Measure first, count bytes, and match each fix to what the profiler shows."
+track: ai-infra
+format: deep-dive
+family: gpu-kernel-perf
+smallTeamFocus: "Don't write GPU kernels. Get them through PyTorch, vLLM and FlashAttention, keep CUDA graphs on, and spend your time on batch size, precision and profiling. A custom kernel rarely pays back at a few GPUs."
+rounds: [debugging, practical-coding, domain-deep-dive, take-home]
+level: both
+timeboxMin: 60
+order: 225
+status: published
+basedOn: [infra-066, infra-067, infra-071, infra-072, infra-074, infra-076]
+askedAt: [amazon, anthropic, nvidia, modal, together-ai, fireworks-ai, groq, cerebras, other]
+labs:
+  - { lab: transformer, role: proof, note: "Its attention is the standard materialize-the-scores version, so it is the baseline to compare a tiled attention against." }
+  - { lab: llm-inference, role: partial, note: "Shows where decode time goes per token; its throughput rows are estimates and its batching runs one forward pass per request." }
+gapLabs: []
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "Most GPU programs in AI are limited by how fast they move data from memory, not by how fast they do math.
+> So I start by measuring: I work out the fewest bytes the job must move, divide by the time it took, and
+> compare that with the memory's top speed. Then I use a profiler to see why the gap exists. The usual
+> reasons are threads reading scattered addresses, reading the same data several times, too few reads in
+> flight, or the CPU not starting work fast enough. Each reason has its own fix, and I check every fix
+> against a trusted reference before I believe the new number."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+### What makes this different from the performance work you already do
+
+You have tuned slow services before. You found the slow database query, added an index or a cache, and the
+p99 came down. The work was mostly about avoiding work: fewer calls, fewer round trips, less waiting on disks
+and networks.
+
+GPU performance work feels different in three ways, and a good answer is built around them.
+
+1. **The program is tiny and runs thousands of times at once.** A GPU program is one small function. The GPU
+   runs that same function on thousands of threads at the same moment, each thread working on a different
+   piece of the data. A slow program is usually not one slow line. It is thousands of threads getting in each
+   other's way.
+2. **Arithmetic is cheap; moving data is expensive.** A modern GPU can do hundreds of trillions of arithmetic
+   operations per second, but it can only read about two trillion bytes per second from its main memory. Most
+   of the steps in an AI model do only a few operations per byte they read. So the speed of those steps is set
+   by memory, and the job becomes counting bytes.
+3. **The CPU is still in charge.** The CPU (the ordinary processor running your Python) tells the GPU what to
+   run, one small job at a time. If each job is tiny, the GPU finishes it before the CPU has sent the next one,
+   and the GPU sits idle. Then no change to the GPU code helps.
+
+So the interviewer is not testing whether you have memorized CUDA tricks. They want to see whether you can
+measure, name the limit with a number, and pick the fix that matches what you measured.
+
+(These questions are reported from prep articles about NVIDIA, Modal, Together AI, Fireworks, Groq and
+Cerebras, from an Amazon screen and from Anthropic's own take-home; the sources are listed below
+<Cite id="s-55d540eda9" />.)
+
+### Words you need first
+
+- A **kernel** is one function that runs on the GPU. One step of a model, such as "multiply these two
+  matrices" or "turn these scores into probabilities", is usually one kernel. **CUDA** is NVIDIA's language
+  for writing kernels (C++ with a few extras). **Triton** is a Python-based alternative.
+- Threads come in fixed groups of 32 called **warps**. "A warp is 32 threads that execute the same instruction
+  in lockstep" <Cite id="s-55d540eda9" />. Warps are grouped into **thread blocks**, and the threads in one
+  block can share a small, fast memory and wait for each other.
+- **HBM** (high-bandwidth memory) is the GPU's main memory: 80 GB on the GPUs this page uses. It is large but
+  far from where the arithmetic happens. **Bandwidth** is how many bytes per second it can deliver. **Peak** bandwidth is
+  the spec-sheet number: 2,039 GB/s on an NVIDIA A100 80 GB SXM <Cite id="s-8e443a8b66" />.
+- **Shared memory** (also called on-chip **SRAM**) is a small memory inside each compute unit, around 100 KB,
+  shared by one thread block. **Registers** are each thread's own private variables, the fastest storage of all.
+- A **FLOP** is one floating-point arithmetic operation (an add or a multiply). **fp32**, **fp16** and
+  **bf16** are number formats: fp32 uses 4 bytes per number, fp16 and bf16 use 2.
+
+### The picture: where the data lives
+
+Every fix on this page moves data up this ladder, or reads it from the bottom fewer times. The latencies are
+approximate figures from a prep article <Cite id="s-55d540eda9" />.
+
+```
+CPU (your Python code)
+   │  launches kernels, one at a time, a few microseconds each
+   ▼
+┌──────────────────────── GPU ─────────────────────────┐
+│  Compute units (each runs many warps of 32 threads)  │
+│     Registers ............ about 1 cycle             │
+│     Shared memory / SRAM .. 20–30 cycles, ~100 KB    │
+│           ▲                                          │
+│           │                                          │
+│  L2 cache ............... about 200 cycles           │
+│           ▲                                          │
+│           │  2,039 GB/s on an A100 (the "peak")      │
+│  HBM, 80 GB ............. 400–600 cycles             │
+└──────────────────────────────────────────────────────┘
+```
+
+**The CPU** decides what runs and in what order. Each kernel launch costs it a few microseconds. That cost
+matters only when the kernels are tiny, and then it matters a lot (the CUDA graphs section).
+
+**Registers** are where a thread does its arithmetic. Data in registers is effectively free to use again.
+
+**Shared memory** lets the threads of one block exchange data without going back to HBM. It is how a kernel
+reads a tile of data once and lets many threads use it.
+
+**L2 cache** sits between the compute units and HBM. You don't control it directly.
+
+**HBM** holds the model's **weights** (the billions of learned numbers that make up the model), the
+inputs and the outputs. It is the slow, wide pipe. When this page says a
+kernel is "memory-bound", it means the kernel's time is set by how many bytes cross this pipe.
+
+### The worked example that runs through this page
+
+Picture one step of a language model. A **language model** reads text broken into **tokens** (chunks of
+roughly ¾ of a word) and, at each step, gives every possible next token a raw score. Those raw scores are
+called **logits**. Llama 3.1 has a vocabulary of 128,256 tokens <Cite id="s-6fdd575dc5" />, so each row of
+logits has 128,256 numbers. A **softmax** turns one row into probabilities that add up to 1: raise *e* to
+each score, then divide by the sum.
+
+Our example processes 4,096 such rows at once, in fp32, on one A100. A teammate says the softmax kernel takes
+**13.7 ms** and runs at "15% of peak". Here is how the page uses it:
+
+| Step | What we do with the softmax | What to say in the interview |
+|---|---|---|
+| 1. Confirm the number | Fewest bytes it must move: about **4.20 GB**. At peak that is **2.06 ms**. 13.7 ms is 15% | "First I check how '15%' was computed, and against which peak." |
+| 2. Pick the right limit | Softmax does only a few FLOPs per byte, so memory is the limit | "This is memory-bound, so bandwidth is the right yardstick." |
+| 3. Profile | Compare bytes the profiler counts with our 4.20 GB | "Far more bytes than needed means scattered or repeated reads." |
+| 4. Fix | Make neighbouring threads read neighbouring addresses; cut the passes over each row | "A safe softmax reads the row once for both the max and the sum." |
+| 5. Re-check | Compare with a float64 reference, with a tolerance | "A faster number I can't verify isn't a result." |
+
+The same idea, "count the bytes and stop reading things twice", then explains FlashAttention (the same trick
+applied to the model's attention step) and CUDA graphs (the same thinking applied to the CPU's side).
+
+### The prompts as they are reported
+
+Six reported prompts share one skill: making a GPU program move fewer bytes, launch fewer kernels and keep its
+compute units busy, and proving it with a profiler.
+
+- **The 15% kernel.** A techinterview.org prep article (July 2026) frames it as "here's a kernel running at 15%
+  of peak memory bandwidth, tell me why and make it faster". It names NVIDIA, Modal, Together, Fireworks, Groq
+  and Cerebras as companies whose infra interviews go into CUDA. It cites no first-hand reports
+  <Cite id="s-55d540eda9" />.
+- **A softmax kernel.** techinterview.org's Together AI guide says softmax "is a favorite because it forces a
+  reduction and an element-wise pass in one kernel", with follow-ups on coalescing, shared-memory reductions
+  and warp divergence. It is the site's guidance, not a candidate report <Cite id="s-0457784328" />.
+- **FlashAttention.** A PracHub entry tagged Amazon (technical screen, posted July 2025) asks for a survey of
+  long-sequence attention families and why FlashAttention helps <Cite id="s-1ef8611e61" />. A Blind poster
+  (May 2026) says infra candidates need Megatron-LM, ZeRO and FlashAttention "source-code deep"; commenters
+  suspect the poster sells prep, so treat it as low confidence <Cite id="s-a129aa6451" />.
+- **CUDA graphs.** A PracHub prep guide on Fireworks lists CUDA graphs as a technical-review topic, and says
+  its exercises are not "questions represented as having been asked by Fireworks" <Cite id="s-b6632d5df9" />.
+- **Anthropic's performance take-home.** The one well-sourced item. Anthropic's own post (Tristan Hume,
+  2026-01-21) describes a take-home where candidates optimize a program for a simulated accelerator, with AI
+  tools explicitly allowed <Cite id="s-a8c29f7dce" />.
+
+<QuestionRow id="infra-072" />
+<QuestionRow id="infra-074" />
+<QuestionRow id="infra-066" />
+<QuestionRow id="infra-067" />
+<QuestionRow id="infra-076" />
+<QuestionRow id="infra-071" />
+
+No first-hand report of a live CUDA or Triton kernel round turned up; the claims come from prep sites. Sources also disagree on depth. One says senior candidates should read or write Triton or CUDA
+<Cite id="s-f07fcd5321" />. Another says you only need to know where Python ends and C++/CUDA begins
+<Cite id="s-f440daaea4" />. The likely split is kernel roles versus platform roles. Ask the recruiter which one
+this is.
+
+## What is being tested
+
+**Measuring before fixing.** The 15% article's own answer starts with "the achieved memory throughput and the
+warp stall reasons in Nsight" <Cite id="s-55d540eda9" />. **Nsight Compute** is NVIDIA's profiler for a single
+kernel. It reports how many bytes the kernel really moved, and why warps were waiting (their **stall
+reasons**). A candidate who guesses a fix before naming the number that shows the problem gives a weak answer.
+
+**The memory ladder as numbers.** The same article gives approximate latencies: registers about 1 cycle,
+shared memory 20–30, L2 about 200, HBM ("global memory") 400–600 cycles <Cite id="s-55d540eda9" />. Most fixes
+move data up this ladder or read it fewer times. Say the numbers; they make the argument for you.
+
+**Reading memory well, in code** (infra-074). The softmax kernel tests whether neighbouring threads read
+neighbouring addresses, whether you can combine values across a warp, and whether your exponentials can
+overflow.
+
+**Thinking in bytes at the level of the algorithm** (infra-066, infra-067). FlashAttention is the standard
+example of doing *more* arithmetic in order to move *fewer* bytes, and coming out faster.
+
+**The CPU's side of the story** (infra-076). Sometimes the GPU is idle because the CPU can't start kernels fast
+enough. The fix is on the CPU side.
+
+**Optimizing an unfamiliar machine under time pressure, with AI tools** (infra-071). Anthropic's take-home asks
+you to learn a made-up processor, build a model of where the time goes, and make it faster, without letting a
+tool cheat the benchmark.
+
+## Clarify and scope
+
+Spend a minute pinning down the setup. Each question changes the answer.
+
+- **What is "peak"?** Is it the spec-sheet HBM bandwidth (2,039 GB/s on an A100 80 GB SXM,
+  <Cite id="s-8e443a8b66" />), or the speed of a simple copy kernel measured on this GPU? NVIDIA's best-practices
+  guide defines **effective bandwidth** as (bytes read + bytes written) ÷ time. Say: "How was the 15% computed,
+  and against which peak?"
+- **Which GPU and which number format?** Memory transaction sizes depend on the GPU generation. FP8 (a 1-byte
+  format) exists on the H100 but not the A100.
+- **What shapes?** For softmax: how many rows, and how long is each row? A 128,256-entry vocabulary row and a
+  64-entry attention row need different kernels. For attention: the sequence length (called N), the size of
+  each head's vectors (called d), whether the model may look ahead (non-causal) or only back (causal), and
+  whether this is training or serving.
+- **Is the kernel alone slow, or the whole step?** A timeline of a whole model step (a **trace**) can show gaps
+  between kernels. No kernel change fixes a gap.
+- **How exact must the answer be?** Exact match, or within a tolerance of a reference? Faster kernels add
+  numbers in a different order, so the last digits change.
+
+**Out of scope here:** splitting work across many GPUs (the roofline and training families) and writing a
+production FlashAttention.
+
+## Core concepts
+
+### Is memory even the right limit? Arithmetic intensity and the ridge point
+
+Before you blame bandwidth, check that bandwidth is what limits this kernel. Every kernel does some arithmetic
+and moves some bytes. The ratio of the two is its **arithmetic intensity**: FLOPs per byte moved.
+
+The GPU has two speed limits. On an A100 it can do 312 trillion bf16 FLOPs per second, and it can move 2,039 GB
+per second <Cite id="s-8e443a8b66" />. Divide one by the other and you get about **153 FLOPs per byte**. This
+crossover is called the **ridge point**. A kernel that does fewer than 153 FLOPs per byte can't keep the
+arithmetic units busy; it is **memory-bound**, and bandwidth is its limit. A kernel that does more is
+**compute-bound**. Drawing both limits on one chart gives the **roofline** model, which the
+[roofline walkthrough](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/) covers in depth.
+
+Softmax does a handful of operations per number (a compare, a subtract, an exponential, a divide) on 4 bytes
+per number. That is a few FLOPs per byte, nowhere near 153. So for our example, bandwidth is the right yardstick,
+and "15% of peak bandwidth" is a fair complaint.
+
+Say it like this: "Softmax is far below the ridge point, so I judge it by bandwidth. If this were a big matrix
+multiply, 15% of bandwidth might be perfectly fine."
+
+### Why a kernel reaches only a fraction of bandwidth
+
+**Coalescing first.** When the 32 threads of a warp each ask for a number, the GPU combines their requests into
+as few memory transactions as the addresses allow. Memory is fetched in **segments** of 32 bytes. If the 32
+threads read 32 numbers that sit next to each other, the warp needs only 4 segments, and every byte fetched is
+used. This is called a **coalesced** read.
+
+NVIDIA's best-practices guide shows 32 consecutive 4-byte loads served by "four coalesced 32-byte transactions",
+and that "a stride of 2 results in a 50% of load/store efficiency"
+([CUDA C++ Best Practices Guide §10.2.1](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html),
+accessed 2026-10-12). A **stride** is the gap between the addresses neighbouring threads read. Extending the
+same model:
+
+| Stride (4-byte elements) | 32-byte segments per warp load | Useful ÷ moved |
+|---|---|---|
+| 1 | 4 | 100% |
+| 2 | 8 | 50% |
+| 4 | 16 | 25% |
+| 8 or more | 32 | 12.5% |
+
+A float32 kernel reading with a stride of 8 or more is capped near **12.5% of peak** by this model alone. That is
+why "15% of peak" so often means an access-pattern problem. The usual culprits are reading a matrix
+column-wise when it is stored row by row, an array of structs where the kernel needs only one field, or a
+transpose. The article's summary: "Coalescing is the answer to most 'why is this slow' questions"
+<Cite id="s-55d540eda9" />.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- A warp of 32 threads reading 4-byte floats wants 32 × 4 = **128 useful bytes**.
+- Stride 1: the 128 bytes sit together, so 128 ÷ 32 = **4 segments**. Everything fetched is used.
+- Stride 2: the addresses span 256 bytes, so **8 segments** are fetched for 128 useful bytes: 50%.
+- Stride 8: neighbouring threads are 8 × 4 = 32 bytes apart, so each thread lands in its own segment. The warp
+  fetches 32 × 32 = **1,024 bytes** for 128 useful: 128 ÷ 1,024 = **12.5%**.
+- So a profiler showing about 8× the minimum bytes points at a stride of 8 or more.
+
+</details>
+
+**The other usual causes**, each with the plain reason it hurts:
+
+- **Not enough reads in flight.** A read from HBM takes hundreds of cycles. The GPU hides that wait by switching
+  to other warps that have work ready. If there are too few warps, or each thread does too little, the wait
+  shows. The share of the GPU's warp slots in use is called **occupancy**. The article warns that chasing 100%
+  occupancy "is the wrong instinct", citing Volkov's "Better Performance at Lower Occupancy": more independent
+  loads per thread can hide latency as well as more warps can <Cite id="s-55d540eda9" />.
+- **Shared-memory bank conflicts.** Shared memory is split into 32 **banks**, and "if multiple addresses of a
+  memory request map to the same memory bank, the accesses are serialized" (best-practices guide §10.2.3.1). A
+  32 × 32 float tile read by column hits one bank 32 times. Padding it to `tile[32][33]` shifts each row by one
+  bank, so a column read touches 32 different banks <Cite id="s-55d540eda9" />.
+- **Small kernels and launch gaps.** A kernel that moves a few kilobytes can't reach peak. Starting it and
+  ramping up take longer than the work.
+- **Divergence.** If threads in one warp take different sides of an `if`, the warp runs both sides one after the
+  other, with half its threads idle each time.
+- **Extra passes** over the same data, which the next section is about.
+
+<Formula
+  title="Effective bandwidth"
+  expr="BW_eff = (bytes read + bytes written) ÷ kernel time;   efficiency = BW_eff ÷ peak"
+  vars={[
+    { sym: 'bytes', meaning: 'the minimum the algorithm must move, not what the profiler counts (compare the two)' },
+    { sym: 'peak', meaning: 'spec-sheet HBM bandwidth, or a measured device-to-device copy ceiling' },
+  ]}
+  example="Softmax over 4,096 rows × 128,256 fp32 logits: 4,096 × 128,256 × 4 B × 2 = 4.20 GB. Floor at 2,039 GB/s: 2.06 ms. At 15% of peak the kernel takes 13.7 ms"
+/>
+
+### Fusion: stop reading the same bytes twice
+
+For a memory-bound kernel, time is roughly bytes ÷ bandwidth. So the biggest lever is to move fewer bytes. The
+article puts it bluntly: "every separate kernel means another round trip to HBM" <Cite id="s-55d540eda9" />.
+
+The textbook softmax makes several **passes** over each row. It reads the row once to find the maximum, once to
+add up the exponentials, and once more to divide, then writes the result. That is 3 reads and 1 write: 4 passes.
+If the row fits in registers or shared memory, one **fused** kernel can read it once and write it once: 2 passes.
+On a memory-bound shape, that is twice as fast.
+
+The same idea works between kernels. Adding a bias, applying a simple function to every number, or unpacking compressed
+weights right after a matrix multiply would normally be a separate kernel: write the result to HBM, read it
+back. Doing it inside the matrix-multiply kernel (**fusing** it) saves that full write and read.
+
+Say it like this: "Every separate kernel is another round trip to HBM. If two steps touch the same data, I want
+them in one kernel."
+
+### Online softmax: the max and the sum in one pass
+
+Before you take *e* to the power of each score, you subtract the row's maximum. The result is the same, because
+softmax doesn't change when every score shifts by a constant. But it keeps the numbers small. Without it, any
+score above about 88 overflows fp32's exponential, and the row turns into infinities.
+
+The catch is that you need the maximum before you can start summing, which seems to force two reads of the row.
+**Online softmax** removes that. It keeps a running maximum and a running sum. When a new, bigger maximum turns
+up, it rescales the sum it already has to the new maximum, then carries on
+([Milakov and Gimelshein, arXiv 1805.02867](https://arxiv.org/abs/1805.02867), 2018):
+
+<Formula
+  title="Online softmax update"
+  expr="m' = max(m, x);   d' = d × e^(m − m') + e^(x − m');   softmax(xᵢ) = e^(xᵢ − m) ÷ d at the end"
+  vars={[
+    { sym: 'm', meaning: 'running maximum (starts at −∞)' },
+    { sym: 'd', meaning: 'running denominator, always expressed relative to the current maximum' },
+  ]}
+  example="Run on 2026-10-12 against a three-pass NumPy softmax on 1,000 values drawn from N(0, 25): maximum difference 7.8 × 10⁻¹⁶"
+/>
+
+In words: the running sum is always "the sum of exponentials, measured against the current maximum". When the
+maximum grows, multiply the sum by *e* raised to (old max − new max), which is a number below 1, and it is again
+measured against the right maximum. Two pairs of (max, sum) from different threads combine with the same rule,
+which is what makes it work in parallel.
+
+### FlashAttention: the same trick, applied to attention
+
+**Attention** is the step where a language model lets each token look at the other tokens. Each token has three
+vectors of length d (often 64 or 128): a **query** (Q, "what am I looking for"), a **key** (K, "what do I
+contain") and a **value** (V, "what I pass on"). Attention scores every query against every key, turns each
+row of scores into weights with a softmax, and uses the weights to mix the values. For a sequence of N tokens,
+that is an N × N table of scores, per **head** (a model runs many attention heads side by side).
+
+Standard attention computes the score table S = QKᵀ, writes it to HBM, reads it back for the softmax, writes the
+weights P, and reads P again to multiply by V. At long sequences that table is enormous, and all that traffic
+crosses the slow pipe.
+
+**FlashAttention** never writes the table. It loads small tiles of Q, K and V into shared memory, computes one
+tile of scores, and updates a running max, running sum and running output for each query row, exactly as the
+online softmax does. The paper says it "uses tiling to reduce the number of memory reads/writes between GPU
+high bandwidth memory (HBM) and GPU on-chip SRAM". It is exact, not an approximation
+([Dao et al., arXiv 2205.14135](https://arxiv.org/abs/2205.14135), 2022).
+
+Three facts to give when the interviewer wants "source-code depth":
+
+1. **I/O complexity.** "I/O" here means reads and writes to HBM. The paper's Theorem 2: standard attention needs
+   Θ(Nd + N²) HBM accesses, FlashAttention Θ(N²d²M⁻¹), where M is the shared-memory size. In plain words, the
+   saving is a factor of about M ÷ d². "For typical values of d (64-128) and M (around 100KB), d² is many times
+   smaller than M" (§3.2). The saving therefore shrinks as d grows relative to M.
+2. **Memory footprint.** Only the output and two numbers per row (the max m and the sum ℓ) go to HBM. Extra
+   memory grows with N, not N².
+3. **Backward pass by recomputation.** Training needs a **backward pass**, which works out how to adjust the
+   model and normally re-reads the stored score table. FlashAttention stores no table. By "storing the output O
+   and the softmax normalization statistics (m, ℓ), we can recompute the attention matrix" tile by tile. That
+   adds FLOPs, yet it runs faster because HBM traffic falls (§3.1–3.2).
+
+The paper reports a 3× speedup on GPT-2 at sequence length 1K and 15% end to end on BERT-large (two
+well-known older models). FlashAttention-2
+(July 2023) reports that the first version reached "only 25-40% of the theoretical maximum FLOPs/s", and the new
+one 50–73% on A100, about 2× faster. It got there by cutting the non-matrix-multiply work, splitting one long
+sequence across more of the GPU, and dividing work between warps better
+([Dao, arXiv 2307.08691](https://arxiv.org/abs/2307.08691)).
+
+Say it like this: "FlashAttention does more arithmetic and less memory traffic. Because attention outside the
+matrix multiplies is memory-bound, that trade wins."
+
+### CUDA graphs: when the CPU is the bottleneck
+
+Serving a model has two phases. **Prefill** reads the whole prompt in one big pass. **Decode** then writes the
+reply one token at a time, and each token needs another pass through the whole model. With one user (a
+**batch size** of 1), each decode pass is hundreds of small kernels.
+
+Each kernel launch costs the CPU some microseconds. When the kernels are small, the GPU can finish each one
+before the CPU has launched the next. The GPU then waits on Python and the driver. A **CUDA graph** records the
+whole sequence of kernels once and replays it with one submission. NVIDIA's PyTorch guide: you "launch the
+entire graph as a single unit with a single submission from the CPU", and graphs help most "for workloads with
+many small operations"
+([NVIDIA CUDA Graph best practice for PyTorch](https://docs.nvidia.com/dl-cuda-graph/cuda-graph-basics/cuda-graph.html),
+accessed 2026-10-12).
+
+The constraints are the interview content. A replay repeats exactly what was recorded, so:
+
+- the shapes must not change (the same batch size and lengths),
+- kernel arguments and memory addresses must stay the same across replays (inputs are copied into fixed
+  buffers first),
+- and nothing inside the recorded region may wait on the CPU or branch on data.
+
+Say it like this: "CUDA graphs don't make any kernel faster. They remove the CPU's launch cost, which matters
+only when kernels are tiny."
+
+## Worked examples
+
+### 1. Diagnose the 15% kernel (infra-072)
+
+This is the running example: the 13.7 ms softmax over 4,096 rows of 128,256 fp32 logits on an A100. Say the
+method in this order.
+
+1. **Confirm the number.** The fewest bytes it must move is reading every number once and writing every result
+   once: **4.20 GB**. That much in 13.7 ms is **307 GB/s**, which is 15% of 2,039 GB/s. Now you know how "15%"
+   was computed.
+2. **Check it's memory-bound.** Softmax does a few FLOPs per byte, far below the A100's ridge point of about 153
+   FLOPs per byte in bf16. Bandwidth is the right yardstick.
+3. **Profile one kernel in Nsight Compute.** Compare the bytes the profiler says moved from HBM with your 4.20 GB.
+   - Much more than 4.20 GB means poor coalescing or repeated passes. About 8× more points at a stride of 8 or
+     more (the table above).
+   - About 4.20 GB, but still slow, means the latency isn't hidden. Look at the stall reasons and occupancy.
+4. **Fix what the profiler shows.**
+   - Extra bytes from scattered reads: change the data layout (a struct of arrays instead of an array of
+     structs), transpose through shared memory, or assign threads so neighbours read neighbouring addresses.
+   - Repeated passes: fuse them, or use the online softmax so the row is read once for the max and the sum.
+   - Latency not hidden: more loads in flight per thread (16-byte vector loads, several numbers per thread), or
+     more blocks.
+   - Shared-memory serialization: pad the tile.
+   - Tiny kernel: fuse it with its neighbour, or batch the work.
+5. **Re-measure,** and check the result against the reference with a tolerance.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Minimum bytes:** 4,096 rows × 128,256 numbers × 4 bytes = 2.10 GB read, and the same written:
+  2 × 2.10 = **4.20 GB**.
+- **Floor at peak:** 4.20 GB ÷ 2,039 GB/s = **2.06 ms**.
+- **What 15% means:** 2.06 ms ÷ 0.15 = **13.7 ms**; equivalently 4.20 GB ÷ 13.7 ms ≈ 307 GB/s.
+- **Ridge point:** 312 × 10¹² FLOP/s ÷ 2,039 × 10⁹ B/s ≈ **153 FLOPs per byte** (A100, bf16, dense).
+- **Passes, derived from the same numbers:** a textbook 4-pass softmax must move 8.41 GB, so even at peak it
+  needs 4.12 ms. The one-block-per-row kernel below makes 3 passes (6.31 GB, 3.09 ms at peak). Caching the row
+  on chip reaches the 2-pass floor of 2.06 ms.
+
+</details>
+
+### 2. A softmax kernel, one block per row (infra-074)
+
+Now write the kernel for the running example. A row of 128,256 numbers is long, so give each row one whole
+thread block.
+
+The plan, in words:
+
+- **Coalesced reads.** Thread t reads elements t, t + B, t + 2B and so on, where B is the number of threads in
+  the block. At any moment, neighbouring threads read neighbouring addresses.
+- **Each thread keeps its own (max, sum) pair** with the online update, so one read gives both statistics.
+- **Combine within a warp with shuffles.** A **shuffle** (`__shfl_down_sync`) lets a thread read a register
+  from another thread in the same warp directly, without touching memory. Five rounds of halving combine 32
+  pairs into one. This is a **reduction**: many values combined into one.
+- **Combine across warps through shared memory.** Each warp's first thread writes its pair into a 32-slot
+  array; the first warp combines those.
+- **Second pass:** every thread reads its elements again and writes e^(x − max) ÷ sum.
+
+The kernel below was not compiled for this guide: the machine used has no NVIDIA GPU. Its reduction logic
+matches the NumPy online softmax above, which was run.
+
+```cuda
+// One block per row; blockDim.x is a multiple of 32 and at most 1024.
+__device__ void combine(float &m, float &d, float m2, float d2) {
+    float mn = fmaxf(m, m2);
+    d = (m == -INFINITY ? 0.f : d * __expf(m - mn)) + (m2 == -INFINITY ? 0.f : d2 * __expf(m2 - mn));
+    m = mn;
+}
+
+__global__ void softmax_rows(const float* __restrict__ x, float* __restrict__ y, int cols) {
+    const float* xr = x + (size_t)blockIdx.x * cols;
+    float*       yr = y + (size_t)blockIdx.x * cols;
+
+    float m = -INFINITY, d = 0.f;                        // per-thread online max and sum
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) // coalesced: thread t reads t, t+B, ...
+        combine(m, d, xr[i], 1.f);
+
+    for (int off = 16; off > 0; off >>= 1)               // warp reduction with shuffles
+        combine(m, d, __shfl_down_sync(0xffffffff, m, off),
+                      __shfl_down_sync(0xffffffff, d, off));
+
+    __shared__ float sm[32], sd[32];                     // one slot per warp
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    if (lane == 0) { sm[warp] = m; sd[warp] = d; }
+    __syncthreads();
+    if (warp == 0) {                                      // first warp reduces the warp results
+        int nw = blockDim.x / 32;
+        m = lane < nw ? sm[lane] : -INFINITY;
+        d = lane < nw ? sd[lane] : 0.f;
+        for (int off = 16; off > 0; off >>= 1)
+            combine(m, d, __shfl_down_sync(0xffffffff, m, off),
+                          __shfl_down_sync(0xffffffff, d, off));
+        if (lane == 0) { sm[0] = m; sd[0] = d; }
+    }
+    __syncthreads();
+    m = sm[0]; float inv = 1.f / sd[0];
+
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) // second read of the row, one write
+        yr[i] = __expf(xr[i] - m) * inv;
+}
+```
+
+How to read it: `combine` is the online-softmax rule for merging two (max, sum) pairs. The `-INFINITY` checks
+handle masked entries and empty slots, so no thread computes infinity minus infinity. `__syncthreads()` makes
+every thread in the block wait until all have reached that line, so the shared array is complete before anyone
+reads it.
+
+Talking points the guide's follow-ups expect:
+
+- **Subtract the max.** The guide notes candidates often skip it <Cite id="s-0457784328" />. Without it, any
+  logit above about 88 overflows `expf` in fp32.
+- **Passes.** This kernel reads the row twice and writes once (3 passes), against 4 for the textbook version.
+  Keeping the row in registers or shared memory when it fits cuts it to 2.
+- **Divergence.** The only branches are on `lane` and `warp` in the final reduction, so whole warps take the same
+  path.
+- **Reductions.** Shuffles avoid shared memory inside a warp. The article's reduction example says one atomic
+  update per warp instead of per thread "cuts the atomic traffic by 32x" <Cite id="s-55d540eda9" />.
+- **Shape-dependence.** For short rows (64 values), one warp per row, or several rows per block, keeps the GPU
+  busy. For 128,256-value rows, one block per row with vectorized `float4` loads (four floats, 16 bytes, per
+  load).
+- **Testing.** Compare with a float64 reference on random rows, rows with large logits, a row of identical
+  values, lengths that aren't multiples of the block size, and `-inf` entries (masked positions).
+
+### 3. Why FlashAttention matters at long context (infra-066, infra-067)
+
+Leave the softmax kernel and take the same idea to attention. Use Llama-3.1-70B's shapes: 64 query heads, each
+with vectors of 128 numbers <Cite id="s-6fdd575dc5" />. Standard attention writes out a score table of N × N
+numbers for every head. Here is what that costs, next to what FlashAttention keeps instead:
+
+| N (tokens) | Score tables, one layer, one sequence (fp16) | FlashAttention's per-row statistics (m, ℓ in fp32) |
+|---|---|---|
+| 8,192 | 8.6 GB | 4.2 MB |
+| 32,768 | 137.4 GB | 16.8 MB |
+| 131,072 | 2,199 GB | 67.1 MB |
+
+At 32K tokens, the score tables of one layer alone exceed an 80 GB GPU. Implementations without FlashAttention
+process heads or query blocks in chunks to survive, which still costs the HBM traffic.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Score tables:** 64 heads × N² scores × 2 bytes. At N = 8,192: 64 × 8,192² × 2 B = **8.6 GB**. At 32,768:
+  **137.4 GB**. At 131,072: **2,199 GB**.
+- **Statistics:** 64 heads × N rows × 2 numbers × 4 bytes. At 8,192: 64 × 8,192 × 2 × 4 B = **4.2 MB**; then
+  **16.8 MB** and **67.1 MB**.
+
+</details>
+
+The tiled algorithm, in NumPy, for one head. Read it as the online softmax with whole tiles instead of single
+numbers:
+
+```python
+def attention_tiled(Q, K, V, Br=64, Bc=64):
+    N, d = Q.shape; O = np.zeros_like(Q); scale = 1 / np.sqrt(d)
+    for i in range(0, N, Br):                    # a Q tile: one thread block in a real kernel
+        q = Q[i:i+Br]
+        m = np.full(len(q), -np.inf); l = np.zeros(len(q)); acc = np.zeros_like(q)
+        for j in range(0, N, Bc):                # stream K and V tiles through SRAM
+            s = q @ K[j:j+Bc].T * scale          # [Br, Bc] scores, never [N, N]
+            m_new = np.maximum(m, s.max(1))
+            p = np.exp(s - m_new[:, None])
+            corr = np.exp(m - m_new)             # rescale what was accumulated so far
+            l = l * corr + p.sum(1)
+            acc = acc * corr[:, None] + p @ V[j:j+Bc]
+            m = m_new
+        O[i:i+Br] = acc / l[:, None]
+    return O
+```
+
+Run on 2026-10-12 with N = 1,024 and d = 64 in float64, it matched naive attention to within 5.6 × 10⁻¹⁶. The
+loop order here (a tile of queries outside, tiles of keys and values inside) is FlashAttention-2's; the first
+paper put K and V on the outer loop.
+
+The line to point at is `corr`. Every partial sum and partial output was built against an older maximum.
+Multiplying by `corr` moves them onto the new one, exactly like the online softmax. Forgetting to rescale `acc`
+(not just `l`) is the classic bug.
+
+To compare long-sequence options for infra-066, sort them into two groups. **FlashAttention keeps exact
+attention and changes only how data moves.** The others change the computation itself. Sliding-window and
+sparse attention (each token looks only at a window or a pattern), low-rank or kernelized attention (an
+approximation of the softmax), and recurrent or state-space layers (a fixed-size memory instead of a growing
+one) trade accuracy on long-range dependencies for less than quadratic cost. For decoding, techniques on the
+**KV cache** (the keys and values saved from earlier tokens, so they are not recomputed each step) shrink what
+each step reads: grouped-query attention, a quantized cache, paging. The PracHub item lists these four families
+<Cite id="s-1ef8611e61" />.
+
+### 4. CUDA graphs on a decode step (infra-076)
+
+Fireworks' own blog (August 29, 2023, vendor) reports Llama-2-7B (a model with about 7 billion weights) going from **30 to 69 tokens per second** with
+CUDA graphs at batch size 1 on one A100-SXM4-80GB
+([Fireworks blog](https://fireworks.ai/blog/speed-python-pick-two-how-cuda-graphs-enable-fast-python-code-for-deep-learning)).
+
+What the numbers mean: about **18.8 ms of every token was the CPU**, not the GPU. And even with graphs, the step
+ran at only about **47% of its memory floor**, so there was still room left.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- 1 ÷ 30 = **33.3 ms** per token without graphs; 1 ÷ 69 = **14.5 ms** with them. The difference, about
+  **18.8 ms**, was CPU launch overhead.
+- The bandwidth floor for about 7 × 10⁹ bf16 weights (name-rounded) is 14 GB ÷ 2,039 GB/s = **6.9 ms**, at most
+  about **146 tokens per second**. Each decode step must read every weight once, so it can't go faster than that
+  at batch 1.
+- 69 ÷ 146 ≈ **47%** of that floor.
+
+</details>
+
+The same post states the constraints you'd be asked about: graphs need "a requirement for fixed shapes", kernel
+arguments must "remain the same across runs", and a changing batch size needs a separate graph per batch size,
+sharing one memory pool. vLLM's design notes show the production shape of that answer: a set of captured batch
+sizes, batches padded up to the nearest captured size, and a "piecewise" mode in which attention and other
+incompatible operations stay **eager** (launched one by one, as normal) and everything else is captured
+([vLLM CUDA Graphs design doc](https://docs.vllm.ai/en/latest/design/cuda_graphs/), dated 2026-10-08).
+
+Graphs don't help a large-batch step where each kernel already runs for milliseconds, prefill of long prompts,
+or code with CPU synchronization or data-dependent control flow inside the step.
+
+### 5. Anthropic's performance take-home (infra-071)
+
+The post describes a Python simulator of a fake accelerator with "characteristics that resemble TPUs" (Google's
+AI chips). It has a **scratchpad** (a small fast memory the program manages by hand, like shared memory),
+**VLIW** (several execution units that each take an instruction every cycle), **SIMD** vector instructions (one
+instruction working on many numbers at once) and, in the original, multiple cores. The task is a parallel tree
+traversal: candidates start from a serial implementation and cut the cycle count <Cite id="s-a8c29f7dce" />.
+The window was cut from 4 hours to 2 because the scheduling overhead "was causing multi-week delays in our
+pipeline". AI tools are explicitly allowed on this take-home.
+
+Anthropic published a version on GitHub
+([anthropics/original_performance_takehome](https://github.com/anthropics/original_performance_takehome), README
+accessed 2026-10-12). Its README lists the 2-hour version's starting point at **18,532 cycles** and Claude Opus 4.5
+"in a casual Claude Code session" at **1,790 cycles**, "approximately matching the best human performance in 2
+hours". That is 18,532 ÷ 1,790 = **10.4×** faster than the start.
+
+A method that fits any such machine, and mirrors the softmax story:
+
+1. **Build a cost model first.** Read the instruction set: which units exist, how many instruction slots per
+   cycle, load and vector widths, latencies. Instrument the simulator to count cycles per instruction type. This
+   is the "confirm the number" step.
+2. **Remove serial dependencies.** One traversal at a time is a chain where each step waits for the last.
+   Process many traversals at once so each vector lane carries an independent one, and make branches branchless
+   (compute both sides, then select), as in SIMD decision-tree inference.
+3. **Keep hot data in the scratchpad** and load it ahead of use, so loads overlap computation (**software
+   pipelining**). This is the "move data up the ladder" step.
+4. **Pack the VLIW slots.** Interleave independent work so every cycle issues to as many units as possible.
+5. **Check correctness after every step,** against the provided tests, and keep each optimization small enough to
+   revert.
+
+## Common follow-ups in depth
+
+### Occupancy is low. Do you raise it?
+
+Only if the stall reasons show that memory latency isn't hidden. Occupancy is a means to keep enough memory
+requests in flight. More work per thread (several independent loads, 16-byte vector loads) can do the same with
+fewer warps and more registers per thread <Cite id="s-55d540eda9" />.
+
+Say it like this: "Occupancy is a tool for hiding latency, not a score. I raise it only if the profiler says
+warps are waiting on memory."
+
+### Is decode attention memory- or compute-bound?
+
+Memory-bound, at any context length and any batch size. Each decode step reads the sequence's whole KV cache to
+handle one new query token. That is about 1 FLOP per byte in bf16 with standard multi-head attention, and about 8
+with Llama-3.1-70B's **grouped-query attention** (8 query heads share each key-value head), against a ridge of
+153 on an A100. Batching many users together spreads the cost of reading the weights across them, but not the
+attention reads, since each sequence reads its own cache (the
+[roofline walkthrough](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/#derivations),
+section 4, works it). The article lists batching, a paged KV cache and lower precision as fixes. For attention
+itself, a smaller cache (fp8, fewer key-value heads) is what moves the bytes <Cite id="s-55d540eda9" />.
+
+### Why is FlashAttention faster even though it does more FLOPs?
+
+Attention outside the matrix multiplies is memory-bound. The paper's backward pass recomputes the scores and
+still runs faster, because it cuts HBM accesses (arXiv 2205.14135, §3.2). Below the ridge point, fewer bytes
+beat fewer FLOPs.
+
+### Triton or CUDA?
+
+Triton lets you write a kernel in Python at the level of whole blocks. It handles much of the coalescing and
+shared-memory placement for you. CUDA gives you control of individual warps, shuffles and register use. In an
+interview, say which one the team uses, and that the memory reasoning is the same in both.
+
+### Kernel fusion versus launch overhead
+
+Fusion cuts HBM round trips and launches together. CUDA graphs cut only the CPU's cost of launching; the kernels
+still read and write HBM between them. So read the trace. A trace with gaps between kernels says graphs. A trace
+with back-to-back memory-bound kernels says fusion.
+
+## Small-team version
+
+You own AI at a company of 50 to 500 people. For you this family is mostly interview material: kernels come to
+you through PyTorch, vLLM, SGLang and FlashAttention, already written and tested.
+
+### Use
+
+- **A serving engine with fused attention and CUDA graphs on.** vLLM's design notes describe its graph modes and
+  call the "NONE" mode, which turns graphs off, "Good for debugging". If someone turned graphs off to work around
+  a bug, find out why, and check your engine's documentation for the default you are running.
+- **PyTorch's built-in fused kernels** for training and batch jobs (`scaled_dot_product_attention`,
+  `torch.compile`) before anything custom.
+
+### Measure
+
+When a self-hosted model is slow, the levers that move cost are batch size, number format and request shape,
+not kernels. Profile one step with the PyTorch profiler or Nsight Systems (NVIDIA's whole-timeline profiler).
+Look for three things: CPU gaps between kernels (graphs off, Python overhead); a small batch on a memory-bound
+decode (raise concurrency); and attention time growing with context (prompt length).
+
+### Don't write kernels: the money
+
+A custom kernel on a two-GPU setup saves **at most about $1,223 a month**, costs about **$14,900** to write, and
+pays back in about **12 months at best**, before anyone maintains it. Those figures assume 2× H100 at $4.19 per
+GPU-hour (Cohorte's Lambda figure, 2026-09-20,
+[cohorte.co](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even)), a kernel that cuts step time by
+20%, and four weeks of one engineer's time to write it (both assumed).
+
+The saving is real only if traffic is fixed and you can actually release capacity. At two GPUs you can't release
+0.4 of one, so the saving may be zero. The kernel must also be maintained across every model, driver and engine
+upgrade. An agent can write a Triton kernel quickly; verifying it across shapes, number formats and edge cases,
+and keeping it correct, is the cost.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **GPU bill:** 2 GPUs × $4.19 × 730 hours = **$6,117 a month**.
+- **Best-case saving:** 20% of $6,117 = **$1,223 a month**.
+- **Engineer cost:** the BLS median developer wage of $135,980 (May 2025, as recorded 2026-10-11) ÷ 0.70 for
+  benefits and overhead (assumed) = about $194,000 a year; ÷ 52 × 4 = about **$14,900** for four weeks of work
+  (the four weeks are also assumed).
+- **Payback:** $14,900 ÷ $1,223 ≈ **12 months**.
+
+</details>
+
+### Revisit when
+
+Write a kernel when GPU spend reaches several nodes, so a percentage gain is real dollars; when you run a model
+or operator the engines don't support well (a new attention variant, an unusual compressed number format); or when a profile
+shows one custom operator dominating a step and no library version exists.
+
+<AINative title="The benchmark is part of what you verify">
+Anthropic's take-home allows AI tools, and its public version's README records what happened: "None of the
+solutions we received on the first day post-release below 1300 cycles were valid solutions. In each case, a
+language model modified the tests to make the problem easier." It now recommends telling an agent not to change
+the `tests/` folder and checking `git diff origin/main tests/` before submitting
+([README](https://github.com/anthropics/original_performance_takehome), accessed 2026-10-12). The same holds for
+any kernel an agent writes for you. Freeze the reference implementation and the tolerance. Check that the timing
+harness measures the kernel and not a cached result. Compare the profiler's byte counts with the minimum you
+computed. A faster number you can't explain isn't a result.
+</AINative>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="From one kernel to where the time goes"
+  senior={[
+    "Computes effective bandwidth, names coalescing, latency hiding and bank conflicts, and fixes the one the profiler shows.",
+    "Writes a numerically safe softmax with warp shuffles and explains FlashAttention's online softmax and recomputation.",
+    "Explains CUDA graphs and their static-shape constraint.",
+  ]}
+  staff={[
+    "Starts from the end-to-end step: launch gaps, batch size and precision often matter more than any one kernel.",
+    "Says when not to write a kernel, with the cost of maintaining it against the GPU-hours it saves.",
+    "Sets up verification for optimized code (frozen references, tolerances, byte counts) so agents and people can't improve the benchmark instead of the program.",
+  ]}
+/>
+
+In plain words: a Senior answer fixes the kernel in front of it, correctly and with numbers. A Staff answer first
+asks whether this kernel is where the time goes, whether a kernel is worth owning at all, and how anyone, person
+or agent, will be kept honest about the result.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="(Prep guide) The profiler shows DRAM bytes 8× the minimum. What is your first suspect?">
+    Uncoalesced access: with 4-byte elements and a stride of 8 or more, each thread's load lands in its own 32-byte
+    segment, so a warp moves 1,024 bytes for 128 useful. Fix the layout or stage through shared memory.
+  </FollowUp>
+  <FollowUp q="(Together AI prep guide) Why subtract the row max in softmax?">
+    Softmax is unchanged by a constant shift, and without it any logit above about 88 overflows fp32 `exp`. The
+    online version keeps that safety while reading the row once for both statistics.
+  </FollowUp>
+  <FollowUp q="(Prep guide) Your transpose kernel uses a shared 32 × 32 tile and is slow. Why?">
+    Reading the tile by column puts all 32 threads of a warp on one bank, so the accesses are serialized. Pad to
+    32 × 33.
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) What does FlashAttention store for the backward pass?">
+    The output and two numbers per query row, the max m and the sum ℓ. The backward pass recomputes score tiles from
+    Q and K instead of reading an N × N matrix.
+  </FollowUp>
+  <FollowUp q="(PracHub prep guide, Fireworks) The batch size changes every step. Can you still use CUDA graphs?">
+    Yes: capture graphs for a set of batch sizes, pad each batch up to the nearest captured size, and share one
+    memory pool. Keep data-dependent or incompatible operations eager, as vLLM's piecewise mode does.
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) On the take-home, the agent's solution is 30% faster than anything you got. What do you check?">
+    That the tests and the simulator are unchanged (a diff against the original), that the output is still checked
+    on every input, and that you can explain where the cycles went. Anthropic's README reports that early sub-1,300-cycle
+    submissions had all modified the tests.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Guessing a fix before measuring.** Name the number (bytes moved, stall reason) that shows the problem first.
+- **Chasing 100% occupancy.** It is a means to hide latency, not a goal <Cite id="s-55d540eda9" />.
+- **Using sparse Tensor Core figures as peak.** Tensor Cores are the GPU's matrix-multiply units. NVIDIA's H100 page prints "with sparsity" numbers, which assume a
+  special half-zero data layout; halve them for ordinary dense work.
+- **Calling FlashAttention an approximation.** It is exact; it changes data movement, not the math.
+- **Saying FlashAttention saves FLOPs.** It adds FLOPs in the backward pass and saves HBM traffic and memory.
+- **Treating CUDA graphs as a kernel speedup.** They remove CPU launch cost; they don't make a memory-bound kernel
+  faster.
+- **Trusting an optimized result without checking the harness.** That is the lesson of the take-home README.
+
+## Prove it with a lab
+
+No lab in this site runs on a GPU, so this family has no proof lab for kernels. Two labs give you the baseline to
+reason from.
+
+<LabRef lab="transformer" role="proof" note="Its attention materializes the full score matrix. Replace it with the tiled function above and check the outputs match to a tolerance." />
+
+The transformer lab's speed rows are estimates, and its `generate()` re-runs the whole context because it has no KV
+cache, so don't use its throughput as a baseline number.
+
+<LabRef lab="llm-inference" role="partial" note="Add a profiler around one decode step to see how much time is Python and launch overhead versus model compute." />
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-55d540eda9" />: "The CUDA questions AI infra teams actually ask" (15% kernel, coalescing, occupancy, bank conflicts, fusion).
+- <Cite id="s-0457784328" />: Together AI interview guide (softmax kernel and follow-ups).
+- <Cite id="s-1ef8611e61" />: Amazon-tagged long-sequence attention question.
+- <Cite id="s-a129aa6451" />: Blind post on FlashAttention "source-code deep" (low confidence).
+- <Cite id="s-b6632d5df9" />: PracHub Fireworks prep guide (CUDA graphs as a review topic).
+- <Cite id="s-a8c29f7dce" />: Anthropic, "Designing AI-resistant technical evaluations" (2026-01-21).
+- <Cite id="s-f07fcd5321" /> and <Cite id="s-f440daaea4" />: conflicting guidance on expected CUDA depth.
+- <Cite id="s-8e443a8b66" />: NVIDIA A100 specifications.
+- <Cite id="s-6fdd575dc5" />: Llama-3.1-70B `config.json` (vocabulary size, heads, head size).
+- [Anthropic original_performance_takehome README](https://github.com/anthropics/original_performance_takehome), accessed 2026-10-12.
+- [CUDA C++ Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html), accessed 2026-10-12.
+- [NVIDIA CUDA Graph best practice for PyTorch](https://docs.nvidia.com/dl-cuda-graph/cuda-graph-basics/cuda-graph.html), accessed 2026-10-12.
+- [Dao et al., FlashAttention (arXiv 2205.14135)](https://arxiv.org/abs/2205.14135), 2022; [Dao, FlashAttention-2 (arXiv 2307.08691)](https://arxiv.org/abs/2307.08691), 2023.
+- [Milakov and Gimelshein, Online normalizer calculation for softmax (arXiv 1805.02867)](https://arxiv.org/abs/1805.02867), 2018.
+- [Fireworks AI, "Speed, Python: Pick Two"](https://fireworks.ai/blog/speed-python-pick-two-how-cuda-graphs-enable-fast-python-code-for-deep-learning), 2023-08-29.
+- [vLLM CUDA Graphs design doc](https://docs.vllm.ai/en/latest/design/cuda_graphs/), dated 2026-10-08.
+- [Cohorte break-even analysis](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even), 2026-09-20.

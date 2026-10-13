@@ -1,0 +1,164 @@
+---
+question: r2b-016
+family: quant-specdec-moe
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "An MoE layer is a gather, a compute and a scatter. The router scores each token against every expert and keeps
+> the top k. I group the token-expert pairs by expert, run one dense matrix multiply per expert on just its tokens,
+> then add each result back into its token's row, weighted by the gate. The tricky part is the bookkeeping: token
+> index, expert index and gate for every pair. On a GPU, a loop over experts means many small kernel launches, so
+> production code uses one grouped matrix multiply and fuses the steps."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants clean bookkeeping and a correct shape at every step, plus an understanding of why the simple
+version is slow on a GPU.
+
+Some background. A transformer, the model design behind today's large language models, has a **feed-forward
+block** in each layer: two matrix multiplies that every **token** (roughly ¾ of a word) goes through. A
+**mixture-of-experts (MoE)** layer replaces that block with several smaller copies, called **experts**, plus a tiny
+scoring layer called the **router**. Each token goes to only its best k experts. Its output is a weighted sum of
+those experts' outputs; the weights are called **gates**.
+
+For a backend engineer, this is a group-by. You have a list of (token, expert, gate) records. You group by expert,
+run a batch job per group, and join the results back by token id. The bugs are the usual group-by bugs: losing
+track of which row came from where, and summing duplicates wrong.
+
+The only evidence for this question is a Glassdoor review for an NVIDIA deep-learning engineer role, seen as a
+search snippet <Cite id="s-0f8d1c21c4" />, so treat the details as low confidence. The same snippet puts it after a
+discussion of GPU kernels, fusion and launch overhead.
+
+## Clarify first
+
+- **Routing:** "Top-1 or top-k?" Assume top-2, with gates renormalized so the two chosen gates sum to 1.
+- **Expert shape:** "A two-matrix feed-forward block with GELU, or a gated (SwiGLU) one?" Assume two matrices with
+  **GELU**, a standard smooth activation function.
+- **Capacity:** "Is there a cap on tokens per expert, with overflow dropped?" Assume none for the first version.
+- **Framework:** "PyTorch, and is a Python loop over experts acceptable for clarity?" Assume yes, then discuss
+  fusion.
+
+## Answer
+
+### The shapes, step by step
+
+Use B for batch (number of sequences), S for sequence length, d for the model width (numbers per token vector), E
+for the number of experts, k for experts chosen per token, and T = B × S for the total tokens.
+
+1. Flatten x [B, S, d] → t [T, d]. Experts don't care about sequences, only tokens.
+2. Router scores: t @ W_r [d, E] → [T, E]. Apply **softmax** (which turns scores into probabilities that sum to 1) in 32-bit
+   floats (fp32). Switch casts the router input to float32 for stability.
+3. Top-k → gates [T, k] and expert ids [T, k]. Renormalize the gates over the k chosen.
+4. Flatten to T × k assignments, each with an expert id, a token id and a gate. Sort by expert id; `bincount` gives
+   the number of tokens per expert.
+5. For expert e with n_e tokens: gather [n_e, d] → @ W_in[e] [d, d_ff] → [n_e, d_ff] → GELU → @ W_out[e]
+   [d_ff, d] → [n_e, d]. Here d_ff is the expert's inner width.
+6. Multiply by the gates and `index_add_` into out [T, d] at the token ids. Reshape to [B, S, d].
+
+```python
+probs = self.router(t.float()).softmax(-1)          # [T, E]
+gate, idx = probs.topk(self.k, dim=-1)              # [T, k], [T, k]
+gate = gate / gate.sum(-1, keepdim=True)
+flat_e = idx.reshape(-1)                            # [T*k]
+flat_t = torch.arange(T).repeat_interleave(self.k)  # [T*k]
+flat_g = gate.reshape(-1)                           # [T*k]
+order = flat_e.argsort(); counts = torch.bincount(flat_e, minlength=self.E)
+start = 0
+for e in range(self.E):
+    sel = order[start:start + int(counts[e])]; start += int(counts[e])
+    if sel.numel() == 0: continue
+    tok = flat_t[sel]                                                  # [n_e]
+    y = torch.nn.functional.gelu(t[tok] @ self.w_in[e]) @ self.w_out[e]  # [n_e, d]
+    out.index_add_(0, tok, y * flat_g[sel, None])
+```
+
+### The worked example: one small batch through the layer
+
+The full version in the family walkthrough ran on 2026-10-12 with d = 64, d_ff = 128, 8 experts and k = 2. Follow an
+input of 2 sequences of 16 tokens:
+
+| Step | Shape | What to say in the interview |
+|---|---|---|
+| Input | x [2, 16, 64] | "Two sequences, 16 tokens each, 64 numbers per token." |
+| Flatten | t [32, 64] | "32 tokens." |
+| Router + softmax | [32, 8] | "Each token scores all 8 experts, in fp32." |
+| Top-2 | ids and gates [32, 2] | "64 assignments in total." |
+| Group by expert | counts 8, 6, 11, 7, 7, 11, 6, 8 | "They sum to 64; an expert can get zero." |
+| Expert 0 | [8, 64] → [8, 128] → [8, 64] | "One dense multiply on just its tokens." |
+| Scatter | out [32, 64] → [2, 16, 64] | "Each token gets the gate-weighted sum of its two experts." |
+
+The output matched a dense reference that runs every expert on every token and masks out the unchosen ones. Say:
+"I'd test against that dense reference, and with an expert that receives zero tokens."
+
+### Why `index_add_` and not `out[tok] += y`
+
+Each token appears twice (once per chosen expert), in two different experts' groups. `index_add_` adds every
+contribution. Fancy-index assignment with `+=` can drop repeated indices in a single call, which is the classic
+group-by-join bug.
+
+### Then the GPU discussion
+
+On a GPU, every operation runs as a small program called a **kernel**, and starting one (a **kernel launch**) has a
+fixed overhead. The loop launches at least two matrix multiplies, an activation and a scatter per expert. With 256
+experts that is over a thousand small launches per layer, each too small to keep the GPU busy.
+
+Production code does three things instead:
+
+- It uses a **grouped GEMM**. GEMM is the standard name for a general matrix multiply; a grouped one runs all
+  experts' multiplies in one launch over groups of different sizes.
+- It **fuses** the gather and activation into that launch, so data doesn't make extra round trips through GPU
+  memory.
+- Under **expert parallelism** (experts spread across GPUs), it overlaps the token exchange between GPUs, called
+  the **all-to-all**, with compute.
+
+Say you would profile before claiming which part dominates.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Assignments:** T × k = 32 × 2 = 64; the per-expert counts 8 + 6 + 11 + 7 + 7 + 11 + 6 + 8 = 64.
+- **Launch count with 256 experts:** at least 4 launches per expert (two matrix multiplies, an activation, a
+  scatter) × 256 = 1,024 per layer, before the router and sort.
+- **Router cost per token:** d × E multiply-adds; at d = 64 and E = 8, that is 512, tiny next to an expert's
+  2 × 64 × 128 = 16,384.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="MoE layer"
+  senior={["Correct shapes at every step, gate renormalization, scatter with index_add, and a dense-reference test."]}
+  staff={["Explains what the loop costs on a GPU (launches, small matmuls, all-to-all) and how grouped GEMMs, fusion and capacity limits change it."]}
+/>
+
+## Small-team version
+
+Nobody on a small team writes this layer for production; serving engines ship MoE kernels. The exercise is worth
+doing once with a coding agent, so that you can read the engine's code when an MoE model misbehaves. Write the dense
+reference yourself and make the agent's version match it.
+
+Default: call an MoE through a provider, or run it on an engine that ships the kernels. For scale, gpt-oss-120b
+(117B total, 5.1B active, per its model card) is **$0.15 per million input tokens and $0.60 per million output
+tokens** on Together (fetched 2026-10-11). A request with 3,000 input and 400 output tokens costs well under a tenth
+of a cent.
+
+## Pitfalls
+
+- **Not renormalizing the top-k gates, or not weighting outputs by them.** The output scale drifts with the
+  router's confidence.
+- **Writing `out[tok] += y`.** It can drop repeated indices; use `index_add_`.
+- **Running the router softmax in bf16.** Low precision makes routing unstable; keep it in fp32.
+- **Claiming fusion helps without saying what it removes.** Name it: kernel launches and round trips through GPU
+  memory.
+
+## Go deeper
+
+- Family walkthrough: [Quantization, speculative decoding and MoE](/system-design-labs/interviews/walkthroughs/quant-specdec-moe/), worked example 7.
+- Launch overhead and fusion: [GPU kernel performance](/system-design-labs/interviews/walkthroughs/gpu-kernel-perf/).
+- Swap the feed-forward block in <LabRef lab="transformer" inline /> for this layer.

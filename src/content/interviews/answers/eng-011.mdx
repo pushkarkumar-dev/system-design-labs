@@ -1,0 +1,186 @@
+---
+question: eng-011
+family: rag-in-code
+status: published
+labs: [rag]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll model the pipeline as a few small types with one job each: a chunker, an embedder interface, retrievers
+> that share one `retrieve(query, k)` method, and a pipeline that takes a retriever and a model call as
+> arguments. Hybrid search is a retriever made of retrievers, so adding keyword search or a reranker changes no
+> existing class. Everything external is injected, so the whole pipeline runs in a test with a fake embedder and
+> a stub model, with no network. I'll sketch the interfaces first, then get the core path running."
+>
+> The rest of this page explains each part of that answer.
+
+This is an object-oriented design round that happens to be about RAG. The signal is interface design and
+separation of concerns. How much you know about RAG matters less.
+
+What makes it different from the class-design rounds you know is that two parts of the system are slow, paid,
+outside services that give different results from run to run: the model that turns text into vectors, and the
+language model that writes the answer. A good design treats both like a database or a payment provider. They sit
+behind interfaces, they are injected, and they are faked in tests. Expect extensions such as "add hybrid search"
+or "swap the model" to arrive mid-round, and design so that each one is a new class rather than an edit.
+
+(The candidate's report says only that the round was "based on a simple RAG pipeline"
+<Cite id="s-90185f6ee1" />, so this card assumes the usual shape: model the pipeline as classes, implement the
+core path, and show it can be tested and extended.)
+
+### Words you need first
+
+- **RAG** (retrieval-augmented generation): find a few relevant pieces of your documents, paste them into the
+  prompt of a large language model (**LLM**), and have it answer from them, citing them.
+- **Chunk**: one of those pieces (a paragraph or short section), with a stable ID such as `billing.md#2`.
+- **Embedder**: the component that turns text into an **embedding**, a vector of numbers where similar meanings
+  point in similar directions. Search then finds the chunks whose vectors are closest to the question's.
+- **Retriever**: anything that takes a question and returns the k best chunks. Vector search is one retriever;
+  keyword search (**BM25**, the standard keyword-ranking formula) is another.
+- **Labeled questions**: a small set of questions whose relevant chunk IDs you know. Retrieval is scored on
+  them, because "good search" can't be checked with an ordinary unit test.
+
+## Clarify first
+
+Ask these, and say your assumption when there is no answer:
+
+- **Mostly design, or working code?** "I'll assume both: interfaces first, then the core path implemented."
+- **Which parts may be stubbed?** "I'll treat the LLM and the embedding model as external services."
+- **Which extensions do you expect?** "I'll plan for a second retriever, a reranker and evaluation."
+- **In memory only?** "Yes for now, behind an interface that a vector database could implement later."
+
+## Answer
+
+### The shape, as a picture
+
+```
+RagPipeline(retriever, llm, k)
+   │  ask(question)
+   ▼
+Retriever  (interface: retrieve(query, k) -> list[Chunk])
+   ├── DenseIndex(embedder)     vector search; Embedder is injected
+   ├── BM25Index                keyword search
+   └── HybridRetriever([retrievers], reranker?)
+           merges the lists from its child retrievers (RRF), then optional rerank
+   │  top k chunks
+   ▼
+build_prompt ──▶ llm(prompt) -> str ──▶ check_citations ──▶ Answer
+
+Evaluator(retrieve) ── scores any retriever on the labeled questions
+```
+
+**RagPipeline** owns the flow and nothing else. It asks its retriever for chunks, builds the prompt, calls the
+model, and checks the reply. It receives every collaborator in its constructor.
+
+**Retriever** is the one interface the rest of the design hangs on. `DenseIndex` and `BM25Index` both implement
+it. `HybridRetriever` also implements it, by holding a list of other retrievers and merging their lists with
+**reciprocal rank fusion** (RRF, which combines rankings by position so that two different scoring scales never
+have to be compared).
+
+**The LLM** is just a function, `llm(prompt) -> str`. That makes the stub in tests one line.
+
+**check_citations** and **Answer** turn the model's raw text into a value object: the text, the chunks it cited,
+whether it said "I don't know" (called **abstention**), and any problems such as an uncited sentence.
+
+**Evaluator** takes any `retrieve(query) -> ids` function, so every configuration is measured the same way.
+
+### The code
+
+Name the types, each with one job, then implement the core path.
+
+```python
+@dataclass(frozen=True)
+class Chunk:  chunk_id: str; doc_id: str; heading: str; text: str
+
+class Chunker(Protocol):
+    def split(self, doc_id: str, text: str) -> list[Chunk]: ...
+class Embedder(Protocol):
+    def embed(self, texts: Sequence[str]) -> np.ndarray: ...       # unit-length rows
+class Retriever(Protocol):
+    def retrieve(self, query: str, k: int) -> list[Chunk]: ...
+
+class DenseIndex:                                                   # implements Retriever
+    def __init__(self, embedder: Embedder): ...
+class BM25Index: ...                                               # implements Retriever
+class HybridRetriever:                                              # composes Retrievers, fuses with RRF
+    def __init__(self, retrievers: list[Retriever], reranker: Reranker | None = None): ...
+
+@dataclass
+class Answer:  text: str; citations: list[Chunk]; abstained: bool; problems: list[str]
+
+class RagPipeline:
+    def __init__(self, retriever: Retriever, llm: Callable[[str], str], k: int = 5): ...
+    def ask(self, question: str) -> Answer:
+        chunks = self.retriever.retrieve(question, self.k)
+        return check_citations(self.llm(build_prompt(question, chunks)), chunks)
+```
+
+### Follow one change request through it
+
+The best way to show the design works is to walk the interviewer's extensions through it. Here is the usual
+sequence, and what each one costs:
+
+| Interviewer asks | What you change | What to say in the interview |
+|---|---|---|
+| "Add keyword search." | Write `BM25Index`; wrap both in `HybridRetriever([dense, bm25])`. | "No existing class changes. Hybrid is a retriever made of retrievers." |
+| "Add a reranker." | Pass `reranker=` to `HybridRetriever`. | "It's optional, and I only keep it if the eval shows a gain worth its latency." |
+| "Swap to a hosted embedding API." | Write `OpenAIEmbedder` implementing `Embedder`. | "One new class. It must return unit-length rows, and I assert the row count." |
+| "How do you test this?" | `RagPipeline(HybridRetriever([DenseIndex(FakeEmbedder()), BM25Index()]), llm=lambda p: "… [1]")` | "The whole pipeline runs in a test with no network." |
+| "How do you know hybrid is better?" | Run the `Evaluator` over the labeled questions once per configuration. | "Same questions, same metric, a paired comparison." |
+
+### Choices to say out loud
+
+- **Dependency injection everywhere.** The pipeline receives its retriever and model, so tests run with a fake
+  embedder and a stub LLM, with no network. The family walkthrough's test suite does exactly this and runs in
+  under a second.
+- **Composition over inheritance.** Hybrid search is a retriever made of retrievers, so adding BM25 or a
+  reranker changes no existing class.
+- **Value objects.** `Chunk` is immutable with a stable ID. `Answer` carries citations and an abstention flag, so
+  callers never parse strings.
+- **Evaluation as its own type.** An `Evaluator` takes any `retrieve(query) -> ids` function, so every
+  configuration is measured the same way.
+- **Failure handling at the edges.** Embedding calls check row counts and vector lengths. LLM calls go through
+  one place that handles retries and timeouts.
+
+Say: "The two outside services sit behind interfaces, like a database driver, so I can fake them, swap them, and
+put retries in one place."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="OO RAG pipeline"
+  senior={["Clean interfaces, a composable retriever, injected dependencies and a test with fakes, finished in time."]}
+  staff={["Also says which interfaces are stable contracts (Retriever, Answer) and which will change, and where evaluation plugs in so every new component is measured."]}
+/>
+
+## Small-team version
+
+This structure is what lets one engineer swap providers and add hybrid search later without a rewrite. That is
+why it beats adopting a framework on day one. Anthropic's advice is to "start by using LLM APIs directly"
+([2024-12-19](https://www.anthropic.com/engineering/building-effective-agents)).
+
+In actions:
+
+- **Build** the few hundred lines yourself, so you understand every one.
+- **Buy** the model calls from a hosted API, behind your `Embedder` and `llm` seams.
+- **Add a framework** only when it gives you something you would otherwise build, such as tracing or durable
+  execution.
+
+## Pitfalls
+
+- **A single `RAG` god-class.** Chunking, embedding, search and prompting in one class means every change touches
+  everything.
+- **Inheritance hierarchies** such as `HybridRAG extends DenseRAG`. Each new combination needs a new subclass,
+  where composition needs none.
+- **No seam for testing.** Every test calls a real model, so tests are slow, cost money and give different
+  answers each run.
+- **All diagram, no running code.** The candidate's other screen stressed that "Speed was definitely important"
+  (<Cite id="s-90185f6ee1" />), so get the core path running before polishing classes.
+
+## Go deeper
+
+- Family walkthrough, the object-oriented shape: [Build a small RAG in code](/system-design-labs/interviews/walkthroughs/rag-in-code/#solution-in-stages).
+- Build the stages for real: <LabRef lab="rag" inline />.
+- Evaluating whatever you build: [Measure retrieval and debug confident wrong answers](/system-design-labs/interviews/walkthroughs/rag-quality-debugging/).

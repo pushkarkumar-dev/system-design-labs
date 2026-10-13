@@ -1,0 +1,197 @@
+---
+question: eng-012
+family: rag-in-code
+status: published
+labs: [vector-index, embedding-pipeline, search-engine, rag]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Product queries come in two kinds. Exact ones like 'iPhone 15 Pro MagSafe case' need precision: every result
+> must match, and returning nothing beats a near miss. Broad ones like 'gift for a runner' need recall and
+> variety. So I pull hard filters such as brand and model out of the query, run keyword and vector search inside
+> those filters, merge the two lists, and use a score threshold so an exact query can come back short or empty.
+> The tool returns structured fields, not prose, and I measure each kind of query with its own metric on a
+> labeled set."
+>
+> The rest of this page explains each part of that answer.
+
+The task is a product search that another model, ChatGPT, calls as a **tool**: the model decides to call your
+function with arguments, reads what it returns, and writes its reply from that. You then defend each design
+choice live.
+
+What makes this different from the product search you may have built on a database is the search by meaning.
+Vector search (explained below) finds "trail running shoes" for the query "shoes for running on dirt paths",
+which keyword search misses. But it also blurs exact things. To vector search, a case for the iPhone 15 Pro and a
+case for the iPhone 15 look almost identical, and that near miss is a wrong answer for the shopper. A single
+search method does one of the two jobs badly, which is what the interviewer's question is about.
+
+(Reported for an OpenAI forward-deployed engineer take-home. The follow-ups were about use case and decision
+points, and "How specific do you want to be on certain searches?" <Cite id="s-05342b6eb9" />.)
+
+### Words you need first
+
+- **Embedding**: a list of numbers (a vector) that a small model computes from text, so that similar meanings
+  point in similar directions. **Dense retrieval** (vector search) ranks products by how close their vector is
+  to the query's. Embedding APIs charge per **token**, a piece of a word (roughly ¾ of one).
+- **BM25**: the standard keyword-ranking formula in search engines. It scores a product higher when it contains
+  the query's words, especially rare ones such as a model number.
+- **Precision@5**: the share of the top 5 results that are right. **Recall**: the share of all right products
+  that you returned.
+- **nDCG** (normalized discounted cumulative gain): a ranking score that gives each result a grade (for example
+  3 for an exact match, 0 for irrelevant), counts results near the top more, and divides by the best possible
+  score. 1.0 means the perfect order.
+
+## Clarify first
+
+- **What does ChatGPT send, and what should it get back?** "I'll assume a tool call with a free-text query plus
+  optional filters, and structured results back."
+- **Catalog size and fields?** "I'll assume a few hundred thousand products with title, brand, category, price,
+  attributes and description."
+- **Freshness: do price and stock change often?** "I'll assume daily updates, with live stock filtered at query
+  time."
+- **How will success be judged?** "I'll assume a labeled query set with graded relevance."
+
+## Answer
+
+### The design, as a picture
+
+```
+ChatGPT
+   │  search_products(query, brand?, category?, max_price?, limit=10)
+   ▼
+Query understanding ── pulls out brand, model, size, price as hard filters
+   │
+   ▼
+Filtered candidate set ── only products that match every hard filter
+   │                         │
+   │ keyword (BM25)          │ vector (dense)
+   ▼                         ▼
+ ranked list A            ranked list B
+   └──────────┬──────────────┘
+              ▼  merge by position (RRF)
+       Optional rerank of the top 20–50
+              │
+              ▼
+       Specificity control ── exact intent: threshold, few results, empty allowed
+                              broad intent: more results, varied brands and categories
+              │
+              ▼
+       Structured items: ID, title, price, key attributes, "why it matched"
+```
+
+1. **Tool contract.** `search_products(query, brand?, category?, max_price?, limit=10)` returns structured items
+   (ID, title, price, key attributes, a short "why it matched"). The calling model can then fill in filters and
+   reason over fields, not prose.
+2. **Query understanding.** Extract hard constraints (brand, model number, size, price) with rules or a small
+   model call. Treat anything extracted from the query as a filter, not a hint.
+3. **Hybrid retrieval inside the filters.** BM25 over titles and attributes catches model numbers and brand names
+   that embeddings blur. Dense retrieval catches "gift for a runner". Merge the two with **reciprocal rank
+   fusion** (RRF), which combines the lists by each product's position, so the two different score scales never
+   have to be compared.
+4. **Specificity control.** For an exact-intent query, return few results and apply a score threshold, so that an
+   empty result set is allowed. For a broad query, return more and spread them across categories or brands.
+5. **Optional rerank** of the top 20–50 with a **cross-encoder**, a model that reads the query and one product's
+   title and attributes together and outputs a relevance score. It is more accurate and slower, so keep it only if
+   the eval shows it pays for its latency.
+
+### Follow one query through it
+
+Take *"iPhone 15 Pro MagSafe case"* (values illustrative):
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| Query understanding | Extracts category = phone case, model = iPhone 15 Pro, attribute = MagSafe. Intent: exact. | "Extracted values are filters, not hints." |
+| Filter | Only cases listed for the iPhone 15 Pro with MagSafe remain. Cases for the iPhone 15 are gone. | "The near miss can't come back, however close its vector is." |
+| Hybrid search | BM25 ranks titles containing "15 Pro" and "MagSafe" high; vector search ranks by description. RRF merges them. | "Keywords for identifiers, vectors for meaning." |
+| Threshold | Only 4 results clear it. | "Four right answers beat ten with six wrong ones." |
+| Return | Four structured items, each with "why it matched: model and MagSafe listed". | "The calling model can explain the choice to the user." |
+
+Now take *"gift for a runner"*. Nothing is extracted as a filter, so the intent is broad. The search returns more
+results, spread across shoes, watches, apparel and accessories, and no threshold cuts the list short.
+
+### "How specific do you want to be?"
+
+Answer with intent classes and how each is measured:
+
+- **Exact**, such as "iPhone 15 Pro MagSafe case". Precision@5 matters, and a case for another model is a
+  failure.
+- **Attribute-constrained**, such as "waterproof running jacket". Filters plus ranking, judged by nDCG.
+- **Exploratory**, such as "gift for a runner". Recall and variety.
+
+Say: "I'd report each class separately. One average across all queries hides the exact-intent failures, which are
+the ones that make a shopper return the item."
+
+Amazon's public Shopping Queries Dataset labels query-product pairs Exact, Substitute, Complement or Irrelevant
+([ESCI, 2022](https://github.com/amazon-science/esci-data)), which gives graded gains for nDCG directly. Mapping
+them to 3/2/1/0 is one reasonable choice, not the dataset's rule. For example, if your top 3 for an exact query is
+[Substitute, Exact, Irrelevant], nDCG@3 is **0.913**: decent, but the exact match should have been first.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="nDCG@k with graded product relevance"
+  expr="nDCG@k = Σ gain_i ÷ log₂(i + 1), divided by the same sum for the ideal order"
+  vars={[
+    { sym: 'gain_i', meaning: 'e.g. Exact 3, Substitute 2, Complement 1, Irrelevant 0 (assumed mapping)' },
+  ]}
+  example="Results [Substitute, Exact, Irrelevant] vs ideal [Exact, Substitute, …]: (2 + 3/1.585) ÷ (3 + 2/1.585) = 3.893 ÷ 4.262 = 0.913"
+/>
+
+</details>
+
+### The defense
+
+Lead the live walkthrough with the eval: the queries in each intent class, how they were labeled, the numbers for
+BM25-only, dense-only and hybrid, and two failure examples you fixed. Then explain choices as trade-offs: why
+filters are hard, why a threshold, and what you would change at 10× the catalog.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Product search as a tool"
+  senior={["Hybrid retrieval with hard filters, a threshold for exact intents, and nDCG per intent class on a labeled set."]}
+  staff={["Designs the tool contract for the calling model, asks how ChatGPT will use the results, and names the business metric (add-to-cart, wrong-item returns) the offline eval stands in for."]}
+/>
+
+## Small-team version
+
+Most 50–500 person commerce companies already run a search engine (Postgres full-text search, OpenSearch or a
+hosted service). Add embeddings to it rather than standing up a separate stack.
+
+- **Store vectors next to the products.** pgvector (a Postgres extension that stores and searches vectors) is
+  fine to about the low millions of vectors. Past that, one practitioner reports HNSW builds (HNSW is a common fast, approximate vector index) needing
+  10+ GB of RAM on the primary database ([Jacobs, 2025-10-29](https://alex-jacobs.com/posts/the-case-against-pgvector/)).
+- **Build the query-understanding rules and the labeled set yourself.** They are product knowledge, and no vendor
+  has it.
+- **The embedding bill is tiny.** For the assumed catalog it is about **$1.20**, and the raw vectors are about
+  **1.8 GB**, which fits in Postgres or in memory.
+- **Re-embedding after a model change costs the same $1.20.** The expensive part is the re-labeling and
+  re-evaluation, not the API bill.
+- **Move to a dedicated vector store** when the catalog reaches several million items with frequent updates and
+  filtered queries.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Tokens:** 300,000 products × 200 tokens of title and attributes (assumed) = 60M tokens.
+- **Embedding cost:** 60M × $0.02 per million (text-embedding-3-small list price, fetched 2026-10-11) ≈ **$1.20**.
+- **Vector memory:** 300,000 × 1,536 float32 dimensions × 4 B ≈ **1.8 GB**.
+
+</details>
+
+## Pitfalls
+
+- **Pure embedding search.** A query for one model number returns its neighbours, which are wrong products.
+- **No way to return zero results.** An exact query with no match then returns a near miss as if it matched.
+- **One metric across all query types.** The average hides the exact-intent failures.
+- **Returning prose to the calling model.** It can't filter or compare fields it has to parse out of sentences.
+
+## Go deeper
+
+- Family walkthrough, the product-search section: [Build a small RAG in code](/system-design-labs/interviews/walkthroughs/rag-in-code/#how-specific-do-you-want-to-be-the-product-search-variant).
+- Metric choice: [Measure retrieval and debug confident wrong answers](/system-design-labs/interviews/walkthroughs/rag-quality-debugging/#core-concepts).
+- Labs: <LabRef lab="search-engine" inline />, <LabRef lab="vector-index" inline />, <LabRef lab="embedding-pipeline" inline />.

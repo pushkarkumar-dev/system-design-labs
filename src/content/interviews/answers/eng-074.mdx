@@ -1,0 +1,190 @@
+---
+question: eng-074
+family: chat-serving-streaming
+status: published
+labs: [websocket-gateway, rate-limiter, llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Before I draw anything: am I talking to a product team or an inference team? For a product team I'll design
+> the conversation service: store the message, build the prompt from history, check the user's token quota, and
+> stream the reply back over Server-Sent Events so a dropped connection can resume. For an inference team I'd
+> spend the time on GPU memory and scheduling instead. Either way, limits count tokens, not messages, and the
+> reply is saved even if the user leaves."
+>
+> The rest of this page explains each part of that answer.
+
+"Design ChatGPT" is open on purpose. The first thing the interviewer learns is how you scope it, especially at
+Staff level.
+
+### What makes this different from a normal chat app
+
+You may have designed a messaging app before. Messages are small, they arrive in one piece, and storing them is
+the hard part. A ChatGPT-style app is different in three ways:
+
+1. **The reply is written while the user watches.** A large language model (**LLM**) writes its reply in small
+   pieces of about ¾ of a word, called **tokens**, one at a time. A reply of a few hundred words takes many
+   seconds, so you stream it piece by piece instead of returning it at the end.
+2. **Each reply is expensive and varies wildly in cost.** The model must read the whole prompt (instructions,
+   history and the new message) before it writes. A long pasted document can cost a thousand times more than a
+   short question. Limits must count tokens.
+3. **There is a hidden second system.** Behind your service sits an inference service, the GPU machines that run
+   the model. A product team calls it; an inference team builds it. The question can be about either.
+
+Hello Interview lists "Design ChatGPT" among OpenAI's commonly asked design questions, and says "The company name
+alone isn't a reason to spend your preparation on model training or GPU infrastructure"
+(<Cite id="s-4d55d9b987" />). So ask which team, choose the scope, and say why.
+
+## Clarify first
+
+Say each assumption out loud, so later numbers mean something:
+
+- **Which team?** "If this is a product team, I'll cover conversations and streaming. If it's an inference team,
+  GPU scheduling."
+- **Do we run the model?** "I'll assume we call an internal inference service that streams tokens and promises a
+  latency target." That fits a product-team answer.
+- **Scale?** "Assume 2,000 new messages per second at peak, with replies of about 400 tokens."
+- **What must survive?** "Conversation history and the stop button are in scope. Shared links and regenerate are
+  nice to have."
+- **Free vs paid?** "Assume token quotas and model access differ by tier."
+
+## Answer
+
+### Two words you need first
+
+- **Time to first token (TTFT)**: how long the user waits before the first word appears. It is spent in queues
+  and in the model reading the prompt.
+- **Inter-token latency (ITL)**: the gap between words after that. It is spent while the model writes.
+
+A serving guide treats these as two separate budgets (<Cite id="s-75e82f8882" />). You will ask the inference
+team for a target on each.
+
+### The path, top to bottom
+
+```
+Browser / app
+   │ 1. POST /conversations/:id/messages
+   ▼
+API gateway ── login, tier, token quota, one open stream for free users
+   │ 2.
+   ▼
+Conversation service ── save the user's message, load history, build the prompt
+   │ 3. streaming call
+   ▼
+Inference service (another team) ── reads the prompt, writes tokens
+   │ 4. tokens
+   ▼
+Stream gateway ── sends each token as an SSE event, keeps a replay buffer,
+   │               saves the finished reply, settles the token charge
+   ▼
+Browser / app  (5. "stop" is a separate POST that cancels generation)
+```
+
+**API gateway.** It checks the login and the tier, enforces one open stream per free user, and reserves tokens
+from the user's quota before any model work starts.
+
+**Conversation service.** It stores the user's message and builds the prompt: the system prompt (the app's fixed
+instructions), then the history trimmed to the tier's length limit, then the new message. Conversations and
+messages live in a database sharded by user. The message id doubles as an **idempotency key**, so a retried send
+doesn't create a duplicate.
+
+**Inference service.** You don't build it on a product team, but you define what you need from it: a streaming
+call, a cancel call, and a target for both TTFT and ITL.
+
+**Stream gateway.** It holds the connection to the browser and writes each token as a **Server-Sent Event
+(SSE)**: a plain HTTP response the server keeps open and keeps writing to. Each event carries an id with the
+token offset. If the connection drops, the browser reconnects and sends the last id it saw in a `Last-Event-ID`
+header, and the gateway replays from its buffer. When the reply finishes, the gateway saves it, even if the
+client has gone.
+
+### Follow one message through it
+
+A free-tier user types *"Explain how DNS works"* in a conversation that already has 1,500 tokens of history.
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| 1. Send | `POST /conversations/:id/messages` with a client-made message id. | "The message id is the idempotency key, so a double-tap doesn't send twice." |
+| 2. Gateway | Free tier, no other open stream. Prompt is 3,600 tokens (2,000 system prompt + 1,500 history + 100 message); the free reply limit is 1,000. Reserve 4,600 tokens. | "I reserve the worst case, because I can't know the reply length yet." |
+| 3. Build | Save the message, load history, add the system prompt. | "History is trimmed to the tier's length limit." |
+| 4. Stream | Tokens arrive; each is sent as an event with id `msg:N`. | "SSE, one way, with resume built in." |
+| 5. Drop | At token 200 the phone loses signal, then reconnects with `Last-Event-ID: msg:200`. | "Replay 201 onwards from the buffer and continue." |
+| 6. Finish | The reply ends at 400 tokens. Save it, refund 600, charge 4,000. | "Two writes to the quota store per message, not one per token." |
+
+If the user presses stop instead, the app sends a separate `POST` and the gateway cancels generation. If the
+user never comes back, the reply is still saved, so they see it next time.
+
+### Limits
+
+Limit three things per user: **tokens per window** (the real cost control), **open streams** (one for free
+users), and **requests per minute** (only to stop abuse). Counting messages fails because one message can cost a
+thousand times another. The reserve-then-refund step above is how you charge tokens when the reply length is
+unknown.
+
+### One sizing number
+
+Show you can size it. Each reply stays open for about 20 seconds, so at 2,000 new messages a second about
+**40,000 streams are open at once**. The stream gateway is therefore a tier with many connections and little CPU
+work, and it scales out by adding machines.
+
+Say it like this: "Forty thousand open connections, almost no CPU each. That's a horizontally scaled gateway, not
+a hard problem."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Little's law** (open items = arrival rate × time each stays): 2,000 turns/s × 20 s per reply = 40,000 open
+  streams. The 20 s is 400 tokens at an assumed 50 ms each.
+- **Reserve and refund:** reserve 3,600 prompt + 1,000 maximum reply = 4,600. The reply stops at 400, so refund
+  600 and charge 4,000.
+
+</details>
+
+### If they push into serving
+
+Move to the family walkthrough's GPU half: GPU memory per stream (the **KV cache**, the model's saved summary of
+the conversation so far), sharing the system prompt between users, reading long prompts in slices, and the order
+in which users are slowed down during a spike.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Design ChatGPT"
+  senior={["Covers write path, streaming with resume, history, stop and token quotas, with one sizing number."]}
+  staff={["Asks which team first, states the scope it chose and why, defines the contract with the inference layer (stream, cancel, TTFT and ITL), and names what it would measure to know the design is failing."]}
+/>
+
+## Small-team version
+
+At a small company this question is close to your actual job: a chat feature on top of a provider's API
+(Anthropic, OpenAI and so on). Build the SSE relay, a conversation store in Postgres, per-user token quotas, and a
+fallback to another model that kicks in only before the first token. Skip GPUs.
+
+Know your provider tier's monthly spend cap before launch. At Claude Sonnet 5 list prices, a feature with 50,000
+requests a day costs **about $9,600 a month**, far above a $500 or $1,000 tier cap (family walkthrough). Revisit
+self-hosting only at hundreds of millions of steady output tokens a month, or for data-residency rules.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Each request: 3,000 input tokens (2,000 of them a cached system prompt) and 400 output tokens.
+- At $2 per million input, $0.20 per million cached input and $10 per million output (Anthropic pricing page,
+  fetched 2026-10-11): 1,000 × $2/M + 2,000 × $0.20/M + 400 × $10/M = $0.0064 per request.
+- 50,000 × 30 days × $0.0064 = $9,600.
+
+</details>
+
+## Pitfalls
+
+- **Jumping into GPUs without asking.** You may be talking to a product team that never touches them.
+- **WebSocket by default.** One-way SSE with resume is enough for a reply, and it is plain HTTP.
+- **Losing the reply on disconnect.** The user comes back to an empty answer they already paid for.
+- **Counting messages for the free tier.** One message can cost a thousand times another, so count tokens.
+
+## Go deeper
+
+- Family walkthrough: [Serve a ChatGPT-style assistant with streaming](/system-design-labs/interviews/walkthroughs/chat-serving-streaming/), especially the high-level design and small-team version.
+- Limits in depth: [rate limits, credits and admission control](/system-design-labs/interviews/walkthroughs/rate-limits-admission/).
+- Labs: <LabRef lab="websocket-gateway" inline /> (reconnect and replay), <LabRef lab="rate-limiter" inline /> (tiers).

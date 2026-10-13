@@ -1,0 +1,187 @@
+---
+question: eng-025
+family: agentic-workflow-design
+status: published
+labs: [agent-framework, message-queue, saga, dist-lock]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "This is a durable job system with a model inside it. The API returns a run id at once and streams progress.
+> Every step is saved to a step log, so if a worker dies, another one picks up the run from the last checkpoint
+> instead of starting over. Workers hold leases with fencing tokens, writes carry idempotency keys, and every run
+> has a per-call timeout, a step and token cap, and a deadline, and ends with a recorded reason. If a budget runs
+> out, the user gets the best partial answer, labelled as partial."
+>
+> The rest of this page explains each part of that answer.
+
+The question underneath is **durable execution**: how a long job keeps its state, resumes after a failure, times
+out, reports progress and can be cancelled, at scale. The model is just a slow, expensive step inside that job.
+
+### What makes this different from a normal request
+
+A normal web request finishes in milliseconds. If the server dies, the client retries and nothing is lost.
+
+A long agentic query is different. An **agent** is a loop in which a large language model (LLM) chooses its own
+next action each turn (search, read a page, take notes) until it is done. A deep-research query might run that
+loop 20–60 times over several minutes. Each step costs money and takes seconds. If the worker dies at minute
+four, starting over wastes four minutes and all the money already spent. And during a few minutes, a deploy or a
+provider error is likely.
+
+So you design it like a long-running job, not like a request. You already know the tools: a job record,
+checkpoints, leases, idempotency keys and timeouts.
+
+This question is reported as a title only, on a login-gated aggregator (<Cite id="s-bebe1e8956" />), so ask what
+the interviewer means. The most likely reading for Perplexity is a deep-research style query that runs for
+minutes: many searches and model calls behind one user request.
+
+## Clarify first
+
+- **How long does a query run, and how many steps?** Assume 2–10 minutes and 20–60 steps.
+- **Does the user wait on the page, or come back later?** Assume both: stream progress, keep the result.
+- **Concurrency?** Assume thousands of runs in flight at peak.
+- **Can the user steer or cancel mid-run?** Assume yes.
+- **What side effects happen?** Assume none beyond reading the web and writing the result.
+
+Say it like this: "If the only side effect is writing the result, replaying a step is safe. That makes resuming
+much simpler."
+
+## Answer
+
+### Words you need first
+
+- **Checkpoint**: the saved state after a step (the plan, findings so far, tokens spent), so work can resume from
+  there.
+- **Lease and heartbeat**: a worker "owns" a run for a short time and keeps renewing that claim with heartbeats.
+  If the heartbeats stop, the lease expires and another worker can take the run.
+- **Fencing token**: a number that goes up each time a run changes owner. Storage rejects writes with an old
+  number, so a worker that wakes up late can't overwrite newer work.
+- **Stop reason**: the recorded reason every run ends with (answered, step cap, budget, deadline, cancelled,
+  error).
+
+### The shape
+
+```
+POST /queries ──► returns run_id at once
+   │
+   ▼
+Run store (Postgres)
+   runs:  status, owner, budget spent, stop reason, version
+   steps: append-only log, a checkpoint after every step
+   │
+   ▼
+Queue ──► Worker (holds a lease, sends heartbeats)
+             loop: load checkpoint → one step (search / read / model call)
+                   → save checkpoint → check cancel flag and budgets
+             │
+             ├── progress events ──► client (plan, sources found, sections drafted)
+             └── worker dies? lease expires → another worker resumes from the last checkpoint
+   │
+   ▼
+Final answer stored; GET /queries/{run_id} returns it
+```
+
+**API.** `POST /queries` returns a run id at once. Progress streams as events (plan, sources found, sections
+drafted). The final answer is stored and can be fetched later.
+
+**Run store.** One row per run (status, owner, budget spent, stop reason, version) and an append-only step log.
+Save a checkpoint after every step: the plan, findings so far, tokens spent.
+
+**Workers** pull runs from a queue and hold a lease with heartbeats. If a worker dies, another takes the run when
+the lease expires and resumes from the last checkpoint. Fencing tokens stop the old worker writing. Anthropic built
+its research agents to "resume from where the agent was when the errors occurred"
+([2025-06-13](https://www.anthropic.com/engineering/multi-agent-research-system)).
+
+**Budgets.** A timeout per tool call, a step and token cap per run, and a wall-clock deadline. Every exit writes a
+stop reason. When a budget runs out, return the best partial answer, labelled as partial.
+
+**Cancel and steer.** A cancel flag is checked between steps. User messages are appended to the run as events that
+the next step reads.
+
+**Deploys.** Keep in-flight runs on the version that started them (Anthropic calls this "rainbow deployments"), so
+a deploy doesn't break running work.
+
+**Overload.** Admission control per user (a limit on how many runs each user has in flight), and a cheaper "quick
+answer" path when the queue backs up.
+
+Say it like this: "This is a job system I already know how to build. The model is one slow, expensive step inside
+each loop."
+
+### Follow one run
+
+A user asks a long question at 14:00:00 (an illustrative example).
+
+| Clock | What happens | What to say in the interview |
+|---|---|---|
+| 14:00:00 | `POST /queries` returns run 77. Worker A takes the lease (fencing token 1). | "The caller never holds a connection for minutes." |
+| 14:00:20 | Step 3: plan saved. The client sees "planning done". | "Checkpoint after every step." |
+| 14:03:10 | Step 22 is saved. A deploy restarts worker A. | "In-flight runs are pinned to their version." |
+| 14:03:40 | Heartbeats stopped, so the lease expires. Worker B takes run 77 (token 2) and loads checkpoint 22. | "Resume, don't restart." |
+| 14:03:45 | Worker A's old process tries one last write with token 1. Storage rejects it. | "Fencing stops the stale writer." |
+| 14:06:00 | Step 41: the answer is written. Stop reason: `answered`. | "Every run ends with a recorded reason." |
+
+### How many runs are in flight
+
+**Little's law** says the number of things in a system equals the arrival rate times the time each one stays. At an
+assumed 10 new long queries per second, each lasting 300 seconds, about **3,000 runs** are in flight. Each one
+holds a lease and a checkpoint row, not a thread. That is why workers load a checkpoint, do one step and can move
+on.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Runs in flight:** L = λ × W, where λ = new long queries per second and W = average run time in seconds.
+  Assumed 10 × 300 s = **3,000** runs in flight.
+- **Cost of one run:** an agent re-sends its whole history at every step, so input tokens = N × C0 + Δ × N × (N + 1)
+  ÷ 2. Assumed 40 steps, a 4,000-token fixed start per call (C0), 1,500 tokens added per step (Δ) and 300 output
+  tokens per step: 160,000 + 1,230,000 ≈ **1.39M input tokens** and 12,000 output tokens.
+- At Claude Sonnet 5 list price ($2 / $10 per 1M, fetched 2026-10-11): $2.78 + $0.12 ≈ **$2.90** per run.
+- With prompt caching (re-reading a previously seen prompt start costs $0.20 per 1M instead of $2): about
+  **$0.54** per run.
+- At 1,000 runs a day: $0.54 × 1,000 × 30 ≈ **$16,000** a month even cached.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Long-running queries"
+  senior={["Async API, checkpointed step log, leases with fencing, three budgets and partial results."]}
+  staff={["Sizes runs in flight, sets per-user admission and a degraded path, and weighs building durable execution against renting a durable-execution engine or a hosted harness."]}
+/>
+
+In plain words: a Senior answer makes the run survive failures. A Staff answer also sizes the load, decides what
+degrades first when it is too high, and weighs building this layer against renting it.
+
+## Small-team version
+
+Use Postgres for the run and step tables, and the queue you already have. That carries you to thousands of runs a
+day.
+
+Rent a *durable-execution engine* (a workflow engine that saves each step and resumes after crashes) or a hosted
+agent harness (the provider runs the loop, tools and state for you) when you find yourself rebuilding
+checkpointing. Check its data-retention terms first: Anthropic's Claude Managed Agents docs, for example, say it
+is not currently eligible for Zero Data Retention
+([overview](https://platform.claude.com/docs/en/managed-agents/overview), fetched 2026-10-12).
+
+Put a dollar cap on every run. With the formula in the box above and an assumed 40 steps, one run costs about
+**$2.90** at Sonnet 5 list price, or about **$0.54** with prompt caching. At 1,000 runs a day that is about
+**$16,000 a month** even cached, so a cheaper model for the worker steps is the first lever.
+
+Check resumption yourself: kill a worker mid-run in a test and confirm the run finishes from its checkpoint.
+
+## Pitfalls
+
+- **A synchronous HTTP request held open for minutes.** Any proxy timeout, deploy or dropped connection loses the
+  whole run.
+- **Restarting from scratch after any failure.** It wastes the time and the money already spent, and long runs may
+  never finish.
+- **No stop reason.** You can't tell timeouts from crashes from budget limits, so you can't fix the right thing.
+- **Deploys that kill every running query.** Every release becomes an outage for users mid-run.
+
+## Go deeper
+
+- Family walkthrough: [Agent or workflow?](/system-design-labs/interviews/walkthroughs/agentic-workflow-design/), section "Long-running runs: state, resuming and timeouts".
+- Leases and fencing: <LabRef lab="dist-lock" inline />. Persistent step log and compensation: <LabRef lab="saga" inline />. Visibility timeouts and dead letters: <LabRef lab="message-queue" inline />.

@@ -1,0 +1,209 @@
+---
+question: r2b-003
+family: read-debug-unfamiliar-code
+status: published
+labs: [rate-limiter]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll run the tests first, then map the entry points and the state. Generated code usually goes wrong in four
+> places: input validation, units, caches, and two-step 'check, then save' logic on shared state, so I'll read
+> those first. I'll write my suspicions down, ranked with security and silent wrong answers on top. For each one I'll write a failing test,
+> make the smallest fix and explain why the original was wrong. Whatever I don't fix, I'll list."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see whether you can find bugs in code that **looks correct**.
+
+When a person writes buggy code, it often looks unfinished: odd names, no comments, missing tests. Code written
+by an **AI coding assistant** (a tool built on a large language model, or LLM, that writes code from a plain
+request) is different. It is tidy. It has docstrings, sensible names and tests that pass. The bugs sit in the gap
+between what the code says and what it does, and many of them are **silent**: the code returns a wrong answer
+without raising an error.
+
+So staring at the code and waiting for something to look wrong doesn't work. You need a method the interviewer
+can watch: run, map, rank, failing test, fix, explain. You also need to know where generated code usually breaks,
+so you know where to look first.
+
+(Only the title of this question is candidate-reported, from a PracHub listing dated June 2026
+<Cite id="s-d302bba651" />. The task shape is clear from it anyway.)
+
+## Clarify first
+
+Ask four quick questions, and say your assumption out loud for each:
+
+- **Is there a spec?** A README, the tests or an API doc. "If the tests and the docstrings disagree, I'll treat the
+  docstring as the spec and say so."
+- **How many bugs?** "If you'd rather not say, I'll assume several, and that at least one is silent."
+- **May I run it and add tests? Is an assistant allowed?**
+- **Fix everything, or find everything and fix the worst?** "I'll assume: find all, fix in order of impact."
+
+## Answer
+
+### The example: a URL shortener
+
+A **URL shortener** turns a long link into a short code and later redirects visitors from the code to the link.
+This guide's practice version is small: four files, 136 lines and four passing tests. Here is the map you should
+be able to draw within ten minutes:
+
+```
+Caller
+   │  shorten(url, alias, ttl_ms)   resolve(code)   delete(code)
+   ▼
+Shortener ── checks the URL, picks a code, sets an expiry
+   │                │                  │
+   ▼                ▼                  ▼
+LRU cache        Store              codec + clock
+code → URL       code → Link        counter → base-62 code;
+no lock          dict + lock        clock in seconds
+```
+
+**Shortener.** All the logic. It accepts a custom **alias** (a code the user picks) or generates one, and sets an
+expiry from `ttl_ms`, the **TTL** (time to live) in milliseconds.
+
+**LRU cache.** A fast copy of code → URL. "LRU" means it keeps the most recently used entries and drops the
+oldest when full. It stores only the URL, and it has no lock.
+
+**Store.** The real record of each link: code, URL, expiry and a hit counter, in a dictionary behind a lock.
+
+**Codec and clock.** The codec turns a counter (0, 1, 2, …) into a **base-62** code (digits plus both cases of
+letters). The clock returns the time in seconds, and it is passed in, so tests can control it.
+
+### Words you need
+
+- **Check-then-act race:** "if the name is free, save it" done as two separate steps. Two threads can both see
+  "free" before either one saves. A **race condition** is any bug that depends on that kind of unlucky timing.
+- **Atomic:** done all at once under a lock, so no other thread can slip in between the steps.
+
+### Step 1: run and map (10 minutes)
+
+Run the tests: they pass. Read the service top to bottom. Note the entry points (`shorten`, `resolve`,
+`delete`), the two pieces of state (store and cache), where codes come from (the counter) and where time comes from
+(a clock in seconds).
+
+Two clues appear before you run anything. The `ttl_ms` docstring says milliseconds while the clock is in seconds.
+And one existing test creates a first link, ignores it, and checks the second. A test that skips the first case is
+often hiding something.
+
+Say it like this: "The store and the cache hold the same fact. My first question is whether every path that
+changes one also changes the other."
+
+### Step 2: rank the hypotheses out loud
+
+In the family's practice codebase there are six bugs and a race. Here they are as you'd write them, most harmful
+first:
+
+| # | Suspicion | Why it matters | What to say in the interview |
+|---|---|---|---|
+| 1 | The cache stores only the URL | Expired and deleted links keep redirecting | "Delete doesn't reach the cache." |
+| 2 | Validation checks the host, not the scheme | `javascript://x%0Aalert(1)` is accepted, so a short link can run script in a visitor's browser | "This is a security bug, so it goes first." |
+| 3 | `ttl_ms` is added to a clock in seconds | Links live 1,000× too long | "The units disagree between the docstring and the code." |
+| 4 | Alias `"1"` equals a future generated code, and `save` overwrites | A user's link is silently replaced | "Silent data loss." |
+| 5 | `encode(0)` returns `""` | The first link gets an empty code | "The zero case." |
+| 6 | Hits are counted only on cache misses | Analytics are wrong | "Wrong numbers, but nobody is sent to the wrong place." |
+| 7 | `exists` then `save` | Two callers can claim the same alias | "Check-then-act; I'll need a race test." |
+
+### Step 3: a failing test first, then the smallest fix
+
+Each test should fail on the original for the reason its row predicts. Two of them:
+
+```python
+def test_deleted_link_stops_resolving():
+    s = Shortener()
+    code = s.shorten("https://gone.example")
+    s.resolve(code)                                    # warm the cache
+    assert s.delete(code)
+    assert s.resolve(code) is None
+
+def test_alias_is_not_overwritten_by_a_generated_code():
+    s = Shortener()
+    s.shorten("https://alias.example", alias="1")   # "1" is also encode(1)
+    s.shorten("https://x.example"); s.shorten("https://y.example")
+    assert s.resolve("1") == "https://alias.example"
+```
+
+Bugs 4 and 7 look separate, but they share a root cause: check, then write, with a `save` that overwrites. One fix
+covers both, a store method that inserts only if the code is absent, under the lock:
+
+```python
+def save_if_absent(self, link) -> bool:
+    with self._lock:
+        if link.code in self._links:
+            return False
+        self._links[link.code] = link
+        return True
+```
+
+Generated codes loop until `save_if_absent` succeeds. The other fixes, one line each:
+
+- **Cache:** it stores `(url, expires_at)`, and `delete` removes the entry.
+- **Scheme:** only `http` and `https` are allowed.
+- **TTL:** divide `ttl_ms` by 1,000 before adding it to the clock.
+- **Zero:** `encode(0)` returns the first alphabet character instead of `""`.
+- **Hits:** every redirect counts a hit, cached or not.
+
+In the scratch run on 2026-10-12, ten of the eleven bug tests failed on the original code, and all fifteen tests
+passed after the fixes.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **TTL:** a 5,000 ms TTL added to a clock in seconds adds 5,000 seconds instead of 5. That is 1,000× too long,
+  about 83 minutes instead of 5 seconds.
+- **Test count:** four original tests plus eleven bug tests (nine functions, one of them run with three inputs)
+  makes fifteen.
+
+</details>
+
+### The one that got away
+
+One bug test passed on the buggy code, and that is the most useful lesson here. The property
+`decode(encode(n)) == n` passes for 0, because `""` decodes to 0. A **round-trip test** (encode, decode, compare)
+can't see a bug that both directions share. Test what a user would see instead: the first link's code is not empty.
+
+Say it like this: "This round-trip test passing doesn't reassure me. Both directions could share the mistake."
+
+### End with what is still wrong
+
+Finish with a short, ranked list. A `resolve` that started before `delete` can refill the cache, so a deleted link
+can briefly come back. The LRU cache has no lock. Counter-based codes are guessable, so anyone can enumerate links.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Find the bugs"
+  senior={["Finds and fixes the functional bugs with a failing test each, and explains why each original was wrong."]}
+  staff={["Ranks by user impact (security and silent data loss first), fixes the shared primitive rather than each symptom, and lists the remaining race and design risks."]}
+/>
+
+In plain words: Senior fixes each bug correctly. Staff notices that two bugs share one cause and fixes it once,
+then says what is still at risk.
+
+## Small-team version
+
+This is the normal review job when an agent wrote the code. Two rules carry most of the value:
+
+- **Every agent fix arrives with the test that failed before it.** Run that test yourself on the old code first.
+- **Check the four categories in every review** of generated code that touches user input, time or shared state:
+  validation, units, caches and check-then-act.
+
+Budget for it. If one engineer reviews an assumed 10 agent diffs a day at 10 minutes each, that is about **1.7
+hours a day**, roughly a fifth of their time (10 × 10 = 100 minutes). When review takes longer than that, make the
+diffs smaller rather than the review lighter.
+
+## Pitfalls
+
+- **Trusting the green suite.** Here one test skipped the first link, which hid bug 5.
+- **Fixing the alias race with a sleep or a retry.** Only an atomic insert closes the window between check and
+  write.
+- **Missing the scheme bug because the URL "looks validated".** Checking the host says nothing about the scheme.
+- **Fixing silently.** Without the one-line explanation, the interviewer can't tell a fix from a lucky edit.
+
+## Go deeper
+
+- Family walkthrough: [Read, explain and fix code you didn't write](/system-design-labs/interviews/walkthroughs/read-debug-unfamiliar-code/), stages 1–5 work this codebase in full.
+- Practise on a real check-then-act bug: <LabRef lab="rate-limiter" inline />.
+- Round tactics with an assistant: [AI-assisted coding in a provided codebase](/system-design-labs/interviews/walkthroughs/ai-coding-in-codebase/).

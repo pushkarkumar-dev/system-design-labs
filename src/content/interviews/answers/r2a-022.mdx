@@ -1,0 +1,164 @@
+---
+question: r2a-022
+family: ai-coding-drive-agent
+status: published
+labs: [rate-limiter]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll choose the algorithm myself before I prompt: there are four standard ones, and for an API that can absorb
+> short bursts I'd pick a token bucket, because it's O(1) and gives an exact Retry-After. Then I'll have the AI
+> write it in small steps, with an injected clock so tests control time. I'll review for the bug that matters in
+> rate limiters, a check-then-act race, and I'll prove the limit holds with a concurrency test run many times,
+> not one green run."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+A **rate limiter** caps how many requests a caller may make in a period of time, for example 100 requests a
+minute per API key. Callers over the limit get HTTP 429 ("too many requests"), usually with a **Retry-After**
+header saying how many seconds to wait. Most backend engineers have used one, and many have built one.
+
+That familiarity is the point. The problem is not hard, so the interviewer can watch something else: whether the
+algorithm and the evidence are yours while an AI writes the code. An **AI coding agent** (or assistant) is a
+program built on a large language model, an **LLM**, that writes code from plain-language instructions called a
+**prompt**. Ask it for "a rate limiter" and you will get one in seconds. If you can't then say why it uses that
+algorithm, what the alternatives were, and how you know it keeps the limit under load, the code is the AI's, not
+yours.
+
+The Snowflake candidate writes that you have to explain "which algorithm you chose, why you chose it", the
+alternatives and the trade-offs. You also have to show live "how you communicate with the AI, how you review the
+code, and how you test it" (<Cite id="s-5b59630431" />). The round was in person, at an ML engineer onsite, on
+your own laptop with any AI preinstalled, and the candidate got an offer.
+
+## Clarify first
+
+- **What is limited, and per what key?** Requests per user, per API key or per IP address. Assume per API key.
+- **Exact or approximate?** Is admitting 101 against a limit of 100 a bug? Assume exact on one server.
+- **Are bursts allowed?** A **burst** is many requests arriving at once after a quiet period. Whether that is fine
+  decides between a token bucket and a smoothed window.
+- **One process or many?** Assume one first, then discuss a shared store.
+- **What does a rejected caller see?** Assume 429 with a Retry-After header.
+
+Say it like this: "I'll assume per API key, exact on one server, short bursts are OK, and a 429 with Retry-After.
+Then I'll talk about many servers."
+
+## Answer
+
+### The algorithm, before the first prompt
+
+| Algorithm | Cost | Behaviour |
+|---|---|---|
+| Fixed window counter | O(1), one counter per key | A client can send twice the limit across a window boundary |
+| Sliding log | Memory per request | Exact, but expensive at high limits |
+| Sliding window of sub-buckets | O(buckets) per check | No boundary burst; close to exact |
+| Token bucket | O(1) | Allows bursts up to capacity; the refill rate gives an exact Retry-After |
+
+In plain words: a **fixed window** counts requests in each calendar minute, so 100 at 12:00:59 and another 100
+at 12:01:00 both pass. A **sliding log** stores a timestamp for every request and counts the ones in the last
+minute: exact, but memory grows with traffic. A **sliding window** splits the minute into small buckets and adds
+them up: close to exact, fixed memory. A **token bucket** is a bucket of permits that refills at a fixed rate.
+Each request takes one permit; an empty bucket means wait.
+
+Pick the token bucket for an API that tolerates short bursts, and say why: "O(1) per check, it allows a burst up
+to the bucket's size, and since I know the refill rate I can tell the caller exactly how long to wait."
+
+### One worked example: a bucket of 5, refilling 1 per second
+
+The numbers are an illustrative assumption: capacity 5, refill rate 1 token per second, one API key.
+
+| Time | Event | Tokens before → after | Response | What to say in the interview |
+|---|---|---|---|---|
+| 0.0 s | Bucket starts full | 5 | — | "A quiet client earns a burst." |
+| 0.0 s | 5 requests arrive at once | 5 → 0 | five 200s | "The burst is allowed, up to capacity." |
+| 0.1 s | 6th request | 0.1 → 0.1 | 429, Retry-After 1 | "0.9 s until a whole token; round **up** to 1, never 0." |
+| 1.0 s | 7th request | 1.0 → 0 | 200 | "Exactly one token has refilled." |
+| 3.5 s | 8th request | 2.5 → 1.5 | 200 | "Refill uses fractions, not integer seconds." |
+
+The last two columns are where the review points come from: integer truncation in the refill would lose that
+0.5 token, and rounding 0.9 s down would send `Retry-After: 0`.
+
+### Direct the AI in small, reviewable steps
+
+```text
+Go, standard library only. A TokenBucket with capacity and refillRate, guarded by one mutex.
+TryAllow() returns (ok bool, wait time.Duration): wait is the time until one whole token exists.
+Inject the clock (a now func() time.Time) so tests control time. Don't write the HTTP layer yet.
+```
+
+**Injecting the clock** means the bucket asks a function you pass in for the current time, instead of reading
+the system clock. Tests can then say "it is now 3.5 s" and replay the table above exactly, with no sleeping.
+
+### Review, out loud, for the bugs that matter here
+
+- **Check-then-act races**, where reading the count and recording the request happen as separate steps, under
+  different locks or none. Two requests can both see "one token left" and both pass.
+- **Refill arithmetic done with integer truncation**, which loses partial tokens.
+- **A zero refill rate**, which means the bucket never refills.
+- **Retry-After rounded down to 0.** Round up instead, and never send 0.
+
+### Test with evidence, not one green run
+
+- A fake-clock test for refill and wait, which is the table above written as code.
+- A concurrency test that releases 64 goroutines at once and requires exactly `limit` admissions, run with
+  `-count` (repeat the test many times) and `-race` (Go's data-race detector).
+
+The site's rate-limiter lab has a real version of the first bug. Its sliding-window limiter checks, then adds,
+without a lock. Its own concurrency test fails intermittently: about 5% to 37% of plain runs, depending on load,
+on 2026-10-11. `-race` reports no data race, because every individual memory access is atomic. The bug is in the
+logic, the gap between two correct steps, so only repeated runs show it.
+
+Say it like this: "The race detector being quiet doesn't prove this is correct. A check-then-act bug can be made
+of atomic operations. That's why I run the concurrency test many times."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="AI-augmented rate limiter"
+  senior={["Explains the four algorithms and picks one with a reason, prompts in small constrained steps, and proves exactness with a concurrency stress test and a fake clock."]}
+  staff={["Covers what happens across many servers (a shared counter costs a network round trip; local limits of global ÷ N drift), decides fail-open vs fail-closed by what the limit protects, and bounds memory per key."]}
+/>
+
+In plain words: a Senior candidate builds one correct limiter and proves it. A Staff candidate also thinks about
+many servers, about what happens when the shared store fails (let traffic through, **fail open**, or block it,
+**fail closed**), and about memory when there are millions of keys.
+
+## Small-team version
+
+At a small company, use what you already run before you build. Your API gateway or reverse proxy may rate-limit
+already, and an LLM provider's own limits sit behind yours. Build a limiter when you need per-customer quotas
+tied to billing. Then keep it in one place, in Redis if you have it, and decide explicitly what happens when Redis
+is down. For a paid quota or a cost cap, fail closed or fall back to a local limit. An agent can write the bucket.
+You write the concurrency test.
+
+**A cost cap is worth the arithmetic.** If each request triggers one model call, the rate limit is also a
+spending limit. LLM calls are billed per **token**, a chunk of text of roughly ¾ of a word, with separate prices
+for input (what the model reads) and output (what it writes). At an assumed $0.010 per call, a customer limited to
+60 requests a minute can spend at most about **$864 a day**. If that is too much, the limit is wrong, not the
+code. Revisit when you run several regions or need per-customer quotas tied to billing.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- One call: an assumed 3,000 input and 400 output tokens at $2 / $10 per 1M (Claude Sonnet 5 list prices,
+  fetched 2026-10-11): 3,000 × $2 ÷ 1M + 400 × $10 ÷ 1M = $0.006 + $0.004 = **$0.010**.
+- Worst case per customer per day: 60 requests a minute × 60 minutes × 24 hours × $0.010 ≈ **$864**.
+
+</details>
+
+## Pitfalls
+
+- **Letting the AI pick the algorithm.** You then struggle to defend a choice you didn't make.
+- **Treating one passing run of a concurrent test as proof.** Intermittent races need many runs.
+- **Sending `Retry-After: 0`, or a fixed 60 regardless of the refill rate.** Clients either hammer you or wait
+  far too long.
+- **No answer for "what if the shared store is down?"** Fail open and fail closed protect different things;
+  choose one on purpose.
+- **Reading the system clock inside the bucket.** Tests then need real sleeps and become slow and flaky.
+
+## Go deeper
+
+- Family walkthrough: [Drive a coding agent through a product-shaped build](/system-design-labs/interviews/walkthroughs/ai-coding-drive-agent/), including the Snowflake follow-up on alternatives.
+- Do the drill on real code with a real intermittent bug: <LabRef lab="rate-limiter" inline />.

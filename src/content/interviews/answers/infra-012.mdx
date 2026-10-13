@@ -1,0 +1,193 @@
+---
+question: infra-012
+family: distributed-training
+status: published
+labs: [gossip, observability]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "At 4,000 GPUs a failure every 12 or 13 hours is normal, so I treat it as a cost to minimize, not a rare event.
+> The whole job stops when one node dies, so the cost is everyone's time: the work since the last checkpoint plus
+> the restart. I'd detect crashes in seconds with heartbeats and hangs with a step watchdog, checkpoint in the
+> background every few minutes, and keep a spare node ready, which brings each failure down to about six minutes of
+> the cluster. And I'd ask whether we need 500 nodes at all."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see you put numbers on a failure: how often it happens, how fast you notice, and how much
+work it throws away. The last follow-up, "do you even need 500 nodes?", tests whether you will question the
+requirement.
+
+### What makes this different from a service losing a node
+
+When a web service loses a node, the load balancer stops sending it traffic and the other nodes carry on. Users
+barely notice.
+
+A large training job is different. It is one program running on every GPU in lockstep. Each **training step** (one
+round of learning on a batch of data) ends with all GPUs exchanging results. If one node dies, every other GPU is
+stuck halfway through that exchange. The whole job stops and has to restart from the last saved copy of its state,
+called a **checkpoint**. So a failure costs the time of all 4,000 GPUs, not one node's.
+
+### Words you need first
+
+- **Rank**: one training process, one per GPU. Ranks call each other to exchange data.
+- **Collective**: an exchange where every rank contributes and every rank waits for the result. If one rank never
+  arrives, the rest wait.
+- **NCCL**: NVIDIA's library that runs those collectives on GPUs.
+- **Straggler**: a rank that is alive but slow, so everyone waits for it every step.
+
+The question was reported by an NVIDIA senior ML engineer candidate, who lists the follow-ups: how fast you detect
+it, how you recover, "At what point do you restart versus let the cluster catch up?", and "Do you even need 500
+nodes, and are you using them efficiently?" (<Cite id="s-79598dd069" />).
+
+## Clarify first
+
+- **GPUs per node?** "I'll assume 8, so 4,000 GPUs."
+- **How is the model split?** "If each model copy spans several nodes, one dead node takes down a whole copy, not
+  just itself."
+- **Spares?** "Are spare nodes on standby, and how long does a replacement take?"
+- **History?** "What does a checkpoint cost today, and how often have nodes failed? If we don't know, I'll use
+  Meta's published Llama 3 rate as an order of magnitude."
+
+## Answer
+
+### How often it happens
+
+Meta reports **419 unexpected interruptions in 54 days** while training Llama 3 on up to 16K H100 GPUs
+([Llama 3 paper](https://arxiv.org/abs/2407.21783)). That is about 2 × 10⁻⁵ per GPU-hour. For a 4,000-GPU job, the
+whole job is interrupted about **every 12.7 hours**.
+
+Say it like this: "Failure is routine at this size. I design for a failure twice a day."
+
+### Detect, by kind of failure
+
+There are four kinds, and each needs its own detector.
+
+| Kind | What it looks like | Detector | Time to notice |
+|---|---|---|---|
+| **Dead** | a process exits or a node stops answering | heartbeats from a health agent on each node | seconds |
+| **Hung** | a peer died inside a collective; everyone else blocks | a step watchdog at about 3× the median step time | about 3 step times |
+| **Slow** | a straggler; nothing fails, everything slows | per-rank step time and time spent waiting | after a few steps |
+| **Wrong** | the loss jumps or becomes NaN (not a number), or a GPU computes bad values silently | alarms on loss and gradient size; several retained checkpoints | varies |
+
+The hung case is the trap. PyTorch's default NCCL timeout is **10 minutes**. Ten minutes of 4,000 GPUs is
+**667 GPU-hours** of waiting, so don't rely on it. Add your own watchdog.
+
+### Recover
+
+Restart from the latest checkpoint. Each rank saved its own piece, so the restore is parallel. Make the restart fast:
+a **hot spare** node that has already joined the job's startup pool, and the newest checkpoint held in a peer node's
+RAM as well as in object storage.
+
+### How often to checkpoint, and what each failure costs
+
+Checkpoint too rarely and every failure throws away hours of work. Checkpoint too often and the pauses add up. A
+classic formula (**Young's approximation**) balances the two: the best interval is about the square root of
+(2 × the pause per checkpoint × the mean time between failures).
+
+Follow one failure through two designs. The pause and restart times are assumptions, not measurements:
+
+| Design | Pause per checkpoint | Restart | Best interval | Total time lost | One failure costs |
+|---|---|---|---|---|---|
+| Synchronous checkpoints | 30 s | 10 min | 28 min | about 4.9% | 24 min of the cluster |
+| Background checkpoints, hot spare | 2 s | 2 min | 7 min | about 1.2% | **5.6 min** |
+
+A synchronous checkpoint stops training while it writes. A background (asynchronous) one stops only for the copy
+into the machine's ordinary RAM, then writes to storage while training continues.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Failure rate: 419 ÷ (54 × 24 × 16,384 GPU-hours) ≈ 1.97 × 10⁻⁵ per GPU-hour. For 4,000 GPUs:
+  M ≈ 1 ÷ (4,000 × 1.97 × 10⁻⁵) = 12.7 h.
+
+<Formula
+  title="Checkpoint interval and failure overhead"
+  expr="τ ≈ √(2δM)     overhead ≈ δ ÷ τ + (τ ÷ 2 + R) ÷ M"
+  vars={[
+    { sym: 'δ', meaning: 'checkpoint stall' },
+    { sym: 'M', meaning: 'mean time between interruptions (12.7 h here)' },
+    { sym: 'R', meaning: 'restart time' },
+  ]}
+  example={[
+    "δ = 30 s, R = 10 min: τ ≈ 28 min, overhead ≈ 4.9%, about 24 min of the cluster per failure",
+    "Async δ = 2 s, hot spare R = 2 min: τ ≈ 7 min, overhead ≈ 1.2%, about 5.6 min per failure",
+  ]}
+/>
+
+One failure costs the average work lost since the last checkpoint (τ ÷ 2) plus the restart R.
+
+</details>
+
+### Restart, or let the cluster catch up?
+
+"Elastic" training sounds as if surviving workers keep going. With PyTorch's launcher, torchrun, they don't: it
+stops and restarts all workers on any failure or membership change
+([torchrun docs](https://docs.pytorch.org/docs/2.14/elastic/run.html)). So every option costs one restart. The choice
+is only whether to wait for a replacement.
+
+The rule: **if a spare will be ready sooner than a restart takes, wait for it.** Otherwise restart without the failed
+model copy. If the job runs, say, 62 model copies, losing one costs
+**1.6%** throughput. Keep the global batch the same by having each copy
+process more data before each update (**gradient accumulation**), so the researchers' setup doesn't change. Then grow
+back at a later checkpoint.
+
+Say it like this: "Every path pays one restart. I wait for the spare if it's faster than a restart; otherwise I
+drop one copy, keep the batch, and grow back later."
+
+### Do you even need 500 nodes?
+
+This is the Staff test. Training compute is about 6 × parameters × tokens floating-point operations. Divide by
+what the GPUs achieve and you get the time. For example, fine-tuning a 70B model on 1B tokens is about
+**295 H100-hours** at an assumed 40% utilization: **37 hours on one 8-GPU node**, and under 5 minutes of compute
+on 4,000 GPUs, where startup and failures would dominate. Then measure utilization on the cluster you already have
+before asking for more.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- 6 × 70 × 10⁹ × 10⁹ = 4.2 × 10²⁰ FLOPs. One H100 at 40% of its dense bf16 peak (989.5 TFLOPS) does
+  3.96 × 10¹⁴ FLOP/s → about 1.06 × 10⁶ s ≈ 295 GPU-hours. ÷ 8 GPUs ≈ 37 hours. ÷ 4,000 GPUs ≈ 4.4 minutes.
+- NCCL hang: 10 min × 4,000 GPUs = 40,000 GPU-minutes ≈ 667 GPU-hours.
+- Losing one of 62 model copies: 1 ÷ 62 ≈ 1.6%.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="One node dies"
+  senior={["Separates dead, hung and slow; checkpoints sharded and async; restarts with a spare."]}
+  staff={["Derives the interval and restart budget from the failure rate, states the wait-or-shrink rule, and sizes the cluster from FLOPs and a deadline."]}
+/>
+
+## Small-team version
+
+Small teams don't run 500-node jobs. A one-machine fine-tune that fails just restarts from its last checkpoint.
+
+What still applies:
+
+- Checkpoint to object storage every few hundred steps, and include the data position.
+- Test the resume path once, before you need it.
+- Put a timeout on the job so a hang doesn't burn a rented machine overnight.
+
+The timeout is about money. A 12-hour hang on an 8×H100 machine at Lambda's $3.99 per GPU-hour (fetched
+2026-10-11) costs 8 × $3.99 × 12 ≈ **$383**. That is more than the whole LoRA fine-tune it was meant to run (the
+family walkthrough prices that at $9–$29). Default to a managed fine-tuning API or one rented machine. Fault
+tolerance across many machines only matters once a job spans many nodes for days.
+
+## Pitfalls
+
+- **Relying on the 10-minute NCCL timeout as your detector.** It wastes 667 GPU-hours per hang at this size.
+- **Calling torchrun "elastic" as if survivors keep going.** It stops and restarts every worker.
+- **Checkpointing every few hours by habit.** The interval should come from the pause and the failure rate.
+- **Never questioning the 500.** The cheapest node is the one you didn't need.
+
+## Go deeper
+
+- Family walkthrough: [Distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/), its checkpointing deep dive and failure section.
+- Fleet-side detection and drain: [GPU cluster control plane](/system-design-labs/interviews/walkthroughs/gpu-cluster-control-plane/).
+- Failure detection logic: <LabRef lab="gossip" inline />. Per-rank metrics: <LabRef lab="observability" inline />.

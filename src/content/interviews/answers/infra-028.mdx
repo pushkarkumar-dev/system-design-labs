@@ -1,0 +1,184 @@
+---
+question: infra-028
+family: systems-concurrency-primitives
+status: published
+labs: [rate-limiter, dist-lock, logical-clocks]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "A race that only shows up under load is usually a timing window in the protocol, not unsynchronized memory, so
+> the race detector alone won't find it. I'd write down the invariant, the rule that must always hold, and check it
+> after every run. Then I'd raise the load and inject delay at the suspicious step until it fails often, log every
+> operation with a lock token or logical clock, and read the order of events. The usual fix is to make the final
+> write check that the caller still owns what it thinks it owns, for example with a fencing token."
+>
+> The rest of this page explains each part of that answer.
+
+### What makes this different from the bugs you usually debug
+
+Most bugs you fix at work are deterministic: the same input gives the same wrong output, so you add a log line and
+read it. A race under load is not. It might fail one run in twenty, only on a busy machine, and adding logging can make
+it disappear because logging changes the timing.
+
+The other surprise is that the code can look perfectly safe. Every read and write can be behind a mutex, and the
+program can still lose updates, because the bug is in the *sequence* of steps across services, not in any single
+step. The interviewer is checking whether you debug that with a method rather than by staring at code.
+
+The question comes from a Glassdoor snippet for an OpenAI Senior Software Engineer loop, which could not be
+re-opened on 2026-10-11 (the page returned 403), so the exact setup is unknown (<Cite id="s-3b9dae2c4c" />). The
+wording implies the bug is load-dependent, so it is probably a timing window: a lease, a timeout, or check-then-act
+across calls.
+
+### Words you need first
+
+- An **invariant** is a rule the system must always keep, such as "the final counter equals the increments
+  performed" or "each job runs once".
+- A **data race** is two threads touching the same memory at once, at least one writing, with no lock or atomic
+  coordinating them. A **logic race** is when every access is synchronized but the steps still interleave in a bad
+  order.
+- A **lease** is a lock with an expiry time (its **time-to-live**, or TTL), so a crashed holder does not block
+  everyone forever. Redis `SET NX` with an expiry is one.
+- A **fencing token** is a number the lock service increases on every grant. Storage remembers the highest one it
+  has seen and refuses older ones.
+- **Check-then-act** is reading a condition ("there is room") and then acting on it, while another thread changes
+  the condition in between.
+
+## Clarify first
+
+- **Can you run the mockup repeatedly, change the load, add logging and inject delays?** Assume yes.
+- **What is the correctness property?** Ask. If nobody says, state one: no lost updates, no job run twice.
+- **Is the mockup one process, with goroutines or threads standing in for services?** Assume yes.
+- **Is a fix expected, or only a diagnosis?** Assume both.
+
+Say it like this: "Before I touch the code, what must always be true at the end of a run? I'll make that a check,
+so 'sometimes wrong' becomes a test that fails."
+
+## Answer
+
+### The method
+
+1. **Write the invariant** and check it at the end of every run: the final counter equals increments performed; each
+   job ran once.
+2. **Run the race detector first**, and know what it covers. It "only finds races that happen at runtime"
+   ([go.dev](https://go.dev/doc/articles/race_detector)), and only data races. A clean run rules out unsynchronized
+   memory access, not a wrong protocol.
+3. **Raise load and inject delay** at the suspicious point (after a read, before the write that depends on it)
+   until the invariant fails often.
+4. **Log every operation with an ordering key** (a lock token, a version, or a Lamport clock, which is a counter each
+   process increments and passes along with its messages) and read the interleaving, the actual order of steps, of
+   a failing run. Wall-clock timestamps from different components disagree by more than the race window.
+5. **Fix, then rerun at the same load many times.**
+
+Before running anything, say what you would look for: a read-modify-write (read a value, compute, write it back)
+that spans a slow call, a lease or timeout that can expire in the middle of it, and a write that does not check
+whether the caller still holds what it thinks it holds.
+
+### A worked example: the lease that expires mid-write
+
+In the family walkthrough's Go mockup, a lock service grants leases with a 2 ms TTL, and workers do
+read-modify-write on a storage service. Every field is behind a mutex. One critical section in 20 stalls for 3 ms,
+standing in for a garbage-collection (GC) pause or a saturated CPU. Here is one stall (the log is reconstructed from
+the mockup's logic, not copied from a run; the times are illustrative):
+
+| Clock | Event | What to say in the interview |
+|---|---|---|
+| 0.0 ms | `w3` gets the lease with token 41 and reads 17. | "w3 thinks it owns the record until 2 ms." |
+| 0.1 ms | `w3` stalls. | "This is the GC pause." |
+| 2.0 ms | The lease expires. `w3` doesn't know. | "Nothing tells a paused process its lease is gone." |
+| 2.1 ms | `w9` gets token 42, reads 17, writes 18. | "The lock service behaved correctly." |
+| 3.1 ms | `w3` wakes and writes 18 with token 41. | "Two increments, final value 18: one is lost." |
+
+Over eight runs on 2026-10-12, **65 to 187 of 800** increments were lost, and `go test -race` reported nothing. The
+log shows two reads of the same value under tokens 41 and 42, with 41 writing last. That pattern is the diagnosis.
+
+Say it like this: "The race detector finds unsynchronized memory access, and there isn't any. Each step is locked;
+the order of steps across services is wrong."
+
+### The fix: a fencing token
+
+The fix is the increasing number Martin Kleppmann describes for exactly this pause scenario
+([Kleppmann, 2016](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)). Storage keeps
+the highest token it has seen, on reads and on writes, and rejects older ones:
+
+```go
+func (s *Storage) Write(v int, token int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if token < s.maxToken {
+		return ErrStale // the caller's lease is gone: redo the read-modify-write
+	}
+	s.maxToken, s.val = token, v
+	return nil
+}
+```
+
+Replay the table. At 2.1 ms, `w9`'s read with token 42 raises the stored maximum to 42. At 3.1 ms, `w3`'s write
+with token 41 is refused, so `w3` starts again with a fresh lease. Reads must record the token too. Otherwise `w3`
+could slip its write in after `w9` read but before `w9` wrote, and the update would still be lost.
+
+With fencing, five runs reached **800 of 800**, each rejecting 43 to 56 stale writes that the workers retried.
+
+Why not just make the lease longer? Because the next pause only has to be longer. A fencing token closes the race
+for a pause of any length.
+
+### The other common shape: check-then-act
+
+The rate-limiter lab has one. Its limiter checks whether a client has room and then records the request, and two
+requests can both pass the check before either records. Run on 2026-10-11, its concurrency test failed 24 to 184
+times in 500 plain runs depending on load, and `-race` reported no data race, because every access is atomic.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Load-only race"
+  senior={["Finds it with an invariant, stress and logs, and fixes it."]}
+  staff={["Separates data races from logic races, makes the failure reproducible on demand, fixes the protocol (fencing or a conditional write) rather than lengthening a timeout, and leaves the stress test behind as a regression gate."]}
+/>
+
+## Small-team version
+
+This is the part of the family that transfers to a small AI team. Three common shapes:
+
+- **A GPU job queue with a visibility timeout.** A worker claims a job, and the job is hidden from other workers
+  for a set time. A worker that stalls past that time lets a second worker run the same job.
+- **A cron job guarded by an expiring Redis lock.** The same stale-holder race.
+- **A spending-budget check before calling a paid model API, under concurrent requests.** Check-then-act: two requests both see budget left, and both
+  spend it.
+
+Make the final write conditional on the claim, with a version or token column in the database, and keep a stress
+test that checks the invariant. An agent can write the stress harness quickly; you write the invariant.
+
+**What it costs.** On the family walkthrough's assumptions (1,000 ten-minute GPU jobs a day on an A100 at $1.39 per
+hour, 2% running twice), the duplicate runs waste about **$140 a month** of GPU time. The bigger cost is a
+duplicated side effect, such as a customer billed twice.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Duplicate runs: 1,000 jobs × 2% (assumed) = 20 a day.
+- GPU time: 20 × 10 minutes = 200 minutes ≈ 3.33 GPU-hours a day.
+- Cost: 3.33 × $1.39 ≈ $4.63 a day; × 30 ≈ **$139 a month**, about $140.
+
+</details>
+
+Use the database's conditional write by default. Reach for a separate lock service only when the protected
+resource lives outside any database you can write to conditionally.
+
+## Pitfalls
+
+- **Treating a clean race-detector run as proof.** It only finds data races, and this bug is a logic race.
+- **"Fixing" it by lengthening the lease or adding a sleep.** The window shrinks but stays open; the next pause
+  just has to be longer.
+- **Debugging from wall-clock timestamps across components.** Clocks disagree by more than the race; log tokens or
+  logical clocks.
+- **Rerunning once after the fix.** A bug that failed one run in twenty needs many runs at the same load to show it
+  is gone.
+
+## Go deeper
+
+- Family walkthrough: [Systems-level concurrency primitives and race hunting](/system-design-labs/interviews/walkthroughs/systems-concurrency-primitives/), stage 4.
+- Related family: [Concurrent I/O workers](/system-design-labs/interviews/walkthroughs/concurrent-io-workers/).
+- Labs: <LabRef lab="rate-limiter" inline />, <LabRef lab="dist-lock" inline />, <LabRef lab="logical-clocks" inline />.

@@ -1,0 +1,167 @@
+---
+question: infra-053
+family: gpu-cluster-control-plane
+status: published
+labs: [container-orchestrator, observability]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "'Scales with load' means three different loops, so I'll design each with its own signal. Workloads scale on
+> queue depth and time to first token, not CPU, and start early because loading a large model takes over a minute.
+> Nodes scale on pending pods, with a small buffer of ready GPU nodes because a new one takes minutes to join, and
+> they scale down by draining, never by killing. The control plane scales with API server replicas and a well-sized
+> etcd, and past one cluster's documented limits I'd shard into several clusters with a placement layer on top."
+>
+> The rest of this page explains each part of that answer.
+
+The prompt is open, so the test is scoping. Which "load": user workloads, the cluster's machines, or the control
+plane's API traffic? And which layer scales? At a GPU cloud, assume GPU workloads and say so.
+
+### What makes this different from autoscaling web services
+
+For a web service you already know the recipe. The Horizontal Pod Autoscaler watches CPU, adds pods in seconds,
+and the cluster autoscaler adds cheap nodes in a minute or two. If you over-provision a little, it costs little.
+
+GPU workloads break the recipe in three ways.
+
+1. **CPU is the wrong signal.** A model server can be swamped while its CPU is idle, because the GPU does the work.
+   And GPU utilization can read high on a server that has plenty of room. The signal that tracks user pain is the
+   **queue**: how many requests are waiting, and how long until the first word of the reply appears (**time to
+   first token**).
+2. **Starting a replica is slow.** A new replica must load the model's weights into GPU memory. For a
+   70-billion-parameter model that is about 140 GB, which takes over a minute even from fast storage. A new GPU node
+   takes minutes more to join, with drivers to install and large images to pull.
+3. **Spare capacity is expensive.** One idle H100 kept "just in case" costs around $2,000 a month. Over-provisioning
+   is a real budget line, not a rounding error.
+
+So you scale earlier, on better signals, and you price your buffers.
+
+The report is a CoreWeave Glassdoor review seen only as a search snippet, from October 2025, with the bare title
+"design a Kubernetes platform that scales with load" (<Cite id="s-5e2c5b84e0" />). Confidence is low, and the open
+wording is the point.
+
+## Clarify first
+
+- **Load on what?** "User workloads (pods), the cluster itself (nodes), or the control plane (API calls)? I'll cover
+  all three, deepest on workloads."
+- **Workload type.** "Inference with traffic swings, or batch jobs that can wait?"
+- **Size target.** "How big a cluster? Kubernetes v1.37 is designed for up to 5,000 nodes, 110 pods per node and
+  150,000 pods" ([Kubernetes large clusters](https://kubernetes.io/docs/setup/best-practices/cluster-large/),
+  fetched 2026-10-12).
+- **Tenancy.** "Multi-tenant? One cluster or several?"
+
+## Answer
+
+Three loops, each with its own signal.
+
+### 1. Workload scaling: more model replicas
+
+Scale inference replicas on **queue depth and time to first token**, not on CPU or GPU utilization.
+
+Start early enough to cover model load time. A 70B model's weights are about 140 GB in bf16 (2 bytes per number,
+rounded from the model's name). At an assumed 2 GB/s from storage, loading them takes about **70 seconds**. A
+replica you start when the queue is already long arrives a minute too late.
+
+So keep a **warm pool**: a few replicas with the model already loaded, ready to take traffic the moment a burst
+arrives.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Weights: 70 × 10⁹ parameters × 2 bytes = 140 GB (name-rounded; the exact count gives about 141 GB).
+- Load time: 140 GB ÷ 2 GB/s (assumed) = 70 s, before the server warms up.
+
+</details>
+
+Say it like this: "I scale on the queue, and I start replicas a load-time ahead of need, because a 70B replica takes
+over a minute to become useful."
+
+### 2. Node scaling: more GPU machines
+
+Pending pods trigger provisioning of a new node of the right GPU type. GPU nodes take **minutes** to join and need
+drivers, so keep a small buffer of ready nodes and pre-pull the large container images.
+
+Scale down by **draining**, never by killing: respect PodDisruptionBudgets (the Kubernetes rule that limits how many
+pods of a service may be down at once) and set deadlines. Pack work tightly with best-fit (put each pod on the
+fullest node that still fits it), so that whole nodes become empty and can be released.
+
+### 3. Control-plane scaling: the cluster's own brain
+
+Run API server replicas per failure zone, scaled up in size first. Size etcd (the store that holds all cluster
+state), and at scale move **events** to a separate etcd; both are on the Kubernetes large-cluster page. Watch API
+latency, etcd size and **watch fan-out** (how many clients are watching each change).
+
+Past one cluster's limits, shard into several clusters with a placement layer above them that decides which cluster
+gets each workload.
+
+### Follow one burst through the three loops
+
+An inference service runs a 70B model. The times below are illustrative, except the 70-second load from the box
+above.
+
+| Clock | What happens | Which loop | What to say in the interview |
+|---|---|---|---|
+| 09:00 | Traffic doubles. The queue grows and time to first token rises. CPU barely moves. | Workload | "This is why CPU is the wrong signal." |
+| 09:00 | The autoscaler routes new traffic to two **warm** replicas immediately. | Workload | "The warm pool absorbs the first minutes." |
+| 09:00 | It also asks for four more replicas. Two fit on existing nodes and start loading; two stay **Pending**. | Workload | "Pending pods are the node autoscaler's signal." |
+| 09:01 | The two loading replicas have finished their ~70 s weight load and take traffic. | Workload | "Load time sets how early I must scale." |
+| 09:01 | One node from the ready buffer takes the Pending pods; a new node is ordered to refill the buffer. | Node | "The buffer exists because a fresh GPU node takes minutes." |
+| 12:00 | Traffic falls. Replicas scale in; best-fit packing empties two nodes; they are drained and released. | Node | "Scale down by draining, never by deleting nodes with work on them." |
+| all day | API latency and etcd size stay flat. | Control plane | "I'd only shard clusters when these trend toward the documented limits." |
+
+### Multi-tenancy
+
+Give each tenant a namespace with quotas. Use priority classes, so a production burst can preempt batch work. For
+isolation, give tenants MIG slices (hardware partitions of one GPU, each with its own memory) or whole GPUs.
+**Time-slicing**, where pods take turns on one GPU, isolates nothing.
+
+### Observability
+
+Track pending time per pod and GPU type, node provisioning time, GPUs allocated versus actually busy, API server
+latency, and how long drains take.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Kubernetes that scales"
+  senior={["Separates workload, node and control-plane scaling and picks the right signal for each."]}
+  staff={["Knows the documented cluster limits, plans multi-cluster before hitting them, and accounts for GPU node join time in the scaling budget."]}
+/>
+
+In plain words: a Senior answer splits the problem into three loops with the right signals. A Staff answer also
+knows where one cluster stops, and budgets for how slowly GPU capacity arrives.
+
+## Small-team version
+
+Use a managed Kubernetes service with autoscaled GPU node pools. Or skip Kubernetes for GPU work entirely and use a
+serverless GPU platform that bills per second. Own the scaling signal (queue depth), the drain runbook and a cost
+alert; leave control-plane scaling to the provider.
+
+A warm buffer has a price you can state. One idle H100 kept ready costs **$1,964–$2,548 a month** at RunPod's
+on-demand rates. Modal bills an H100 per second at about **$3.95 an hour** (both fetched 2026-10-11). So for
+bursty traffic of a few hours a day, serverless is cheaper. Revisit once the GPUs are busy most of the day.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- RunPod on-demand H100 at $2.69–$3.49 an hour × 730 hours a month ≈ $1,964–$2,548.
+- Modal, at an assumed 3 busy hours a day: 3 × 30 days × $3.95 ≈ $356 a month for the same GPU used only when traffic is there.
+
+</details>
+
+Say it like this: "Below steady all-day load, I'd pay per second for GPUs rather than keep one idle at about $2,000
+a month."
+
+## Pitfalls
+
+- **Answering only with the Horizontal Pod Autoscaler on CPU.** CPU says nothing about a GPU server's queue.
+- **Ignoring how long GPU nodes take to become ready.** Scaling starts minutes too late and users wait.
+- **Scaling down by deleting nodes with running work.** Drain first, with budgets and deadlines.
+
+## Go deeper
+
+- Family walkthrough: [GPU cluster control plane](/system-design-labs/interviews/walkthroughs/gpu-cluster-control-plane/#small-team-version).
+- Labs: <LabRef lab="container-orchestrator" inline />, <LabRef lab="observability" inline />.

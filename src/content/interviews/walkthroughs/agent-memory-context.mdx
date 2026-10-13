@@ -1,0 +1,773 @@
+---
+title: "Agent memory and context management"
+summary: "Keep a long-running agent inside its context window and help it remember across sessions: compaction that keeps promises and tool results, long-term memory with a write and a read path, expiry, and reusable skills."
+track: ai-engineer
+format: deep-dive
+family: agent-memory-context
+smallTeamFocus: "Compaction is a few dozen lines you own and test. Long-term memory is a Postgres table with provenance and expiry, written by a small model after each session. Skip memory frameworks until the plain version fails an eval."
+rounds: [practical-coding, domain-deep-dive]
+level: both
+timeboxMin: 45
+order: 221
+status: published
+basedOn: [eng-026, eng-033, r2a-023]
+askedAt: [sierra, promptlayer, snowflake]
+labs:
+  - { lab: agent-framework, role: partial, note: "AgentMemory keeps the last 5 turns verbatim and passes older turns to a summarizer whose default keeps 120 characters per turn, and appends each new summary to the old one. The LLM is a mock and 3 of 15 tests fail (2026-10-11)." }
+  - { lab: vector-index, role: proof, note: "Flat, HNSW and IVF-PQ search: the retrieval half of a long-term memory store. Its benchmark rows are estimates." }
+  - { lab: rag, role: proof, note: "Dense, hybrid and reranked retrieval measured on BEIR: memory retrieval is the same problem over a much smaller, per-user corpus." }
+  - { lab: mcp-server, role: background, note: "Resources and tools with schemas: a natural way to expose memory read and write as tools the agent calls." }
+  - { lab: llm-eval, role: proof, note: "Paired tests and confidence intervals for comparing two compaction prompts or two memory policies on the same probe set." }
+gapLabs: [llm-observability]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "The model remembers nothing between calls, so my code resends the conversation every time, and that gets
+> long, slow and expensive. Inside one conversation I keep it small by compaction: I clear old tool output
+> first, then summarize the middle, and I never drop the system prompt, a tool call's result, or a promise to the
+> user. Facts that actions depend on live in a separate state object, never in the summary. Across conversations
+> I keep a memory table: a small model writes short facts after each session, each with its source and an expiry,
+> and each turn I fetch the few that matter. Then I test all of it with questions the shortened context must
+> still answer."
+>
+> The rest of this page explains each part of that answer.
+
+Here is the task as it is usually set. A chatbot or agent talks with the same user for a long time, inside one
+session and across many. It runs out of context window, its token bill grows, and it forgets what it learned
+last week. Implement context compaction: what stays verbatim, what gets summarized, when it triggers, and how
+tool results and promises to the user survive. Then design long-term memory: what to store (facts, preferences,
+past episodes, reusable skills), how to write, retrieve and expire it, and how to stop a wrong or stale memory
+from compounding across sessions.
+
+### Why this is not a normal session store
+
+In a normal web app, a user's session is cheap. The server keeps a session id and a few rows in Redis or
+Postgres. Each request reads only the rows it needs. Nothing gets more expensive as the session gets older.
+
+A chat with a large language model (LLM) works the other way round. The model itself keeps nothing between
+calls. To continue a conversation, your code sends the **whole** conversation again on every call: the
+instructions, every earlier message, and the output of every function it asked your code to run. So three
+things go wrong as the conversation grows:
+
+1. **It hits a hard size limit.** The model can only read so much text in one call.
+2. **Every turn costs more than the last.** You pay for everything you resend, every time.
+3. **It forgets everything when the session ends.** Next week's conversation starts from an empty page unless
+   your code puts something back in.
+
+The first two are solved by **compaction** (shrinking the conversation while keeping what matters). The third
+is solved by **long-term memory** (a store your code writes to after a session and reads from in the next one).
+Both are ordinary engineering: deciding what to keep, where to keep it, and how to prove nothing important was
+lost.
+
+### Words you need first
+
+- **Token:** the unit an LLM reads and writes, roughly ¾ of an English word. Prices and limits are counted in
+  tokens.
+- **Context window:** the most tokens the model can read in one call: instructions, history and the new message
+  together. Assume 200,000 tokens on this page.
+- **System prompt:** the fixed instructions your app puts at the start of every call ("You are a support agent
+  for…"), often with the definitions of the tools the model may use.
+- **Tool call and tool result:** the model can ask your code to run a function, such as "look up order A-17".
+  The request is a **tool call**. Your code runs it and adds the output to the conversation as a **tool result**,
+  linked to the call by an id. Tool results are often large (a full JSON order record).
+- **Agent:** a model running in a loop, calling tools and reading their results until a task is done. A support
+  bot that looks up orders and issues replacements is an agent.
+
+Other terms are explained where they first appear.
+
+This family covers three reported questions: a Sierra coding task, a PromptLayer interviewer's question about
+long-term memory, and a Snowflake onsite round about agent memory and skills (<Cite id="s-985967885e" />,
+<Cite id="s-1205b0cc50" />, <Cite id="s-5b59630431" />).
+
+<QuestionRow id="eng-026" />
+<QuestionRow id="eng-033" />
+<QuestionRow id="r2a-023" />
+
+## What is being tested
+
+The reports themselves are short. The Sierra item is a coding task listed as "Implement chatbot compaction
+logic", with no more detail (<Cite id="s-985967885e" />). PromptLayer's question, from the interviewer's side, is
+"What different strategies could you use for long-term memory?", and its post gives no model answer
+(<Cite id="s-1205b0cc50" />). A Snowflake ML engineer had an "Expertise" round where "All the questions I got were
+about agents": first a pipeline that distills agent skills for enterprise customers, then the common components
+of agent memory (<Cite id="s-5b59630431" />). The more detailed titles on that page, such as what each memory
+component stores and how it is written and read, are the listing written by PracHub (the site that collected
+the report), not the candidate's words.
+
+From those three, four things are being checked:
+
+- **Can you treat context as a budget?** Anthropic's context-engineering guide says context "must be treated as a
+  finite resource with diminishing marginal returns". It also describes **context rot**: as the context grows,
+  "the model's ability to accurately recall information from that context decreases"
+  ([Anthropic, 2025-09-29](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)).
+  So the question is not only "how do I make it fit" but "what earns its place".
+- **Can you write a lossy function and test it?** Compaction throws information away on purpose, like a lossy
+  image codec. The coding version is graded on whether you know what must never be dropped and how you would
+  prove it isn't.
+- **Do you know the memory vocabulary and its failure modes?** The standard names for kinds of memory are
+  working, episodic, semantic and procedural (defined under Core concepts below). The follow-ups are about
+  memories that go stale, contradict each other, are planted by an attacker, or leak private data.
+- **At Staff level, can you run it as a product?** Skills distilled for enterprise customers raise questions of
+  tenant isolation (keeping one business customer's data away from another's), review and evaluation, which
+  the Snowflake round reportedly went into (<Cite id="s-5b59630431" />).
+
+My reading: one correct implementation detail (never splitting a tool call from its result, keeping promises
+outside the summary) is worth more in these rounds than a tour of memory products.
+
+## Clarify and scope
+
+Spend a minute on these before designing. Say each assumption out loud:
+
+1. **What kind of agent?** A support chat has short sessions and makes promises to customers. A coding agent has
+   long tool loops with big tool outputs. A personal assistant has many sessions over months. "I'll assume a
+   support or assistant chat with returning users."
+2. **Window and budget.** "I'll assume a 200,000-token window, but I'll set a much lower working budget, say
+   30,000 tokens per call, because cost and quality both get worse as the context grows."
+3. **What is authoritative?** Orders, refunds and account data live in backend systems. "The transcript and its
+   summaries are never the source of truth for an action. The refund tool reads the order from the backend."
+4. **Who may see a memory?** One user, one workspace, or a whole tenant (one business customer of the platform).
+   This decides the keys and the isolation rules.
+5. **Retention and deletion.** Can users see and delete what is remembered? Is there a legal limit on how long
+   data may be kept?
+6. **Latency budget for memory reads.** "I'll assume one memory lookup per turn, under about 100 ms, so it can be
+   a database query rather than another model call."
+
+Out of scope: training the model on user data, and how the model handles long inputs internally.
+
+## Core concepts
+
+### The running example: Maya and order A-17
+
+One conversation runs through the rest of this page. Maya writes to a shop's support assistant: "My order A-17
+is late." Over 40 turns, the assistant looks up the order (a tool call), checks her identity, offers a
+replacement, and promises: "I'll email you the tracking number when the replacement ships." She mentions she
+prefers email to SMS. A week later she comes back and asks, "Did my replacement ship?"
+
+The numbers for this conversation are assumptions, chosen to be typical and easy to follow:
+
+- The system prompt and tool definitions are **3,000 tokens**, sent on every call.
+- Each turn adds about **600 tokens** of history (her message, the reply, sometimes a tool result).
+- Each reply is about **300 tokens**.
+
+Without compaction, turn 40 sends 3,000 + 40 × 600 = **27,000 tokens** just to write a 300-token reply. The
+model is reading a lot of old, mostly irrelevant text to answer a short question.
+
+### Four kinds of memory, four lifetimes
+
+Researchers already have names for the different things an agent remembers. The CoALA paper gives the standard
+vocabulary. "Working memory maintains active and readily available information as symbolic variables for the
+current decision cycle." "Episodic memory stores experience from earlier decision cycles." "Semantic memory
+stores an agent's knowledge about the world and itself." **Procedural memory** (how to do things) is implicit in
+the model's weights (the numbers it learned in training) and explicit in the agent's code
+([Sumers et al., arXiv 2309.02427, v3 2024-03-15](https://arxiv.org/abs/2309.02427)).
+
+In plain words: **working memory** is what the model sees right now. **Episodic memory** is "what happened
+last time". **Semantic memory** is facts ("Maya prefers email"). **Procedural memory** is know-how ("how to
+replace a delayed order").
+
+Here is how those map to a production chat agent, using Maya's case:
+
+| Layer | Lives for | Example from Maya's case | Stored where |
+|---|---|---|---|
+| Working context | one model call | system prompt, recent turns, retrieved memories | the request itself |
+| Session state | one conversation | verified identity, order A-17, replacement issued, promise to email tracking | a structured object beside the transcript |
+| Semantic memory | months | "prefers email", "account is on the EU plan" | a memory table, per user |
+| Episodic memory | weeks to months | "on 3 Oct we replaced order A-17; customer was unhappy with the delay" | session summaries, per user |
+| Procedural memory | until replaced | a skill: instructions and scripts for "reconcile a refund in system X" | versioned files or rows, per tenant |
+
+Session state is not one of CoALA's terms, but it is the layer interviewers care most about in the coding task.
+Say it like this: "Anything an action depends on, like an order id, an amount or a promise, goes in a typed
+state object. Compaction never edits it."
+
+### Why "just use a bigger window" is not the answer
+
+The obvious question is: the window is 200,000 tokens, Maya's conversation is 27,000, so why compact at all?
+There are three reasons.
+
+**Cost.** Every call resends the whole history. Turn 1 sends a little, turn 40 sends a lot, and you pay for all
+of them. The total input grows with the *square* of the number of turns, not in a straight line. Maya's 40-turn
+conversation reads **612,000 input tokens** in total, even though no single call is bigger than 27,000 (the
+arithmetic is in the box in worked example 2).
+
+**Quality.** Models do not read long inputs evenly. Besides context rot, the "Lost in the Middle" study found
+that performance "is often highest when relevant information occurs at the beginning or end of the input
+context" and "significantly degrades" when it sits in the middle
+([Liu et al., TACL 2023](https://arxiv.org/abs/2307.03172)). Maya's promise from turn 5 is exactly the kind of
+fact that ends up in the middle.
+
+**Lifetime.** A window ends with the session. Memory has to survive it.
+
+Say it like this: "A bigger window delays the problem. It doesn't remove it, and it makes every turn more
+expensive and less accurate in the meantime."
+
+### Compaction techniques, lightest first
+
+There are four ways to shrink the context. Use them in this order, because each one loses more than the one
+before:
+
+1. **Tool-result clearing.** Replace old tool outputs with a short stub such as "[cleared tool result 7]", but
+   keep the call itself. Anthropic calls it "One of the safest lightest touch forms of compaction": once a tool
+   result is deep in history, the agent rarely needs it raw again. Its API has a beta context-editing feature for
+   this, which by default triggers at 100,000 input tokens and keeps the 3 most recent tool uses
+   ([Context editing docs](https://platform.claude.com/docs/en/build-with-claude/context-editing), fetched 2026-10-12).
+   In Maya's case, the full order record from turn 2 becomes a one-line stub; the facts the agent needed from it
+   are already in the session state.
+2. **Summarize the middle.** Keep the system prompt and the last few turns word for word. Replace the older turns
+   with a summary written by a model (the **summarizer**, usually a small, cheap model). Anthropic's description of
+   compaction is: take a conversation nearing the limit, summarize it, and start a new window with the summary.
+   In Claude Code (Anthropic's coding agent) the model "preserves architectural decisions, unresolved bugs, and implementation details while
+   discarding redundant tool outputs or messages".
+3. **Structured state outside the transcript.** Facts that actions depend on (ids, amounts, promises) go into the
+   typed state object. Compaction never edits it, so a bad summary can't lose them.
+4. **Notes and sub-agents.** The agent writes notes "persisted to memory outside of the context window", or hands
+   a side task to a **sub-agent** (a second model call with its own, fresh window) that returns "a condensed,
+   distilled summary", often 1,000–2,000 tokens (same Anthropic guide).
+
+### Long-term memory: a write path and a read path
+
+Long-term memory is a small database with two paths, like any cache or index you have built.
+
+**Write.** After a session ends (or when the user says "remember this"), a small model reads the transcript and
+pulls out candidate memories as structured records. Each record has the claim, its kind, the user it belongs to,
+the message it came from, a confidence and a time. This step is called **extraction**. Your code then removes
+duplicates and resolves conflicts: a newer statement the user made outright replaces an older one the model
+guessed, and the old record is kept as **superseded** (replaced but not deleted), so you can audit what changed.
+From Maya's session, extraction would produce "prefers email for updates" (she said it) and an episode summary
+of the replacement.
+
+**Read.** At the start of each turn, your code fetches a few memories and puts them into the context, under a
+fixed token budget. It ranks them by a mix of three things: how relevant they are to the current message, how
+recent they are, and how important they are. Relevance is usually measured with **embeddings**: a model turns
+each piece of text into a list of numbers (a vector) so that texts with similar meaning get nearby vectors.
+Finding the memories nearest to the current message is a **vector search**. Every query is filtered by user and
+tenant first. When Maya asks "Did my replacement ship?", the A-17 episode and "prefers email" come back.
+
+There is a second design, where the agent manages memory itself by calling `search_memory` and `save_memory`
+tools. The MemGPT research system framed this as an operating system that manages "different memory tiers in order to effectively
+provide extended context" ([Packer et al., arXiv 2310.08560](https://arxiv.org/abs/2310.08560)). Automatic
+injection by your code is predictable. Tool-based recall is flexible, but it costs extra steps and the model can
+decide not to look.
+
+**Expire.** Give every memory a lifetime that depends on its kind, plus a "last confirmed" date. Preferences
+decay slowly. Situational facts ("traveling this week") expire fast.
+
+### Skills as procedural memory
+
+A **skill** is reusable know-how rather than a fact: "how to replace a delayed order in our system", written down
+so the agent can follow it next time. Voyager, a research agent, kept "an ever-growing skill library of executable code for storing
+and retrieving complex behaviors" ([Wang et al., arXiv 2305.16291](https://arxiv.org/abs/2305.16291)).
+Anthropic's Agent Skills are "organized folders of instructions, scripts, and resources that agents can discover
+and load dynamically". The agent loads only each skill's name and description up front, and reads the full
+`SKILL.md` file when the skill seems relevant, so carrying many skills stays cheap. The same post advises
+"installing skills only from trusted sources" and says users can ask Claude to "capture its successful approaches
+and common mistakes" into a skill
+([Anthropic, 2025-10-16](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)).
+
+That capture step, done automatically for thousands of conversations, is the Snowflake question. **Distillation**
+means turning many successful runs into one short skill, with evaluation and review in between.
+
+### The whole system in one picture
+
+```
+Maya's message
+     │
+     ▼
+Orchestrator (your code) ──────────► Session state
+     │  1. fetch memories              (identity, order A-17, promises)
+     │◄─────────────────────────────── Memory store
+     │                                 (Postgres table + embeddings)
+     │  2. build the context:
+     │     system prompt + state + memories + recent history
+     │  3. over budget? ──► Compactor ──► Summarizer (small model)
+     ▼
+Model call (LLM API) ──► tool call? ──► Tools / backend (orders, refunds)
+     │                        ◄── tool result
+     ▼
+Reply streamed to Maya
+     │  at session end
+     ▼
+Memory extractor (small model) ──► Memory store
+Successful runs, many users ──► Skill pipeline ──► Skill registry (per tenant)
+```
+
+**Orchestrator.** Your code, not the model. It decides what goes into each call. All the rules on this page
+live here.
+
+**Session state.** A typed object per conversation. Tools and code write it; the model reads a rendered copy of
+it. It survives every compaction unchanged.
+
+**Memory store.** A table of short claims with their source and expiry, plus embeddings for search. It survives
+across sessions.
+
+**Compactor and summarizer.** The compactor is a plain function with a token budget. It calls the summarizer
+model only when clearing tool results is not enough.
+
+**Model call and tools.** The LLM reads the context and may ask for tool calls. Tools read and write the real
+backend. Actions never trust the transcript.
+
+**Memory extractor.** A small model that runs after the session and proposes memories. Code decides which ones
+to keep.
+
+**Skill pipeline and registry.** A batch job that turns verified successful runs into reviewed skills, stored
+per tenant.
+
+## Worked examples
+
+### 1. Compaction in code (the Sierra task)
+
+Walk through Maya's conversation first, so the code has a story. The budget here is set very low, **6,000
+tokens of history**, so that compaction happens several times in 40 turns:
+
+| Turn | What happens | History size (approx.) | What to say in the interview |
+|---|---|---|---|
+| 1 | Maya: "My order A-17 is late." | 600 | "History grows by about 600 tokens a turn." |
+| 2 | Tool call `lookup_order(A-17)`; a large JSON result comes back | 1,200 | "Facts the agent needs from this go into the state object now." |
+| 5 | Agent promises to email the tracking number | 3,000 | "The promise goes into `state.promises`, not only into the chat." |
+| 11 | History passes 6,000 tokens; compaction runs | 6,600 → 1,000 | "First I clear old tool payloads. If that's not enough, I summarize everything but the recent tail." |
+| 20, 29, 38 | Compaction runs again; the old summary is folded into the new one | back to 1,000 each time | "There is only ever one summary. A summary of a summary loses detail every pass." |
+| 40 | Maya says thanks | 2,200 | "The promise is still there, because it was never in the part that got summarized." |
+
+The function below does that. It clears old tool payloads first, and summarizes only if that is not enough. It
+never separates a tool result from the call that produced it. It folds an earlier summary into the next one, so
+summaries never nest. And it keeps pinned state outside the transcript. It and five tests were run on 2026-10-12
+(Python 3.13); all pass.
+
+```python
+@dataclass
+class Msg:
+    role: str          # "system" | "user" | "assistant" | "tool"
+    text: str
+    call_id: str = ""  # ties a tool result to the assistant message that asked for it
+
+@dataclass
+class State:           # authoritative facts; compaction never edits these
+    facts: dict = field(default_factory=dict)
+    promises: list = field(default_factory=list)
+    def render(self) -> str:
+        return f"[state] facts={self.facts} promises={self.promises}"
+
+def tokens(text: str) -> int:
+    return max(1, len(text) // 4)  # stand-in: use the provider's token counter
+
+def size(history, state) -> int:
+    return sum(tokens(m.text) for m in history) + tokens(state.render())
+
+def compact(history, state, budget, keep_recent, summarize):
+    """history[0] is the system prompt. Returns a history that fits the budget."""
+    if size(history, state) <= budget:
+        return history
+    system, rest = history[0], history[1:]
+    # Step 1, cheapest: clear old tool payloads but keep the call and its id.
+    cleared = [Msg(m.role, f"[cleared tool result {m.call_id}]", m.call_id)
+               if m.role == "tool" and i < len(rest) - keep_recent else m
+               for i, m in enumerate(rest)]
+    if size([system, *cleared], state) <= budget:
+        return [system, *cleared]
+    # Step 2: summarize everything older than the recent tail, including any
+    # earlier summary, so summaries never nest.
+    keep = keep_recent
+    while True:
+        cut = max(0, len(cleared) - keep)
+        while 0 < cut < len(cleared) and cleared[cut].role == "tool":
+            cut -= 1  # never separate a tool result from its call
+        old, recent = cleared[:cut], cleared[cut:]
+        summary = Msg("assistant", "[summary] " + summarize(old)) if old else None
+        out = [system, *([summary] if summary else []), *recent]
+        if size(out, state) <= budget or keep == 0:
+            return out
+        keep -= 1  # still too big: keep fewer verbatim messages
+```
+
+How to read it, in order:
+
+- **`Msg` and `State`.** A message has a role and text. A tool result also carries the `call_id` of the call that
+  asked for it. `State` holds facts and promises; it is rendered into the prompt but never passed to the
+  summarizer.
+- **`tokens` is a stand-in.** Four characters per token is a rough rule. In production, use the provider's
+  token counter.
+- **Step 1 clears tool payloads** older than the recent tail, keeping the id so the call still has a matching
+  result. If that alone fits the budget, the summarizer is never called.
+- **Step 2 picks a cut point.** Everything before it is summarized, including any earlier summary. If the cut
+  would land on a tool result, the loop moves it back one message, so a call and its result are always on the
+  same side. Many model APIs reject a history where a tool result appears without its call.
+- **If the result is still too big,** it keeps one fewer recent message and tries again, down to zero.
+
+The tests check what an interviewer will ask about. A short history is returned untouched. A 40-turn history (161
+messages, about 20,600 estimated tokens) fits a 3,000-token budget with the system prompt first and the state's
+promise intact. No kept tool result appears without its call just before it. A 6-turn history fits by clearing
+alone, without calling the summarizer. And compacting twice leaves exactly one summary.
+
+Points to say out loud:
+
+- **Trigger on tokens, not turns.** One turn with a 30,000-token tool result matters more than ten short ones.
+  Leave room for the reply and the next tool result.
+- **Compact rarely, not every turn.** Providers offer a **prompt cache**: if the start of this call's input is
+  identical to the start of a recent call's, that part is billed at a much lower rate. Compaction rewrites the
+  start of the history, so everything after the system prompt misses the cache on the next call. Compact down to
+  well below the trigger (a high-water and a low-water mark, as in Maya's 6,600 → 1,000), so you pay that miss
+  once every several turns.
+- **The summarizer prompt is the part you tune.** Anthropic's advice is to start "by maximizing recall to ensure
+  your compaction prompt captures every relevant piece of information", then "iterate to improve precision".
+- **Test it like a lossy codec.** Build long transcripts with known facts, compact them, and ask questions the
+  compacted context must still answer: which order, what amount, what was promised, what the user refused. This
+  test set is called a **probe set**.
+
+### 2. What compaction saves, with and without caching
+
+Now put money on Maya's conversation. Prices are Claude Sonnet 5 for the main model ($2 per million input tokens,
+$10 per million output tokens) and Claude Haiku 4.5 for the summarizer ($1 in, $5 out), list prices fetched on
+2026-10-11. The other numbers are the assumptions from the running example, with 1,000-token summaries.
+
+Without a prompt cache, the result is simple:
+
+| Conversation length | No compaction | With compaction (6,000-token history budget) |
+|---|---|---|
+| 40 turns | **$1.34** | **$0.67** |
+| 100 turns | **$6.96** | **$1.69** |
+
+Compaction halves the cost at 40 turns and cuts it by three quarters at 100, because the uncompacted cost grows
+with the square of the length.
+
+With a warm prompt cache (the conversation keeps going quickly enough that the cache does not expire), the
+picture changes:
+
+| Conversation length | No compaction, cached | With compaction, cached |
+|---|---|---|
+| 40 turns | **$0.30** | **$0.27** |
+| 100 turns | **$1.10** | **$0.69** |
+
+This is the non-obvious result. **With a warm cache, compaction barely changes the bill for medium-length
+conversations.** Its job there is quality and fitting the window. It starts saving real money only on long
+sessions, or when users pause long enough for the cache to expire.
+
+Say it like this: "With caching on, I compact for accuracy first and cost second. The money only shows up past
+about a hundred turns or when the cache goes cold."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Variables: T turns (one model call each), S = 3,000 fixed prefix tokens, m = 600 tokens added per turn,
+300 output tokens per turn, B = 6,000-token history budget, 1,000-token summaries. All assumed.
+
+- **Uncompacted input:** turn t sends S + m × t tokens, so the total is T × S + m × T × (T + 1) ÷ 2. At T = 40:
+  40 × 3,000 + 600 × 40 × 41 ÷ 2 = 120,000 + 492,000 = **612,000 tokens**. Cost: 612,000 × $2 per 1M = $1.224,
+  plus 40 × 300 = 12,000 output tokens × $10 per 1M = $0.12, total **$1.34**. At T = 100 the same formula gives
+  **$6.96**.
+- **Compacted input:** history grows by 600 a turn; when it passes 6,000 it is summarized to 1,000. That happens
+  at turns 11, 20, 29 and 38 (4 summaries in 40 turns). Main-model input totals **249,600 tokens** ($0.499);
+  output is $0.12. The summarizer reads the history each time, **25,800 tokens** in total ($0.026 at $1 per 1M),
+  and writes 4 × 1,000 tokens ($0.02 at $5 per 1M). Total about **$0.67**. At 100 turns (10 summaries):
+  **$1.69**. A simple upper bound is T × (S + B) plus the summarizer calls.
+- **With caching:** cache reads cost $0.20 per 1M, and writing new tokens into the cache is assumed to cost 1.25×
+  the normal input price. Each turn reads the previous turn's input from the cache and writes only the new part.
+  After a compaction, only the fixed prefix is still cached. This gives about $0.30 vs $0.27 at 40 turns and
+  $1.10 vs $0.69 at 100 turns (arithmetic run on 2026-10-12; small changes in how the first post-compaction turn
+  is counted move the compacted figures by about a cent).
+
+</details>
+
+### 3. Long-term memory in Postgres (the PromptLayer question)
+
+Maya's session has ended. The extractor ran and proposed two memories: "prefers email for updates" (she said
+it) and an episode, "3 Oct: replaced order A-17 after a delay; customer unhappy". Here is where they go:
+
+```sql
+CREATE TABLE memory (
+  id            bigserial PRIMARY KEY,
+  tenant_id     text NOT NULL,
+  user_id       text NOT NULL,
+  kind          text NOT NULL,      -- 'preference' | 'fact' | 'episode'
+  content       text NOT NULL,      -- one claim, in plain words
+  embedding     vector(1536),
+  source_msg    text NOT NULL,      -- where it came from: provenance
+  origin        text NOT NULL,      -- 'user_stated' | 'inferred' | 'tool'
+  confidence    real NOT NULL,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  confirmed_at  timestamptz,
+  expires_at    timestamptz,
+  superseded_by bigint REFERENCES memory(id)
+);
+```
+
+Each column answers an interview question. `tenant_id` and `user_id` keep one customer's memories away from
+another's. `embedding` is the vector used for search; the `vector` type comes from **pgvector**, a Postgres
+extension that adds vector columns and nearest-neighbour search. `source_msg` and `origin` are the
+**provenance**: where the memory came from and whether the user said it or the model guessed it. `expires_at`
+and `superseded_by` handle staleness and correction.
+
+When Maya comes back a week later and asks "Did my replacement ship?", the read path filters by her tenant and
+user id, ranks her small set of memories, and injects the episode and the email preference. The agent then calls
+the order tool to check shipping. It does not answer from memory, because memory is a hint and the backend is
+the truth.
+
+The strategies to name, and when each one fits:
+
+- **A rolling summary per user.** Cheap and lossy; fine for a few sessions.
+- **Extracted facts and preferences with retrieval** (the table above). This is the default.
+- **Episodic summaries retrieved by similarity,** for "last time we talked about this".
+- **Tool-based memory the agent manages itself.** Flexible, but harder to evaluate.
+- **Procedural memory as skills** (worked example 4).
+
+Retrieval quality is measured like any search system. Build probe questions whose answers depend on a stored
+memory and check **hit@k**: how often the right memory is among the top k results. The rag lab does the same for
+documents.
+
+### 4. A skill-distillation pipeline (the Snowflake question)
+
+Suppose the shop is one tenant on an agent platform, and thousands of conversations like Maya's have happened.
+The platform wants to turn the good ones into a "replace a delayed order" skill for that tenant. A **trace** is
+the full record of one agent run: messages, tool calls and the outcome.
+
+1. **Collect successful runs** per tenant: traces where the task was verified as done (tests passed, the
+   customer confirmed, a reviewer approved), not traces where the agent merely stopped.
+2. **Cluster by task** and keep clusters with enough runs to generalize from.
+3. **Draft a skill** with a strong model: a short instruction file, the tool sequence, any script, and the
+   failure cases seen in unsuccessful runs of the same cluster.
+4. **Evaluate against held-out tasks** from the same cluster (tasks not used to write the skill), with and
+   without the skill, as a **paired comparison**: the same tasks run both ways, so the difference is caused by
+   the skill and not by easier tasks. Anthropic's skills post lists "Start with evaluation" as the first practice.
+5. **Review and publish** to the tenant's skill registry with a version, an owner and the eval result. A person
+   approves anything that runs code or touches customer data.
+6. **Monitor and retire:** track how often a skill loads and whether runs that load it succeed more often.
+   Retire skills whose success rate falls after an upstream system changes.
+
+Isolation is the Staff point. A skill distilled from tenant A's traces can contain A's data and A's internal
+procedures. So it lives in A's namespace unless it is scrubbed, reviewed and deliberately promoted to a shared
+library.
+
+Say it like this: "The hard part isn't writing the skill. It's knowing which runs really succeeded, proving the
+skill helps on tasks it hasn't seen, and keeping one customer's procedures out of another's agent."
+
+## Common follow-ups in depth
+
+### "How do you stop a wrong memory from compounding?"
+
+A wrong memory is worse than a missing one, because it gets injected into every future session and the model
+treats it as true. Several defences work together:
+
+- Store provenance and origin, and rank memories the model inferred below ones the user stated.
+- Never take a high-stakes action on a memory alone. Confirm with the user, or read the backend.
+- Show users what is remembered and let them edit it.
+- Re-confirm old memories when they are used: "You mentioned you prefer email; is that still right?"
+- Give every memory an expiry by kind.
+- Don't summarize summaries again and again without the source. Each pass loses detail, so keep raw transcripts
+  in cold storage for re-extraction.
+
+### "Can memory be attacked?"
+
+Yes. The attack is **prompt injection**: text the model reads (a web page, a document, an email) contains
+instructions, and the model follows them as if they came from the user. Johann Rehberger showed that a website
+or document read by ChatGPT could use prompt injection to write a memory that put attacker instructions into "all
+new conversation going forward". OpenAI fixed the channel the attack used to send data out in version 1.2024.247, and the post
+says untrusted content "can still invoke the memory tool to store arbitrary memories"
+([Embrace The Red, 2024-09-20](https://embracethered.com/blog/posts/2024/chatgpt-macos-app-persistent-data-exfiltration/)).
+The post calls this pattern SpAIware.
+
+The defences:
+
+- Write memories only from turns the user wrote or from tool results you trust, never from retrieved web or
+  document text.
+- Store memories as data with an `origin`, and inject them labelled as data, never as instructions in the system
+  prompt.
+- Review memories that look like instructions ("always…", "ignore…").
+
+### "What triggers compaction, and what if the summary is wrong?"
+
+Trigger at a token threshold well below the window, minus room for the reply. Anthropic's context-editing default
+of 100,000 input tokens is one reference point. A wrong summary is the reason actions never read the summary: the
+refund tool reads the order from the backend, and promises live in the state object. Log every compaction with
+its input and output, so a bad summary can be traced from a customer complaint.
+
+### "Where does the agent-framework lab get this wrong?"
+
+The agent-framework lab has a small memory class worth critiquing in an interview. Its `AgentMemory` compacts
+by turn count (more than 5 recent turns), not tokens. The default summarizer keeps the first 120 characters of
+each turn, which drops the end of long tool results, where the answer often is. Each new summary is appended to
+the previous one, so the summary itself grows without bound over a long conversation. And its async agent sends
+both the memory context and a separate `history` string, so the same content appears twice. All four are worth
+spotting in a code review (read 2026-10-12).
+
+<AINative title="Let the agent write the compactor; you write the probes">
+A coding agent will produce a compactor like the one above in minutes, and it will look right. The bugs live in
+the edges: a tool result split from its call, a summary of a summary, a promise dropped because it was phrased
+casually. What you own is the probe set: long transcripts with known facts and the questions the compacted
+context must still answer. Keep that set out of the agent's view (a held-out set), so the agent can't tune the summarizer to the
+test.
+</AINative>
+
+## Small-team version
+
+You own AI at a 50–500 person company, and the support assistant now has returning users like Maya. You need a
+compaction policy before the first long conversation breaks, and a memory policy before someone asks why the bot
+forgot.
+
+### Build, buy, skip
+
+- **Build** compaction (the function above, a summarizer prompt and a probe set) and the session state object.
+  These encode your product's rules about what must never be lost, so they are yours.
+- **Use what the provider gives you, after testing it.** Anthropic recommends its server-side compaction over compaction done in
+  its client libraries (the SDK) and offers beta tool-result clearing and a memory tool (docs fetched 2026-10-12). Turning these on is
+  cheap; check them against your probe set like any other compactor.
+- **Build long-term memory on Postgres** with pgvector if you already run it. Each user has only a small number
+  of memories, so a filtered query is enough. Start retrieval in the database you already run.
+- **Skip** memory frameworks and graph memory (memories stored as a graph of linked people and things) until the
+  plain table fails an eval (a test run on your probe set). Skip a dedicated vector
+  database for this. Skip skill distillation unless the product is an agent platform for enterprise customers,
+  which is the kind of product the Snowflake question describes.
+
+### Cost per conversation and per user (prices fetched 2026-10-11)
+
+Compaction: Maya's 40-turn conversation costs about **$1.34** uncompacted and **$0.67** compacted without
+caching, and **$0.30** and **$0.27** with a warm cache (worked example 2).
+
+Long-term memory costs about **$0.47 per user per month**, or **$470 a month for 1,000 such users**, with
+assumed usage of 20 sessions a month and 10 turns per session. Embedding the memories is close to free. The
+alternative, resending three months of history instead of keeping memory, overflows a 200,000-token window and
+would cost **$0.72 per turn**.
+
+Say it like this: "Memory costs about half a dollar per active user per month. Resending history instead would
+cost more than that on every single turn, and it wouldn't fit."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+All usage figures are assumptions. Prices are list prices fetched 2026-10-11.
+
+- **Extraction** after each session with Claude Haiku 4.5: 6,000 tokens in × $1 per 1M = $0.006, plus 300 out ×
+  $5 per 1M = $0.0015, total **$0.0075**.
+- **Injection:** 800 tokens of memories in each of 10 turns = 8,000 tokens × Sonnet 5's uncached $2 per 1M =
+  **$0.016**.
+- **Per session:** $0.0075 + $0.016 = $0.0235. **Per user-month:** 20 × $0.0235 = **$0.47**. For 1,000 users:
+  **$470**.
+- **Embeddings:** 20 short memories a session, about 50 tokens each (assumed), is 1,000 tokens; with OpenAI's
+  text-embedding-3-small at $0.02 per 1M that is about **$0.00002**.
+- **Resending history instead:** 60 sessions × 6,000 tokens = 360,000 tokens, which is over a 200,000-token
+  window; at $2 per 1M that would be **$0.72 per turn**.
+
+</details>
+
+### A realistic delivery plan
+
+1. **Days 1–3:** session state object and token-triggered compaction with tool-result clearing; a probe set of 30
+   long transcripts with known facts.
+2. **Week 2:** summarizer prompt tuned for recall on the probe set, then precision; every compaction logged.
+3. **Weeks 3–4:** memory table, post-session extraction, per-turn retrieval behind a feature flag; a "what I
+   remember" view with delete.
+4. **Then:** measure whether memory helps (resolution rate, repeated questions per session) before expanding it.
+
+### What you still verify yourself
+
+- The probe set and its answers.
+- That no memory crosses users or tenants (a test with two users who share a name).
+- That deletion removes the memory, its embedding and any summary derived from it.
+- That injected memories are labelled as data.
+- The cost per conversation, on a dashboard.
+
+### What small-company interviewers probe
+
+Expect practical coding (the Sierra format) and questions about what the user sees: what happens when the bot
+remembers something wrong, how a customer deletes their data, and what a long conversation costs. My reading:
+small-company loops lean on work samples and failure handling more than on theory.
+
+### Revisit when
+
+Revisit the design when users ask for memory across devices or products (a shared memory service), when a
+regulator asks for retention limits (expiry by policy, audit), when memory retrieval starts missing on probes
+(better ranking or a **reranker**, a second model that re-orders search results), or when customers want
+reusable automations (skills with review and per-tenant isolation).
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Memory and context"
+  senior={[
+    "Writes a token-triggered compactor that clears tool results first, never splits a tool pair and keeps promises in a state object, with probe tests.",
+    "Designs a memory table with provenance, expiry and per-user retrieval, and knows summaries are never the source of truth for actions.",
+  ]}
+  staff={[
+    "Prices compaction with and without caching and sees that its value is quality and window fit before it is cost.",
+    "Treats memory as a security and privacy surface: write sources, poisoning, deletion, tenant isolation.",
+    "For skills, designs the evaluation, review and retirement loop and who owns a skill, not just the extraction step.",
+  ]}
+/>
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="Implement compaction. What exactly do you keep verbatim? (Reported, Sierra)">
+The system prompt, the last few turns, every tool call together with its result, and a structured state object
+with ids, amounts and promises. Old tool payloads are cleared first; older turns are summarized. Trigger on a
+token count with room left for the reply, and test with probe questions.
+  </FollowUp>
+  <FollowUp q="What strategies could you use for long-term memory? (Reported, PromptLayer interviewer post)">
+A rolling per-user summary; extracted facts and preferences with retrieval; episodic summaries retrieved by
+similarity; memory tools the agent calls itself; and skills as procedural memory. Pick by lifetime and by what
+you can evaluate, and add provenance and expiry to whichever you choose.
+  </FollowUp>
+  <FollowUp q="What are the common components of agent memory? (Reported, Snowflake)">
+Working context for the current call, session state, semantic memory (facts and preferences), episodic memory
+(past interactions) and procedural memory (skills, code, the weights). For each, say what it stores, who writes
+it, how it is read and when it expires.
+  </FollowUp>
+  <FollowUp q="Design a pipeline that distills reusable skills for enterprise customers. (Reported, Snowflake)">
+Collect verified-successful traces per tenant, cluster by task, draft a skill, compare with and without it on
+held-out tasks, have a person approve, publish with a version and owner in the tenant's namespace, and retire it
+when its success rate falls.
+  </FollowUp>
+  <FollowUp q="The user says the bot remembered something wrong. What do you do? (Not reported; a natural next push)">
+Find the memory and its source message, mark it superseded, and check whether it was inferred or stated. If
+inferred memories are often wrong, raise the extraction threshold or require confirmation before use. Add the
+case to the probe set.
+  </FollowUp>
+  <FollowUp q="Doesn't compaction break prompt caching? (Not reported; a natural next push)">
+Yes. Everything after the rewritten point is a cache miss on the next call. Compact rarely, down to well below the
+trigger, and keep the fixed prefix (system prompt, tools) before the summary so it stays cached.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Truncating the oldest messages.** It drops the user's original goal and splits tool calls from their results.
+- **Triggering on turn count.** One huge tool result matters more than ten short turns; the agent-framework lab
+  makes this mistake.
+- **Using the summary as the source of truth.** A summary is lossy; a refund must read the order from the backend.
+- **Writing memories from untrusted content.** That is the SpAIware pattern
+  ([Embrace The Red, 2024-09-20](https://embracethered.com/blog/posts/2024/chatgpt-macos-app-persistent-data-exfiltration/)).
+- **No expiry and no provenance.** A stale guessed fact then outranks a fresh statement from the user.
+- **Listing memory products instead of saying what is stored, written and read.** The Snowflake round reportedly
+  asked about components (<Cite id="s-5b59630431" />).
+
+## Prove it with a lab
+
+<LabRef lab="agent-framework" role="partial" note="Replace AgentMemory's turn-count trigger with a token budget, cap the summary's own size, stop sending memory and history twice, and add probe tests. Fix its tool-call parser first; 3 of 15 tests fail." />
+
+<LabRef lab="vector-index" role="proof" note="The retrieval index behind a memory store; add a per-user filter and measure what it does to search." />
+
+<LabRef lab="rag" role="proof" note="Reuse its hit@k evaluation with probe questions whose answers live in stored memories." />
+
+<LabRef lab="llm-eval" role="proof" note="Compare two summarizer prompts on the same probe set with a paired test." />
+
+<LabRef lab="mcp-server" role="background" note="Expose save_memory and search_memory as tools with schemas, and decide which identity the memory belongs to." />
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-985967885e" />
+- <Cite id="s-1205b0cc50" />
+- <Cite id="s-5b59630431" />
+- Anthropic, "Effective context engineering for AI agents", 2025-09-29: https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents
+- Anthropic, "Equipping agents for the real world with Agent Skills", 2025-10-16: https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills
+- Anthropic, context editing docs (beta), fetched 2026-10-12: https://platform.claude.com/docs/en/build-with-claude/context-editing
+- Sumers et al., "Cognitive Architectures for Language Agents", arXiv 2309.02427 (v3 2024-03-15): https://arxiv.org/abs/2309.02427
+- Packer et al., "MemGPT: Towards LLMs as Operating Systems", arXiv 2310.08560 (2023-10-12): https://arxiv.org/abs/2310.08560
+- Wang et al., "Voyager", arXiv 2305.16291 (2023-05-25): https://arxiv.org/abs/2305.16291
+- Liu et al., "Lost in the Middle", arXiv 2307.03172 (TACL 2023): https://arxiv.org/abs/2307.03172
+- Johann Rehberger, "Spyware Injection Into Your ChatGPT's Long-Term Memory (SpAIware)", 2024-09-20: https://embracethered.com/blog/posts/2024/chatgpt-macos-app-persistent-data-exfiltration/
+- Model and embedding prices: Anthropic and OpenAI pricing pages, fetched 2026-10-11: https://platform.claude.com/docs/en/about-claude/pricing and https://developers.openai.com/api/docs/pricing

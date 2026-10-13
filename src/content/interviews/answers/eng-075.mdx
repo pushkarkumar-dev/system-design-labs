@@ -1,0 +1,189 @@
+---
+question: eng-075
+family: chat-serving-streaming
+status: published
+labs: [websocket-gateway, rate-limiter, llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "It's the design-ChatGPT problem with long documents. I'll cover the product path first: gateway, conversation
+> service, a router, the GPU machines, and a stream back to the browser that can resume after a disconnect. Then
+> the long-context point, because it drives everything: a 100,000-token document takes seconds just to read, so I
+> cap prompt length per plan, read long prompts in slices so other users don't stall, cache repeated documents,
+> and limit users by tokens, not messages."
+>
+> The rest of this page explains each part of that answer.
+
+### What makes this different from a normal chat service
+
+In a normal messaging service, a message is a few hundred bytes and every message costs about the same. Here a
+large language model (**LLM**) answers each message, and its cost depends on how much text it must read.
+
+The model reads and writes in pieces of about ¾ of a word, called **tokens**. Before it writes anything, it reads
+the whole prompt in one big pass: the app's instructions, the conversation so far, any pasted document, and the
+new message. That pass is called **prefill**, and the user waits through it before the first word appears. Then
+the model writes the reply one token per pass, which is called **decode**.
+
+Long documents make one point sharper than in other chat designs: a single prompt can cost thousands of times
+another. A user who pastes a 100,000-token report and a user who says "thanks" are both "one message".
+
+The question is listed by interviewing.io for Anthropic as "design a Claude chat service"
+(<Cite id="s-4edc43db4e" />). No first-hand account of how it is graded was found. Expect it to test whether you
+can scope an open prompt, design streaming and limits correctly, and go down to the GPU layer when asked.
+
+## Clarify first
+
+- **Product or serving scope?** "I'll assume both, product first."
+- **Long documents in the chat?** "I'll assume yes, up to 100,000 tokens. That changes the first-word wait and
+  the free-tier caps."
+- **Peak load?** "Assume 2,000 new messages per second and replies of 400 tokens."
+- **Shared across devices?** "Assume yes, so the server holds the history, not the client."
+- **What does the free tier get?** "Assume a token quota per time window and a cap on prompt length."
+
+## Answer
+
+### Two more words you need
+
+- **Time to first token (TTFT)**: the wait before the first word. Queueing and prefill spend it.
+- **Inter-token latency (ITL)**: the gap between words after that. Decode spends it.
+- While the model writes, the GPU keeps a saved summary of every token so far, so it never re-reads the whole
+  conversation. That is the **KV cache**, and it lives in scarce GPU memory. Its size per token depends on the
+  model's **KV heads**. Each layer has several parallel attention units called heads. Llama-3.1-70B has 64 heads
+  that look things up (query heads) but only 8 that store a saved key and value (KV heads), so sizing with 64
+  overstates the cache 8×. For that model one token costs 327,680 bytes.
+
+### The path
+
+```
+Browser
+   │ message
+   ▼
+API gateway ── login, tier, reserve tokens, one open stream for free users
+   ▼
+Conversation service ── history, build the prompt, trim to the plan's length cap
+   ▼
+Router ── same machine as last turn if possible, free GPU memory, queue length
+   ▼
+GPU machine (inference replica) ── queue per tier, many users decoded together,
+   │                                 cached prompt prefixes, prefill in slices
+   ▼
+Stream gateway ── SSE events with a token offset in each id, heartbeats,
+   │               replay buffer, cancel when the user leaves
+   ▼
+Browser
+```
+
+Each box in a sentence. The **gateway** decides whether the user may start a reply and reserves their tokens.
+The **conversation service** builds the prompt. The **router** prefers the machine that served this conversation
+before, because it may still hold that conversation's KV cache; keeping a conversation on one machine is called
+**affinity**. The **replica** is one copy of the model on a GPU machine; it runs users of the same tier from a
+queue and decodes all admitted users together in each pass, which is called **continuous batching**. The
+**stream gateway** sends each token as a **Server-Sent Event (SSE)**, a long-lived HTTP response; a reconnecting
+browser sends the last event id it saw, and the gateway replays from there.
+
+### Follow one long document through it
+
+A user pastes a 100,000-token report and asks, *"What are the three biggest risks in this?"* Then they ask 19
+more questions about the same report.
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| Gateway | Checks the plan's prompt cap and reserves 100,000+ tokens. | "A free plan may not allow this at all. The cap is a product decision backed by cost." |
+| Router | Sends it to the machine that already served this conversation. | "Next time the document's KV cache may still be there." |
+| Prefill | The machine must read 100,000 tokens. On compute alone that takes **about 3.4 s**. | "That alone blows a 2-second first-word budget." |
+| Slicing | It reads the document in slices of about **688 tokens** per pass, between decode work for everyone else. | "Otherwise every other user on the machine sees a multi-second freeze." |
+| Decode | The answer streams back token by token. | "From here it is a normal reply." |
+| Question 2 | The document's tokens are found in the prefix cache, so only the new question is read. | "The cache turns a 3.4-second first word into a normal one." |
+
+### Why long prompts cost so much
+
+Reading a prompt costs a fixed amount of work per token for the model's weights, plus a part called
+**attention**: each token looks back at every earlier token, so that part grows with the square of the length.
+For a normal 3,600-token chat prompt on a machine of 8 H100 GPUs, attention adds about 3% and prefill takes
+about **64 ms** at the hardware's limit. At 100,000 tokens attention is almost half the work, and prefill takes **about 3.4 s**.
+
+Prefill and decode share the same GPUs. If the machine read the whole document in one pass, every other user's
+next word would wait seconds. So the machine reads long prompts in slices, called **chunked prefill**. The slice
+size comes from the word-gap budget: in the family walkthrough's example, whatever time decode leaves inside a
+50 ms pass is enough for about **688 tokens**.
+
+Three design decisions follow from that one number:
+
+1. **Cap prompt length on the free tier.** A free user can't be allowed to spend 3.4 seconds of a whole machine.
+2. **Limit by tokens, not messages.** The limiter must see 100,000 tokens, not "one request".
+3. **Cache repeated prefixes.** Split prompts into token blocks and key each block by a hash of its tokens and
+   all the blocks before it, including the model version. Then a repeated document and the shared system prompt
+   skip recomputation. This is a **prefix cache**.
+
+Say it like this: "A 100,000-token prompt costs about 3.4 seconds of compute before the first word. That sets my
+context cap, my slice size and my quota unit."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Prefill floor with attention:** (2 × params × n + 2 × layers × hidden × n²) ÷ (GPUs × peak FLOP/s), where n is
+  the prompt tokens not served from cache.
+- **Example model:** Llama-3.1-70B, with 70.55 × 10⁹ parameters, 80 layers and a hidden size of 8,192.
+- **Example machine:** 8 × H100 SXM at 989.5 TFLOPS dense bf16 each = 7.916 × 10¹⁵ FLOP/s.
+- **3,600 tokens:** about 64 ms.
+- **100,000 tokens:** (1.411 + 1.31) × 10¹⁶ FLOPs ÷ 7.916 × 10¹⁵ FLOP/s ≈ 3.4 s.
+- **Slice size:** about 688 tokens per pass, from the 50 ms budget minus a 37.7 ms decode pass (family
+  walkthrough).
+
+</details>
+
+### Close with two things
+
+**Disconnects.** Notice them with heartbeats, keep generating for a short grace window so a reconnect can resume
+from the buffer, then cancel and free the GPU memory.
+
+**Spikes.** Protect replies already running first, and shed the free tier first.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Claude chat service"
+  senior={["Designs the path with SSE resume and token quotas, and sizes KV per stream with KV heads."]}
+  staff={["Uses long-context prefill cost to set context caps, chunk size and quota units, and says how it would verify that a cancelled stream actually frees GPU memory."]}
+/>
+
+## Small-team version
+
+If you are building a Claude-backed chat feature, you don't run GPUs. Relay the stream through your backend, cap
+per-user tokens, and cache the stable start of the prompt: system prompt, tool definitions and long documents.
+For most Claude models, cached input also stops counting toward the input-token rate limit, per Anthropic's
+rate-limit docs (fetched 2026-10-12).
+
+Long pasted documents are where your bill and your first-word wait go, so cap them per plan. At Claude Sonnet 5
+list prices, a 100,000-token document costs **$0.25 to send the first time** (with a cache write) and **$0.02 per
+later message** while the cache is warm. Twenty questions on it cost **about $0.63** of document input cached,
+against **$4.00** uncached. Default: the provider API with caching. Revisit only for data-residency rules or very
+high steady volume.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Prices fetched 2026-10-11: $2 per 1M input tokens; cache reads $0.20 per 1M; 5-minute cache writes 1.25× base.
+- First message: 100,000 × $2/M × 1.25 = $0.25.
+- Later messages: 100,000 × $0.20/M = $0.02.
+- Twenty questions cached: $0.25 + 19 × $0.02 = $0.63. Uncached: 20 × $0.20 = $4.00.
+
+</details>
+
+## Pitfalls
+
+- **Treating a 100,000-token request like a 100-token one in the limiter.** Their prefill costs differ by about 2,000×,
+  so the limit must count tokens.
+- **Quoting long-prompt prefill from the weights alone.** Attention roughly doubles it at 100,000 tokens.
+- **Sharing a prefix cache across customers without thinking.** A cache hit is faster, and that timing can reveal
+  that someone else sent the same text.
+- **No cancel path.** Abandoned long replies keep running and holding GPU memory.
+
+## Go deeper
+
+- Family walkthrough: [Serve a ChatGPT-style assistant with streaming](/system-design-labs/interviews/walkthroughs/chat-serving-streaming/), especially the back-of-envelope on the first-word wait and long prompts.
+- KV sizing in depth: [KV-cache memory math](/system-design-labs/interviews/walkthroughs/kv-cache-memory-math/).
+- Labs: <LabRef lab="llm-inference" inline />, <LabRef lab="websocket-gateway" inline />.

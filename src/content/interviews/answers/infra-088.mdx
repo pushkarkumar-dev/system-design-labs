@@ -1,0 +1,149 @@
+---
+question: infra-088
+family: quant-specdec-moe
+status: published
+labs: [speculative-decoding, llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Speculative decoding works by spending compute the GPU isn't using. At small batch, decode waits on memory
+> reads, so checking several guessed tokens in one pass is nearly free. At large batch, the GPU's math is already
+> busy, so the verify pass costs real time for every token in it, and every rejected guess is wasted work. I'd
+> confirm it by plotting throughput against batch size with speculation on and off, then make speculation
+> conditional: on below a measured batch size, off or with fewer guesses above it."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you understand why speculative decoding works well enough to predict when it
+stops working.
+
+Some background. A large language model writes one **token** (roughly ¾ of a word) per pass through the model. This
+phase is called **decode**. A GPU serves many conversations at once; one step produces one token for each
+conversation in the **batch**. **Speculative decoding** adds a small **draft** model that guesses the next K tokens.
+The big **target** model checks all of them in one **verify pass** and keeps the ones it agrees with.
+
+For a backend engineer, this is speculative execution. A CPU's branch predictor runs ahead on a guess and throws
+the work away if the guess was wrong. That is free when the CPU had idle cycles, and costly when it didn't. The
+same is true here, and the interviewer wants you to say where the idle cycles run out.
+
+The prep guide that poses this says speculation at high batch "can leave throughput flat or make it slightly worse"
+<Cite id="s-4525fcd815" />. It is the guide's example question, not a candidate report. The strong answer shows
+where the crossover is and turns it into a policy.
+
+## Clarify first
+
+- **Which number moved:** "Did throughput fall, or did per-user latency rise too?" Speculation can still help
+  latency.
+- **When:** "At what batch size or queries per second did it start? What K and what draft model?"
+- **Acceptance:** "Is the draft's acceptance rate the same as in testing?" A new traffic mix can lower it.
+- **Setup:** "Which model, GPU and number precision?" You need these to place the ridge point, defined below.
+
+## Answer
+
+### Words you need first
+
+- Every step takes the longer of two times: reading the weights from GPU memory, and doing the math. An A100 does
+  312 trillion bf16 operations per second and reads 2,039 GB per second, so it can do about **153 operations per
+  byte** it reads. That break-even is the **ridge point**.
+- In decode, operations per byte (the **arithmetic intensity**) is roughly the number of tokens processed together
+  in one step. Below 153 tokens, the step waits on memory: **memory-bound**. Above, it waits on math:
+  **compute-bound**.
+
+### Why it flips
+
+At small batch, each decode step is limited by reading the weights. The verify pass over K + 1 tokens per sequence
+still costs about one step, so committing several tokens per pass is a win.
+
+At batch B, the verify pass carries B × (K + 1) tokens. Once that number passes the ridge point, the pass is
+compute-bound and costs in proportion to its tokens. Every rejected draft token is then paid-for math that produced
+nothing.
+
+### The worked example: a 70B model on four GPUs
+
+Take Llama-3.1-70B in bf16, split across 4 A100s so each holds a quarter of every weight matrix (**tensor
+parallelism**, TP = 4). Use a 1B draft, K = 5 guesses, and an acceptance rate α = 0.8. Assume peak compute and
+ignore the conversation-memory reads. A normal step reads each GPU's 35.28 GB share of the weights in **17.3 ms**.
+
+| Batch | Verify step (B × 6 tokens) | Round incl. 5 draft steps | Speedup vs normal decoding | What to say |
+|---|---|---|---|---|
+| 1–16 | 17.3 ms | 23.4 ms | 2.73× | "Still memory-bound: the verify pass is free." |
+| 32 | 21.7 ms | 27.8 ms | 2.30× | "Past the ridge; the gain is shrinking." |
+| 64 | 43.4 ms | 49.5 ms | 1.29× | "Barely worth it." |
+| 128 | 86.8 ms | 92.9 ms | 0.69× | "Now it costs 31% of throughput." |
+
+The verify pass crosses the ridge at about **batch 25**. This model is idealized: its drop is steeper than the
+guide's "slightly worse", so trust the direction more than the size. In practice, different sequences in one batch
+accept different numbers of guesses, which wastes slots and makes it worse.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Weight read:** 141.1 GB ÷ 4 = 35.28 GB per GPU ÷ 2,039 GB/s = **17.3 ms**.
+- **Compute:** step time = max(17.3 ms, 2 × 70.55 × 10⁹ × tokens ÷ (4 × 312 × 10¹²)). The compute term is 0.113 ms
+  per token and passes 17.3 ms at about **153 tokens per step**.
+- **Crossover:** B × 6 = 153 at B ≈ **25**.
+- **Draft:** 2.47 GB ÷ 2,039 GB/s = 1.21 ms per step; 5 steps add 6.05 ms.
+- **Speedup:** E × 17.3 ÷ round time, with E = (1 − 0.8⁶) ÷ 0.2 = 3.689. Batch 1: 3.689 × 17.3 ÷ 23.4 = 2.73×.
+  Batch 128: 768 tokens × 0.113 = 86.8 ms; + 6.05 = 92.9 ms; 3.689 × 17.3 ÷ 92.9 = 0.69×.
+
+</details>
+
+### What to do
+
+1. **Confirm with metrics.** Plot throughput and **inter-token latency** (the gap between words a user sees)
+   against batch size, with speculation on and off. Measure α on current traffic.
+2. **Make speculation conditional.** On below a measured batch threshold; off, or with a smaller K, above it.
+3. **Use cheaper drafts where they work.** **n-gram lookup**, which copies a continuation from text already in the
+   prompt, costs almost nothing to propose and suits repetitive text such as retrieval-heavy answers and code, per
+   the guide.
+4. **Report both numbers to whoever owns the trade-off:** latency for interactive users, total throughput for
+   batch jobs.
+
+Say it like this: "Speculation spends idle compute. Above about batch 25 on this setup there isn't any, so I'd turn
+it on per batch size and measure latency and throughput separately."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Throughput fell"
+  senior={["Explains the ridge-point crossover with numbers and proposes disabling or shrinking K at high batch."]}
+  staff={["Turns it into a measured, per-model policy with a threshold, and separates latency-sensitive from throughput-bound traffic so each gets the right setting."]}
+/>
+
+## Small-team version
+
+This is the failure you are most likely to meet. Someone turns speculative decoding on, a benchmark with one user
+looks great, and the nightly batch job slows down. vLLM, a widely used open-source serving engine, aims the feature
+at "medium-to-low QPS (queries per second), memory-bound workloads"
+([vLLM docs](https://docs.vllm.ai/en/latest/features/speculative_decoding/), dated 2026-09-25).
+
+Load-test at your real peak concurrency before you keep it, and consider separate deployments for interactive and
+batch traffic. In the step model above, the same 4×A100 box that gains 2.73× at batch 1 loses about a third of its
+throughput at batch 128 (0.69×). At RunPod's $5.56–$6.36 an hour for that box (fetched 2026-10-11), the batch job's
+cost per token rises by the same factor, about **1.45×**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Cost factor:** same hourly price, 0.69× the tokens, so cost per token × 1 ÷ 0.69 ≈ **1.45**.
+
+</details>
+
+Default: speculation off for batch traffic.
+
+## Pitfalls
+
+- **Benchmarking at batch 1 and shipping to a batch-64 workload.** The win you measured doesn't exist at that
+  load.
+- **Ignoring a drop in acceptance after a traffic change.** Lower α shrinks the gain at every batch size.
+- **Reporting only throughput when the point was latency, or the reverse.** Speculation can help one and hurt the
+  other.
+
+## Go deeper
+
+- Family walkthrough: [Quantization, speculative decoding and MoE](/system-design-labs/interviews/walkthroughs/quant-specdec-moe/), common follow-ups in depth.
+- The derivation: [infra-087](/system-design-labs/interviews/questions/infra-087/).
+- Draft cost and optimal K in code: <LabRef lab="speculative-decoding" inline />. Verify passes and the KV cache: <LabRef lab="llm-inference" inline />.

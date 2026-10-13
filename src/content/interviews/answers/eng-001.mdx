@@ -1,0 +1,179 @@
+---
+question: eng-001
+family: rag-system-design
+status: published
+labs: [rag, embedding-pipeline, vector-index, llm-eval]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Before drawing anything, I'd ask what the documents are and what people ask about them. If it's one document
+> that fits in the model's input, I'd send the whole thing with prompt caching and skip search. Otherwise I'd
+> split the documents into passages along their headings, search them by keywords and by meaning, give the best
+> few to the model with ids it must cite, check those citations in code, and say 'not found' when the evidence is
+> weak. Every choice gets measured on 50 questions a domain expert has answered."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you can build an assistant that answers from **someone else's** documents
+and can prove it is right.
+
+You already know search: a query returns ten links and the user picks one. Here the user never sees the list. A
+large language model (**LLM**, such as Claude or GPT) reads the passages you hand it and writes one answer. That
+changes three things:
+
+1. **A search miss turns into a confident wrong answer.** The model writes something fluent from whatever it was
+   given, and the user can't tell.
+2. **Every passage you send costs money.** LLMs are billed per **token** (a piece of a word, about ¾ of a word),
+   and the input has a size limit, the **context window**.
+3. **You can't judge quality by looking.** Right and wrong answers read the same, so you need questions with
+   known answers and a number.
+
+In a forward-deployed engineer (FDE) loop, where you build on site with a customer, "a customer's private data"
+is the whole point. Find out what the documents and questions are before you draw boxes. In a first-hand account
+of OpenAI's FDE loop, the interviewer stopped an early architecture dive with "what questions would you ask the
+customer before designing anything?" (<Cite id="s-812dbc9385" />). The prompt itself is listed in a
+candidate-submitted bank for that loop and also tagged Google; only the title is known (<Cite id="s-ee91b6c25d" />).
+
+## Clarify first
+
+Say an assumption out loud for each question the interviewer won't answer:
+
+- **What are the documents?** Formats, count, growth, and whether PDFs are scanned images or made by software.
+  "Let's assume 50,000 mixed files averaging 4,000 tokens."
+- **What do users ask?** Single facts, procedures, or questions about everything at once? "Mostly facts and
+  procedures."
+- **Who may see what?** "One permission level for now; per-user permissions are a separate design."
+- **Can the data leave the customer's environment or region?** "Assume a managed API is allowed."
+- **What counts as success, and who can grade answers?** "A support lead can write down 50 questions with the
+  right answer and where it lives."
+
+## Answer
+
+### Words you need first
+
+- **RAG** (retrieval-augmented generation): search your documents first, then put only the best passages in the
+  LLM's prompt.
+- **Chunk**: one passage cut from a document, a paragraph to a section long. You index, retrieve and cite chunks.
+- **Embedding**: a list of numbers (a vector) computed from text by a small model, so that texts with similar
+  meaning get similar vectors. Searching by embeddings finds paraphrases.
+- **Eval set**: the 50–200 questions with known answers and source locations. Every knob is measured on it.
+
+### The plan, in the order to say it
+
+```
+Customer documents
+   │  parse: keep headings, tables, page numbers
+   ▼
+Chunker ── split on headings, heading path on every chunk, hash each chunk
+   │
+   ▼
+Keyword index (BM25) + vector index ── in Postgres at this size
+   │
+   ▼  (per question)
+Rewrite follow-up → search both indexes → merge → (rerank) → pack k chunks
+   │
+   ▼
+LLM answers with chunk ids ── code checks every cited id
+   │
+   ▼
+Answer with sources, or "not found in the documents"
+```
+
+1. **Check whether retrieval is needed.** If the corpus is one document under about 200,000 tokens, put it in the
+   prompt with **prompt caching** (the provider keeps the processed start of your prompt for a few minutes, so
+   repeat requests pay about a tenth of the input price). A 200-page PDF is about 80,000 tokens. On a warm cache
+   that costs about **$0.020 per question**, against **$0.012 for RAG**, on Claude Sonnet 5 list prices (fetched
+   2026-10-11). Larger corpora need retrieval.
+2. **Ingestion.** Parse with structure (headings, tables, pages). Chunk on that structure, with the heading path
+   at the top of each chunk so it makes sense alone. Hash each chunk, so an edit re-embeds only what changed.
+   Write with idempotent upserts.
+3. **Query.** Rewrite follow-up questions into standalone ones. Run keyword search (**BM25**, the standard
+   keyword-ranking formula) and embedding search side by side. Merge the two ranked lists with **reciprocal rank
+   fusion** (RRF), which scores each chunk by its positions in both lists. Add a **reranker** (a slower model that
+   rereads the top 20–50 together with the question) only if the eval shows the answer sitting at ranks 4–20.
+   Pack **k** chunks, the number you send, into a token budget.
+4. **Answer.** Cite chunk ids, verify them in code, and refuse when the evidence is missing.
+5. **Measure.** On the eval set: **recall@k** (the share of questions where the answer's chunk is among the k you
+   send) with a confidence interval, citation validity on every answer, and correct refusals on questions the
+   documents can't answer.
+
+### Follow one question through it
+
+An employee asks a company assistant *"What is the notice period?"* and then *"What about for contractors?"*.
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| Rewrite | "What about for contractors?" becomes "notice period for contractors". | "Follow-ups are made standalone before search." |
+| Search | Keywords rank the general notice section 1st; the contractor section is 3rd in both lists. | "Each search misses things the other catches." |
+| Merge (RRF) | Being 3rd in both beats being 1st in one and 10th in the other. | "Agreement wins." |
+| Pack | 8 chunks plus instructions, about 4,000 tokens in. | "k comes from a token budget, capped in code." |
+| Answer | "Contractors get 14 days' written notice [c-412]." (an invented handbook) | "About 1.2 cents on Sonnet 5." |
+| Check | Code confirms `c-412` was in the context. | "No valid citation, no answer." |
+
+### Size and cost
+
+The assumed 50,000 documents become **600,000 chunks**. Their vectors take about **3.7 GB**, and embedding them
+all costs about **$4.80** once. That fits in Postgres with **pgvector** (an extension that adds vector columns
+and indexes), so you don't need a separate vector database. The real cost is generation: about **$0.012 per
+question** for 4,000 input and 400 output tokens on Sonnet 5.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Chunks = docs × ceil((T − o) ÷ (c − o)), with T = 4,000 tokens per document, c = 400 chunk size, o = 50 overlap:
+  50,000 × ceil(3,950 ÷ 350) = 50,000 × 12 = **600,000 chunks**.
+- Vectors at 1,536 dimensions, 4 bytes each: 600,000 × 1,536 × 4 B = **3.69 GB** float32.
+- Embedding: 600,000 × 400 tokens = 240M tokens × $0.02 per 1M (text-embedding-3-small, fetched 2026-10-11) =
+  **$4.80**.
+- Sonnet 5 per question ($2 in, $10 out per 1M): 4,000 × $2 ÷ 1M + 400 × $10 ÷ 1M = $0.008 + $0.004 = **$0.012**.
+- Whole 80,000-token PDF on a warm cache ($0.20 per 1M cached): 80,000 × $0.20 ÷ 1M + $0.004 = **$0.020**.
+
+</details>
+
+The failure to name is the **stale index**: a document changed, but the old chunks still answer. Re-index by
+content hash, reconcile deletions on a schedule, and track how far behind each source is. Say it like this: "The
+worst bug in RAG isn't a crash. It's a confident answer from last quarter's policy."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="RAG over a customer's data"
+  senior={["Builds the full pipeline with a reasoned value for chunk size, k and reranking, and a recall@k eval."]}
+  staff={["Starts from the customer's questions and constraints, prices long context against RAG, and names the metric and sample size that would prove a knob wrong."]}
+/>
+
+## Small-team version
+
+At a 50–500 person company this is usually the first AI feature you ship. Build the pipeline in plain code on
+Postgres full-text search plus pgvector. Buy the embeddings and the LLM as managed APIs. A plan of about two weeks
+for one engineer is an assumption: week 1 is parsing and a baseline with 50 labelled questions; week 2 is chunks
+split on headings, citation checks and an eval that runs in CI.
+
+**What it costs**, at an assumed 5,000 questions a day: about **$1,800 a month** on Claude Sonnet 5, or about
+**$270** on gpt-5-mini ($0.0018 per question), plus about **$5 once** to embed 600,000 chunks (prices fetched
+2026-10-11). One line: 5,000 × $0.012 × 30 ≈ $1,800.
+
+**Skip** a vector database and a reranker until the numbers ask for them. **The answer changes** when the
+customer's data may not leave its region or network (self-host the embedder and model, or use a regional
+endpoint), when the corpus passes a few million chunks, or when documents carry per-user permissions.
+
+**What you own**: the eval set, the refusal behaviour, a monthly spend cap, and reading 20 traces a week.
+
+## Pitfalls
+
+- **Drawing before asking.** The documents and the questions decide every knob, and the OpenAI interviewer asked
+  for them first.
+- **Fixed 512-token chunks and an untested k.** Both are defaults, not decisions; tie them to the questions and
+  measure them.
+- **"We'll evaluate with an LLM."** With no human labels and no interval, you are measuring the grader, not the
+  system.
+- **Never asking where the data may go.** A residency rule changes which models you can use at all.
+
+## Go deeper
+
+- Family walkthrough: [Design a RAG system end to end](/system-design-labs/interviews/walkthroughs/rag-system-design/), especially the back-of-envelope and the small-team version.
+- Build and measure the pipeline: <LabRef lab="rag" inline />; plan embedding swaps: <LabRef lab="embedding-pipeline" inline />.
+- If the customer's documents carry permissions: [permission-aware enterprise RAG](/system-design-labs/interviews/walkthroughs/enterprise-rag-acl/).

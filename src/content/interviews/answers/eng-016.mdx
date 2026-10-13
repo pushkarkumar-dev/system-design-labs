@@ -1,0 +1,180 @@
+---
+question: eng-016
+family: rag-quality-debugging
+status: published
+labs: [rag, llm-eval, embedding-pipeline]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I wouldn't touch the prompt first. I'd pull the traces for the bad answers and, for each one, find the first
+> stage that failed: the answer wasn't in our documents, search didn't find it, search found it but ranked it
+> too low, the model had it and ignored it, or the model faithfully repeated an outdated document. Then I'd
+> count the buckets and fix the biggest one. Finally I'd add those questions to a labeled set and show the
+> number moved on the same questions, before and after."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants a debugging procedure, not a guess.
+
+A normal backend bug gives you something to hold: an exception, a failing test, the same wrong output for the
+same input. A chatbot that answers from your documents gives you none of that. The wrong answer arrives with
+status 200, in fluent sentences that sound certain. Nothing in the logs says "failed". And the answer passes
+through several stages, any of which could be the cause, while the output looks the same either way. So the
+work is to find *which stage* failed, for many bad answers, and count.
+
+### Words you need first
+
+- **RAG** (retrieval-augmented generation): before the language model answers, the system searches your own
+  documents and pastes the best passages into the prompt. Finding the passages is **retrieval**; writing the
+  answer is **generation**.
+- Documents are split into passages called **chunks**. Search returns them in score order, and the best k (the
+  **top k**) go into the prompt.
+- A **trace** is a log record of one request's path through every stage, like a distributed trace across your
+  services.
+- An answer is **faithful** when every claim in it is supported by the chunks the model was given. Faithful is not
+  the same as correct: the chunk itself can be wrong.
+
+The question comes from a Mistral prep page that refused every fetch on 2026-10-11 and 2026-10-12 (HTTP 429),
+so its wording is known only second-hand (<Cite id="s-7552ed2bee" />). The question is standard either way.
+
+## Clarify first
+
+- **What does "wrong" mean?** "Does it contradict our documents, say something that isn't in them, or repeat
+  something outdated?"
+- **How many reports, over how much traffic?** *Assume a few dozen flagged answers in two weeks.*
+- **Are the retrieved chunk IDs, scores and the final prompt logged?** "If not, logging them is step one."
+- **Is there a labeled set** of questions with the right documents marked? *Assume not.*
+
+## Answer
+
+### 1. Reproduce with full traces
+
+For each flagged answer, capture the question, any rewritten version of it, the retrieved chunks with their
+ranks and scores, the prompt exactly as sent, the answer, and the model and index versions. Say: "Without the
+trace I'm guessing. With it, each bad answer takes a few minutes to classify."
+
+### 2. Classify each failure by its first failing stage
+
+| Stage | Evidence in the trace |
+|---|---|
+| Coverage gap | No document contains the answer; it should have declined |
+| Retrieval miss | The right chunk isn't in the top 50 candidates |
+| Ranking miss | It's in the top 50 but not in the top k sent to the model |
+| Generation | The supporting text was in the prompt and the answer ignored or contradicted it |
+| Stale or wrong source | The answer faithfully follows an outdated or out-of-scope document |
+
+"Confident" is not a stage. The model writes fluent, certain-sounding text whatever its evidence, so tone tells
+you nothing.
+
+### Follow one bad answer through it
+
+Here is one case (invented for illustration). A customer asks the support bot: *"Can I get a refund on the annual
+plan 45 days after I paid?"* The bot answers: *"Yes, annual plans can be refunded within 60 days."* The real
+policy is 30 days.
+
+| Check | What the trace shows | Verdict | What to say in the interview |
+|---|---|---|---|
+| Is the truth in our documents? | The current policy chunk says 30 days | Not a coverage gap | "The right answer exists." |
+| Was it found? | The current policy is at rank 2 of 50 | Not a retrieval miss | "Search found it." |
+| Did it reach the model? | Top 3 sent: the 2024 policy, the current policy, an unrelated chunk | Not a ranking miss | "It was in the prompt." |
+| What did the answer follow? | It quotes the 2024 policy's "60 days" | Faithful, to the wrong chunk | "A faithfulness check would pass this." |
+| Why was the old policy there? | Never removed from the index | **Stale source** | "This is a data bug that looks like a model bug." |
+
+The fix is in the index (remove superseded versions, add dates), not in the prompt or the search engine.
+
+### 3. Count the buckets
+
+Now do the same for every flagged answer. Suppose 40 answers were flagged (counts invented to show the method):
+6 coverage gaps, 9 retrieval misses, 8 ranking misses, 12 generation failures, 3 stale sources and 2 ambiguous
+questions.
+
+The useful conclusion: a prompt change can only fix the generation bucket, here **at most 12 of 40, or 30%**.
+Say: "The triage tells me the ceiling on any prompt fix before I write one."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Upper bound on what a prompt fix can do"
+  expr="max improvement from prompt changes ≤ generation failures ÷ all flagged failures"
+  vars={[
+    { sym: 'generation failures', meaning: 'flagged answers whose supporting text was in the prompt' },
+  ]}
+  example="Hypothetical triage: 12 generation failures of 40 flagged → at most 30% of the pile"
+/>
+
+</details>
+
+### 4. Fix by bucket
+
+- **Retrieval.** Check chunks against the **embedder's window**. The embedder is the small model that turns text
+  into vectors for search, and it reads only a fixed number of tokens: all-MiniLM-L6-v2 embeds 256 word pieces,
+  and longer text is cut silently. Add keyword search (**BM25**, the classic scoring formula behind search
+  engines) for product codes and IDs, and rewrite chatty questions into search queries.
+- **Ranking.** Add a **reranker** (a slower model that rescores the candidates) or raise k, but only after
+  comparing how many right chunks are in the top 50 against the top 5.
+- **Generation.** Require citations, permit "I don't know", send fewer distracting chunks, put the strongest
+  chunk first, try a stronger model. Check faithfulness before and after.
+- **Stale sources.** Re-index, remove old versions, filter by date or scope.
+- **Coverage.** Let the bot decline and hand off to a person.
+
+### 5. Prove it
+
+Add the flagged questions to a labeled set. Compute the metric for the failing stage before and after the fix,
+on the same questions, and report the difference with an interval. Comparing on the same questions (a **paired
+comparison**) cancels most of the noise, because only the questions where the two versions disagree count.
+
+One trap from the rag lab (this site's hands-on retrieval lab) is worth telling. Hybrid search (vector search
+plus keyword search) seemed to add nothing, until the bug turned out to be the keyword search's **tokenizer**,
+the code that splits text into words. It split on spaces only, so "limit," and "limit" were different words.
+Hybrid went from <LabNumber lab="rag" metric="hit@3 on BEIR SciFact" /> (the middle value) to
+<LabNumber lab="rag" metric="BM25 tokenizer (SciFact)" /> with a `\w+` tokenizer. Say: "A technique that
+doesn't help may be broken. I test each component alone before I give up on it."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Debugging confident wrong answers"
+  senior={["Traces, classifies by stage, fixes the largest bucket, and shows a paired before-and-after on a labeled set."]}
+  staff={["Also makes tracing and the labeled set standing infrastructure, and adds production monitoring so the next failure is found before a user reports it."]}
+/>
+
+In plain words: Senior fixes this incident with evidence. Staff makes sure the next one is found by the team's
+own monitoring, not by a customer.
+
+## Small-team version
+
+At a small company this ticket arrives with a screenshot and nothing else. Turn tracing on first, with an
+open-source tracer such as Langfuse or a vendor. Then spend a day triaging 40 flagged answers before touching
+any code.
+
+- **Use an agent for the first pass.** AI agents are good at the first pass of classification; check 20–30 of
+  their labels yourself before trusting the counts.
+- **The cost is time, not tools.** 40 traces at an assumed 5 minutes each is about 3.3 hours, and labeling the
+  first 50 questions at 3 minutes each another 2.5 hours: roughly **$540** in total at an assumed loaded rate of
+  $93 an hour.
+- **Tracing.** Self-hosting Langfuse is free apart from the server; buy a hosted tracer if no one wants to run it.
+- **Don't buy a new vector database as the fix** until the triage says retrieval is the largest bucket.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Triage: 40 × 5 min = 200 min ≈ 3.3 h. Labeling: 50 × 3 min = 150 min = 2.5 h.
+- Total ≈ 5.8 h × $93 (assumed) ≈ $540.
+
+</details>
+
+## Pitfalls
+
+- **Editing the prompt before looking at what was retrieved.** A prompt change can fix only the generation bucket.
+- **Treating "confident" as a signal.** Fluent text sounds certain regardless of the evidence behind it.
+- **Trusting faithfulness alone.** An answer that faithfully repeats a stale document is still wrong.
+- **Declaring a fix from three re-run examples.** Only a paired metric on a labeled set shows the fix is real.
+
+## Go deeper
+
+- Family walkthrough: [Measure retrieval and debug confident wrong answers](/system-design-labs/interviews/walkthroughs/rag-quality-debugging/#worked-examples), especially the triage example.
+- Labs: <LabRef lab="rag" inline />, <LabRef lab="llm-eval" inline />, <LabRef lab="embedding-pipeline" inline />.

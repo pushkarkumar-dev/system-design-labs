@@ -1,0 +1,164 @@
+---
+question: eng-005
+family: enterprise-rag-acl
+status: published
+labs: [search-engine, rag, vector-index]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "There are two ways to search across one person's email, calendar, documents and chat. I can ask each product's
+> own search at query time and merge the answers, which is always fresh and always respects permissions, but is
+> as slow as the slowest source. Or I can copy everything into my own index, which is fast and ranks
+> consistently, but now I own permissions, deletion and a sensitive copy of everyone's mail. I'd mix them per
+> source: copy documents and wikis, query mail and calendar live, merge by rank, and give the fan-out a deadline
+> so one slow source can't stall the whole search."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see whether you can make the "copy or query live" decision with reasons, source by
+source.
+
+In a normal search feature, all the data sits in one database you own, so there is one ranking function and one
+place to enforce access. Here the data lives in four products with four search engines, four permission models
+and four ways of reporting changes. Each product's scores mean different things, so they can't simply be added.
+The central decision is whether to call each product's search live (**federated** search) or copy the data into
+one index of your own (**centralized** search).
+
+Only a one-line framing is known: a social post describes a Google question asking for a unified query engine
+across a user's email, calendar, documents and chat. The post itself couldn't be fetched, so there are no reported
+follow-ups (<Cite id="s-58f4f0f712" />). The answer below is one reasonable interpretation: personal search across
+products.
+
+## Clarify first
+
+- **Whose data?** "Only one user's own items, or shared content too, such as team drives and group chats?"
+- **Latency.** "I'll assume 300 ms for a list of results, and longer if we also generate a written answer."
+- **Copying.** "May the system copy mail and chat into its own index, or must data stay inside each product?"
+  This is often a privacy or legal question, not an engineering one.
+- **Query types.** "Keyword lookups ('the invoice from Acme'), time-scoped questions ('what did Sam say last
+  week'), or full questions to answer?"
+
+## Answer
+
+### Words you need first
+
+- **Federated search**: at query time, call each source's own search API, as the user, in parallel, and merge
+  the results.
+- **Centralized search**: copy every source's items, and who may read them, into your own index ahead of time.
+- **Keyword search**: the classic inverted index, scored by a formula called **BM25**. **Vector search** compares
+  **embeddings**, lists of numbers a small model computes from text so that similar meanings get similar vectors.
+  It finds matches by meaning rather than by exact word.
+- **Rank fusion**: merging several result lists by each item's position in them rather than by their raw scores.
+
+### The two architectures
+
+```
+FEDERATED                                 CENTRALIZED
+ Query ─► parse ─┬─► Mail search   ─┐      Sources ─► ingest ─► your index (+ who may read what)
+                 ├─► Calendar API  ─┤                              │
+                 ├─► Docs search   ─┼─► merge ─► rerank            Query ─► parse ─► search ─► rerank
+                 └─► Chat search   ─┘
+       (each source checks permissions)            (you check permissions)
+```
+
+**Federated.** Each source enforces its own permissions and is always up to date, so if access to an email is
+revoked, it disappears from results immediately. The costs: you are as slow as the slowest source, ranking
+across sources is hard, and meaning-based search is only as good as each source's own search.
+
+**Centralized.** One index gives fast, consistent ranking, real **hybrid retrieval** (keyword plus vector) and
+answers that combine several sources. But you now copy permissions and must keep them in sync, a deleted email
+lingers until your copy catches up, and you hold a sensitive copy of everyone's mail. That staleness has a bound
+you can state: how long until you hear about a change, plus how long to apply it, or the lifetime of any login
+token that carries the user's groups, plus any cache that ignores permissions. The family walkthrough writes it
+as max(t_detect + t_apply, t_claims) + t_cache.
+
+**The mix.** Decide per source, on three questions: does the source offer change events and a permissions API,
+how fast does its content change, and how sensitive is it?
+
+| Source | Change events and permission API? | Changes how often? | Sensitive? | Choice |
+|---|---|---|---|---|
+| Documents, wikis | Usually yes | Slowly | Mixed | Centralize |
+| Mail | Often limited | Constantly | Very | Federate |
+| Calendar | Live API is good | Constantly | Moderately | Federate |
+| Chat | Varies | Constantly | Mixed | Decide with the product owner |
+
+Personal data also changes how you partition a centralized index: one partition per user for mailboxes, and
+per-company partitions with access lists for shared content.
+
+Say it like this: "I'd decide per source: copy what has good change events and is fairly stable, query live what
+is personal or changes every minute."
+
+### Follow one query
+
+Take the query *"what did Sam say about the offsite last week"* with an assumed 300 ms budget.
+
+| Step | Time (assumed) | What happens | What to say in the interview |
+|---|---|---|---|
+| 1. Parse | ~50 ms | Extract the person (Sam), the time (last week) and the topic (offsite). | "Structure becomes filters and decides which sources to ask." |
+| 2. Route | — | A "what did Sam say" query goes to mail and chat; the calendar is asked only for an "offsite" event. | "A calendar question shouldn't wait on a chat search." |
+| 3. Fan out | 200 ms deadline | Call mail and chat search as the user, in parallel, each filtered to Sam and last week. | "Any source that misses the deadline is dropped and flagged." |
+| 4. Merge + rerank | ~50 ms | Fuse the lists by rank, then rerank the top items. | "Scores from different engines aren't comparable; ranks are." |
+| 5. Return | ≤300 ms | Results, with a note if chat timed out. | "Partial results beat a spinner." |
+
+### Merging results from different engines
+
+Mail search might score a hit 0.92 and chat search 14.3. Those numbers mean nothing next to each other. So fuse by
+rank: with **reciprocal rank fusion (RRF)**, each item scores 1 ÷ (60 + its rank) in each list it appears in, and
+the sums set the order. Then rerank the merged top items with features that matter for personal search: recency,
+how often the user interacts with that sender or document, and the type of item. Tune that ranker on clicks and
+time spent on results, and check it offline with **recall@k** (how often the right item is in the top k) on
+labelled queries, sliced by source.
+
+### Permissions and deletion
+
+Federated sources are correct by construction: they check access themselves on every call. For the sources you
+centralize, put deletions and permission changes in their own fast lane, separate from content updates. A deleted
+email must vanish from results and from any cached answer. Cache only with keys that include who is asking and
+the current permission version.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Latency budget (assumed):** 50 ms parsing + 200 ms fan-out deadline + 50 ms merge and rerank = 300 ms.
+- **RRF example:** an item ranked 1st in one list and 10th in another scores 1 ÷ 61 + 1 ÷ 70 ≈ 0.0307. An item
+  ranked 3rd in both scores 2 ÷ 63 ≈ 0.0317, so steady agreement beats one strong vote.
+- **Revocation bound, centralized sources:** with change events (about 1 minute), 2 minutes to apply, groups
+  looked up per request, and caches keyed by permission version: max(1 + 2, 1) + 0 = 3 minutes.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Unified personal search"
+  senior={["Compares federated and centralized, fuses by rank, sets a fan-out deadline."]}
+  staff={["Splits the decision per source by sensitivity, volatility and API support, and names the metric (recall by source, deadline misses) that would change it."]}
+/>
+
+In plain words: a Senior answer knows both designs and their costs. A Staff answer decides source by source and
+says which measurement would make them change that decision.
+
+## Small-team version
+
+A small company rarely builds personal search across mail. It gets that with its office suite. What it does build
+is the shared half: one assistant over the team's documents and channels.
+
+Start federated where a source's own search is good enough: you write no sync code and permissions are the
+source's problem. Centralize only the sources where answers need retrieval across many documents, and there use
+Postgres full-text search plus pgvector. Before copying anyone's mail or chat, ask whether you may.
+
+## Pitfalls
+
+- **Copying everyone's mail without asking whether you may.** It is a privacy and legal decision before it is an
+  engineering one.
+- **Adding raw scores from different engines.** They are on different scales; merge by rank.
+- **A fan-out with no deadline.** One slow source then stalls every query.
+- **Centralizing without a deletion bound.** A deleted email that keeps appearing is the bug users remember.
+
+## Go deeper
+
+- Family walkthrough: [Permission-aware enterprise RAG](/system-design-labs/interviews/walkthroughs/enterprise-rag-acl/#federated-versus-centralized-the-google-variant).
+- Rank fusion and hybrid retrieval: <LabRef lab="rag" inline />; an inverted index from scratch: <LabRef lab="search-engine" inline />.

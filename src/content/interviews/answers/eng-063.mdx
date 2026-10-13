@@ -1,0 +1,183 @@
+---
+question: eng-063
+family: concurrent-llm-client
+status: published
+labs: [embedding-pipeline, rate-limiter]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "'Batching' can mean three things: many calls in flight at once, many items packed into one call, or the
+> provider's offline batch API, which is half price but slow. I'll name all three, then build the second one:
+> callers each ask for one item, and a batcher sends a request when it has 32 items or after 10 ms. The parts
+> that matter are that every caller always hears back, the result count is checked before handing results
+> out, and one bad item doesn't fail everyone."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer is checking two things. First, can you see that "batch" is ambiguous and ask which meaning
+they want? Second, can you write the batching code so that no caller is ever lost, even when a request fails?
+
+You know batching from databases: one insert of 500 rows beats 500 inserts. Calling an LLM (a large language
+model, the kind behind ChatGPT or Claude) changes three details:
+
+1. **You pay per token, not per request.** A **token** is a chunk of text, roughly ¾ of a word. Packing 32
+   texts into one request sends the same number of tokens, so it doesn't change the bill. It saves request
+   overhead and request-count limits.
+2. **Providers sell a separate "batch" product.** You upload a file of requests and collect the answers within
+   hours, at a discount. That is the batching that cuts the bill.
+3. **Limits come in several shapes.** Inputs per request, tokens per request, requests per minute and tokens
+   per minute. A good batcher respects all of them.
+
+The prompt comes from PromptLayer's guide for interviewers, which suggests asking candidates to "implement a
+function to batch API calls to an LLM efficiently" and to focus on "clean code, error handling, and
+understanding trade-offs" (<Cite id="s-1205b0cc50" />). It is a suggested exercise, not a candidate report.
+
+## Clarify first
+
+Ask these, and say your assumption for each:
+
+- **Which batching?** Many requests in flight (concurrency), many items per request (micro-batching), or the
+  provider's asynchronous batch API (cheaper, slower)? Say it like this: "Batching can mean three things.
+  Which one do you want?"
+- **Does the endpoint accept a list?** Embedding endpoints (which turn texts into lists of numbers for search),
+  classification and reranking endpoints usually do. Chat
+  completions don't, unless you pack items into one prompt.
+- **Limits?** Inputs per request, tokens per request, requests and tokens per minute.
+- **Latency budget?** It decides how long the batcher may wait to fill a batch, or whether a 24-hour batch API
+  is acceptable.
+- **Partial failure?** If one input is invalid, should 31 other callers fail?
+
+## Answer
+
+### Words you need first
+
+- An **embedding** is a list of numbers that stands for a text's meaning, used for search. Embedding
+  endpoints take many texts in one request, which makes them the classic place to batch.
+- **Micro-batching** means collecting many small calls for a few milliseconds and sending them as one request.
+- A **future** is a placeholder for a result that doesn't exist yet. The caller waits on it; the batcher fills
+  it in when the response arrives.
+- A **poison input** is one bad item that makes the whole request fail.
+- **429** is the HTTP status "Too Many Requests": the provider's rate limit was exceeded. **400** means the
+  request itself is invalid, so sending it again gives the same error.
+
+### The shape of the batcher
+
+```
+caller 1: embed("refund policy")  ─┐
+caller 2: embed("reset password") ─┤   each caller gets a future and waits on it
+   ...                             ─┤
+caller 200: embed("...")          ─┘
+                                    ▼
+MicroBatcher ── pending list; flush when 32 items, or 10 ms after the first item
+                                    │  one request per flush
+                                    ▼
+_request ── the shared retry function (server errors and 429s retried)
+                                    │
+                                    ▼
+POST /v1/embed  {"inputs": [32 texts]}  →  {"vectors": [32 vectors]}
+                                    │
+                                    ▼
+check count, then hand vector i to future i
+```
+
+**Callers** each ask for one embedding and wait on their own future. They never see a batch. **The batcher**
+holds a pending list. It sends a request when the list is full, or when the first item has waited long
+enough. **`_request`** is the same retry function as the rest of the client, so a 503 on a batch is retried
+like any call. **The fan-back** step checks the response has as many vectors as inputs, then gives each
+caller its own.
+
+### Follow 200 callers through it
+
+The family walkthrough's batcher ran on 2026-10-12 against a fake server whose embed endpoint costs an assumed
+20 ms plus 1 ms per text, and rejects a request with a 400 if any input starts with `bad`.
+
+| What happens | Result in the test | What to say in the interview |
+|---|---|---|
+| 200 callers arrive at once | **7 requests**, largest batch 32 | "Full batches flush immediately, so busy traffic never waits." |
+| Each response is fanned back | every caller gets its own vector | "I check the count first, or caller 7 could get caller 8's vector." |
+| 1 bad input among 16 | isolated in **9 requests**; the other 15 callers succeed | "On a 400 I split the batch in half and retry each half." |
+| 256 texts in batches of 32 | about **0.065 s** | "Against about 0.78 s sending one text per request, 8 at a time." |
+
+### The parts that are graded
+
+1. **Every caller hears back.** On success, set each result. On failure, set the exception on every future in
+   the batch. On cancellation, cancel them. A dropped future hangs a caller until its own deadline.
+2. **A length check** before zipping results to callers, or a short response hands caller 7 caller 8's
+   vector.
+3. **Poison inputs.** One bad input fails the whole request with a 400. Split the batch in half on a 400 only:
+   one bad input in 16 took 9 requests to isolate (1 + 2 + 2 + 2 + 2). A 401 split in half is just twice the
+   failure.
+4. **Limits.** Cap the batch size at the endpoint's input limit and at a token budget per request. Pace
+   requests with a **token bucket** (a counter of permits that refills at a fixed rate) set to the known rate.
+5. **What it saves.** Micro-batching cuts request count and fixed overhead. Token cost is unchanged. The
+   asynchronous batch API is what cuts the bill: Anthropic documents 50% off, up to 100,000 requests per
+   batch, with a 24-hour expiry (docs fetched 2026-10-12).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Requests and time per request"
+  expr="requests = ⌈n / B⌉;   time per request = a + k × B"
+  vars={[
+    { sym: 'n, B', meaning: 'items, items per request' },
+    { sym: 'a, k', meaning: 'fixed and per-item cost; assumed 20 ms and 1 ms in the fake server' },
+  ]}
+  example="n = 256, B = 32: 8 requests of 52 ms; measured 0.064–0.066 s, against 0.77–0.80 s for one item per request at concurrency 8 (fake server, 2026-10-12)"
+/>
+
+The gain comes from the fixed cost `a`. When `a` is small next to `k × B`, batching saves little time but
+still cuts the request count, which matters under a requests-per-minute limit.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Batching calls"
+  senior={["Builds a size-or-timeout batcher that resolves every future, checks counts, and isolates a poison input."]}
+  staff={["Chooses between concurrency, micro-batching and the batch API from the latency budget and the bill, and says which limit binds first."]}
+/>
+
+In plain words: a Senior answer builds a batcher that never loses a caller. A Staff answer first decides which
+batching the job needs. A user waiting on a page needs concurrency or micro-batching. A nightly job that can
+wait hours should use the batch API and pay half. The Staff answer also says which limit runs out first:
+requests per minute, tokens per minute, or inputs per request.
+
+## Small-team version
+
+For offline work (backfills, nightly classification, re-embedding), **use the provider's batch API first**.
+With assumed volumes of 200,000 calls of 1,500 input and 200 output tokens on gpt-5-mini, a nightly run costs
+about **$155** sent normally and **$77.50** through a batch API.
+
+For online traffic, pass lists to endpoints that take them, and keep a concurrency cap. Build a micro-batcher
+only when many independent callers each send one item. An agent can write the batcher. You write the
+poison-input and short-response tests, because those are the bugs an agent's version will have.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Price:** gpt-5-mini at $0.25 per 1M input tokens and $2.00 per 1M output tokens (price page fetched
+  2026-10-11).
+- **Per call:** 1,500 × $0.25 ÷ 10⁶ + 200 × $2.00 ÷ 10⁶ = $0.000375 + $0.0004 = $0.000775.
+- **Per run:** $0.000775 × 200,000 = $155. With a 50% batch discount: $77.50.
+
+</details>
+
+## Pitfalls
+
+- **Treating "batch" as `gather` over 10,000 calls.** That is unbounded fan-out: 10,000 requests at once and a
+  wall of 429s.
+- **Failing 31 callers for one bad input.** With no way to find the bad one, every retry fails the same way.
+- **Zipping results without a length check.** A short response silently gives callers each other's answers.
+- **Packing items into one chat prompt without ids.** The model's outputs can come back out of order and get
+  assigned to the wrong item.
+- **Claiming micro-batching saves tokens.** It saves requests and overhead; the batch API saves money.
+
+## Go deeper
+
+- Family walkthrough: [Concurrent LLM API client](/system-design-labs/interviews/walkthroughs/concurrent-llm-client/), stage 5 and the Small-team cost math.
+- Measured server-side batching: <LabRef lab="embedding-pipeline" inline />. Pacing at a known rate: <LabRef lab="rate-limiter" inline />.

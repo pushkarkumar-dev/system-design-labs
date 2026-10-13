@@ -1,0 +1,174 @@
+---
+question: infra-037
+family: roofline-sharded-matmul
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "The block is two matrix multiplies with an activation between them. I can split it three ways. Splitting the
+> tokens copies all the weights to every GPU and needs no communication when serving. Splitting the wide middle
+> dimension lets each GPU do its slice of both multiplies alone, but the second multiply then gives partial sums
+> of the output, so I need one all-reduce at the end. Splitting the hidden dimension gives partial sums
+> already after the first multiply, and the activation can't be applied to partial sums, so I must add up the
+> wide middle result: 3.5× more bytes for this model. For low-batch serving I'd split the middle dimension."
+>
+> The rest of this page explains each part of that answer.
+
+This is a sharding question in the shape of a real model layer. You already know sharding from databases:
+split the data so each node does part of the work, and pay for any step that has to combine results across
+nodes. A scatter-gather query that must merge partial aggregates is more expensive than one that each shard
+can answer alone.
+
+The same is true here, with one twist that has no database equivalent. Between the two multiplies sits an
+**activation**, a simple function applied to each number on its own, such as GELU. It is not linear:
+activation(a) + activation(b) is not activation(a + b). So if a split leaves you holding partial sums at the
+point where the activation runs, you must add them up first. That one fact decides which split is cheap.
+
+(The question is an Anthropic onsite item listed on PracHub, a site that collects reported questions, posted
+2026-03-30 <Cite id="s-1ffbee39ea" />.) The page doesn't define the three schemes, so defining them precisely
+is part of the answer. The listed follow-ups ask why FFN sharding needs an output reduction and why hidden
+sharding can need a larger one.
+
+### Words you need first
+
+- The **FFN** (feed-forward network, also called the MLP) is the part of each model layer that transforms each
+  token on its own. Here it is `Y = activation(X W1) W2`, with X `[B, H]`, W1 `[H, F]`, W2 `[F, H]`, and no gate
+  (Llama's real FFN has a third "gate" matrix; this one has two).
+- **H** is the hidden size, the length of each token's vector. **F** is the wider intermediate size. **T** is the
+  number of tokens (the item calls it B).
+- A **matmul** of an M × K matrix by a K × N matrix costs **2MKN FLOPs** (counting a multiply-add as 2). The
+  dimension K, which disappears in the result, is the one it **contracts over**.
+- An **all-reduce** adds every device's full-size partial result so each device ends up with the sum. A
+  **reduce-scatter** does the same but leaves each device only its slice, for half the bytes.
+
+## Clarify first
+
+- **Serving or training?** "I'll assume an inference forward pass, and mention the training gradient cost."
+- **Layout at the start and the end?** "Is X copied to every GPU? Must Y be copied to every GPU, or can it leave
+  split?"
+- **Hardware?** "D = 8 H100s: 989.5 dense bf16 TFLOPS, 3.35 TB/s of memory bandwidth, NVLink (NVIDIA's fast
+  GPU-to-GPU link) at 450 GB/s each way."
+- **Sizes?** "H = 8,192 and F = 28,672, Llama-3.1-70B's sizes, in bf16 (2 bytes per number, s = 2). A
+  multiply-add is 2 FLOPs."
+
+## Answer
+
+### The worked example: one 70B-sized FFN on 8 GPUs
+
+With these sizes, the block's weights are **939.5 MB**, and it costs **0.94 GFLOP per token**. We run it at two
+batch sizes: **T = 4,096** (a long prompt being read, called **prefill**) and **T = 64** (64 users each getting
+their next word, called a **decode** batch).
+
+Unsharded, the block does 4THF FLOPs and reads 2HF × s bytes of weights. Activations of T × H × s come in and go
+out, and the in-between result is T × F × s.
+
+### The three schemes
+
+- **Data sharding** (split T). Each GPU has all the weights and 1/8 of the tokens. No communication at
+  inference. In training, the weight **gradients** (the corrections each GPU computes from its tokens) must be
+  all-reduced: 2HF × s bytes.
+- **FFN-dimension sharding** (split F). Each GPU has some columns of W1, the matching rows of W2, and all of X.
+- **Hidden-dimension sharding** (split H). Each GPU has some columns of X, the matching rows of W1, and some
+  columns of W2.
+
+| Scheme | Per device | Communication | T = 4,096 | T = 64 |
+|---|---|---|---|---|
+| Data (shard T) | all weights, T/D tokens | none at inference; training all-reduces 2HF × s of gradients | compute 486 µs, weight read 280 µs | every device reads all 939.5 MB: 280 µs |
+| FFN dim (shard F) | W1 columns, W2 rows, all of X | all-reduce of Y: T × H × s | 117 MB sent per device, 261 µs | weight read 35 µs, 1.8 MB sent |
+| Hidden dim (shard H) | X, W1 rows, W2 columns | all-reduce of the intermediate: T × F × s | 411 MB sent, 913 µs | weight read 35 µs, 6.4 MB sent |
+
+### Why FFN-dimension sharding needs an output reduction
+
+The first multiply needs no communication: each GPU computes its own columns of the in-between result. The
+activation works on each number alone, so it applies locally too. The trouble is the second multiply. It
+contracts over F, and F is split. So each GPU multiplies its slice of the in-between result by its rows of W2
+and gets a **partial sum** of the full `[T, H]` output. Y exists only after summing them: an all-reduce, or a
+reduce-scatter if the next layer accepts split rows (half the bytes).
+
+Say it like this: "Splitting F is free until the second multiply, which contracts over F. So I pay one
+all-reduce of the output, T × H × s."
+
+### Why hidden-dimension sharding can need a larger reduction
+
+Now the first multiply contracts over the split H. So `X W1` is a partial sum of the `[T, F]` in-between result,
+and the activation can't be applied to partial sums. The reduction must happen before the activation, and it
+moves T × F × s. That is **F ÷ H = 3.5×** the FFN scheme's T × H × s. The second multiply then produces output
+columns without further communication.
+
+### Which one is the bottleneck
+
+- **At T = 4,096**, every scheme is compute-bound on each GPU (486 µs of math). The ratio of link time to math
+  time is **0.54** for FFN sharding, so its communication can hide under compute. For hidden sharding it is
+  **1.88**, so it can't. Neither ratio depends on T.
+- **At T = 64**, data sharding makes every GPU read all the weights (**280 µs**), while FFN sharding reads an
+  eighth (**35 µs**). Its 1.8 MB all-reduce is so small that the fixed start-up time of the collective, not
+  bandwidth, dominates.
+- **Microbatching** (splitting T into smaller pieces) overlaps one piece's reduction with the next piece's math.
+
+Say it like this: "For low-batch serving I'd split F: each GPU reads an eighth of the weights and pays one
+small all-reduce. For training I'd combine data sharding with F sharding."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Weights:** 2 × 8,192 × 28,672 × 2 B = 939.5 MB; ÷ 3.35 TB/s = 280 µs, or 35 µs for an eighth.
+- **Compute at T = 4,096:** 4 × 4,096 × 8,192 × 28,672 ÷ 8 GPUs ÷ 989.5 × 10¹² = 486 µs.
+- **FFN-dim all-reduce:** T × H × s = 67.1 MB; each GPU sends 2 × 7 ÷ 8 × 67.1 MB = 117 MB; ÷ 450 GB/s = 261 µs.
+  At T = 64: 1.8 MB.
+- **Hidden-dim all-reduce:** T × F × s = 234.9 MB; × 1.75 = 411 MB; ÷ 450 GB/s = 913 µs. At T = 64: 6.4 MB.
+
+<Formula
+  title="Communication over compute (all-reduce, no overlap)"
+  expr="FFN-dim: (D − 1) × s × P ÷ (2 × F × L);   hidden-dim: (D − 1) × s × P ÷ (2 × H × L)"
+  vars={[
+    { sym: 'P', meaning: 'peak FLOP/s per device' },
+    { sym: 'L', meaning: 'link bandwidth per direction' },
+  ]}
+  example="D = 8: FFN-dim 7 × 2 × 989.5 × 10¹² ÷ (2 × 28,672 × 450 × 10⁹) = 0.54; hidden-dim 1.88. Neither depends on T"
+/>
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="FFN sharding"
+  senior={["Defines the three schemes with per-device shapes, gives FLOPs, bytes and collective sizes, and explains the output reduction."]}
+  staff={["Derives the T-independent ratios, explains the 3.5× larger hidden reduction, and picks per regime: FFN sharding for low-batch inference, data plus FFN sharding for training."]}
+/>
+
+In plain words: Senior defines the schemes and gets the reductions right. Staff also shows the ratios don't
+depend on batch size, and picks a scheme for each situation.
+
+## Small-team version
+
+You won't hand-shard an FFN. Your serving engine's **tensor parallelism** (splitting one model across GPUs) does
+exactly the FFN-dimension scheme. The takeaway: at low batch, splitting weights across GPUs cuts the per-step
+weight read, but only over NVLink. If a model fits one GPU after **quantization** (storing weights in fewer
+bits), that usually beats splitting it.
+
+An example for a 70B model, at RunPod list prices fetched 2026-10-11:
+
+- **int4** (4 bits per weight, with a small scale per group of 32, called g32) is about **39.7 GB**. It fits one
+  A100 80GB with room for about 13 requests at 8K tokens, at 730 × $1.39–$1.59 ≈ **$1,010–$1,160 a month**.
+- **bf16** split across four GPUs (TP = 4) needs four of them, about **$4,060–$4,640 a month**.
+
+Split the model when the int4 build fails your eval (your quality tests on your own prompts), or when you need more concurrent long requests than one
+card's memory allows.
+
+## Pitfalls
+
+- **Applying the activation to partial sums.** In hidden sharding it is wrong, because the activation isn't linear.
+- **Forgetting data sharding's weight reads.** At decode, every device reads every weight, so it doesn't cut the step time.
+- **Undercounting the all-reduce.** Each device sends 2(D − 1) ÷ D × T × H × s, not T × H × s.
+- **Silently using Llama's gated FFN.** The item's FFN has two matrices, not three; say which one you are counting.
+
+## Go deeper
+
+- Family walkthrough: [Roofline and sharded-matmul math](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/#derivations), section 8.
+- Training-side parallelism: [distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/).
+- Count a two-matrix GELU FFN in <LabRef lab="transformer" inline />.

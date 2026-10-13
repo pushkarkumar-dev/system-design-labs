@@ -1,0 +1,191 @@
+---
+question: infra-011
+family: continuous-batching
+status: published
+labs: [llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Reading a prompt and writing a reply are two different kinds of work. Reading a long prompt is one big burst of
+> arithmetic; writing is many small steps limited by memory. When they share a GPU, a long prompt makes every other
+> user's words pause. There are two fixes. Chunked prefill reads long prompts a slice at a time between writing
+> steps; it is one setting, so I'd try it first. Disaggregation runs the two phases on separate GPU pools and ships
+> each request's saved state between them. That gives smoother latency at large scale, but not more throughput,
+> and the handoff becomes a new thing that can fail."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The interviewer wants to know one thing: do you understand why the two phases of a model request get in each
+other's way, and what separating them buys and costs?
+
+### Words you need first
+
+- A language model writes a reply one **token** (roughly ¾ of a word) at a time. Before it can write anything, it
+  reads the whole prompt in one pass. That first pass is called **prefill**.
+- Writing the reply, one token per step, is called **decode**. Many users share each decode step: the GPU runs one
+  step for the whole batch, and each user gets one token from it.
+- While a request is being served, the GPU keeps a saved summary of every token so far, so it doesn't re-read the
+  conversation at every step. That is the **KV cache**. Prefill creates it; decode reads it and adds to it.
+- The two delays users feel: **time to first token (TTFT)**, how long until the first word appears, and
+  **inter-token latency (ITL)**, the gap between words once the reply is flowing. **Tail ITL** is the worst of
+  those gaps, say the 99th percentile.
+
+### What makes this different from a normal service
+
+In a backend service, a big request and a small request run side by side on different threads. A big report query
+doesn't make someone's login slower, unless the database is saturated.
+
+On a GPU serving a model, everyone in the batch moves forward together, one step at a time. A step is only as fast
+as the slowest work in it. Prefill of a long prompt is heavy arithmetic: thousands of tokens processed at once.
+Decode is light arithmetic but has to read the whole model from memory every step. Put a long prefill into the same
+step as everyone's decode, and every user's next word waits for the prefill to finish. Their ITL spikes because
+someone else arrived.
+
+(This comes from a PracHub prep guide for Fireworks dated 2026-09-03, not a candidate report. It lists
+disaggregated prefill and decode as a technical-review topic, notes it "can allow different pools and scaling
+decisions", and flags the handoff of cached state between pools <Cite id="s-b6632d5df9" />.)
+
+## Clarify first
+
+Ask these before proposing anything, and say why each one matters:
+
+- **Which target is binding?** Say: "Do we care most about first-word delay, the gap between words, or the worst
+  gaps? The fixes trade one against another."
+- **How long are prompts?** Say: "Long prompts are what cause the interference. If prompts are short, this barely
+  matters."
+- **How big is the fleet?** Say: "Disaggregation needs enough traffic to keep two separate pools busy."
+- **What connects the machines?** Say: "With separate pools, each request's KV cache has to cross that network."
+
+## Answer
+
+### The interference, with one request
+
+Follow one request. A busy server runs a 70-billion-parameter model on 8 H100 GPUs (NVIDIA's data-centre GPU).
+Hundreds of users are mid-reply, and each decode step takes about **38 ms**, so each of them sees a new word about
+every 38 ms. The target is **50 ms** between words. Now a new user arrives with a 3,600-token prompt.
+
+| Strategy | What happens to the new user | What happens to everyone else | What to say in the interview |
+|---|---|---|---|
+| Prefill in one go, same GPUs | The prompt is read in one step that takes at least **64 ms** of arithmetic on its own. First word comes fast. | That one step stretches to roughly **100 ms**. Every user's next word is late, past the 50 ms target. | "One long prompt makes hundreds of streams stutter." |
+| Chunked prefill, same GPUs | The prompt is read about **688 tokens per step**, over **6 steps**. First word arrives after about 300 ms. | Each step stays near 50 ms. Nobody's stream stutters. | "I trade some first-word delay for the new user against smooth words for everyone else." |
+| Disaggregated pools | A separate prefill pool reads the prompt, then ships about **1.2 GB** of KV cache to a decode machine. | Decode steps never contain prefill, so word gaps stay steady. | "Latency is smoother, but each request now moves over a gigabyte between machines." |
+
+The figures are worked out from first principles in the box below. They are lower bounds on an idealized machine,
+good for the shape of the answer, not for a capacity plan.
+
+### Option 1: chunked prefill
+
+Split long prompts into slices, and process one slice per step alongside the normal decode work. vLLM, a widely
+used open-source serving engine, exposes this as a token budget per step: smaller budgets "achieve better ITL" and
+larger ones "better time to first token" ([docs](https://docs.vllm.ai/en/latest/configuration/optimization.html)).
+The right slice size is whatever fits in the time left over in each step.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Reading one prompt token costs about 2 × parameters of arithmetic (a multiply and an add per weight). Attention, the part where tokens are compared
+with each other, is ignored; it adds about 3% at 3,600 tokens. Eight H100s do about 7.916 × 10¹⁵ operations per second, which is half
+the "with sparsity" figure on NVIDIA's spec page.
+
+<Formula
+  title="Largest prefill slice inside an ITL budget"
+  expr="chunk ≈ (ITL budget − decode step) × P ÷ (2 × params)"
+  vars={[
+    { sym: 'P', meaning: 'dense compute of the replica, FLOP/s' },
+    { sym: '2 × params', meaning: 'FLOPs per prompt token, attention ignored' },
+  ]}
+  example="70B on 8×H100 (7.916 × 10¹⁵ FLOP/s dense), 50 ms budget, 37.7 ms step: about 688 tokens per step"
+/>
+
+- **Whole prompt at once:** 2 × 70.55 × 10⁹ × 3,600 ≈ 5.1 × 10¹⁴ operations ÷ 7.916 × 10¹⁵ per second ≈ **64 ms**.
+  Added to a 37.7 ms decode step, that step takes roughly **100 ms** (assuming the two parts don't overlap).
+- **Chunked:** 3,600 ÷ 688 ≈ 5.2, so **6 steps** of at most 50 ms each, about **300 ms** to the first word, plus
+  any queueing.
+- **KV cache to move:** 327,680 bytes per token for this model × 3,600 tokens ≈ **1.18 GB** per request.
+- The 37.7 ms decode step and the 50 ms budget are assumptions of this example (a busy machine with about 700
+  active conversations).
+
+</details>
+
+### Option 2: disaggregated prefill and decode
+
+```
+ new request
+     │
+     ▼
+ ┌───────────────┐   KV cache (~1.2 GB here)   ┌───────────────┐
+ │ prefill pool  │ ──────────────────────────▶ │ decode pool   │ ──▶ words stream to the user
+ │ reads prompts │   over the network          │ writes replies│
+ │ (arithmetic)  │                             │ (memory)      │
+ └───────────────┘                             └───────────────┘
+        ▲                                              │
+        └─── router picks a decode machine with free memory before prefill ends
+```
+
+**The prefill pool** only reads prompts. It is sized for arithmetic and scheduled by prompt tokens and first-word
+deadlines. **The decode pool** only writes replies. It is sized for memory and scheduled by how much KV cache it can
+hold and the gap between words. **The router** chooses a decode machine with room before the prefill finishes, so
+the handoff doesn't wait. **The network link** carries every request's KV cache from one pool to the other.
+
+What it buys: each pool can be sized and split across GPUs in the way that suits its own phase, and decode never
+stalls behind a prefill, which helps tail ITL. DistServe, the research system that argued for it, calls the problem
+"strong prefill-decoding interferences" and notes that sharing GPUs also forces both phases into the same resource
+and parallelism choices ([Zhong et al., OSDI 2024](https://arxiv.org/abs/2401.09670)).
+
+What it costs:
+
+- **A KV transfer per request**, about a gigabyte for a long prompt on a 70B model.
+- **A handoff that must name, find and retry** the cached state. If a transfer fails, the request is read again
+  from scratch.
+- **Two pools to balance.** Too few prefill machines and first words are slow; too few decode machines and memory
+  runs out.
+
+And what it does *not* buy: vLLM's page states "Disaggregated prefill DOES NOT improve throughput" and marks the
+feature experimental ([docs](https://docs.vllm.ai/en/latest/features/disagg_prefill.html), dated 2026-10-03).
+
+Say it like this: "Disaggregation is a latency tool, not a throughput tool. You move a gigabyte per request so
+that long prompts stop hurting other users."
+
+### When to choose which
+
+Try chunked prefill first. It is one setting on one pool, and you can tune it in an afternoon by watching TTFT and
+ITL percentiles. Disaggregate only when tail ITL is a product requirement, prompts are long, and the fleet is big
+enough to keep two pools busy.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Disaggregated serving"
+  senior={["Explains why a long prompt stalls everyone else's words, and what chunked prefill and disaggregation each do to first-word delay and the gap between words."]}
+  staff={["Names the KV handoff as the new thing that can fail, says disaggregation targets latency rather than throughput, and states the traffic level at which two pools pay off."]}
+/>
+
+## Small-team version
+
+Skip disaggregation. On one or two GPUs there aren't two pools to balance, and vLLM calls the feature
+experimental. Tune chunked prefill instead, and let the measurements decide:
+
+- **Users say streams stutter** (high ITL): lower the per-step token budget.
+- **Users say the first word is slow** (high TTFT): raise it.
+- **Measure before and after** each change: TTFT and ITL at the 50th and 99th percentiles, on a replay of real
+  prompts.
+
+This costs you an afternoon of an engineer's time and no new hardware. Revisit disaggregation only if you grow
+into a fleet where tail ITL is a product requirement.
+
+## Pitfalls
+
+- **Claiming disaggregation raises throughput.** vLLM's own documentation says it doesn't; it smooths latency.
+- **Ignoring the KV transfer.** Each request moves about a gigabyte between machines, and that transfer can fail.
+- **Treating latency as one number.** First-word delay and the gap between words have different causes and
+  opposite tuning directions.
+- **Disaggregating a small deployment.** Two half-idle pools cost more than one tuned pool and add a failure point.
+
+## Go deeper
+
+- Family walkthrough: [Continuous batching](/system-design-labs/interviews/walkthroughs/continuous-batching/), "Stage 3: explain prefill, chunked prefill and disaggregation".
+- <LabRef lab="llm-inference" inline /> separates prefill and decode branches per request.
+- TTFT in a product context: [infra-075](/system-design-labs/interviews/questions/infra-075/).

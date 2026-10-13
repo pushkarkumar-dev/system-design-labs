@@ -1,0 +1,669 @@
+---
+title: "Critique a batch-inference design doc"
+summary: "You are handed a half-built design for running a model on GPUs in batches. Walk one request through it, check its math, find where it breaks under load or failure, rank the fixes, and say them like a good reviewer."
+track: ai-infra
+format: design
+family: design-doc-critique
+smallTeamFocus: "You will rarely build a batch-inference service, but you will review a teammate's or vendor's AI design. Run the same pass: flow, math, overload, failure, metrics, cost; then name the top three fixes."
+rounds: [design-review]
+level: both
+timeboxMin: 45
+order: 242
+status: published
+basedOn: [eng-072, infra-082, infra-083]
+askedAt: [anthropic]
+labs:
+  - { lab: rate-limiter, role: proof, note: "Admission control the reviewed design is missing: per-tenant buckets and a shared counter. It fails open on a Redis error, a choice a reviewer should flag." }
+  - { lab: load-balancer, role: proof, note: "A circuit breaker and a 20% retry budget, plus a real review finding: its v2 retry runs after the first 5xx was already written." }
+  - { lab: message-queue, role: partial, note: "Visibility timeouts and a dead-letter queue for requeue on GPU failure; SendMessage appends without a cap, the unbounded-queue flaw in code. Its delayed-message test panics." }
+  - { lab: observability, role: partial, note: "The metrics and traces a doc should promise. The Go package doesn't compile yet." }
+  - { lab: llm-inference, role: partial, note: "A small serving engine to review: admission ignores KV out-of-memory returns." }
+gapLabs: [gpu-scheduler]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "This design will fall over under a burst, and it will lose work when a GPU dies. I'd make three changes
+> first. Bound the queue by how long a request would wait, and turn extra requests away early with a 'try again
+> later'. Retry in one place only, with a cap on how many retries we allow. And give each batch a lease, so a dead
+> GPU's work goes back on the queue instead of vanishing. After those, I'd fix the capacity math, which assumes
+> every batch is full and every GPU is 100% busy."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+In this round you don't design anything from a blank whiteboard. You are handed someone else's design document
+(a "design doc") for a service that runs a machine-learning model on GPUs, and you are asked to read it, walk
+through how it works, say what is wrong, and say what you would change first.
+
+You already know how to review a normal backend design. A normal web service is cheap per request. A server
+reads a few rows, answers in a few milliseconds, and any server can take the next request. If a burst arrives,
+you add servers, and they come up in seconds.
+
+A model-serving design is different in three ways, and every finding in this round comes from one of them:
+
+1. **Each request is expensive, and it runs on scarce hardware.** The work happens on GPUs (graphics processors
+   used for the large matrix math a model needs). They are costly and you can't add more in seconds. So when
+   traffic exceeds capacity, the design has to decide who waits and who is turned away. A web service can often
+   just scale out instead.
+2. **Requests are grouped before they run.** A GPU does many requests at once almost as fast as one, so the
+   service holds requests for a moment and sends them together. That makes the service far more efficient, but
+   it adds a wait, and it means one failure takes many requests down with it.
+3. **The GPU is busy for a long time per group.** If the machine dies halfway, everything in that group is lost
+   unless the design says how to get it back.
+
+So the reviewer's job is mostly about **overload** (too much traffic) and **failure** (a part dies), with a
+quick check of the doc's numbers. You don't need to be a GPU expert. You need the instincts you already have
+from queues and retries, applied to a system where every request is costly.
+
+### Words you need first
+
+- **Inference** means running a trained model on an input to get an output. It's the "serving" side of machine
+  learning, as opposed to training.
+- A **batch** is a group of requests the GPU processes in one go. **Batch size** is how many requests are in it.
+  Grouping requests this way is called **batching**.
+- **QPS** is queries (requests) per second, as in any backend.
+- **Utilization**, written **ρ** ("rho"), is the fraction of time a GPU is busy. A fleet sized for ρ = 1.0
+  (always busy) has no room for a burst, so real designs aim lower.
+
+This round was reported by a Staff candidate and an engineering-manager candidate at Anthropic, and a prep site
+lists a matching onsite title (<Cite id="s-eab681003c" />, <Cite id="s-4e3dc29a95" />, <Cite id="s-f24bae1f6b" />).
+
+<QuestionRow id="infra-082" />
+<QuestionRow id="infra-083" />
+<QuestionRow id="eng-072" />
+
+No real document is public. This walkthrough uses an invented one, written to contain the usual flaws, and
+follows one request through it from start to finish.
+
+## What is being tested
+
+The interviewer is checking four things. Each one comes from what candidates and prep sites report.
+
+**Review judgment, not invention.** Can you find the two or three flaws that matter most and leave the rest?
+The engineering-manager (EM) candidate expected a blank-sheet design. Instead "they showed me a partially built
+design and asked me to review it", on inference and batch inference, and found it "much more about design
+judgment, communication, and review skills than deep calculations" (<Cite id="s-4e3dc29a95" />). PracHub's
+Anthropic ML system design list carries similar titles (<Cite id="s-3650fe20d8" />).
+
+**Depth on failure and overload.** The Staff candidate's round, titled "Design Doc Review - Batch Sampling
+Service", "asked me to review an existing design doc and give feedback". After pointing out a few issues, "it
+becomes a typical deep dive session on failure handling, overload protection". Their advice: "Have a deep
+understanding of the LLM inference stack and the failure scenarios" (<Cite id="s-eab681003c" />). ("Sampling"
+here means generating output from a model, and an LLM is a large language model, the kind that writes text.)
+
+**Checking the doc's math.** PracHub lists an onsite titled "Review a Batched GPU Inference API Design Doc:
+Flaws, Throughput, Mixed-Model GPUs". The page says "The real document was not reported". Its body is the site's
+own illustrative stand-in, with parts on flaws, throughput (100 ms per batch at 10,000 QPS) and two models on
+one 8-GPU machine (<Cite id="s-f24bae1f6b" />). Only the title is reported; the numbers are the site's. They are
+still good practice, so this page uses them.
+
+**How you say it.** A design review is a conversation with an author. A Fireworks prep guide describes a good
+comment: "A useful review comment names behavior, a reproducer and a narrow change" (<Cite id="s-b6632d5df9" />).
+Behaviour is what goes wrong, a reproducer is how to make it happen on demand, and a narrow change is the
+smallest fix.
+
+Say this early: "I'll walk the flow first, then check the numbers, then go through overload, failure, mixed
+models and monitoring, and finish with my top three changes."
+
+## Clarify and scope
+
+Before you critique anything, ask the doc's author (played by the interviewer) the questions the doc doesn't
+answer. A missing answer is itself a finding: if the doc never says who calls it or how long they wait, nobody
+has designed the timeout.
+
+| Question | Why it matters | If unanswered, assume and say so |
+|---|---|---|
+| Who calls this, and do they wait for the answer? | Decides timeouts and how results get back | Interactive callers with a 1 s timeout |
+| What is the latency target, and does the 100 ms batch time count inside it? | Decides whether batching fits at all | p99 of 300 ms end to end |
+| What is the traffic: average, peak, burstiness, mix of customers? | Capacity and fairness | 10,000 QPS peak; one customer can spike |
+| Is a request safe to retry? | Failure handling | Yes, it has no side effects |
+| One model on the fleet, or several? | Placement and queueing | Two models |
+| What does "batch" mean here? | Changes how waste and waiting behave | Fixed-cost passes first |
+
+Two terms in that table. **p99** is the 99th-percentile latency, as in any backend. A **tenant** is one customer
+or team sharing the service. "One tenant can spike" means one customer can suddenly send far more than usual.
+
+The last question needs a sentence of background. For a classifier or an embedding model (one that turns text
+into a list of numbers), every request in a batch costs about the same, and the batch finishes in a fixed time.
+For a model that writes text, each request produces a different number of output words. Then you must ask
+whether the doc uses **static batching** (the whole group waits for its longest request) or **continuous
+batching** (finished requests leave and new ones join between steps). The rest of this page assumes fixed-cost
+batches unless it says otherwise.
+
+Then say what you'll cover and what you won't: "I'll cover the flow, capacity, overload, failure, mixed models
+and monitoring, then rank. I won't rewrite the whole design."
+
+## Back-of-envelope
+
+Check the doc's numbers before its boxes. The doc says: "batches of 32 every 100 ms give 320 QPS per GPU, so
+32 GPUs serve 10,000 QPS." Two checks cover most reviews: how many GPUs that really takes, and whether two
+models can share the machines the way the doc proposes.
+
+### How many GPUs the doc's numbers really need
+
+The idea is simple. Each GPU can serve (batch size ÷ batch time) requests per second. Divide peak traffic by
+that and you have the GPU count at 100% busy. Then divide by the utilization you are willing to run at, because
+a fleet that is always busy has nowhere to put a burst.
+
+The doc made two optimistic choices. It assumed every batch is **full** (32 requests), and it assumed every GPU
+is **100% busy**. Fix only the second, aiming for ρ = 0.7, and the fleet goes from 32 GPUs to **45**. Fix both,
+because batches only fill to 8 at some times of day, and you need about **179**. The doc's fleet needs 40% more
+GPUs at best and more than five times as many at worst.
+
+Say it like this: "The doc sizes at the maximum batch and 100% busy. At a 0.7 utilization target that's 45 GPUs,
+not 32, and if batches only fill to 8 it's closer to 180. I'd want the batch-fill histogram before trusting
+either."
+
+Why real throughput falls short even of the corrected formula:
+
+- **Batches don't fill at low load.** If only 8 requests arrive in the window, the GPU runs a batch of 8 for the
+  same 100 ms.
+- **Padding.** When inputs have different lengths, a batch is usually padded to its longest input. Ninety-nine
+  inputs of 100 tokens plus one of 4,000 do only **3.5%** useful work. (A **token** is a chunk of text, roughly
+  three-quarters of a word, and it's the unit models count in.)
+- **Failed batches are redone,** and the GPU time spent on them is lost.
+- **Uneven routing** leaves some GPUs idle while others have a queue.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="GPUs the doc's own numbers require"
+  expr="GPUs = QPS × T_batch ÷ (B × ρ)"
+  vars={[
+    { sym: 'QPS', meaning: 'peak request rate' },
+    { sym: 'T_batch', meaning: 'time per batch (100 ms in the PracHub write-up)' },
+    { sym: 'B', meaning: 'requests per batch actually achieved, not the maximum' },
+    { sym: 'ρ', meaning: 'target utilization, leaving headroom (assumed 0.7)' },
+  ]}
+  example={[
+    '10,000 × 0.1 ÷ 32 = 31.25 GPUs at 100% busy; ÷ 0.7 = 44.6, so 45',
+    'If batches only fill to 8 off-peak-style: 10,000 × 0.1 ÷ 8 = 125 at 100%, 179 at ρ = 0.7',
+  ]}
+  note="A doc that sizes with the maximum batch and 100% utilization undercounts. Achieved batch size depends on arrival rate, timeouts and padding."
+/>
+
+- **Padding waste:** useful work ÷ work done = (99 × 100 + 4,000) ÷ (100 × 4,000) = 13,900 ÷ 400,000 ≈ **3.5%**.
+- **The doc's own claim:** 32 per batch ÷ 0.1 s = 320 QPS per GPU; 32 GPUs × 320 = 10,240 QPS at 100% busy and
+  full batches, with 2.4% to spare.
+
+</details>
+
+### Two models on one 8-GPU machine
+
+PracHub's write-up describes a proposal to keep two queues, one per model, and dispatch "in proportion to each
+model's QPS". The large model needs all 8 GPUs of a machine for each batch; the small one needs 1
+(<Cite id="s-f24bae1f6b" />).
+
+The mistake is counting requests when you should count **GPU-time**: how many GPUs a request ties up, times for
+how long. A large-model request ties up 8 GPUs; a small-model request ties up 1. So one large request costs
+about 8 times as much.
+
+Take an assumed mix of 9,000 QPS for the small model and 1,000 QPS for the large one, both in batches of 32 that
+take 100 ms. The large model sends **10%** of the requests but needs **47%** of the GPU-time. Dispatching by
+request count gives it about 10% of the machine, so its queue grows without limit.
+
+There is a second, quieter problem. Every large batch needs all 8 GPUs free *at the same moment*. If small
+batches are scattered across the machine, there is almost never a moment when all 8 are free, so the large model
+waits even when the machine looks only half busy.
+
+The fix: give the large model whole machines of its own, run small-model copies on separate GPUs, and size each
+pool by GPU-time.
+
+Say it like this: "Dispatching by QPS gives the large model 10% when it needs about half the GPU-time, and its
+batches need all 8 GPUs free at once. I'd split them into separate pools and size each by GPU-time."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="GPU-time share of a model"
+  expr="share_m = QPS_m × GPUs_m × T ÷ B ÷ Σ over models (QPS × GPUs × T ÷ B)"
+  vars={[
+    { sym: 'GPUs_m', meaning: 'GPUs one batch of model m occupies (8 or 1)' },
+    { sym: 'T, B', meaning: 'batch time and batch size (assumed 100 ms and 32 for both)' },
+  ]}
+  example={[
+    'Assumed traffic 9,000 QPS small, 1,000 QPS large',
+    'Small: 1 × 100 ms ÷ 32 = 3.1 GPU-ms per request; large: 8 × 100 ms ÷ 32 = 25 GPU-ms',
+    'Large share = 1,000 × 25 ÷ (1,000 × 25 + 9,000 × 3.125) = 25,000 ÷ 53,125 = 47%',
+  ]}
+/>
+
+Request share of the large model: 1,000 ÷ 10,000 = **10%**.
+
+</details>
+
+## High-level design
+
+Here is the invented doc under review, as its author drew it. Every arrow is a synchronous call (the caller
+waits), the queue has no size limit, and retries happen at two layers.
+
+```
+Clients  (interactive callers, 1 s timeout)
+   │
+   ▼
+Load balancer ─────────── up to 3 attempts per call
+   │
+   ▼
+API pods ──────────────── also up to 3 attempts
+   │  push request
+   ▼
+In-memory queue ───────── no size limit, lives inside the dispatcher process
+   │  every 100 ms, take up to 32
+   ▼
+Dispatcher ────────────── one process; sends batches round-robin
+   │
+   ▼
+GPU workers ───────────── two models mixed on the same machines
+   │  write results
+   ▼
+Results table ─────────── API pods poll it for their request's answer
+```
+
+**Clients.** Other services that wait for an answer. The doc doesn't say how long they wait; we assumed 1 s.
+
+**Load balancer (LB).** Spreads requests across API pods. In this doc it also retries a failed call, making up to 3 attempts.
+
+**API pods.** Check the request and put it on the queue. They also make up to 3 attempts. Two retry layers
+stacked on each other is the first thing a reviewer should circle.
+
+**In-memory queue.** Holds requests until the dispatcher takes them. It has no size limit and lives in one
+process's memory, so a crash loses everything in it.
+
+**Dispatcher.** Every 100 ms it takes up to 32 requests, forms a batch and sends it to the next GPU worker in
+turn (**round-robin**). It doesn't look at how busy each worker is or which model the worker holds.
+
+**GPU workers.** Run the batch through the model. Two models share the same machines.
+
+**Results table.** Workers write answers into a shared table, and API pods poll it to find their request's
+answer. Polling adds delay and load on the table.
+
+The doc's claims, as written: "batches of 32 every 100 ms give 320 QPS per GPU, so 32 GPUs serve 10,000 QPS";
+"the in-memory queue absorbs bursts"; "the load balancer and API pods retry on failure"; "round-robin keeps GPUs
+evenly loaded"; "monitoring: GPU utilization dashboard".
+
+### Follow one request through it
+
+The best way to find gaps is to walk one request through the boxes, out loud, naming at each hop how long it can
+wait and what happens if that hop fails. Take request #4,812 from a tenant called Acme. It's a normal day at
+peak, 10,000 QPS.
+
+| Clock | Hop | What happens | What to say in the interview |
+|---|---|---|---|
+| 0 ms | **Load balancer** | Picks an API pod. | "What's the LB's timeout, and does it know the client gives up at 1 s?" |
+| ~2 ms | **API pod** | Validates the request and pushes it on the queue. | "Is anything checking Acme's share before we accept this?" |
+| 2–100 ms | **Queue** | Waits for the next 100 ms tick. | "At peak this wait is up to 100 ms. Under a burst, it has no limit." |
+| ~100 ms | **Dispatcher** | Takes 32 requests, sends them to the next GPU in turn. | "Round-robin doesn't know whether that GPU is busy or which model it holds." |
+| 100–200 ms | **GPU worker** | Runs the batch for 100 ms. | "If this GPU dies now, what happens to these 32 requests?" |
+| ~200 ms + poll | **Results table** | Worker writes the answer; the API pod finds it on its next poll. | "Polling adds up to one poll interval. Why not send the answer straight to the pod that holds the connection?" |
+
+On a normal day that's about 200–250 ms, inside our assumed 300 ms target. The design works on its happy path.
+The questions in the right-hand column are where it doesn't.
+
+Walking the request this way finds most of the gaps by itself: nobody owns a deadline, the dispatcher is a single
+process, the queue lives in that process's memory, and results come back through a polled table.
+
+## Deep dives
+
+### A review method you can run in 30 minutes
+
+Use the same six steps every time. They keep you from drowning in details or redesigning from scratch.
+
+1. **Restate** the goal and the numbers in one sentence, and confirm them with the author.
+2. **Walk** one request end to end, then walk one request that fails at each hop.
+3. **Check the math**: capacity at the batch size actually achieved and at a target utilization; latency as wait
+   time plus batch time.
+4. **Look through five lenses**: overload, failure, mixed models and tenants, observability (what you can see
+   from dashboards), and cost.
+5. **Rank** findings by impact times likelihood. Present the top three as decisions; keep the rest as a list.
+6. **Propose narrow changes**, each with how you'd know it worked.
+
+### Overload: the finding that matters most
+
+Now replay request #4,812 on a bad day. A burst arrives and traffic doubles to 20,000 QPS. The fleet as drawn can
+serve about 10,000 QPS at full batches, so roughly 10,000 extra requests per second pile up in the queue.
+
+| Time into the burst | Queue length | How long a new request waits | What callers see |
+|---|---|---|---|
+| 0 s | about 0 | about 100 ms | Normal |
+| 0.5 s | about 5,000 | about 0.5 s | Slow, but answers arrive |
+| 1 s | about 10,000 | about 1 s | New requests hit the 1 s timeout |
+| 2 s | about 20,000 | about 2 s | **Every** caller times out; GPUs compute answers nobody waits for |
+
+(Wait is queue length divided by how fast the queue drains, about 10,000 per second. These are illustrative
+numbers for the invented doc.)
+
+Request #4,812 arrives at 1.5 s. It sits in the queue for about 1.5 s. Its caller gave up at 1 s. The GPU still
+computes its answer half a second later, and that GPU time is wasted. Then the retries start, and it gets worse.
+Three flaws compound here.
+
+**Unbounded queue.** "Absorbs bursts" really means "turns bursts into latency". Once queued work can't finish
+within the callers' timeouts, every request in the queue is wasted work. The fix is to bound the queue by
+*time*, not by count. Estimate the wait as queue length ÷ drain rate, and when it passes the budget, reject at
+once with `503` (service unavailable) and a `Retry-After` header that tells the caller when to try again. A
+200 ms budget at this drain rate is a queue of about 2,000 requests.
+
+**Retries at two layers.** The load balancer and the API pods each make up to 3 attempts. So one failing request
+can become 3 × 3 = **9** attempts on the GPUs, at exactly the moment the GPUs are overloaded. Google's SRE book
+describes this multiplication and recommends retrying only at the layer immediately above the failure, with a
+**retry budget**: a cap on retries as a share of all traffic
+([Handling Overload](https://sre.google/sre-book/handling-overload/)). The fix: retry at the API tier only,
+capped at a share of traffic (the load-balancer lab uses 20%), with **jittered backoff** (each retry waits a
+random, growing delay so clients don't retry in lockstep). With a 20% budget, total load stays at most 1.2× the
+base load instead of multiplying.
+
+**No admission control.** **Admission control** is deciding at the door whether to accept a request at all. The
+doc has none, so one tenant can fill the queue for everyone. PracHub's follow-up asks about "A single tenant sends
+60 percent of the traffic" (<Cite id="s-f24bae1f6b" />). The fix: a **token bucket** per tenant at the edge (a
+counter that refills at the tenant's agreed rate; each request spends one, and an empty bucket means reject), a
+priority class for interactive work, and shedding the lowest class first.
+
+A fourth fix ties the first three together: **carry a deadline with every request.** If the request's deadline
+has passed by the time it reaches the front of the queue, drop it before it reaches a GPU. Then the GPU never
+computes an answer nobody is waiting for.
+
+Say it like this: "The queue doesn't absorb bursts; it converts them into timeouts. I'd bound it at about 200 ms
+of estimated wait, reject with Retry-After, drop expired work before it hits a GPU, and retry at one layer with
+a budget."
+
+### Failure: a GPU dies mid-batch, and other single points
+
+Go back to request #4,812 on a normal day. It's in a batch of 32 on a GPU, and at 150 ms that GPU dies.
+
+**GPU death.** The doc doesn't say what happens. With a dispatcher that pushes batches and forgets them, the
+batch is simply lost and 32 callers time out. The fix is a **lease**: the worker takes the batch for a limited
+time. If the worker doesn't report success before the lease expires, the items go back to the head of the queue
+with an attempt count. Retry once if the deadline still allows it; otherwise fail fast so the caller can decide.
+This is the same idea as a message queue's **visibility timeout**.
+
+**Poison input.** Sometimes one input crashes the worker itself (a malformed input, an edge case in the model
+code). If the batch is retried as-is, the crash walks across the fleet one worker at a time. The fix: if a batch
+fails twice, split it in half and retry each half (**bisect**), until the bad input is alone. Then move it to a
+**dead-letter queue** (a side queue for messages that keep failing) and return an error that tells the caller
+not to retry.
+
+**The dispatcher and its in-memory queue** are one process. If it dies, every queued request is gone. Fix: use a
+replicated queue, or accept the loss explicitly and let callers retry, and say which in the doc.
+
+**Results table polling** adds latency and load. Fix: send the result straight to the API pod that holds the
+caller's connection, using a `reply_to` address carried with the request.
+
+Say it like this: "A dead GPU loses 32 requests silently today. I'd lease each batch, requeue on lease expiry
+with an attempt count, and bisect a batch that fails twice so one poison input can't take down the fleet."
+
+### Batching policy and mixed models
+
+"32 every 100 ms" is a timer-only flush. At low load it waits the full 100 ms even when the GPU is idle. At high
+load it caps the batch at 32 even when the GPU could take more. A better rule: send a batch when a GPU is free
+*and* either the batch is full or the oldest request has waited long enough.
+
+Round-robin ignores both queue depth and which model a worker holds. **Pull-based workers** fix both: each worker
+asks its own model's queue for the next batch when it's ready, so a busy worker simply doesn't ask.
+
+For models that write text, ask whether the doc means static batches (where one long output holds up the whole
+batch) or continuous batching. The [continuous-batching walkthrough](/system-design-labs/interviews/walkthroughs/continuous-batching/)
+covers the second.
+
+### Saying it like a reviewer
+
+Lead with the outcome, not the list: "Under a burst this design turns overload into an outage. Three changes fix
+most of it: bound the queue by time, retry at one layer with a budget, and lease batches so a dead GPU doesn't
+lose work." Then take questions.
+
+Write each comment as behaviour, reproducer, change: "At 2× peak the queue grows at 10,000 requests/s and every
+caller times out after 1 s (reproduce by replaying peak traffic at 2×); bound the queue at 200 ms of estimated
+wait and return 503."
+
+Ask before asserting where the doc might be right for reasons it doesn't state. The EM report's emphasis on
+communication (<Cite id="s-4e3dc29a95" />) and a separately reported Anthropic candidate's regret that "some of
+the assumptions didn't feel realistic, and I pushed on that too directly" (<Cite id="s-4e04a1689c" />) point the
+same way: disagree with the design, not the interviewer.
+
+## Failure modes and overload
+
+Here are the ranked findings for the invented doc. "Verify with" is the test that would prove each fix works.
+
+| # | Finding | Impact | Fix | Verify with |
+|---|---|---|---|---|
+| 1 | Unbounded queue, no deadlines | Burst → everyone times out; GPUs compute abandoned work | Time-bounded queue, deadline per request, drop expired work | Replay at 2× peak: accepted p99 stays bounded, rejections rise |
+| 2 | Retries at LB and API, 3 attempts each | Up to 9× attempts under failure | Retry once, at one layer, within a budget | Inject 50% GPU errors; attempts per request ≤ budget |
+| 3 | No lease on dispatched batches | GPU death loses 32 requests | Lease and requeue with attempt count; bisect repeats | Kill a worker mid-batch in staging |
+| 4 | Dispatch by QPS across models | Large model starves (47% of GPU-time needed, 10% given) | Separate pools sized by GPU-time | Queue wait per model under mixed load |
+| 5 | Sizing at max batch, 100% busy | Fleet undersized | Size at achieved batch and ρ ≈ 0.7 | Batch-fill histogram |
+| 6 | Single dispatcher process | Total outage on crash | Replicated queue or explicit loss contract | Kill the dispatcher |
+| 7 | Monitoring = GPU utilization | Can't tell busy from drowning | Queue wait, batch fill, rejections, retries | Dashboards in the doc |
+
+Why this order? Findings 1–3 cause an incident on an ordinary bad day: a burst or one dead machine. Finding 4
+starves one product every day the mix holds. Findings 5–7 make the others harder to see or fix but don't cause
+an outage on their own.
+
+<Pitfall title="Listing twenty findings at equal weight">
+A flat list hides judgment. Rank, present three, and keep the rest in reserve for when the interviewer asks
+"what else?".
+</Pitfall>
+
+## Evals and observability
+
+The doc's only monitoring is a GPU utilization dashboard. That can't tell "busy and healthy" from "busy computing
+answers nobody is waiting for": in the burst above, utilization is at 100% the whole time. Here is what the doc
+should promise instead, and what each tells you:
+
+- **Queue wait** (p50 and p99, per model). This is the leading sign of overload: it rises before anything times
+  out.
+- **Batch fill** (how full batches actually are) and **flush reason** (full, or timer). These test the sizing
+  assumption directly.
+- **Rejections by reason** (tenant limit, queue budget, deadline) and the **retry share** of traffic.
+- **Requeues and dead letters** after GPU failures.
+- **Each tenant's share** of GPU-time.
+- **Output checks**: after any change to batching or the model, run a fixed set of inputs with randomness turned
+  off (**temperature 0**, the setting that makes a model give its most likely output every time) and compare the
+  answers. In ML this fixed, re-runnable test set is called an **eval set**.
+
+PracHub's write-up asks which three dashboard metrics come first and their alert thresholds
+(<Cite id="s-f24bae1f6b" />). A defensible three:
+
+1. **Queue-wait p99** against the latency budget. Alert at, say, 50% of the budget.
+2. **Rejection rate.** Alert on a sudden step up.
+3. **Batch fill.** Alert when it falls below the level the sizing assumed.
+
+Those thresholds are illustrative. Say so: "I'd set them from a baseline week of real traffic."
+
+## Trade-offs
+
+Every fix has a cost. Name it before the author does. The right-hand column says when the author's original
+choice is actually fine, which shows you aren't critiquing for its own sake.
+
+| Proposed change | What it costs | When the original choice is fine |
+|---|---|---|
+| Time-bounded queue with rejection | Some requests are rejected that would have succeeded | Offline batch traffic with no deadline |
+| One retry layer with a budget | Fewer silent recoveries from brief errors | Never two layers; one layer is enough |
+| Leases on batches | Duplicate work after a slow (not dead) GPU | Callers can tolerate loss and retry themselves |
+| Separate pools per model | Lower packing efficiency | Models are the same size |
+| Pull-based workers | The queue is on the hot path | A small, fixed fleet where round-robin is good enough |
+
+The lease trade-off is worth saying out loud. A GPU that is slow but alive can let its lease expire, so the batch
+runs twice. That's fine here because we assumed requests are safe to retry. If they weren't, you'd need to drop
+the duplicate result.
+
+<AINative title="Have an agent attack the doc; you decide what matters">
+Review is where agents help most and mislead most. Ask one to list failure modes hop by hop and to recompute
+every number in the doc; it is fast and thorough, and it will produce twenty findings of equal confidence. Your
+job is the ranking and the evidence: which three findings would cause an incident, and what replay or
+fault-injection test proves each fix. Check every number it recomputes yourself, because a confident wrong
+capacity figure is worse than none. In the interview, assume no AI help unless told otherwise.
+</AINative>
+
+## Small-team version
+
+At a 50–500 person company you probably never build a batch-inference service. But you will review AI designs
+often: a teammate's plan to run a model on your own GPUs, a vendor's architecture for a feature you're buying, an
+agent pipeline someone drafted with an assistant. Same skill, different documents.
+
+### What you review, build, buy or skip
+
+- **Review** every design that puts a model call on a user's path: timeouts, retries, fallbacks and spend limits.
+- **Buy** the serving layer where you can. Then the review is of the vendor's limits. Anthropic's API docs, for
+  example, set monthly spend caps per tier and return a 429 (too many requests) without a `retry-after` header at
+  the cap, so an SDK's automatic retries keep failing until the month resets
+  ([rate-limits docs](https://platform.claude.com/docs/en/api/rate-limits), fetched 2026-10-11). That's a
+  design-review finding for any feature built on it.
+- **Skip** formal review boards. A one-page template and a 30-minute walk-through with one other engineer is
+  enough.
+
+### The cost check every AI design review needs
+
+Many proposals to run your own GPUs (**self-hosting**) skip the comparison with just paying a provider per token.
+The usual comparison is a **serverless endpoint**: a provider runs the same open model, and you pay only for the
+tokens you use.
+
+Cohorte's break-even analysis compares the two for the same open model, gpt-oss-120B. On Together's serverless
+endpoint it costs $0.60 per million output tokens. A rented machine with 2 H100 GPUs (a high-end NVIDIA
+data-center GPU), used only during business hours, would need 213% of its maximum throughput to break even, so
+it can't ([Cohorte](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even), 2026-09-20).
+
+For a concrete number: at an assumed 50,000 requests a day, self-hosting that model costs **about $8,550 a
+month** (two GPUs at Lambda's $4.19 per GPU-hour for a 2-GPU instance, plus 15% of an engineer's
+time), against **about $1,035 a month** on the serverless endpoint. List prices were fetched 2026-10-11
+([Lambda](https://lambda.ai/pricing), [Together](https://www.together.ai/pricing)).
+
+Say it like this: "Before I read the architecture, what's the measured traffic, and what does the same model cost
+on a serverless endpoint? At 50,000 requests a day, self-hosting is about eight times the price."
+
+### A review checklist to keep
+
+1. Every external call has a timeout shorter than its caller's.
+2. Retries happen at one layer, with a budget, and only for errors that are safe to retry.
+3. Every queue has a bound and a rejection path the client understands.
+4. A dead worker or provider loses no accepted work, or the doc says it may and why that's acceptable.
+5. There is a fallback (a second provider or a degraded mode) for a provider outage.
+6. Spend caps and per-user limits exist for anything priced per token.
+7. The doc names the three metrics and alerts it will ship with.
+8. The cost section names the comparison and the measured volume.
+
+### Delivery plan
+
+A written review takes one to two days. Spend half a day reading and walking flows. Spend half a day on the math,
+plus a quick replay or fault-injection test if a staging environment exists. Then write a short note with the top
+three findings and the checklist. That's a plan, not a sourced norm.
+
+### What small-company interviewers probe
+
+Employer-side reports describe probing failure paths. Elicit's hiring manager probes error handling, retries,
+fallbacks and timeouts rather than the happy path ([Latent Space](https://www.latent.space/p/hiring),
+2024-06-21). PostHog's handbook describes a pairing session debugging existing code for product engineers
+([hiring process](https://posthog.com/handbook/people/hiring-process), fetched 2026-10-11). Expect to be handed
+something that exists and asked what's wrong with it.
+
+### Revisit when
+
+Revisit this when the company starts running its own GPUs (then the full critique applies), when a second team
+depends on the service (add tenants and quotas to the checklist), or when an incident shows a gap the checklist
+missed (add it).
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Reviewing the doc"
+  senior={[
+    "Walks the flow, finds the unbounded queue, the double retry and the missing lease, and proposes concrete fixes.",
+    "Recomputes the fleet size at achieved batch size and a utilization target.",
+    "Names the metrics the doc should ship with.",
+  ]}
+  staff={[
+    "Ranks findings by incident risk and presents three decisions before the list.",
+    "Finds the cross-model GPU-time error and changes the placement model, not just the dispatcher.",
+    "Attaches a verification test to each fix and asks what the author knows that the doc doesn't say.",
+  ]}
+/>
+
+In plain terms: a Senior reviewer finds the right problems and fixes them. A Staff reviewer also decides which
+three matter most, proves each fix with a test, and changes the structure (separate pools per model) where a
+local patch wouldn't be enough.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="(Reported, Anthropic) After the first few issues: how does this design handle overload?">
+    It doesn't: the queue grows without bound and retries multiply load. Bound the queue by time, admit per
+    tenant, shed by priority, retry once at one layer within a budget, and return `Retry-After`
+    (<Cite id="s-eab681003c" />).
+  </FollowUp>
+  <FollowUp q="(Reported, Anthropic) What are the weak points, and how would you improve it?">
+    Rank them: overload first, then failure handling (leases, bisection), then placement for mixed models, then
+    observability. Give each a test that proves the fix (<Cite id="s-4e3dc29a95" />).
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page, Anthropic) Using the doc's formula, how many GPUs? Why does reality fall short?">
+    1,000 ÷ B GPUs at 100% busy for 10,000 QPS and 100 ms batches; divide by a utilization target. Reality falls
+    short because batches don't fill, padding wastes slots, failures redo work and routing is uneven (<Cite id="s-f24bae1f6b" />).
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page, Anthropic) One tenant sends 60% of traffic. Protect the others.">
+    Per-tenant token buckets sized by contract, a per-tenant share of queue capacity, and fair dequeuing across
+    tenants (weighted round-robin over tenant queues) so a burst only delays its sender (<Cite id="s-f24bae1f6b" />).
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page, Anthropic) How do you canary a new model version on this fleet?">
+    A separate pool for the new version, a small share of traffic routed by user hash, comparison of error rate,
+    latency and a fixed eval set, and automatic rollback on regression (<Cite id="s-f24bae1f6b" />).
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) The author disagrees with your top finding. What now?">
+    Ask what traffic or constraint makes the queue safe in their view, and propose a replay at 2× peak as the
+    tiebreaker. A design review settles on evidence, not seniority.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Redesigning from scratch.** The round asks for a review; keep the author's structure and change what breaks.
+- **Equal-weight lists.** Twenty findings with no order hide your judgment; rank them and lead with three.
+- **Skipping the math.** The doc's sizing error is often the easiest finding to prove (<Cite id="s-f24bae1f6b" />).
+- **Missing compound retries.** Retries at two layers multiply, so count attempts across all layers.
+- **Critiquing the interviewer.** A reported candidate regrets that they "pushed on that too directly"
+  (<Cite id="s-4e04a1689c" />); disagree with the design, not the person.
+- **Vague comments.** "This won't scale" gives the author nothing to act on; name the behaviour, how to reproduce
+  it, and the narrow change (<Cite id="s-b6632d5df9" />).
+
+## Prove it with a lab
+
+<LabRef lab="load-balancer" role="proof" note="Circuit breaker after 5 consecutive 5xx and a 20% retry budget, with a review-worthy bug in its v2 retry path." />
+
+Treat its v2 retry as a review exercise. The retry runs after `forward` already wrote the first 5xx and its body,
+so the client never sees the retried answer. A retried POST also goes out with an empty body, because `r.Body`
+(a stream that can be read only once) is reused. Finding that by reading is the skill this round tests.
+
+<LabRef lab="rate-limiter" role="proof" note="Per-tenant token buckets and a shared counter: the admission control the invented doc lacks." />
+
+It fails open on a Redis pipeline error: if the shared counter can't be reached, it lets the request through.
+Decide whether an expensive GPU tier should fail open or closed, and write that down as a review comment.
+
+<LabRef lab="message-queue" role="partial" note="Visibility timeouts, receive counts and a dead-letter queue: leases and poison handling." />
+
+`SendMessage` appends without a cap: the unbounded-queue finding in code. Its delayed-message test panics as of
+2026-10-11.
+
+<LabRef lab="llm-inference" role="partial" note="A small engine to review end to end." />
+
+Review `src/v2_batched.py` as if it were a design doc. Admission ignores the memory allocator's out-of-memory
+return, and every request still gets its own forward pass (one run through the model), so the "batch" doesn't
+actually batch.
+
+<LabRef lab="observability" role="partial" note="Histograms and trace propagation for the metrics a doc should promise; it doesn't compile yet." />
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-eab681003c" />: Anthropic Staff design-doc review (Batch Sampling Service)
+- <Cite id="s-4e3dc29a95" />: Anthropic EM, critique of a half-built inference design
+- <Cite id="s-3650fe20d8" />: PracHub Anthropic ML system design titles
+- <Cite id="s-f24bae1f6b" />: PracHub, review a batched GPU inference API design doc (site-written body)
+- <Cite id="s-4e04a1689c" />: Anthropic inference-team loop; pushing on assumptions
+- <Cite id="s-b6632d5df9" />: Fireworks prep guide (PracHub); what a useful review comment contains
+- [Google SRE book, Handling Overload](https://sre.google/sre-book/handling-overload/)
+- [Anthropic API rate limits](https://platform.claude.com/docs/en/api/rate-limits) (fetched 2026-10-11)
+- [Cohorte, self-hosted LLM break-even](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even) (2026-09-20); [Lambda pricing](https://lambda.ai/pricing), [Together pricing](https://www.together.ai/pricing) (fetched 2026-10-11)
+- [Latent Space on hiring at Elicit](https://www.latent.space/p/hiring) (2024-06-21); [PostHog hiring process](https://posthog.com/handbook/people/hiring-process)

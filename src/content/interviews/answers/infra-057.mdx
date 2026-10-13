@@ -1,0 +1,175 @@
+---
+question: infra-057
+family: move-big-bytes
+status: published
+labs: [faas-runtime, cdn-edge]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "A cold start is a chain of steps: place the container, start it, fetch the weights, copy them to the GPU,
+> start the engine. For a 40 GB model, fetching the weights dominates, and its time depends on where the
+> bytes are: about 20 seconds from object storage, 8 from local disk, 2 from memory. So the second start is
+> fast when it lands where the bytes already are. Then I size a pool of ready containers from how often bursts
+> arrive times how long a cold start takes, and turn each second of cold start into dollars of idle GPU."
+>
+> The rest of this page explains each part of that answer.
+
+The task: a GPU container serves a 40 GB model. Make its second start fast, and design the pool of ready
+containers. The interviewer wants to know whether you know which step of a cold start you are paying for, and
+whether you can price a warm pool.
+
+### What makes this different from a normal cold start
+
+You know cold starts from serverless functions: a few hundred milliseconds to start a runtime and load some
+code. The fixes are small images and keeping a few instances warm, and a warm instance costs almost nothing.
+
+A GPU model breaks both assumptions. The model's **weights** (the numbers it learned in training, stored as
+files) are 40 GB, so loading them takes seconds to minutes, not milliseconds. And a warm GPU container costs
+dollars an hour while it sits idle. So "keep some warm" has a real price, and every second of cold start you
+remove reduces how many you need.
+
+The question comes from a prep article about Modal that cites no first-hand sources. It calls "just keep
+instances always on" the weak answer (<Cite id="s-86890a1069" />).
+
+## Clarify first
+
+- **Where do the 40 GB live now?** Object store, a network volume, local NVMe SSD, or host memory?
+- **Interactive or batch?** How long may the first request wait?
+- **How bursty is demand?** How often does traffic need a container beyond the ones already running?
+- **GPU price.** "I'll assume $2 per GPU-hour for the arithmetic."
+- **Is the model dense?** A **dense** model reads every weight to produce its first word, so all 40 GB must be
+  loaded before it can answer.
+
+## Answer
+
+### Words you need first
+
+- **Cold start**: the time from "we need one more container serving" to "it answers its first request".
+- **Warm spare**: a container that is already loaded and idle, ready for the next burst. Several of them form
+  a **warm pool**.
+- **Page cache**: the operating system's in-memory copy of recently read files. A file in page cache reads at
+  memory speed.
+
+A 40 GB model is roughly a 70-billion-parameter model stored at 4 bits per weight instead of 16, a format
+called **int4** (it also stores one 16-bit scale per 32 weights, so it comes to 39.4 GB, not 35).
+
+### The steps, and where the time goes
+
+```
+Place on a host ──► Start container ──► Fetch weights ──► Copy to GPU ──► Start engine ──► first answer
+                                         (the big one)
+```
+
+Write the steps down, because each has a different fix. For a 40 GB model the fetch dominates, and its time
+depends on where the bytes are:
+
+| Where the 40 GB are | Load time (assumed bandwidths) | What to say in the interview |
+|---|---|---|
+| Object store, 2 GB/s | **about 20 s** streamed; 22 s step by step; 32 s if written to local disk first | "Never write to disk and read it back on the critical path." |
+| Local NVMe SSD, 5 GB/s | **about 8 s** | "Put restarts on hosts that already have the file." |
+| Page cache, 20 GB/s | **about 2 s** | "The fastest second start lands where the bytes already are." |
+
+"Streamed" means the copy to the GPU starts on the first chunk while later chunks are still arriving, so the
+total is set by the slowest step, not the sum.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+T_load ≈ S ÷ min(source bandwidth, host-to-GPU bandwidth) + T_init, with S = 40 GB.
+
+- 70 × 10⁹ × 4.5 bits ÷ 8 = 39.4 GB.
+- Object store at 2 GB/s, then host-to-GPU at 20 GB/s: 20 s + 2 s = 22 s step by step, about 20 s streamed.
+  Writing to local disk on the way (40 ÷ 4 = 10 s) makes it 32 s.
+- Local NVMe at 5 GB/s: about 8 s streamed. Page cache at 20 GB/s: about 2 s.
+
+</details>
+
+### Make the second start land where the bytes are
+
+Place restarts on hosts that hold the model in page cache or on local NVMe. Hash each model to a few preferred
+hosts so that is likely. Elsewhere, stream from a peer or a cache straight into GPU memory, instead of writing
+a file and reading it back.
+
+Two ideas sound helpful but don't fix the weights:
+
+- **Lazy loading** (fetching file contents only when they are first read) helps the container image and its
+  libraries. A dense model reads every weight for its first word, so nothing about the weights is lazy.
+- **GPU memory snapshots** (saving the loaded GPU state and restoring it) need care. Modal's own docs list them
+  as alpha and say they "do not speed up model loading from storage"; they target imports and compilation
+  ([Modal docs](https://modal.com/docs/guide/memory-snapshot), fetched 2026-10-12).
+
+Say: "I'd fix where the bytes live first. Snapshots help with start-up code, not with loading weights."
+
+### Size the warm pool
+
+How many warm spares do you need? Enough to cover the bursts that arrive while a new container is still
+starting. This is **Little's law**: the number of things in progress equals their arrival rate times how long
+each takes.
+
+Worked example: new containers are needed at 0.5 per second during bursts.
+
+| Cold start | Spares needed | Idle cost (assumed $2/GPU-hour) |
+|---|---|---|
+| 30 s | **about 15** | **about $720 a day** |
+| 4 s | **about 2** | **about $96 a day** |
+
+So the pool is proportional to the cold-start time, and "faster cold start" and "smaller pool" are one lever.
+Say: "At these numbers every second I cut from the cold start is worth about $24 a day."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+n_warm ≈ λ_new × T_cold, where λ_new is the rate of new-container demand. Idle cost per day ≈ n_warm × p × 24.
+
+- 0.5/s × 30 s = 15 spares; 15 × $2 × 24 = $720 a day.
+- 0.5/s × 4 s = 2 spares; 2 × $2 × 24 = $96 a day.
+- One second saved: 0.5 × $2 × 24 = $24 a day.
+
+</details>
+
+Run the pool as a control loop: measure the burst rate over a window, add a margin, and shrink slowly so a dip
+followed by a burst doesn't find the pool empty. Merge concurrent cold starts of the same model so a burst
+starts one load, not fifty.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Warm pool and cold start"
+  senior={["Breaks the start into stages with times, and places restarts where the bytes are."]}
+  staff={["Turns each second of cold start into dollars of idle GPU and decides when to stop engineering and pay for spares."]}
+/>
+
+In plain words: Senior knows where the time goes. Staff knows what each second costs and when to stop
+optimizing.
+
+## Small-team version
+
+On a serverless GPU platform the settings already exist. Modal exposes `min_containers` (a floor that stops
+scaling to zero), `buffer_containers` (spares while active) and `scaledown_window` (idle time before
+shutdown), and bills idle containers ([cold-start guide](https://modal.com/docs/guide/cold-start), fetched
+2026-10-12). Pre-download the weights into a volume or the image first; the same guide says that can cut boot
+"from minutes to seconds".
+
+Then price one warm replica. At Modal's list price of $0.000694 per second, an A100 80 GB GPU costs **$2.50 an
+hour**: about **$1,824 a month** always on, or about **$550** for an assumed 220 business hours
+([pricing](https://modal.com/pricing), fetched 2026-10-12). A cold start itself costs little GPU money: 60 s on
+an A100 is about $0.04.
+
+So: scale batch work to zero, and keep a floor of one only on interactive endpoints. Say: "A cold start costs
+latency, not money. I pay for one warm replica only where a user is waiting."
+
+## Pitfalls
+
+- **Quoting a cold-start time.** Derive it from where the bytes live and how fast that source reads.
+- **"Keep everything warm", or scaling an interactive endpoint to zero.** Both ignore what a spare costs and
+  what a user waits for.
+- **Expecting snapshots or lazy loading to fix dense weight loading.** Neither reduces the bytes read.
+- **Writing weights to disk and reading them back on the critical path.** That adds about 10 s for 40 GB.
+
+## Go deeper
+
+- Family walkthrough: [cold start anatomy and the warm pool](/system-design-labs/interviews/walkthroughs/move-big-bytes/#cold-start-anatomy-and-the-warm-pool) and its [Small-team version](/system-design-labs/interviews/walkthroughs/move-big-bytes/#small-team-version).
+- Pool logic with eviction and snapshots: <LabRef lab="faas-runtime" inline />. Coalescing concurrent misses: <LabRef lab="cdn-edge" inline />.

@@ -1,0 +1,213 @@
+---
+question: infra-001
+family: batcher-to-fleet
+status: published
+labs: [embedding-pipeline, rate-limiter, message-queue, load-balancer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'd put a queue in front of the GPU. Whenever the GPU finishes a batch, it takes everything waiting, up to
+> 100, so under load the batches fill themselves without a long timer. Each caller waits on a future keyed by its
+> request id, and the result is sent back to the server holding that caller's connection. The queue is bounded by
+> waiting time, so work that would miss its deadline is rejected at once. If the GPU dies mid-batch, its items go
+> back on the queue and are retried once if their deadline allows."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you can keep an expensive, batch-friendly machine busy without making any
+one caller wait too long, and whether you can say what happens when it breaks.
+
+In a normal backend, a worker handles one request at a time, and each request costs the same whether others are
+waiting or not. A GPU running a model is different in three ways:
+
+1. **A batch costs almost the same as one input.** Running the model means reading all of it from GPU memory
+   once per batch. One input or 100 inputs, that read happens once. So batching is worth a large multiple in
+   throughput, not a small optimisation.
+2. **Waiting to batch costs the caller time.** The first request in a batch waits for the others. You must decide
+   when to stop collecting.
+3. **The caller makes one blocking call, but the work runs elsewhere.** The request goes onto a queue, joins a
+   batch with strangers' requests, and runs on a GPU worker. You must route each answer back to the right caller.
+
+The one-GPU setup is the warm-up. The follow-ups decide the round: when to flush, how a queued result gets back to
+a blocked caller, a GPU dying mid-batch, and which GPU has room once there are several. Candidates have reported
+the first two from Anthropic loops (<Cite id="s-2348518c66" />, <Cite id="s-e9fee3985a" />).
+
+## Clarify first
+
+Spend a minute on the setup and say each assumption out loud.
+
+- **Is one input a fixed-cost run of the model, or a generated reply of varying length?** "I'll assume a fixed
+  cost per input first, and treat the model as a black box."
+- **How long does a batch take?** "I'll assume a fixed 40 ms per batch plus 0.6 ms per input, so a full batch of
+  100 takes 100 ms. These numbers are assumptions; tell me if you have real ones."
+- **Latency budget and client timeout?** "Assume p99 under 300 ms and a client timeout of 1 second."
+- **Arrival rate and burstiness?** Ask. The answer below works at several rates.
+- **Are retries safe?** "Running the model changes nothing, so I'll assume a retry has no side effects."
+
+## Answer
+
+### Words you need first
+
+- **Batch:** a group of inputs the GPU runs together in one pass of the model. Here it holds 1 to 100 inputs.
+- **Flush:** the moment the batcher stops collecting and sends the batch to the GPU.
+- **Future:** an object a request handler waits on, which another thread completes later with the answer.
+- **Lease:** when a worker takes items from the queue, they are hidden from other workers for a while. If the
+  worker doesn't confirm (ack) them in time, they reappear on the queue.
+
+### The design
+
+```
+Callers (each waits on one HTTP call)
+   │  1. request arrives
+   ▼
+API pod ── assigns id + deadline, checks the tenant's quota,
+   │       parks a future for the request
+   │  2. enqueue (id, deadline, reply_to, input)
+   ▼
+Queue ── bounded by how long a request may wait
+   │  3. when the GPU is free: take up to 100, under a lease
+   ▼
+GPU worker ── drops expired items, runs the batch
+   │  4. sends each result to the pod named in reply_to
+   ▼
+API pod ── completes the future, writes the response
+```
+
+**API pod.** A web server that holds callers' connections. It gives each request an id and a deadline, checks
+the tenant's (customer's) quota, and parks a future.
+
+**Queue.** Each item carries the id, the deadline, the input and `reply_to`, the address of the pod holding the
+caller's connection. It is bounded by waiting time, not by a count.
+
+**GPU worker.** When the GPU is free, it takes up to 100 items in one atomic operation under a lease, drops any
+whose deadline has passed, runs the rest, and sends each result to its `reply_to` pod. Then it acks the lease.
+
+### Why the batches fill themselves
+
+Use the simplest rule: **whenever the GPU is free, take everything waiting, up to 100.** It works like a lift
+that leaves as soon as it returns to the lobby. At light load it carries one or two people. Under load it fills
+up, because everyone who arrived during the last trip is waiting when it gets back. The batch size sets itself
+from the arrival rate. This is called **self-clocking**.
+
+### Follow one request through it
+
+Take one GPU at **800 requests a second** and follow one request, R. At that rate the batches settle at about 62
+inputs, which take about 77 ms (the arithmetic is in the box below).
+
+| Clock | Step | What happens | What to say in the interview |
+|---|---|---|---|
+| 0 ms | Arrive | The pod gives R an id and a deadline 300 ms away, checks quota, parks a future. | "The deadline travels with the request." |
+| ~1 ms | Enqueue | R goes on the queue with `reply_to` set to this pod. | "Any GPU can answer any caller." |
+| ~38 ms | Wait, then pull | The previous batch finishes. The worker takes about 62 items, R among them. | "The wait during one batch is what fills the next." |
+| ~115 ms | Run, reply | The batch of about 62 runs for about 77 ms. R's result goes to its pod, which completes the future. | "R saw one blocking call of about 115 ms." |
+
+On average R waits half a batch (about 38 ms) and then rides one batch (about 77 ms): about **115 ms**. At worst,
+R arrives just as a batch starts and waits a whole one: about **154 ms**. Both fit the 300 ms budget. At
+**1,000 requests a second** the batch is always full at 100 and the GPU is saturated. Above that, no flush policy
+helps; only rejecting work at the door does. That is **admission control**.
+
+Say it like this: "Batching pays because each batch has a big fixed cost. Under load, the batch fills itself, so
+the timer only matters when the GPU is idle."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Batch time is `T(b) = a + c × b`, with a = 40 ms and c = 0.6 ms (assumed). Throughput at batch size b is
+`b ÷ T(b)`: 24.6 requests/s at b = 1, 1,000/s at b = 100.
+
+The batch settles where the arrivals during one batch equal the next batch, `b = λ × T(b)`:
+
+<Formula
+  title="Self-clocking batch size"
+  expr="b* = λ × a ÷ (1 − λ × c)     (stable while b* ≤ 100)"
+  vars={[
+    { sym: 'λ', meaning: 'arrival rate, requests per second' },
+    { sym: 'a, c', meaning: 'fixed and per-input batch cost, in seconds' },
+  ]}
+  example={[
+    'λ = 500/s: 20 ÷ 0.70 = 28.6 per batch, T = 57 ms',
+    'λ = 800/s: 61.5 per batch, T = 77 ms; average latency ≈ 38 + 77 = 115 ms',
+    'λ = 1,000/s: saturated at 100 per batch; above this only admission control helps',
+  ]}
+/>
+
+Worst case at 800/s is 2T ≈ 154 ms.
+
+</details>
+
+### The follow-ups
+
+**When do you flush?** Flush when the GPU is free and either the batch is full, the oldest item has waited a short
+window `W`, or waiting longer would break a deadline. The two simple rules each fail at one level of load.
+Size-only flushing ("wait for 100") strands a lone request at low load. Timer-only flushing ("every 20 ms")
+launches small batches at high load and caps throughput. Taking a batch must be one atomic queue operation, so a
+size trigger and a timer firing together can't grab the same items.
+
+**How does the result get back?** In one process, keep a map from request id to future. Across machines, the
+request carries `reply_to`, and the worker sends the result straight there. If two results arrive for one id
+after a requeue, the first wins and the rest are dropped.
+
+**Bound the queue by time.** Reject a new request at once if its estimated wait (queue depth ÷ how fast the GPU
+drains it) exceeds its budget. Because deadlines travel with requests, the worker also drops anything whose caller
+has already given up. Computing answers nobody is waiting for is how overload turns into an outage.
+
+**The GPU dies mid-batch.** The worker stops renewing its lease. When the lease expires, the items go back to the
+head of the queue with an attempt count. Retry once if the deadline allows, otherwise fail fast with a retryable
+error. DesignGurus gives the same choice: retry idempotent in-flight requests or fail fast
+(<Cite id="s-5f44d8637a" />). If the same items also fail on a second GPU, one input is probably a **poison
+input** that crashes any worker. Split the batch in halves until you find it, and move it to a **dead-letter
+queue** (a holding area for work that keeps failing).
+
+**Several GPUs: which one has room?** Let workers pull from the queue. A GPU asks for work exactly when it has
+room, so nothing has to track capacity, and a slow GPU simply asks less often. Routing by pushing work to GPUs
+makes sense only when placement matters, for example when a model is loaded on only some of them.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="One GPU, 100 inputs"
+  senior={["Derives batch size and latency from a stated cost model, bounds the queue by time and requeues on failure with a retry limit."]}
+  staff={["Treats the batch as the unit of failure (bisection), answers the capacity question with pull vs push, and names the metric (flush reason, queue wait) that would show the policy is wrong."]}
+/>
+
+## Small-team version
+
+At a company of 50–500 people you rarely own this layer. A hosted model API batches for you. If you self-host an
+**embedding model** (one that turns text into numbers for search) or a small generator, use a serving engine that
+batches internally and keep your own batcher to one process.
+
+What stays yours: deadlines on every call, a bounded queue, per-tenant limits, and a test that kills the worker
+mid-batch.
+
+Self-hosting rarely wins on cost alone. One always-on NVIDIA L4 (a small data-centre GPU) at RunPod's $0.44 an
+hour (fetched 2026-10-11) costs about **$321 a month**. An embeddings API at $0.02 per million tokens costs the
+same only at about **16 billion tokens a month**. (A **token** is the unit models count text in, roughly three
+quarters of a word.)
+
+Buy the API; host a small model yourself only when steady volume approaches that break-even at high utilisation,
+when the round trip to the API breaks your latency budget, or when the data can't leave your network.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+$0.44 × 730 hours ≈ $321 a month. $321 ÷ $0.02 per million ≈ 16,000 million tokens a month.
+
+</details>
+
+## Pitfalls
+
+- **Flushing only on a fixed timer.** The GPU idles beside a half-full batch at low load, and batches stay small
+  at high load.
+- **An unbounded queue.** Under overload, every caller waits, and they all time out together.
+- **Retrying a poison batch whole.** The bad input crashes one GPU after another; split the batch to find it.
+- **Arguing with the black-box framing.** One inference-team candidate says, in hindsight, that they pushed on
+  the assumptions "too directly"; add depth inside the frame instead (<Cite id="s-4e04a1689c" />).
+
+## Go deeper
+
+- Family walkthrough: [From one GPU batcher to a fleet](/system-design-labs/interviews/walkthroughs/batcher-to-fleet/), especially its back-of-envelope and failure sections.
+- A measured dynamic batcher with futures: <LabRef lab="embedding-pipeline" inline />. Admission: <LabRef lab="rate-limiter" inline />. Requeue semantics: <LabRef lab="message-queue" inline />.
+- For variable-length generation: [Continuous batching](/system-design-labs/interviews/walkthroughs/continuous-batching/).

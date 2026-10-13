@@ -1,0 +1,215 @@
+---
+question: r2b-014
+family: llm-from-scratch
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "A modern decoder block has two steps, attention and then a feed-forward layer, and each step is
+> normalized first and then added back onto its input. Modern models use RMSNorm, which only rescales, and a
+> SwiGLU feed-forward layer, which has three matrices instead of two: one makes a gate, one makes values, the
+> two are multiplied, and the third projects back down. Because there are three matrices, I shrink the hidden
+> size to 8/3 of the model width so the parameter count matches the older 4× design. I'll test the output
+> shape, the parameter count and causality."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer is checking that you know what a current decoder block looks like, beyond the 2017 paper. A
+strong answer gets the gated feed-forward right, puts the norms and residual adds in the right places, and can
+justify the hidden size with arithmetic.
+
+The trap is that most mistakes here still run. Apply the gate to the wrong branch, keep the old hidden size,
+or forget to remove LayerNorm's mean subtraction, and you still get an output of the right shape. Nothing
+crashes. You catch these by stating the design out loud and checking counts, not by watching for errors. That
+is unlike most backend code, where a wiring mistake usually fails at the first call.
+
+(The evidence is one question title, "Implement a Transformer Block with SwiGLU", Google MLE, Dec 2025, with no
+body <Cite id="s-4e3fbcaea8" />.)
+
+## Clarify first
+
+- **Norm placement.** "Pre-norm with RMSNorm, as in Llama-style models? I'll assume yes."
+- **Attention.** "Causal attention, plain multi-head or grouped-query? I'll assume causal, with GQA as an
+  option."
+- **Hidden size.** "Is the feed-forward hidden size given, or should I choose it? I'll choose it and justify
+  it."
+- **Biases.** "No bias terms, like Llama? I'll assume none."
+
+## Answer
+
+### Words you need first
+
+- **Block**: one repeated unit of the model. A decoder is a stack of identical blocks.
+- **Attention**: each token looks back at earlier tokens and takes a weighted mix of their information.
+- **Feed-forward layer (MLP)**: a small network applied to each token on its own. Its inner width is `d_ff`.
+- **Residual connection**: `x = x + f(x)`; the sub-layer's output is added back onto its input.
+- **Normalization**: rescales each token's vector to a steady size. **Pre-norm** does this inside the residual
+  branch, before the sub-layer.
+- **RMSNorm**: divides by the root-mean-square of the vector and multiplies by a learned scale. Unlike
+  **LayerNorm**, it subtracts no mean and adds no bias.
+- **SiLU**: the function `z × sigmoid(z)`, a smooth version of "keep positives, squash negatives".
+- **SwiGLU**: a gated feed-forward layer. `silu(x·W_gate)` is multiplied element by element with `x·W_up`, then
+  `W_down` projects back to `d_model`.
+
+### A picture of the block
+
+```text
+x  (B, T, d_model)
+ │
+ ├──► RMSNorm ──► attention ──┐
+ │                            ▼
+ x = x + ◄────────────────────┘          residual add 1
+ │
+ ├──► RMSNorm ──► SwiGLU ─────┐
+ │      gate = silu(x·W_gate) │
+ │      up   = x·W_up         │
+ │      out  = (gate × up)·W_down
+ │                            ▼
+ x = x + ◄────────────────────┘          residual add 2
+ │
+ ▼
+x  (B, T, d_model)                        same shape out
+```
+
+**The first branch** normalizes and runs attention, then adds the result back. **The second branch**
+normalizes and runs SwiGLU, then adds the result back. The straight line down the left is never normalized,
+which is what pre-norm means and why deep stacks train stably.
+
+### Follow one token through it
+
+Take `d_model` = 96. The default hidden size is `d_ff` = 8 × 96 ÷ 3 = 256. One token's vector of 96 numbers
+goes through the SwiGLU branch like this:
+
+| Step | Size | What to say in the interview |
+|---|---|---|
+| RMSNorm | 96 | "Rescale only; no mean, no bias." |
+| `x·W_gate`, then SiLU | 256 | "The gate decides how much of each hidden unit passes." |
+| `x·W_up` | 256 | "The values to be gated." |
+| gate × up | 256 | "Element by element." |
+| `·W_down` | 96 | "Back to model width." |
+| add to input | 96 | "Residual add; same shape out." |
+
+### The code
+
+```python
+class RMSNorm(nn.Module):
+    def __init__(self, d, eps=1e-5):
+        super().__init__()
+        self.eps, self.weight = eps, nn.Parameter(torch.ones(d))
+    def forward(self, x):                                  # scale only; no mean, no bias
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.w_gate = nn.Linear(d_model, d_ff, bias=False)
+        self.w_up = nn.Linear(d_model, d_ff, bias=False)
+        self.w_down = nn.Linear(d_ff, d_model, bias=False)
+    def forward(self, x):                                  # (B, T, d_model)
+        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+
+class Block(nn.Module):
+    def __init__(self, d_model, n_heads, n_kv_heads=None, d_ff=None):
+        super().__init__()
+        d_ff = d_ff or int(8 * d_model / 3)
+        self.norm1, self.attn = RMSNorm(d_model), Attention(d_model, n_heads, n_kv_heads)
+        self.norm2, self.mlp = RMSNorm(d_model), SwiGLU(d_model, d_ff)
+    def forward(self, x, cache=None):
+        x = x + self.attn(self.norm1(x), cache)
+        return x + self.mlp(self.norm2(x))
+```
+
+### The gate and its source
+
+SwiGLU comes from Shazeer's "GLU Variants Improve Transformer"
+([arXiv 2002.05202](https://arxiv.org/abs/2002.05202), read 2026-10-12). Llama-3.1-8B's config lists `silu` as
+its activation (<Cite id="s-20bffa9709" />). Say: "SiLU goes on the gate branch only; the up branch stays
+linear."
+
+### Why the hidden size is 8/3 of the width
+
+The older feed-forward layer had two matrices and a 4× expansion. SwiGLU has three. To keep the same number of
+parameters, the hidden size shrinks:
+
+<Formula
+  title="Matching a 4× MLP's parameters"
+  expr="3 × d_model × d_ff = 2 × d_model × 4 d_model  ⇒  d_ff = 8 d_model ÷ 3"
+  vars={[{ sym: 'd_ff', meaning: 'feed-forward hidden size' }, { sym: '3', meaning: 'gate, up and down matrices' }]}
+  example="d_model = 96 → d_ff = 256, 73,728 parameters vs 73,728 for the GELU MLP; Llama-3.1-8B uses 14,336 ÷ 4,096 = 3.5 instead"
+/>
+
+So at `d_model` = 96 both designs have **73,728 parameters**. Real models don't always use 8/3:
+Llama-3.1-8B uses 14,336 ÷ 4,096 = **3.5**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Older MLP: two matrices of `d × 4d` = 8d² parameters. At d = 96: 8 × 9,216 = 73,728.
+- SwiGLU: three matrices of `d × d_ff`. Setting 3 × d × d_ff = 8d² gives d_ff = 8d ÷ 3 = 256 at d = 96.
+  3 × 96 × 256 = 73,728.
+- Keeping d_ff = 4d with three matrices gives 12d², which is 50% more than 8d².
+
+</details>
+
+### Verify the block
+
+1. **Shape:** the output shape equals the input shape.
+2. **Parameter count:** it matches the formula.
+3. **Causality:** changing the last token leaves earlier outputs unchanged.
+4. **RMSNorm:** it matches `torch.nn.RMSNorm` on random input.
+
+If the interviewer adds a KV cache (stored keys and values from earlier tokens, used when the model generates
+one token at a time), the block only passes it through to attention. The feed-forward layer works on each
+position independently, so it needs no cache.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="A SwiGLU block"
+  senior={["Correct gate, norms and residuals, with d_ff chosen and justified."]}
+  staff={["Explains why the hidden size shrinks to keep parameters equal, notes that real models pick other ratios, and connects GQA in the same block to KV-cache size."]}
+/>
+
+## Small-team version
+
+You will never implement this block for production. You will read model configs before you decide whether to
+host a model yourself. Three fields tell you the memory and compute you are signing up for:
+`num_key_value_heads` (how big the per-token cache is), `intermediate_size` (the `d_ff` above) and `hidden_act`
+(the activation).
+
+Worked example: Llama-3.1-8B's config gives 8.03B parameters. In bf16 (2 bytes per number) that is **16.06 GB
+of weights**. Its cache costs **131,072 B per token**, about 1.07 GB for one 8,192-token request. So one 80 GB
+GPU holds the model plus **a few dozen 8K-token requests**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Weights: 8.03B × 2 B = 16.06 GB.
+- Cache per token: 2 (K and V) × 32 layers × 8 KV heads × 128 × 2 B = 131,072 B.
+- One 8,192-token request: 8,192 × 131,072 B ≈ 1.07 GB.
+
+</details>
+
+Default: a managed API, or the same open model on a serverless endpoint. Read the config only when
+self-hosting is on the table: steady high volume, a data-residency requirement, or a narrow task a small model
+wins.
+
+## Pitfalls
+
+- **Two matrices instead of three.** Without the separate up projection there is nothing to gate, so it isn't
+  SwiGLU.
+- **SiLU on the wrong branch.** The gate gets the SiLU; putting it on the up branch changes the function.
+- **Keeping `d_ff = 4 × d_model`.** With three matrices that silently grows the parameter count by 50%.
+- **LayerNorm called "RMSNorm".** If the mean is still subtracted, it is LayerNorm, and it won't match the
+  reference.
+- **Norms placed after the residual add without saying so.** That is post-norm, a different design that trains
+  differently.
+
+## Go deeper
+
+- Family walkthrough: [Stage 5: a modern block](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#stage-5-a-modern-block).
+- Lab: <LabRef lab="transformer" inline /> (GELU MLP; swap in SwiGLU as an exercise).

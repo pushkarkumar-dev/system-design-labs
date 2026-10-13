@@ -1,0 +1,174 @@
+---
+question: infra-067
+family: gpu-kernel-perf
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "FlashAttention computes exact attention in tiles. A block of threads loads a tile of queries into fast on-chip
+> memory, then streams tiles of keys and values past it. For each query row it keeps a running maximum, a running
+> sum and a running output. When a new tile brings a bigger maximum, it rescales what it has so far. At the end it
+> divides by the sum and writes only the output and two numbers per row. The full score table never goes to GPU
+> memory, and the backward pass recomputes it from those two numbers."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The interviewer wants you to walk through FlashAttention's inner loop line by line: what sits in fast memory,
+what the rescaling does, what gets written out, and what the backward pass recomputes. It is a "can you read the
+source" question.
+
+First, what the loop computes. In a language model, **attention** lets each token (a chunk of roughly ¾ of a
+word) look at the other tokens. Each token has a **query** vector, a **key** vector and a **value** vector, of
+length d (often 64 or 128). Attention scores each query against every key, turns each row of scores into weights
+with a **softmax** (raise *e* to each score, divide by the row's sum), and uses the weights to average the
+values. For N tokens, that is an N × N table of scores per **head** (a model runs many heads side by side).
+
+What makes FlashAttention interesting to a backend engineer: it does *more* arithmetic than the obvious version,
+and is faster anyway. A GPU does arithmetic far faster than it reads its main memory, so a step that reads and
+writes a huge table is limited by memory speed. FlashAttention recomputes instead of storing, and comes out ahead.
+It is the same instinct as "recompute a cheap value rather than fetch it from a slow store".
+
+(The evidence that this depth is asked is a Blind post, May 2026, saying infra candidates who can't go
+"source-code deep" on Megatron-LM, ZeRO and FlashAttention shouldn't apply. Commenters call it an ad for the
+poster's course, so treat it as low confidence <Cite id="s-a129aa6451" />.)
+
+## Clarify first
+
+- **Forward only, or forward and backward?** The **forward pass** computes the output; the **backward pass**,
+  used in training, works out how to adjust the model.
+- **FlashAttention 1 or 2 loop order?** They swap which loop is outside.
+- **Causal mask? Dropout?** A causal mask stops tokens looking ahead; dropout randomly zeroes weights in training.
+- **Pseudocode level or CUDA level** (warps, shared memory)?
+
+## Answer
+
+### Words you need first
+
+- **HBM** is the GPU's main memory: large (80 GB) but slow to reach. **SRAM** is the small on-chip memory, around
+  100 KB per compute unit, shared by a **thread block** (a group of GPU threads that work together).
+- **Online softmax** computes a softmax in one pass by keeping a running maximum and a running sum, and
+  rescaling the sum whenever the maximum grows.
+
+### The forward loop, one head, FlashAttention-2 order
+
+Each thread block owns a tile of B_r query rows and streams tiles of B_c key and value rows past it:
+
+```python
+for i in range(0, N, Br):                    # one Q tile per thread block
+    q = Q[i:i+Br]; m = -inf; l = 0; acc = 0  # per-row running max, sum, output
+    for j in range(0, N, Bc):                # K, V tiles through SRAM
+        s = q @ K[j:j+Bc].T * scale          # [Br, Bc] scores
+        m_new = max(m, rowmax(s))
+        p = exp(s - m_new)
+        corr = exp(m - m_new)                # rescale earlier partial results
+        l = l * corr + rowsum(p)
+        acc = acc * corr + p @ V[j:j+Bc]
+        m = m_new
+    O[i:i+Br] = acc / l                      # also store m and l (or logsumexp) for backward
+```
+
+A NumPy version ran on 2026-10-12 (N = 1,024, d = 64) and matched naive attention to 5.6 × 10⁻¹⁶. The original
+paper put K and V on the outer loop and set B_c = ⌈M ÷ 4d⌉ for SRAM size M
+([arXiv 2205.14135](https://arxiv.org/abs/2205.14135)).
+
+### The worked example: one query row, two tiles
+
+Follow one query row through the loop with tiles of 2 keys. To keep it small, let each value be a single number.
+The row's four scores are 1, 3, 5 and 2, and the four values are 10, 20, 30 and 40.
+
+| Step | m (max) | l (sum) | acc (output so far) | What to say in the interview |
+|---|---|---|---|---|
+| Start | −∞ | 0 | 0 | "Nothing seen yet." |
+| Tile 1: scores 1, 3 | 3 | 1.135 | 21.35 | "Everything is measured against the current max, 3." |
+| Tile 2: scores 5, 2 | 5 | 1.203 | 34.88 | "The max grew, so I multiply l and acc by e^(3 − 5) = 0.135 before adding the new tile." |
+| Finish | | | 34.88 ÷ 1.203 = **28.98** | "Same answer as computing all four at once." |
+
+Computing all four scores at once gives exactly 28.98. The whole trick is the `corr` line: every earlier
+partial sum and partial output was built against an older maximum, so multiplying by e^(m − m_new) moves them onto
+the new one.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Tile 1:** m = 3. l = e^(1−3) + e^(3−3) = 0.135 + 1 = **1.135**. acc = 0.135 × 10 + 1 × 20 = **21.35**.
+- **Tile 2:** m_new = 5, corr = e^(3−5) = 0.135. p = e^(5−5), e^(2−5) = 1, 0.050.
+  l = 1.135 × 0.135 + 1 + 0.050 = **1.203**. acc = 21.35 × 0.135 + 1 × 30 + 0.050 × 40 = **34.88**.
+- **Output:** 34.88 ÷ 1.203 = **28.98**.
+- **Check, all at once:** weights e^(x − 5) for 1, 3, 5, 2 are 0.018, 0.135, 1, 0.050, summing to 1.203;
+  (0.18 + 2.71 + 30 + 1.99) ÷ 1.203 = **28.98**.
+
+</details>
+
+### What to say at each line
+
+- **The correction factor** is the online-softmax trick, explained above. Forgetting to rescale `acc` (not just
+  `l`) is the classic bug.
+- **Causal masking** skips tiles entirely above the diagonal (keys that come after every query in the tile),
+  which is about half the work.
+- **Where the arithmetic runs.** The two matrix multiplies (`q @ K.T` and `p @ V`) run on **Tensor Cores**, the
+  GPU's matrix-multiply units. The exponentials and rescaling are the non-matrix-multiply arithmetic, which
+  Tensor Cores don't speed up.
+
+### I/O: why it's faster
+
+"I/O" here means reads and writes to HBM. The paper's Theorem 2: Θ(Nd + N²) HBM accesses for standard attention
+against Θ(N²d²M⁻¹) for FlashAttention, and "for typical values of d (64-128) and M (around 100KB), d² is many
+times smaller than M". Extra memory is O(N): two numbers per row, instead of an N × N table.
+
+### Backward: recompute, don't store
+
+By "storing the output O and the softmax normalization statistics (m, ℓ), we can recompute the attention matrix"
+tile by tile, instead of reading a stored N × N matrix. That is more arithmetic (more **FLOPs**, floating-point
+operations) and less HBM traffic, and it runs faster.
+
+Say it like this: "The backward pass redoes the score tiles from Q, K and the saved max and sum. That costs FLOPs,
+but attention is limited by memory, so it's a good trade."
+
+### Why version 2 was faster
+
+FlashAttention-2 reports that the first version reached "only 25-40% of the theoretical maximum FLOPs/s" and the
+second 50–73% on A100, about 2× faster. It did three things: cut the non-matrix-multiply FLOPs; parallelized over
+sequence length (so one long sequence with few heads still fills the GPU); and split work between **warps**
+(groups of 32 threads) to reduce shared-memory traffic
+([arXiv 2307.08691](https://arxiv.org/abs/2307.08691)).
+
+## Senior vs Staff
+
+<LevelContrast
+  title="FlashAttention at depth"
+  senior={["Writes the tiled loop with the rescaling, explains the statistics saved and the recomputation in backward."]}
+  staff={["Explains the I/O bound and when it weakens (large d against SRAM), why v2 changed parallelism, and what kernel support a new attention variant would need."]}
+/>
+
+In plain words: a Senior answer can write and explain the loop. A Staff answer also knows its limits: bigger heads
+leave less room in SRAM, and any new attention variant needs the kernel to support it.
+
+## Small-team version
+
+You will use these kernels through PyTorch or a serving engine. Knowing the loop helps you read failures. An
+unsupported head size or mask can silently fall back to a slower path, and that is a real production issue to
+check in the profiler.
+
+Buy, don't build: the kernels ship with PyTorch and the serving engines, and writing your own rarely pays back at
+a few GPUs. The check is cheap: one profiler session of about an hour on a rented A100 costs **$1.39–$1.59** at
+RunPod list prices (fetched 2026-10-11). The fallback is not cheap: at 8K tokens a materialized score table is
+about **8.6 GB per layer per sequence** for Llama-3.1-70B shapes (64 × 8,192² × 2 B). Revisit only if you adopt
+an attention variant your engine doesn't support.
+
+## Pitfalls
+
+- **Forgetting to rescale the accumulated output, not just the sum.** The output was built against the old
+  maximum, so it comes out wrong.
+- **Saying the N × N matrix is stored for backward.** Only the output and two numbers per row are stored; the
+  scores are recomputed.
+- **Claiming fewer FLOPs.** FlashAttention does more arithmetic; it wins on memory traffic.
+
+## Go deeper
+
+- Family walkthrough: [GPU kernel performance](/system-design-labs/interviews/walkthroughs/gpu-kernel-perf/), core concepts and worked example 3.
+- The comparison question: [infra-066](/system-design-labs/interviews/questions/infra-066/).
+- Replace the attention in <LabRef lab="transformer" inline /> with the tiled loop and check outputs match.

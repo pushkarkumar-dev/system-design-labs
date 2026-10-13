@@ -1,0 +1,158 @@
+---
+question: r2a-018
+family: move-big-bytes
+status: published
+labs: []
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "First I'll check whether the network can do it at all. 200 TB is 1.6 million billion bits. At 10 Gbit/s
+> that is about two and a half days in practice, at 1 Gbit/s almost a month, so below about 10 Gbit/s I'd ship
+> disks. Then I'd land it in object storage near the GPUs with checksums and a manifest so the copy can resume,
+> pack the small files into large shards, and measure whether reading and decoding keep up with the GPUs,
+> because idle GPUs are the expensive failure."
+>
+> The rest of this page explains each part of that answer.
+
+The task: move 200 TB of images and video from on-premises storage to a cloud GPU cluster, once, within "a few
+days". Then use it to train. The interviewer wants to see whether you do the bandwidth math before naming
+tools, and whether you follow the bytes all the way to the GPU.
+
+### What makes this different from a normal data migration
+
+You may have migrated a database: a few TB, copied over a weekend, then verified. Bandwidth was rarely the
+question.
+
+200 TB is different in two ways. First, at common link speeds the copy takes days or weeks, so "can the
+network do it at all?" is a real question, and the answer may be a truck of disks. Second, the data's job is
+to feed GPUs during training. GPUs are expensive and fast. If reading and decoding images can't keep up, the
+GPUs sit idle while you pay for them. The candidate named this risk "GPU starvation".
+
+In the first-hand Apple account (edited by PracHub), bandwidth was not given, so the candidate worked the move
+at 1, 10 and 100 Gbit/s, weighed shipping disks, and was then pushed toward the training input pipeline. The
+only feedback reported is that asking clarifying questions "was itself a point in my favor"
+(<Cite id="s-8e08e84623" />).
+
+## Clarify first
+
+- **One-time or recurring?** One-time, per the account. The deadline is "a few days".
+- **Link speed, and what else shares it?** Unknown in the account, so work several speeds.
+- **File count and sizes.** How many small images versus large videos?
+- **Where does it land?** Object storage near the cluster, or straight onto hosts?
+- **What reads it afterwards?** Preprocessing, inference, or training?
+
+## Answer
+
+### Words you need first
+
+- **Goodput**: the useful transfer rate you actually get, after protocol overhead and retries. The candidate
+  assumed about **70%** of the link's rated speed.
+- **Shard**: here, one large file that bundles many small training examples, so you read one 1 GB file instead
+  of a thousand 1 MB ones.
+- **Data loader**: the code that reads, decodes and batches examples for the GPUs during training.
+
+### Is the network fast enough?
+
+Links are sold in bits per second, so multiply bytes by 8. 200 TB is 1.6 × 10¹⁵ bits.
+
+| Link | At full speed | At 70% | What to say in the interview |
+|---|---|---|---|
+| 1 Gbit/s | 18.5 days | **26 days** | "Never makes a few-day window." |
+| 10 Gbit/s | 1.85 days | **2.6 days** | "Barely makes three days." |
+| 100 Gbit/s | 4.4 hours | **6.3 hours** | "Easy, if we really get it." |
+
+To finish in three days you need about **6.2 Gbit/s of goodput**, which is about 8.8 Gbit/s of link at 70%.
+So 10 Gbit/s barely makes it, 1 Gbit/s never does, and below that you ship disks. The candidate describes
+transfer appliances holding "tens of TB" each, so you would ship several in parallel.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+T = bytes × 8 ÷ (link rate × efficiency).
+
+- 1 Gbit/s: 1.6 × 10¹⁵ ÷ 10⁹ = 1.6 × 10⁶ s ≈ 18.5 days; ÷ 0.7 ≈ 26 days.
+- 10 Gbit/s: 160,000 s ≈ 1.85 days; about 2.6 days at 70%. 100 Gbit/s: 4.4 hours; 6.3 hours at 70%.
+- Three days: 200 × 10¹² bytes ÷ 259,200 s ≈ 0.77 GB/s = 6.2 Gbit/s of goodput; ÷ 0.7 ≈ 8.8 Gbit/s of line.
+
+</details>
+
+### The transfer
+
+```
+On-prem storage
+   │  many parallel streams (or shipped disks)
+   ▼
+Object storage near the GPU cluster  ◄── manifest: what has landed, with checksums
+   │  pack small files into ~1 GB shards
+   ▼
+Data loader (read → decode → shuffle → batch)
+   │
+   ▼
+GPUs (training)
+```
+
+**Copy with resume.** Use many parallel streams, a checksum per chunk, and a manifest of what has landed, so
+the job resumes after a failure instead of starting over. Encrypt in transit and at rest.
+
+**Count objects as well as bytes.** If half the bytes are images averaging an assumed 1 MB, that is 10⁸ (100
+million) objects. Object stores limit request rates: at S3's documented 3,500 PUTs per second per prefix (a
+**prefix** is the leading part of the key, like a folder), one prefix needs about **7.9 hours** of PUTs
+([S3 guidance](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html), fetched 2026-10-12).
+So pack small files into **shards of about 1 GB**, which makes 200,000 shards. The candidate proposed doing
+this with WebDataset or TFRecord, two common formats for bundling training examples. Say: "A bandwidth
+problem with 100 million small files is also a request-rate problem."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- 100 TB ÷ 1 MB = 10⁸ objects; 10⁸ ÷ 3,500 per second ≈ 28,600 s ≈ 7.9 hours.
+- 200 TB ÷ 1 GB = 200,000 shards.
+
+</details>
+
+### Feeding the GPUs
+
+The data loader streams shards with prefetching (reading ahead) and a **shuffle buffer**, which mixes
+examples from several shards so training doesn't see them in file order.
+
+Find the bottleneck by measuring, in order: how busy the GPUs are, how long each training step waits on the
+loader, read throughput, and decode rate. Worked example with assumed numbers: if the GPUs can consume 20,000
+images a second at 1 MB each, reads must reach **20 GB/s**. If one CPU core decodes 200 images a second,
+decoding needs **100 cores**. Either one starves the GPUs before the GPUs are the limit.
+
+Say: "Before buying more GPUs, I'd check how long each step waits on the data loader."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Bulk move"
+  senior={["Works the transfer at several link speeds, picks network or disks, and makes the copy resumable and verified."]}
+  staff={["Plans for the consumer from the start: packs shards for training, and names the measurement that shows whether network, decode or GPU is the bottleneck."]}
+/>
+
+In plain words: Senior gets the data there safely. Staff designs the copy around what reads the data next.
+
+## Small-team version
+
+Use the cloud provider's managed transfer service or an appliance rather than writing a copier. Your job is
+the math, the manifest, and checking counts and checksums at the end. Pack into shards before upload if you
+control the source.
+
+Before buying more GPUs for training, check data-loader wait, because idle GPUs are billed anyway. At an
+assumed $2 per GPU-hour, 8 GPUs waiting on the loader 30% of the time waste about **$115 a day**
+(8 × 0.3 × $2 × 24). If the link gives under about 6 Gbit/s of goodput for a 3-day window, order transfer
+appliances instead of tuning the copy.
+
+## Pitfalls
+
+- **Naming S3 and Kafka before computing the transfer time.** The time decides network or disks.
+- **Ignoring object count.** Per-request limits stretch what looks like a bandwidth problem.
+- **Copying with no manifest.** A failure then means starting over.
+- **Assuming the GPUs are the bottleneck.** Measure data-loader wait first.
+
+## Go deeper
+
+- Family walkthrough: [the one-time bulk move](/system-design-labs/interviews/walkthroughs/move-big-bytes/#the-one-time-bulk-move-and-feeding-the-gpus) and the [transfer-time formula](/system-design-labs/interviews/walkthroughs/move-big-bytes/#back-of-envelope).

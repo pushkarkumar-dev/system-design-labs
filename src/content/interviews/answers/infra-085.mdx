@@ -1,0 +1,160 @@
+---
+question: infra-085
+family: quant-specdec-moe
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "The two numbers control different resources. The 671 billion total parameters all have to sit in GPU memory, so
+> they decide how many GPUs I need: at 8 bits that's 671 GB, more than one 8-GPU machine. The 37 billion active
+> parameters decide the math per token, so once the model fits, each token costs about what a dense 37B model
+> costs, 18 times less than a dense 671B one. The saving is in compute, not memory, and at large batch sizes even
+> the saving in bytes read mostly disappears."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you can tell which resource each number in a model spec controls.
+
+Some background first. A model is a large set of learned numbers called **parameters** (or weights). In a normal
+"dense" model, every parameter is used for every **token** (roughly ¾ of a word) the model reads or writes. A
+**mixture-of-experts (MoE)** model is different. In each layer, it has many parallel blocks called **experts**, and
+a small scoring layer, the **router**, sends each token to only a few of them. So most parameters sit idle for any
+one token. "671B total, 37B active" means the model has 671 billion parameters, but each token only uses 37 billion.
+
+The backend analogy is a sharded service where each request touches only a few shards. Each request does less
+work. But you still have to provision every shard, and the hot shards set your latency. Keep that picture in mind;
+every point below follows from it.
+
+The prompt is from a techinterview.org prep guide's own example list, not a candidate report
+<Cite id="s-9e6b455b13" />. Its follow-ups test whether you know the saving shrinks at large batch, and where
+spreading experts across GPUs adds latency.
+
+## Clarify first
+
+- **Precision:** "Will we serve at 8 bits (fp8) or 16 bits (bf16)?" Assume fp8 for the arithmetic, and show bf16
+  too. Bytes per parameter: 1 at fp8, 2 at bf16.
+- **Hardware:** "80 GB GPUs in 8-GPU machines?" Assume so.
+- **Load:** "What batch size and latency target?" The **batch** is the set of requests the GPU serves together in one
+  step. This decides whether the "37B" saving shows up as speed.
+- **The real question:** "Do you mean the cost per token, or the cost to stand up the deployment at all?"
+
+## Answer
+
+### Two numbers, two resources
+
+Every token needs about 2 math operations per parameter it uses (one multiply and one add). Every parameter the
+model has must be stored, whether a token uses it or not. That gives the core rule:
+
+<Formula
+  title="Two numbers, two resources"
+  expr="FLOPs per token ≈ 2 × active params;   weight bytes = total params × bytes per param"
+  vars={[
+    { sym: 'active params', meaning: 'attention, router, shared experts and the k routed experts each token uses' },
+    { sym: 'total params', meaning: 'every expert in every layer, all resident in GPU memory' },
+  ]}
+  example="671B / 37B: 2 × 37 × 10⁹ = 74 GFLOP per token, against 1,342 GFLOP if dense (671 ÷ 37 = 18× fewer). Weights: 671 GB at fp8, 1,342 GB at bf16"
+/>
+
+A FLOP is one floating-point operation; a GFLOP is a billion of them.
+
+### The worked example: what an operator asks about this model
+
+| Question | Answer for 671B / 37B | What to say in the interview |
+|---|---|---|
+| How many GPUs to stand it up? | 671 GB of fp8 weights doesn't fit in one 8 × 80 GB = 640 GB machine, even before any per-conversation memory. You need two machines or lower precision. | "The fixed cost looks like a dense 671B model." |
+| What does a token cost once it fits? | About what a dense 37B model costs: 74 GFLOP per token. | "Active parameters set the cost per token." |
+| How fast is one user's stream (batch 1)? | Each new token reads only the active weights, about 37 GB at fp8, so tokens come much faster than from a dense 671B model. | "At small batch, speed follows bytes read." |
+| What happens under heavy load? | A batch of a few hundred tokens touches nearly every expert, so each step reads close to all the weights. | "The byte saving erodes at large batch." |
+| Anything new to pay for? | Experts spread across GPUs need tokens shipped to them and back. | "Communication is a new cost." |
+
+The guide's summary of the first two rows: "It saves compute. The memory bill, if anything, goes up"
+<Cite id="s-9e6b455b13" />.
+
+### Why batch size changes the picture
+
+Generating text one token at a time (**decode**) is usually limited by how fast the GPU can read weights from its
+memory, not by its math. At batch 1, each step reads just the experts that one token picked. At a large batch, the
+tokens together pick almost every expert, so each step reads nearly all 671 GB.
+
+The model behind these numbers is DeepSeek-V3: each MoE layer has 256 routed experts plus 1 shared expert, with 8
+routed experts active per token ([arXiv 2412.19437](https://arxiv.org/abs/2412.19437)). With 8 of 256 picked per
+token, a few hundred tokens cover nearly all of them. The guide makes the same point about compute savings at large
+batch.
+
+### The new cost: moving tokens between GPUs
+
+When experts are spread across GPUs, called **expert parallelism**, each token's vector must travel to the GPU that
+owns its expert and come back. That exchange, where every GPU sends to every other, is an **all-to-all**, and it
+happens twice per MoE layer. Because routing is uneven, some GPUs get more tokens than others, and the busiest GPU
+sets the time of every step. That is the hot-shard problem from the analogy.
+
+### Per-conversation memory follows neither number
+
+While a model writes a reply, the GPU keeps a saved summary of every earlier token in the conversation, so it
+doesn't redo that work for each new token. This is the **KV cache**, and it is sized by the attention design, not
+by the parameter count. Llama models use **grouped-query attention (GQA)**, with its own formula. DeepSeek-V3 uses
+**Multi-head Latent Attention**, which caches a 512-number compressed vector plus a 64-number position key per
+layer: **70,272 bytes per token** in bf16 (derived from the config). Size it separately, and don't apply the GQA
+formula to it.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Compute:** 2 × 37 × 10⁹ = 74 GFLOP per token; dense 671B would be 2 × 671 × 10⁹ = 1,342 GFLOP. 671 ÷ 37 = 18.1,
+  so **18× fewer**.
+- **Memory:** 671 × 10⁹ × 1 byte = 671 GB at fp8; × 2 bytes = 1,342 GB at bf16. One machine: 8 × 80 GB = 640 GB.
+- **Batch-1 bytes per token:** about 37 × 10⁹ × 1 byte = 37 GB at fp8.
+- **KV cache:** 61 layers × (512 + 64) values × 2 bytes = **70,272 bytes per token**.
+
+</details>
+
+Say it like this: "MoE saves math per token, not memory. Total parameters set the GPU count; active parameters set
+the cost per token; and at high batch the byte saving fades."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Reading an MoE spec"
+  senior={["Separates memory (total) from FLOPs (active) and turns both into a GPU count and a per-token cost."]}
+  staff={["Adds the batch-size effect, the all-to-all and straggler cost of expert parallelism, and asks whether utilization is high enough to justify a two-node minimum."]}
+/>
+
+## Small-team version
+
+A two-machine minimum puts self-hosting a 671B MoE out of reach for most small teams. Buy it per token.
+
+The fixed cost alone is about **$46,600 a month** before a single token is served: sixteen H100 GPUs at an assumed
+$3.99 per GPU-hour (Together's on-demand cluster price, fetched 2026-10-11).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Two 8-GPU machines for a month:** 16 × $3.99 × 730 hours ≈ **$46,600**.
+
+</details>
+
+Smaller MoE models change the picture. gpt-oss-120b reports "117B parameters with 5.1B active parameters" and fits
+on a single 80 GB GPU ([model card](https://huggingface.co/openai/gpt-oss-120b), accessed 2026-10-12). Together
+listed it at $0.15 per million input tokens and $0.60 per million output tokens on 2026-10-11.
+
+Either way, run your own eval (a fixed set of your real prompts, scored) on the endpoint you will actually call.
+Default: call the large MoE per token; consider hosting only a model that fits on one GPU, and only at steady high
+volume.
+
+## Pitfalls
+
+- **"MoE saves memory."** It saves math per token; memory follows total parameters.
+- **Assuming the 18× saving holds at every batch size.** At large batch, nearly every expert is read each step.
+- **Applying the GQA cache formula to latent attention.** DeepSeek-V3 caches a compressed vector, so the formula
+  gives the wrong size.
+- **Forgetting the always-on parts.** The router and attention run for every token, and they count as active.
+
+## Go deeper
+
+- Family walkthrough: [Quantization, speculative decoding and MoE](/system-design-labs/interviews/walkthroughs/quant-specdec-moe/), worked example 5.
+- The router-skew follow-up: [infra-086](/system-design-labs/interviews/questions/infra-086/).
+- Add an MoE block to <LabRef lab="transformer" inline /> to see tokens per expert.

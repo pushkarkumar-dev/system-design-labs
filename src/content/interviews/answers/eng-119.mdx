@@ -1,0 +1,207 @@
+---
+question: eng-119
+family: kv-store-durable-log
+status: published
+labs: [wal, kv-cache]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll keep committed data in a base dictionary, and give each open transaction its own small dictionary on a
+> stack. Writes go to the top one. A read checks the stack from newest to oldest, then the base. A delete inside
+> a transaction writes a marker that says 'deleted here', so the old value can't show through. Rollback throws
+> the top dictionary away; commit merges it into the one below. And I'll test it against a slow, obviously
+> correct copy on random operations."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The store itself takes five minutes: `get`, `set` and `delete` on a dictionary. The round is decided by what
+happens when transactions **nest**, meaning a `begin` inside another `begin`. That is different from the
+transactions you use every day in a database, in two ways:
+
+1. **You are writing the isolation, not using it.** Inside a transaction, `get` must see that transaction's own
+   writes. Outside, nobody sees them until commit. You have to build the layering that makes both true.
+2. **Nesting changes what commit means.** An inner `commit` cannot make writes permanent, because the outer
+   transaction might still roll back. So an inner commit only hands its writes to its parent.
+
+The interviewer is also watching for something else. This question is usually the first part of a longer
+problem: after transactions come saving to disk, crash safety and many threads. A clean model here makes each
+of those a small change. Hello Interview describes OpenAI's live coding as practical work with "several
+behaviors to implement", run against tests in CoderPad, a shared online code editor (<Cite id="s-4d55d9b987" />).
+
+## Clarify first
+
+Spend a minute pinning down the rules. Say your assumptions out loud:
+
+- **Nested commit.** "Does an inner `commit` make writes permanent, or only visible to the parent? I'll assume
+  visible to the parent, and nothing is permanent until the outermost commit." Some versions of this problem
+  commit every open transaction at once, so ask.
+- **Errors.** "What should `commit` or `rollback` do with nothing open? I'll raise an exception."
+- **Values.** "Strings only? I'll assume strings."
+- **Threads.** "One thread for now; I'll say how locking fits later."
+- **Naming.** "Is `abort` the same as `rollback`?" Aced's listing (Aced is a site that aggregates reported questions) says "begin, commit, and abort"
+  (<Cite id="s-d7a8e88bf0" />). Assume yes.
+
+## Answer
+
+### Words you need first
+
+- An **overlay** is a small dictionary that sits on top of the main one and holds only the changes made inside
+  one transaction. Reads look at the overlay first.
+- A **tombstone** is a special value meaning "this key was deleted here". It is needed because removing a key
+  from an overlay would make a read fall through to the old value underneath.
+- The **base** is the main dictionary of committed data.
+
+### The picture
+
+```
+  get(key) looks from the top down; the first layer that has the key wins
+        │
+        ▼
+┌───────────────────────────┐
+│ overlay 2 (inner begin)   │   bob → TOMBSTONE
+├───────────────────────────┤
+│ overlay 1 (outer begin)   │   alice → 70, bob → 130
+├───────────────────────────┤
+│ base (committed data)     │   alice → 100, bob → 100
+└───────────────────────────┘
+```
+
+**The base** holds what is committed. **Each overlay** holds one open transaction's writes and tombstones. The
+stack grows by one on `begin` and shrinks by one on `commit` or `rollback`.
+
+### Follow one transfer through it
+
+Picture a credit-tracking service. Alice and Bob each have 100 credits. Alice sends Bob 30, and then, inside a
+nested transaction, someone tries deleting Bob's account and changes their mind.
+
+| Step | Call | Stack after the call | `get` results | What to say in the interview |
+|---|---|---|---|---|
+| 1 | `begin` | base + empty overlay 1 | alice 100, bob 100 | "Each begin pushes an empty overlay." |
+| 2 | `set alice 70`, `set bob 130` | overlay 1 holds both writes | alice 70, bob 130 | "Writes go to the top overlay, so this transaction sees them and nobody else does." |
+| 3 | `begin` | overlay 2 on top | same | "Nesting is just a deeper stack." |
+| 4 | `delete bob` | overlay 2: bob → tombstone | bob `None` | "A delete writes a tombstone, or Bob's 130 would show through." |
+| 5 | `rollback` | overlay 2 dropped | bob 130 again | "Rollback is popping one dictionary: O(1)." |
+| 6 | `commit` | overlay 1 merged into base | alice 70, bob 130 | "This is the outermost commit, so now it's permanent." |
+
+### The code
+
+```python
+_TOMBSTONE = object()
+
+class TxKV:
+    def __init__(self):
+        self._base, self._layers = {}, []
+
+    def get(self, key):
+        for layer in reversed(self._layers):
+            if key in layer:
+                v = layer[key]
+                return None if v is _TOMBSTONE else v
+        return self._base.get(key)
+
+    def set(self, key, value):
+        (self._layers[-1] if self._layers else self._base)[key] = value
+
+    def delete(self, key):
+        if self._layers:
+            self._layers[-1][key] = _TOMBSTONE
+        else:
+            self._base.pop(key, None)
+
+    def begin(self):
+        self._layers.append({})
+
+    def rollback(self):
+        if not self._layers:
+            raise NoTransaction()
+        self._layers.pop()
+
+    def commit(self):
+        if not self._layers:
+            raise NoTransaction()
+        top = self._layers.pop()
+        if self._layers:
+            self._layers[-1].update(top)      # inner commit merges into the parent
+        else:
+            for k, v in top.items():           # outermost commit applies to the base
+                if v is _TOMBSTONE:
+                    self._base.pop(k, None)
+                else:
+                    self._base[k] = v
+```
+
+Notice the inner commit uses `update`, which copies tombstones into the parent too. That is correct: a delete
+committed by an inner transaction must still hide the key from the outer one.
+
+### Name the alternative and pick one
+
+There is a second way to build this, and naming it shows design sense. An **undo log** writes straight into the
+base and records each old value, so rollback can put them back.
+
+| | Overlays (this answer) | Undo log |
+|---|---|---|
+| `get` | O(depth): checks each layer | O(1): reads the base |
+| `rollback` | O(1): drop one dictionary | O(writes): restore each old value |
+| `commit` | O(writes in the transaction) | O(1) for an outer commit |
+
+Say: "Overlays make reads cost the depth of nesting, and an undo log makes rollback cost the number of writes.
+I'll take overlays, because at the outermost commit the top overlay is exactly the set of writes to save."
+That last point matters when the next requirement arrives. If the interviewer asks for crash safety, the popped
+overlay becomes one log record, so a two-key transfer is saved all-or-nothing.
+
+### Test it against a reference model
+
+Hand-picked tests miss the odd combinations, like a delete inside an inner transaction that is committed and
+then rolled back by the outer one. The better test is a **reference model**: a slow version that is obviously
+correct, run side by side with yours on random operations. The slow version copies the whole dictionary on
+every `begin`, so rollback is just "go back to the copy". Run a few hundred random sequences of set, delete,
+begin, commit and rollback against both and compare every key after every step. The family walkthrough's
+version of that test ran 300 sequences of 60 operations and passed on 2026-10-12.
+
+Say: "I trust random tests against a dumb copy more than five cases I picked myself."
+
+### If they add "count values equal to X"
+
+A common extra is an operation that counts how many keys hold a given value. Keep a value-to-count map for the
+base, and either compute the overlays' effect at read time or keep a small count change per layer. Say which
+you chose and what it costs: the first makes each count cost O(writes in the open overlays); the second makes
+every write update a counter.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Transactions"
+  senior={["Overlays with tombstones, correct nested semantics, errors without a transaction, and a randomized test against a reference model."]}
+  staff={["States the semantics as a choice (inner commit visible to parent, or flatten), compares overlays with an undo log by cost, and shapes the model so durability and locking slot in later."]}
+/>
+
+In plain words: a Senior candidate gets nesting right and proves it with a good test. A Staff candidate also
+treats the commit rule as a decision to confirm, weighs the two designs by cost, and picks the one that makes
+the next requirement easy.
+
+## Small-team version
+
+You will not ship this class. Nested transactions in production come from your database: Postgres savepoints
+give you nested rollback inside one transaction, at no extra cost beyond the database you already pay for. The
+value of the exercise at a small company is the habit: write the reference model and the randomized test before
+trusting clever state code, whether you or an agent wrote it.
+
+Practise the timed version without AI tools, since the OpenAI guide tells candidates to assume none in live
+coding (<Cite id="s-4d55d9b987" />). Then ask an agent for the reference-model test and read every line of it.
+
+## Pitfalls
+
+- **Deleting from the overlay instead of writing a tombstone.** The older value underneath reappears.
+- **An inner commit that writes straight to the base.** The writes become permanent before the outer
+  transaction decides, so an outer rollback can't undo them.
+- **No reference-model test.** Nesting bugs survive hand-picked cases and show up as wrong balances later.
+- **Silently ignoring `commit` with no open transaction.** It hides a caller's bug; raise instead.
+
+## Go deeper
+
+- Family walkthrough: [Key-value store to durable log](/system-design-labs/interviews/walkthroughs/kv-store-durable-log/), stages 1 and 2 and the reference-model test.
+- Next part of the same problem: [serializer and restore](/system-design-labs/interviews/questions/infra-025/), then [crash consistency](/system-design-labs/interviews/questions/infra-031/).
+- Labs: <LabRef lab="wal" inline /> for the durability that follows; <LabRef lab="kv-cache" inline /> for a Redis-style store to extend.

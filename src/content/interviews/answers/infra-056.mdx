@@ -1,0 +1,183 @@
+---
+question: infra-056
+family: move-big-bytes
+status: published
+labs: [cdn-edge, feature-flags, gossip]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll keep two steps apart: staging, which gets a version's bytes onto a host's disk and checks every piece
+> by hash, and activation, which switches traffic to it. Staging is slow, invisible and cheap to undo.
+> Activation is fast, gated by health and quality checks, and goes wave by wave. Hosts keep the last good
+> versions on disk, so rollback is activating one of them with no download. And every control decision
+> carries an increasing number, an epoch, so a late message can never undo a rollback."
+>
+> The rest of this page explains each part of that answer.
+
+The task: design the system that publishes new model versions and gets them running on thousands of workers.
+PracHub's write-up of this Anthropic-tagged question asks for publish, discover, download and activate APIs
+across 10³ to 10⁴ workers, then adds four follow-ups: a cold regional cache, a rollback while a worker is
+mid-download, a version that passes checksums but answers worse, and sharing bytes between versions that are
+mostly the same (<Cite id="s-2d04c3afaf" />). Only the title is candidate-reported; the follow-ups are
+PracHub's.
+
+### What makes this different from a normal deploy
+
+In a normal deploy, the download is a few seconds and "healthy" means "it starts and passes a health check".
+So download and go-live happen together, and rollback means deploying the old build again.
+
+A model version breaks both habits. The file is about 150 GB, so the download takes real time and real
+bandwidth. A rollback that has to download the old version again is slow exactly when you are in a hurry. And
+a model can load perfectly and still answer worse. So the design separates moving bytes from making a version
+live, and gates go-live on quality, not only health.
+
+## Clarify first
+
+- **Release size.** "I'll assume 150 GB in 8 to 64 files called shards, never changed after publishing."
+- **Fleet.** "1,000 hosts in 4 regions." Do different GPU generations need differently split shards? Then each
+  group of identical hardware, a **cohort**, gets its own artifact.
+- **Targets.** How fast must a version reach the fleet? Is rollback time a hard SLO?
+- **Activation.** Does the server restart to load a version, swap it in place, or run old and new side by side
+  (blue/green)? Can two versions sit in memory at once?
+- **Signals.** Which health and quality checks exist to gate a wave?
+
+## Answer
+
+### Words you need first
+
+- **Staging**: the version's bytes are on the host's disk and every piece has passed its hash check.
+- **Activation**: the host starts serving traffic from a staged version.
+- **Manifest**: a signed list of every chunk's hash (chunks are fixed-size pieces, here 64 MB).
+- **Epoch**: a number on every control-plane decision that only goes up. Hosts ignore anything older than the
+  last epoch they applied.
+
+### The pieces
+
+```
+Publisher ── chunks, hashes, signs the manifest
+   │
+   ▼
+Origin store (immutable)
+   │  one fetch per chunk per region
+   ▼
+Regional chunk cache ──► Host agent ◄──► peers
+                             ▲
+                             │ (desired version, epoch)
+Control plane ── stores versions, runs waves, replicated across regions
+```
+
+The **publisher** splits each shard into chunks, hashes each, writes and signs the manifest, and uploads
+everything to an **origin** that never changes it. The **control plane** stores the desired version for each
+(service, region, cohort) and stamps each decision with an epoch. The **regional cache** is keyed by chunk hash
+and merges identical misses. The **host agent** works toward its desired version: it fetches chunks from peers
+then the cache, checks each hash, records progress in a bitmap, reports "staged", and activates only when
+told. It keeps the last two known-good versions on disk.
+
+**APIs.** `publish(manifest)`, `desired(service, region, cohort) → (version, epoch)`, chunk `GET` by hash, and
+`activate(version, epoch)` with an acknowledgement.
+
+### Follow one release: v5
+
+1. The publisher finalizes v5 and uploads chunks and manifest.
+2. The control plane sets v5 as desired for a few **canary** hosts per cohort. They stage it, activate it and
+   take a little traffic.
+3. Gates check health (did it load, are errors and latency normal) and quality (a fixed prompt set on the
+   canaries, compared with a reference run of the same version).
+4. If both pass, one region stages and activates, then the rest. If either fails, the rollout pauses itself.
+
+Now the four follow-ups, each on this same release.
+
+### Follow-up 1: a cold regional cache
+
+A region's cache is empty just as v5 ramps there. If every host's miss goes to origin separately, 250 hosts
+pull 250 copies: **37.5 TB**. If the cache merges identical misses into one fetch per chunk (**request
+coalescing**), the region pulls **150 GB**. Spread chunks across cache nodes by hash so only one node fetches
+each, rate-limit fills with a token bucket (a standard rate limiter), and let peers carry most bytes. Without peers, limit how many
+hosts start at once: about **100 hosts per 5-minute wave**.
+
+Say: "Coalescing turns 250 identical misses into one origin fetch per chunk."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- No coalescing: 250 × 150 GB = 37.5 TB. With coalescing: 150 GB.
+- Hosts per wave ≤ U × T_wave ÷ S, with U the cache egress (assumed 50 GB/s), T_wave the time per wave and S the
+  release size: 50 GB/s × 300 s ÷ 150 GB = **100 hosts per 5-minute wave**.
+
+</details>
+
+### Follow-up 2: rollback while mid-download of v5
+
+v5 is half-downloaded on a host when someone orders a rollback to v3. The desired version flips to v3 with a
+higher epoch. The agent stops fetching v5, keeps its verified chunks for later cleanup, and activates v3 from
+its own disk. No bytes move.
+
+Then it drops any instruction with an older epoch. Without that, an "activate v5" stuck in a queue could arrive
+after the rollback and undo it. Say: "It's the same fencing idea as a lease token."
+
+### Follow-up 3: checksums pass, quality drops
+
+A checksum proves the bytes match what was published. It doesn't prove that the version suits this hardware
+cohort, or that it ships the right tokenizer and config. The **tokenizer** turns text into the numbers the
+model reads; a wrong one gives the model nonsense input without any error. So gate each wave on a fixed
+prompt set run on canaries per cohort, compared with a reference run of the same version, and let the gate
+pause the rollout on its own.
+
+### Follow-up 4: a LoRA on a shared base
+
+A **LoRA adapter** is a small add-on that fine-tunes a big model by training a few extra weights instead of
+all of them. Two versions may share the whole base and differ only in the adapter. Because chunks are named by
+their hash, hosts that already hold the base see that only the adapter's chunks are new. A typical adapter
+on a 70B model is about **131 MB**, against **140 GB** for the base. Pin the base chunks while any active
+version uses them.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+A rank-16 adapter on the q, k, v and o projections of a 70B base: 80 × 16 × (16,384 + 9,216 + 9,216 + 16,384) =
+65.5M parameters, about 131 MB at 2 bytes each (bf16). Base: 70 × 10⁹ × 2 bytes = 140 GB (name basis).
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Distribution with rollout and rollback"
+  senior={["Separates staging from activation, coalesces misses, and answers each follow-up with a mechanism."]}
+  staff={["Adds epochs so message order can't undo a rollback, makes a per-cohort quality gate part of the rollout contract, and asks who may override it."]}
+/>
+
+In plain words: Senior has an answer for each follow-up. Staff makes the answers part of the system's rules
+(epochs, gates per cohort) and asks who is allowed to push past a failing gate.
+
+## Small-team version
+
+Most of this shrinks to three habits:
+
+1. Store each model version at a path keyed by its hash, and check the hash on download.
+2. Keep the previous version next to the GPU and make the active one a config flag, so rollback is a flip with
+   no download.
+3. Gate the flip with a small eval set (a fixed list of test prompts with known good answers), and canary on one replica before the rest.
+
+The arithmetic for a 40 GB model: keeping two versions costs **80 GB** of node or volume disk. A rollback that
+downloads again takes 40 ÷ 2 = **20 s** at an assumed 2 GB/s object-store read, plus engine start-up, on every
+replica at once. Skip the cache tier, swarm and epochs until you have dozens of nodes or several releases a
+day.
+
+Say: "Two versions on disk costs 80 GB; that buys a rollback with no download."
+
+## Pitfalls
+
+- **Activating as bytes arrive.** Then a rollback means another download.
+- **No ordering on control messages.** A late "activate" undoes the rollback.
+- **Gating only on infra health.** A bad model is perfectly healthy.
+- **Treating a LoRA update as a new full model.** That re-sends 140 GB to move 131 MB.
+
+## Go deeper
+
+- Family walkthrough: [rollout and rollback by epoch](/system-design-labs/interviews/walkthroughs/move-big-bytes/#integrity-staged-rollout-and-rollback-by-epoch) and its [Small-team version](/system-design-labs/interviews/walkthroughs/move-big-bytes/#small-team-version).
+- Cohort activation: <LabRef lab="feature-flags" inline />. Miss coalescing: <LabRef lab="cdn-edge" inline />. Peer membership: <LabRef lab="gossip" inline />.
+- The quality gate itself: [eval-system walkthrough](/system-design-labs/interviews/walkthroughs/eval-system/).

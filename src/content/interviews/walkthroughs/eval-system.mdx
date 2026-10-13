@@ -1,0 +1,912 @@
+---
+title: "Know whether an LLM feature is good: error analysis, eval sets, release gates, production metrics"
+summary: "Decide whether an AI assistant is good enough to ship or expand: turn complaints into failures you can count, grade with code, a checked AI grader and people, compare versions on the same test cases, then roll out slowly."
+track: ai-engineer
+format: design
+family: eval-system
+smallTeamFocus: "Build the test suite and the release check yourself: 100–300 cases from real conversations, code checks plus one checked AI grader per failure type, a before/after comparison in CI. Buy tracing. Skip generic scores."
+rounds: [ml-system-design, domain-deep-dive, project-presentation]
+level: both
+timeboxMin: 45
+order: 103
+status: published
+basedOn: [eng-034, eng-035, eng-036, eng-037, eng-038, eng-043, eng-044, eng-046, eng-103]
+askedAt: [openai, anthropic, sierra, perplexity, applied-ai-generic]
+labs:
+  - { lab: llm-eval, role: proof, note: "Bootstrap confidence intervals and a paired bootstrap test: the statistics a release gate needs. Its bundled server answers with a mock model, so it tests the harness, not a model." }
+  - { lab: feature-flags, role: proof, note: "Deterministic SHA-256 percentage bucketing for a per-user canary, and an audit log of every evaluation so outcomes can be joined to variants." }
+  - { lab: cicd-engine, role: proof, note: "DAG pipelines with fail-fast and a content-addressed step cache, whose key shows what an eval step must declare before it is safe to cache." }
+  - { lab: rag, role: proof, note: "Retrieval measured on two BEIR datasets with paired bootstrap intervals: a worked example of which changes a paired gate would pass." }
+  - { lab: embedding-pipeline, role: proof, note: "A measured neighbour-overlap comparison between two embedding models, the retrieval-side check before an embedding swap." }
+  - { lab: prompt-optimization, role: partial, note: "Searches instructions and few-shot demos against a validation set, which shows how a golden set quietly becomes training data. The LLM is a mock." }
+gapLabs: [llm-judge-evals, llm-observability]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "You can't test an LLM feature like normal code, because the same input can give a different answer each
+> time and there is often no single right answer. So I'd build its testing like a test-and-release system for
+> a service, with statistics on top. First, read real conversations and turn complaints into a short list of
+> failure types I can count. Then I build a test set from real traffic and grade it with code where I can, with
+> an AI grader that I've checked against people where I can't, and with people on a sample. Every change is
+> compared with the current version on the same test cases, with an error bar, and blocked if it is worse.
+> Then it goes to a few users first, and I watch outcomes like 'solved without a person' and 'came back within
+> a week'."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+Here is the task as interviewers frame it. You built an assistant: a policy assistant for a bank's
+employees, or a support agent that answers customers. Now someone has to decide whether it is good enough to
+ship, to expand to the next team, or to survive the next prompt edit and the next model swap. Design the system
+that makes that decision.
+
+### What makes this different from testing normal code
+
+A backend engineer already knows how to decide whether code is good. You write unit tests that assert an
+exact output, run them in CI on every commit, and block the merge if one fails. A test passes or fails the
+same way every time. Then you roll out behind a flag and watch error rates.
+
+A feature built on a large language model (**LLM**, the kind of model behind ChatGPT or Claude) breaks those
+habits in four ways:
+
+1. **The output is random.** Ask the same question twice and you can get two different answers. One run of
+   a test proves little. You run each test several times and count how often it passes.
+2. **There is often no single right answer.** "Your refund is on its way" and "We've issued the refund; it
+   should arrive in 3–5 days" can both be correct. A string comparison can't grade that, so you need other
+   ways to decide pass or fail.
+3. **Small changes move everything.** A one-line edit to the instructions you send the model, or a model
+   update by the provider, can change behaviour on every request at once. Nothing crashes. Answers just get
+   a bit worse.
+4. **Every score is an estimate.** "85% of tests passed" on 50 tests could really be anywhere from about 75%
+   to 95%. Two versions that score 82% and 84% may not differ at all.
+
+So the system you design looks like the test and release pipeline you know, with three additions: graders
+that can judge open-ended text, statistics that say how sure you are, and a product decision about what
+"good enough" means.
+
+### Words you need first
+
+- **Prompt**: the text you send to the model. It holds your instructions (the **system prompt**), any
+  documents or tool results you looked up, and the user's message.
+- **Eval** (short for evaluation): a test that scores the model's output. An **eval set** is a fixed list of
+  test cases, each called an **item**. When the items come from real traffic and carry a known good outcome,
+  people call it a **golden set**.
+- **Trace**: the full log of one request: the user's input, what was looked up, every model call and tool
+  call, and the final answer. It is the LLM version of a distributed trace.
+- **Grader**: whatever decides pass or fail for one item. It can be code, a person, or another model call
+  that is asked "does this answer do X?". That last kind is called an **LLM judge** (or **LLM-as-judge**).
+- **Pass rate**: the share of items that pass. It is the basic score on this page.
+
+Other terms are defined where they first appear.
+
+### The two assistants on this page
+
+The page follows two assistants. All their numbers are assumptions, chosen to make the arithmetic concrete.
+
+- **The support agent** is the main example. It answers customers, looks up orders and can issue refunds
+  within limits. It handles about 40,000 conversations a day. The team makes about 20 prompt or setting
+  changes a week, and its main test suite has 500 items, each run 3 times.
+- **The bank policy assistant** is the contrast. Bank staff ask it about internal procedures, about 600
+  questions a day. It looks up the relevant policy passages and answers from them; this pattern is called
+  **RAG** (retrieval-augmented generation). Its answers must cite the current version of the policy.
+
+The support agent shows what you can do with a lot of traffic. The bank assistant shows what changes when
+traffic is too low to measure much in production.
+
+The nine questions this page answers come mostly from prep guides' example prompts, plus two candidate
+accounts; the next section lists where each came from.
+
+<QuestionRow id="eng-034" />
+<QuestionRow id="eng-035" />
+<QuestionRow id="eng-036" />
+<QuestionRow id="eng-037" />
+<QuestionRow id="eng-038" />
+<QuestionRow id="eng-043" />
+<QuestionRow id="eng-044" />
+<QuestionRow id="eng-046" />
+<QuestionRow id="eng-103" />
+
+## What is being tested
+
+The interviewer is listening for four things.
+
+- **Can you say how you know it works?** Many candidates can build the assistant. Fewer can say, with
+  numbers, how they know it is good. The OpenAI prep guide calls "a concrete answer to how you know the
+  system works" the reliable differentiator of the technical round (<Cite id="s-26f0cae3fe" />). A
+  first-hand account says most engineers hand-wave through that question and that interviewers "clearly use
+  it as a differentiator" (<Cite id="s-812dbc9385" />). The applied-AI guide calls evaluation "the widest
+  skill gap in the field" (<Dated asOf="2026-07-23" src="s-7d03a572e0">techinterview.org applied-AI guide</Dated>).
+- **Did you define success before building?** The OpenAI guide's scoping advice: "Define success as an
+  evaluation before you build: a labeled set, a metric, and a bar." The Anthropic guide's version ends: "Gate
+  releases on the eval so a regression cannot ship" (<Cite id="s-a982325743" />).
+- **Can you measure quality when there is no single right answer?** The Sierra guide says this is the hard
+  part interviewers push on: "measuring quality when there is no single correct answer". It points to graded
+  rubrics and human review of a sample (<Cite id="s-9116046d24" />).
+- **Do you use numbers, not feel?** If you can't say what good retrieval is as a number, the applied-AI guide
+  warns, "the interviewer assumes you tuned yours by feel" (<Cite id="s-7d03a572e0" />).
+
+My reading: describe the eval the way you would describe the test and release system for a distributed
+service. It has test fixtures, deterministic checks where possible, handling for flaky tests, CI tiers and a
+staged rollout. On top of that it needs statistics, because the system under test is random. It also needs a
+product decision, because "good enough" belongs to whoever owns the outcome.
+
+### Where these questions come from
+
+Several are prep-guide examples rather than candidate reports, so treat their wording as typical, not exact.
+
+- **The roll-out decision.** An OpenAI forward-deployed prep guide's representative question (a
+  **forward-deployed engineer**, or FDE, builds AI features alongside a customer's own team): a bank's
+  internal-policy assistant designed end to end, then "How would you know it is working well enough to expand
+  to the next team?" (<Cite id="s-26f0cae3fe" />).
+- **Regulated drafting.** An Anthropic forward-deployed prep guide's practice prompt: the eval and
+  human-checkpoint plan for an agent that drafts customer messages in a regulated industry
+  (<Cite id="s-a982325743" />).
+- **Swaps and support metrics.** The techinterview.org Sierra guide lists regression suites for prompt or
+  model swaps and "live signals like containment and escalation rate": the share of conversations solved
+  without a person, and the share handed to one (<Cite id="s-9116046d24" />).
+- **Helps or hurts, and "feels dumb".** The techinterview.org applied-AI guide gives both as its own example
+  prompts (<Cite id="s-7d03a572e0" />).
+- **The open versions.** A first-hand OpenAI forward-deployed account describes a deep dive that "pushed hard
+  on evaluation" (<Cite id="s-812dbc9385" />). A candidate account on Exponent's Medium, seen only
+  second-hand, reports "How would you evaluate a chatbot?" and, inside a project deep dive, whether there was
+  a real eval framework or it was "vibes-based" (<Cite id="s-9ffe6685c2" />). Aced's question list tags
+  "define success metrics for an AI feature" to Perplexity (<Cite id="s-d7a8e88bf0" />).
+
+## Clarify and scope
+
+Spend a minute or two pinning down what the eval is for. Each answer changes the design.
+
+1. **What decision does the eval serve?** Ship or not, expand to the next team, accept a model swap, or catch
+   regressions on every prompt edit. Each needs a different test set and a different bar. Say: "Before I
+   design anything, which decision is this for?"
+2. **What is "good" for this user?** The task done, a correct answer with a citation, a correct handoff to a
+   person, no policy or compliance violation, speed, cost per solved request.
+3. **What ground truth exists?** Logged resolutions by human agents, a policy owner who can label answers,
+   past tickets with outcomes. This decides how fast you can build graders.
+4. **Which failures block outright?** Quoting a policy that has been replaced, or promising a refund the
+   policy forbids, is not the same as a clumsy sentence. The first kind becomes a **must-pass item**: a test
+   that blocks the release if it fails even once.
+5. **Traffic and conversation length.** Daily volume decides whether tests on live traffic can measure
+   anything. Multi-turn conversations decide how you split users between versions.
+6. **Regulation and accountability.** Who signs off, what must be logged, and which outputs a person must
+   approve before a customer sees them.
+
+Then state the two examples out loud, with their numbers as assumptions: "Support agent, about 40,000
+conversations a day, about 20 changes a week, a 500-item suite run 3 times per item. Bank assistant, about
+600 questions a day, answers must cite the current policy."
+
+Out of scope here: benchmark evals for training foundation models; retrieval metrics in depth (the
+[rag-quality-debugging](/system-design-labs/interviews/walkthroughs/rag-quality-debugging/) family); and how
+to check an LLM judge in depth (the [llm-judge](/system-design-labs/interviews/walkthroughs/llm-judge/)
+family).
+
+## Back-of-envelope
+
+These numbers answer one question: how much can a test of a given size tell you? Each subsection explains
+the idea first. The formulas are in the boxes, for a Staff-level follow-up.
+
+### How much can you trust one score?
+
+Say the agent passes 85% of a 50-item suite. If you built a different 50-item suite from the same kind of
+traffic, you would get a somewhat different number. The **confidence interval** is the range the true pass
+rate probably sits in. People write it as "85% ± 9.9 points", where 9.9 is the **half-width**. A 95% interval
+means a range that contains the true rate 95 times out of 100 when you build it this way.
+
+The half-width shrinks slowly as the suite grows:
+
+| Items | 95% interval at an 85% pass rate | What it can tell you |
+|---|---|---|
+| 50 | **± 9.9 points** | Finds failures; catches a change that breaks 20 points |
+| 200 | **± 4.9 points** | Enough to compare against a bar with some margin |
+| 1,000 | **± 2.2 points** | Close to what you need to see small changes |
+
+Anthropic's agent-evals guide says 20 to 50 simple tasks drawn from real failures is "a great start", because
+early changes have large effects and "small sample sizes suffice" (linked under Sources). Both halves are
+true. Fifty items find failures and catch a 20-point break. They cannot see a 3-point regression.
+
+Say: "A score without its item count is meaningless. 85% on 50 items is somewhere between about 75% and 95%."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="95% interval for a pass rate"
+  expr="half_width ≈ 1.96 × √(p × (1 − p) ÷ n)"
+  vars={[
+    { sym: "p", meaning: "observed pass rate" },
+    { sym: "n", meaning: "independent items (not trials of the same item)" },
+  ]}
+  example={[
+    "p = 0.85, n = 50: ±9.9 points",
+    "p = 0.85, n = 200: ±4.9 points",
+    "p = 0.85, n = 1,000: ±2.2 points",
+  ]}
+/>
+
+</details>
+
+### Compare on the same items: the paired comparison
+
+When you test a change, you have two versions: the current one (the **baseline**) and the new one (the
+**candidate**). You could run each on its own set of items and compare the two pass rates. That is noisy,
+because each number carries its own error bar.
+
+A better way is to run both versions on the **same** items. Most items pass under both or fail under both.
+Those items tell you nothing about the change. Only the items that **flip** (pass under one version, fail
+under the other) carry information. Comparing this way is called a **paired comparison**, and it is much
+tighter.
+
+The example: 300 items, 8% of them flip, and the candidate is 2 points worse.
+
+- Paired, the difference is **−2.0 ± 3.2 points**.
+- Comparing two separate pass rates on 300 items each would give **± 5.7 points**.
+- To pin the difference down to ± 2 points you need **about 770 items**.
+
+There is a second, subtler point. A half-width is the gap that only just reaches significance. It is not the
+gap you will *reliably* catch. The chance of catching a real gap is called **power**, and 80% is the usual
+target. The llm-eval lab measured this by simulation with its own paired test: at 500 items, the smallest
+true gap it catches 80% of the time is
+<LabNumber lab="llm-eval" metric="Smallest true gap with 80% power, paired test, n=500" /> when the versions
+disagree on 20% or 40% of items. That matches the rule of thumb in the box below.
+
+So for the support agent's 500-item suite, say: "This suite can promise to catch a 5-point regression. A
+2-point regression has only about a one-in-four chance of showing up, so it will usually go unseen."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Paired difference between two versions"
+  expr="SE(Δ) ≈ √((d − Δ²) ÷ n),   n_needed ≈ 1.96² × d ÷ h²"
+  vars={[
+    { sym: "Δ", meaning: "candidate pass rate minus baseline pass rate" },
+    { sym: "d", meaning: "fraction of items whose outcome differs between the two versions" },
+    { sym: "n", meaning: "items run under both versions" },
+    { sym: "h", meaning: "the 95% half-width you want on Δ" },
+  ]}
+  example={[
+    "n = 300, d = 0.08, Δ = −0.02: SE ≈ 0.0163, so Δ = −2.0 ± 3.2 points",
+    "Unpaired at p = 0.85: 1.96 × √(2 × 0.1275 ÷ 300) = ±5.7 points",
+    "To resolve ±2 points with d = 0.08: 3.84 × 0.08 ÷ 0.0004 = 768, about 770 items",
+  ]}
+/>
+
+- **Smallest gap caught with 80% power (one-sided paired test):** gap ≈ (1.645 + 0.84) × √(d ÷ n) =
+  2.49 × √(d ÷ n). At n = 500, d = 0.2: 2.49 × √0.0004 = **5.0 points**. The lab's simulation measured 5.0
+  (d = 0.2) and 7.3 (d = 0.4); the formula gives 5.0 and 7.0.
+- **A 2-point regression** at n = 500, d = 0.2 sits one standard error from zero, which gives roughly **26%
+  power**.
+
+</details>
+
+### Retries help one number and hurt the other
+
+Because output is random, you run each item several times; each run is a **trial**. Two scores come out of
+that, and they move in opposite directions:
+
+- **pass@k** ("pass at k"): the chance that *at least one* of k trials succeeds. It suits a tool where a
+  person can retry and keep the best answer.
+- **pass^k** ("pass all k"): the chance that *all* k trials succeed. It measures consistency.
+
+Anthropic's guide gives the worked example: an agent that succeeds 75% of the time per trial succeeds on all
+three of three trials only about **42%** of the time. The same agent shows **98%** on pass@3 (that second
+number is derived, not from the guide).
+
+Say: "A customer gets one try. For a customer-facing agent I gate on pass^k over repeated trials, not pass@k."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="pass@k versus pass^k"
+  expr="pass@k = 1 − (1 − p)^k,   pass^k = p^k"
+  vars={[
+    { sym: "p", meaning: "per-trial success rate on a task" },
+    { sym: "k", meaning: "independent trials" },
+  ]}
+  example="p = 0.75, k = 3: pass^3 = 0.75³ ≈ 42% (the worked example in Anthropic's guide); pass@3 = 1 − 0.25³ ≈ 98% (derived)"
+  note="A customer-facing agent gets one try per customer, so its bar is pass^k on repeated trials, not pass@k."
+/>
+
+</details>
+
+### How long does a live test take to show anything?
+
+A **canary** sends a small share of real users to the new version while everyone else stays on the old one.
+Comparing the two groups is an online A/B test. The two groups are different users, so the comparison is
+unpaired and needs far more data than the offline suite.
+
+Take the support agent's **containment** rate: the share of conversations solved without handing off to a
+person. Assume it is 60%. To catch a 3-point drop with 80% power you need **about 4,180 conversations in each
+group**. At 40,000 conversations a day:
+
+- a 5% canary sees 2,000 conversations a day, so it needs **about 2 days**;
+- a 1% canary sees 400 a day, so it needs **about 10 days**.
+
+The bank assistant, at 600 questions a day split 50/50, gets 300 per group per day. A 3-point change takes
+**about 14 days** to see and a 5-point change about 5 days.
+
+Two conclusions follow. A 1% canary catches crashes and policy failures, not a 3-point drop. And for a
+low-traffic internal tool, the offline paired suite plus human review *is* the measurement; the live phase is
+a smoke alarm.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Conversations per arm to catch a drop in a rate"
+  expr="n per arm ≈ 2 × p × (1 − p) × (z_α + z_β)² ÷ δ²"
+  vars={[
+    { sym: "p", meaning: "baseline rate, for example containment" },
+    { sym: "δ", meaning: "the drop you want to catch" },
+    { sym: "z_α", meaning: "1.96 for a two-sided 5% test" },
+    { sym: "z_β", meaning: "0.84 for 80% power" },
+  ]}
+  example={[
+    "p = 0.6, δ = 0.03: 2 × 0.24 × 2.8² ÷ 0.0009 ≈ 4,180 conversations per arm",
+    "Support agent: 5% of 40,000 a day is 2,000 a day, so about 2 days; at 1% (400 a day) about 10 days",
+    "Bank assistant (same assumed 60% baseline): 600 a day split 50/50 is 300 per arm a day, so about 14 days for 3 points (4,180 ÷ 300); for 5 points n ≈ 1,505 per arm, so about 5 days",
+  ]}
+  note="Using 1.96² alone gives about 2,050, which is a 50%-power size. Bucket by user, and repeat users count for less than their conversation count suggests."
+/>
+
+</details>
+
+### What one test run costs
+
+Providers bill per **token** (a chunk of text, roughly ¾ of a word), so a test run has a price. For the
+support agent, assume each conversation makes 6 model calls of 3,000 tokens and is graded by two judges of
+2,000 tokens each. One full run of the 500-item, 3-trial suite is then about **33 million tokens**. At 20
+changes a week that is **about 660 million tokens a week**, before retries or re-running the baseline.
+
+That is why the checks come in tiers. Cheap code checks run on every commit. The judged suite runs before
+merge or release. The small-team section prices a smaller suite in dollars.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Tokens per full gate run"
+  expr="tokens = items × trials × (tokens_per_run + judges × tokens_per_judge)"
+  vars={[
+    { sym: "items, trials", meaning: "suite size and runs per item" },
+    { sym: "tokens_per_run", meaning: "all model calls in one run of the feature" },
+    { sym: "judges", meaning: "model-graded checks per output" },
+  ]}
+  example={[
+    "Support agent (assumed 6 calls of 3,000 tokens, two judges of 2,000): 500 × 3 × (18,000 + 4,000) = 33M tokens per run",
+    "20 changes a week: 660M tokens a week, before retries or re-running the baseline",
+  ]}
+/>
+
+</details>
+
+## High-level design
+
+Walk the interviewer through the path a change takes, top to bottom. Each step is more expensive and more
+realistic than the one before. Production feeds new test items back in at the bottom.
+
+```
+Prompt, model or setting change  (saved as a new version in the config registry)
+   │  1. on every commit
+   ▼
+Fast checks ── code only: output format, tool arguments, policy limits
+   │  2. before merge or release
+   ▼
+Runner + offline suite ── same items, baseline and candidate, k trials each,
+   │                       recorded tool responses, items from the eval registry
+   │  3. grade every output
+   ▼
+Graders ── code checks → one LLM judge per failure type → people on a sample
+   │  4. decide
+   ▼
+Stats and gate ── paired difference with its interval, must-pass items
+   │  5. live traffic, no user sees the output
+   ▼
+Shadow ── copies of real requests, answers graded but not served
+   │  6. real users, a few at a time
+   ▼
+Canary and rollout ── 1% → 5% → 25% → 100%, automatic rollback
+   │  7. outcomes
+   ▼
+Production traces and metrics
+   │
+   └──► error analysis ──► new items in the eval registry   (back to step 2)
+                      └──► fresh human labels ──► judges re-checked
+```
+
+**Config registry.** Every prompt, model id, retrieval setting and tool description is saved as an
+immutable, numbered version. A change is a diff between two versions, so the gate always knows exactly what
+it is comparing. This is version control for everything that shapes the model's behaviour, not only the code.
+
+**Eval registry.** The test sets, versioned, with **provenance**: a link to the ticket, trace or incident each
+item came from. It holds two kinds of suite. A **regression suite** holds cases the system already handles and
+should sit near 100%. A **capability suite** holds hard cases and is meant to stay hard, so it can show
+progress. Anthropic's guide describes capability tasks that "graduate" into the regression suite once they
+pass reliably.
+
+**Runner.** It runs the baseline and the candidate on the same items, several trials each. It replays
+**frozen fixtures**: recorded tool responses and a snapshot of the document index. That way you measure the
+change, not a moving environment. It stores the full transcript of every run, with tokens, latency and cost.
+
+**Graders.** Code checks first, because they are cheap and never disagree with themselves. One LLM judge per
+open-ended failure type second. People review a sample third.
+
+**Stats and gate.** For each metric it computes the score with its interval, and the paired difference
+against the baseline. The pass/fail rules are written as code. An override needs a named owner and a written
+reason, like an emergency change to production.
+
+**Shadow.** Real requests are copied to the candidate. Its answers are graded but never shown to users.
+
+**Canary and rollout.** A small share of users gets the candidate, chosen by a feature flag that hashes the
+user id. The share ramps up step by step, and a guard metric crossing its limit rolls it back automatically.
+
+**Feedback.** A sample of production traces goes to **error analysis** (reading and labelling failures, the
+first deep dive below). New failure types become new items. Fresh human labels keep the judges honest.
+
+### Follow one change through it
+
+Say an engineer edits the support agent's refund instructions to make replies shorter. The prompt moves from
+version 42 to version 43. Here is what happens. Times are illustrative assumptions; the measurement numbers
+come from the back-of-envelope section.
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| **1. Config registry** | v43 is saved. The diff shows one changed paragraph. | "Every prompt and model is versioned, so the gate always knows what it compares." |
+| **2. Fast checks** (minutes) | Code checks run on a small sample: the reply is valid JSON, the refund tool gets an amount within the policy table. | "Cheap checks on every commit; they're safe to block on because they're deterministic." |
+| **3. Offline suite** (tens of minutes) | 500 items × 3 trials under v42 and v43, against recorded tool responses. | "Same items under both versions, so only the flips carry signal." |
+| **4. Graders** | Code checks, then one judge per failure type, for example "did it ask for information the user already gave?" | "Each judge was checked against human labels before it was allowed to block anything." |
+| **5. Gate** | Must-pass items all pass. The paired difference on task success has a lower bound above the agreed margin (how much worse we will tolerate, fixed in advance). | "This suite catches a 5-point regression, not a 2-point one. I say that up front." |
+| **6. Shadow** (a day, assumed) | Live requests copied to v43; refund and account tools stubbed. | "A shadowed refund is still a refund, so write tools are stubbed." |
+| **7. Canary** | 1%, then 5% of users, bucketed by user. | "1% catches crashes and policy failures. At 5% a 3-point drop in containment shows in about 2 days." |
+| **8. Production** | Containment, correct handoffs, recontact within 7 days (customers coming back about the same problem) and harm signals, watched together. | "One metric alone can be gamed, so I watch a set." |
+| **9. Feedback** | A conversation where v43 dropped the refund timeline turns up in review and becomes a new item. | "Every escaped failure becomes a test." |
+
+## Deep dives
+
+### From "feels dumb" to failure modes you can count
+
+A complaint like "the bot feels dumb" is not a metric. It is a pointer to traces. Pull that customer's
+conversations plus a sample of similar ones, and read them.
+
+This step is called **error analysis**. Hamel Husain and Shreya Shankar's evals FAQ (linked under Sources)
+describes the process. You **annotate** at least 30 traces yourself, which means writing a short open-ended
+note on what went wrong in each. Then you group the notes into **failure modes** (named, recurring kinds of
+failure). You keep reading (they recommend at least 100 traces) until new traces stop revealing new modes.
+
+For a support bot, "dumb" usually turns out to be a handful of countable things:
+
+- it ignored context the user already gave (asked for the order number twice);
+- retrieval returned a stale or wrong document, so the answer was confidently wrong;
+- it refused or handed off a question it could have answered;
+- it answered a different question than the one asked;
+- tone or length problems.
+
+Each mode gets a definition, a few pass and fail examples, a count, and a grader. Only then do you change
+anything, starting with the most frequent or most expensive mode. The FAQ makes the same call about tools:
+error analysis comes first, and generic scores such as "helpfulness" can mislead: "Good scores on them don't
+mean your system works."
+
+Say: "Before I change anything, I read about a hundred traces and count what is actually going wrong."
+
+### Golden sets from real traffic
+
+Build items from failures and real requests, not from imagined ones. Each item carries four things:
+
+- the input, including the conversation so far;
+- the **frozen context**: the documents that were retrieved and the tool responses that came back, recorded,
+  so a rerun sees exactly the same world;
+- the expected outcome, or one pass/fail check per failure mode;
+- tags for failure mode, customer segment and risk level, and a link to where it came from.
+
+For the bank assistant, three kinds of item matter most. Include questions whose answer changed in the last
+policy revision; the check is that the citation points to the current version. Include questions the
+policies don't cover; the check is that the assistant says so and sends the employee to the policy owner.
+And include questions from the next team, collected before they get access.
+
+Keep a **held-out split**: a part of the set that nobody tunes the prompt against, used only for the final
+check. The prompt-optimization lab shows why. Its optimizer picks the instruction with the best accuracy on
+its validation set, and its own list of what the toy misses says it has no held-out test set. That is exactly
+how a golden set quietly turns into training data: you keep editing until the test passes, and the score
+stops predicting anything.
+
+### Graders, and where people stay in the loop
+
+Use the cheapest grader that can decide the question. Anthropic's guide describes three kinds:
+
+- **Code-based**: fast and reproducible, but brittle when a valid answer looks different.
+- **Model-based** (LLM judges): flexible, but not deterministic, and they need to be checked against people.
+- **Human**: the reference, but slow and expensive.
+
+**Code checks** cover more than people expect: the output format, which tool was called and with which
+arguments, a refund amount against the policy table, citations that exist and point to the current document
+version, required disclosures present, banned phrases absent, length and latency.
+
+**Judges.** Use one pass/fail judge per failure mode, not one judge that scores "quality" from 1 to 5. The FAQ
+argues "Binary evaluations force clearer thinking and more consistent labeling" than 1-to-5 scales. Before a
+judge may block a release, measure it against human labels on a held-out set. Two numbers matter. The
+**true-positive rate (TPR)** is the share of answers people marked as failures that the judge also fails. The
+**true-negative rate (TNR)** is the share of answers people marked as good that the judge also passes. The
+[llm-judge](/system-design-labs/interviews/walkthroughs/llm-judge/) family covers that step in depth.
+
+**People** label the sets used to check judges, settle disagreements, and review a sample of production.
+
+Say: "A judge is a test that can itself be wrong, so I measure how often it agrees with people before it
+gates anything."
+
+#### When people are a release control, not only a measurement
+
+In a regulated flow, a person approving output is part of the safety system. For an agent that drafts
+customer messages, the Anthropic prep guide asks you to say "what blocks an unsafe send, who is accountable
+when one slips through, and what your failure budget is" (<Cite id="s-a982325743" />). A **failure budget**
+is the highest defect rate you will accept, for example 1 compliance defect per 1,000 messages (an
+assumption). A plan that answers all three parts:
+
+1. **Code blockers before any send**: required disclosures, prohibited claims, personal data that must not
+   leave, numbers checked against the system of record. A blocked draft goes to a person.
+2. **Human approval by risk level.** At first a person approves every draft and the tool records whether they
+   sent it unchanged, edited it, or rejected it. A category of message earns automatic sending only after its
+   measured defect rate is below the budget with statistical confidence. It keeps a fixed review sample after
+   that.
+3. **A named owner** who signs off each release of the prompt, model and test suite, plus an audit log of
+   every draft, check result, approver and final text.
+
+How much evidence is "below budget with confidence"? With a budget of 1 defect per 1,000 messages, you need
+about **3,000 reviewed drafts in a row with no defect** before that category can send automatically at 95%
+confidence. One defect in those 3,000 means you have not shown the budget yet; keep reviewing.
+
+The legal backdrop is plain. In Moffatt v. Air Canada (2024) the tribunal held the airline responsible for
+its chatbot's wrong fare advice, writing that the chatbot "is still just a part of Air Canada's website"
+([Law360](https://www.law360.ca/ca/articles/1804075), fetched 2026-10-12).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Reviews needed before you can claim a defect rate (zero defects observed)"
+  expr="n ≥ ln(0.05) ÷ ln(1 − p_max) ≈ 3 ÷ p_max"
+  vars={[
+    { sym: "p_max", meaning: "the failure budget: the highest defect rate you can accept" },
+    { sym: "n", meaning: "reviewed drafts in that category, all defect-free" },
+  ]}
+  example="Budget of 1 compliance defect per 1,000 messages: n ≥ 2.996 ÷ 0.001 ≈ 3,000 reviewed, defect-free drafts before that category can auto-send at 95% confidence"
+  note="One defect in those 3,000 means you have not shown the budget yet; keep reviewing. The ≈3 ÷ n rule is the standard zero-event bound."
+/>
+
+</details>
+
+### The gate: "no worse than", judged on the paired interval
+
+The gate is the CI check that says yes or no to a change. The llm-eval lab has its building blocks: a
+**bootstrap** interval for one pass rate (an interval found by resampling the items many times, instead of
+from a formula) and a paired bootstrap test that resamples the item list. A production gate needs three
+changes on top.
+
+1. **Gate on the interval of the difference.** The real question is usually **non-inferiority**: is the
+   candidate no more than *m* points worse than the baseline? You pick *m*, the **margin**, in advance.
+   Bootstrap the paired difference and pass only if the lower end of its interval is above −*m*. The paired
+   numbers in the back-of-envelope section tell you whether the suite is big enough for the *m* you chose.
+   This lets neutral changes ship, such as a cheaper model that is no worse.
+2. **Resample items, not trials.** Three trials of one item are not three independent tests; they share the
+   same question. Average the trials per item first, then resample over items. Otherwise the interval looks
+   tighter than it really is.
+3. **Declare the blocking metrics in advance.** If you check 20 slices of the data, each with a 5% chance of
+   a false alarm, you expect about one false alarm per run. Block on a few metrics (must-pass items, policy
+   violations, task success). Treat the slices as warnings.
+
+Must-pass items allow no tolerance. A regression item that has always passed and now fails on every trial
+blocks the change, even if the average went up.
+
+Say: "I gate on the lower bound of the paired difference, not on the average, and must-pass items block on
+their own."
+
+#### What such a gate decides, on real numbers
+
+The rag lab shows it. It measured **hit@3** (the share of questions where a correct document is among the
+top 3 results) for three retrieval setups on two public test sets from the BEIR benchmark, about 300 queries
+each: <LabNumber lab="rag" metric="hit@3 on BEIR SciFact" /> on SciFact and
+<LabNumber lab="rag" metric="hit@3 on BEIR NFCorpus" /> on NFCorpus. The three setups are plain vector
+search ("dense"), a hybrid of keyword and vector search, and hybrid plus a **reranker** (a second model that
+re-sorts the top results).
+
+Reranking's gain on SciFact has a paired 95% interval that excludes zero, so a gate passes it. Its gain on
+NFCorpus points the same way, but the interval includes zero, so the gate can't call it. Hybrid against dense
+sits inside the noise on both. A dashboard of averages would have called every one of those moves real.
+
+### Live traffic: shadow, canary, and the metrics that say help or hurt
+
+**Shadow.** Copy live requests to the candidate, don't serve its output, and grade the pairs later with
+judges that don't need a reference answer. For an agent, stub every tool that changes something: a shadowed
+refund is still a refund.
+
+**Canary.** Route a small share of users to the candidate behind a flag. Bucket by user, so a conversation
+never switches versions halfway. Ramp 1%, 5%, 25%, 100%, with step sizes chosen from the canary arithmetic,
+and roll back automatically when a guard metric crosses its limit.
+
+**Production metrics.** For a support agent the Sierra guide names containment and escalation rate
+(<Cite id="s-9116046d24" />). **Escalation** means handing the conversation to a person. Each metric can be
+gamed on its own: containment rises if the bot simply stops escalating cases it should escalate. So report
+them as a set:
+
+| Metric | What it catches | Its blind spot |
+|---|---|---|
+| Containment (solved without a person) | Value from deflected work | Rises when the bot wrongly refuses to escalate |
+| Correct-escalation rate (sampled review) | Bad handoffs in both directions | Needs human review |
+| Recontact within 7 days (assumed window) | "Solved" conversations that weren't | Lags by a week |
+| Harm signals: policy violations, promised refunds, invented policies | The incidents that cost money or trust | Rare, so slow to measure |
+| Customer satisfaction (CSAT) or thumbs on contained conversations | How users feel about it | Sparse, and only some users answer |
+| Cost and latency per solved conversation | Whether the quality is affordable | Says nothing about quality |
+
+"Helps rather than hurts" is a claim about what would have happened without the assistant. So keep a small,
+long-running **holdout**: a group of users who keep the previous experience. Compare their time to
+resolution and recontact rates with everyone else's.
+
+Two incidents show why both offline evals and user signals can mislead. Cursor's support bot invented a login
+policy that did not exist, and users cancelled subscriptions
+([Fortune](https://fortune.com/article/customer-support-ai-cursor-went-rogue), April 2025). OpenAI's April
+2025 GPT-4o update went out although expert testers said it "felt slightly off", because of positive signals
+from users who tried it. OpenAI later wrote that it "didn't have specific deployment evaluations tracking
+sycophancy" (as quoted by a [Georgetown Law brief](https://www.law.georgetown.edu/tech-institute/insights/tech-brief-ai-sycophancy-openai/), 2025-07-30).
+
+## Failure modes and overload
+
+The eval system is a service, and it fails like one. Name these and what you do about each.
+
+- **The judge provider is down or rate-limited.** Blocking tiers fail closed, so nothing ships ungraded. An
+  emergency path exists, with human sign-off and an audit entry.
+- **Flaky evals.** People rerun until green. Track how often each item flips across reruns of the same
+  version, and quarantine flaky items the way you quarantine flaky tests.
+- **Saturation.** Anthropic's guide describes suites that stop telling versions apart once everything
+  passes. Keep capability suites hard and refresh them from new failures.
+- **Overfitting the golden set.** Prompt tuning against the gate's own items makes the score meaningless.
+  Keep the held-out split and rotate new traces into it.
+- **Drift nobody filed.** The provider updates the model behind a name like "latest", the mix of user
+  questions shifts, or a document index ages. Pin model versions and re-run the regression suite on a
+  schedule, even when nothing changed on your side.
+- **Quality incidents that error rates miss.** Anthropic's 2025 postmortem of three infrastructure bugs says
+  "The evaluations we ran simply didn't capture the degradation users were reporting", and that it would run
+  quality evaluations continuously on production systems ([Anthropic](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues), 2025-09-17).
+- **Side effects from shadow mode.** A write tool left live in shadow mode acts on real accounts.
+
+<Pitfall title="One number on a dashboard">
+"Quality went from 82 to 84" with no interval, no pairing and no breakdown by failure mode is how regressions
+ship. With 200 items that difference is inside the noise. Report the paired difference with its interval, the
+must-pass items, and the failure modes that moved.
+</Pitfall>
+
+## Evals and observability
+
+The eval system needs its own report card, the way a CI system has flake and duration dashboards:
+
+- **Escaped regressions**: incidents the gate passed. Each one becomes a regression item.
+- **Justified overrides**: how often an owner overrode a failing gate and turned out to be right. A high rate
+  means the gate blocks good changes, and people will route around it.
+- **Judge health**: each judge's TPR and TNR on a held-out labelled set, re-measured on a schedule and
+  whenever the judge's model or prompt changes.
+- **Flake rate and time to gate**: an hour-long merge check makes people batch changes, and then you can't
+  tell which change caused what.
+- **Coverage**: which failure modes have items, and how many.
+- **Cost per gate run**, by tier.
+
+Show every quality number with its interval and a link to the transcripts behind it. Anthropic's guide puts it
+this way: "we do not take eval scores at face value until someone digs into the details of the eval and reads
+some transcripts."
+
+## Trade-offs
+
+Each row is a choice you can defend out loud, with the case where you'd choose differently.
+
+| Decision | What you gain | What you give up | Choose differently when |
+|---|---|---|---|
+| Paired offline comparison | ±3.2 instead of ±5.7 points for the same 300 items | Two runs per gate | The baseline can't be re-run (retired model): compare against stored results with wider intervals |
+| Pass/fail checks per failure mode | Consistent labels, judges you can check | A gradual sense of progress | Tracking progress: add more pass/fail sub-checks rather than a 1-to-5 scale |
+| Code checks before judges | Cheap, deterministic, safe to block on | Brittle when a valid answer looks different | Open-ended output: checked judges plus human samples |
+| A "no worse than" margin m | Ships neutral changes such as cost cuts | Lets small regressions through | Safety and compliance: zero tolerance on must-pass items |
+| Shadow before canary | Problems found with no user impact | Doubles the cost of running the model; write tools must be stubbed | Agents with many write tools: a small canary with tight limits instead |
+| Offline suite as the main measurement | Works at 600 questions a day | Misses what the suite doesn't cover | High traffic: live tests can measure 3-point effects within days |
+
+<AINative title="Agents write the graders; you check the graders">
+Coding agents are good at the volume work here: turning a list of failure modes into code checks, drafting
+judge prompts, generating variants of a failing case, wiring the CI tiers, and building a custom annotation
+screen in an afternoon. The FAQ reports that teams with custom annotation tools "iterate ~10x faster". What you
+verify is the grader itself. Label a sample yourself before an agent proposes failure modes (the FAQ's order
+too, so its guesses don't bias your judgment), and measure each judge against those labels before it can
+block anything. Watch for an agent "fixing" a failing eval by loosening the check or editing the expected
+output: review diffs to eval data as carefully as diffs to production code. If one model family writes the
+test cases, answers them and grades them, treat the score as unverified until people have labelled a sample.
+</AINative>
+
+## Small-team version
+
+You own AI at a company of 50–500 people, with a few engineers and coding agents. The eval gate is the most
+valuable thing you can build. Without it, every prompt tweak is a silent change to production.
+
+### Build, buy, skip
+
+- **Build** the test suite, the graders and the gate. They encode your product's definition of good, so no
+  vendor has them. In practice it is a few hundred lines: a runner that replays items against a version, code
+  checks, one judge per failure mode, a paired bootstrap, and a CI job that posts the result on the pull
+  request.
+- **Buy or self-host** tracing and a queue for annotating traces. Langfuse is open source and self-hostable,
+  and said it would stay so after joining ClickHouse
+  ([Langfuse](https://langfuse.com/blog/joining-clickhouse), announced 2026-01-16). Hosted platforms
+  (LangSmith, Braintrust, Arize) do the same job. The FAQ's view is that such vendors differ more in support
+  than in features. Check current pricing yourself.
+- **Skip** generic metric suites as quality measures, labelling vendors for error analysis (the FAQ advises
+  against outsourcing it), fine-tuned judge models, and a separate eval platform team.
+
+### Default stack, and when to deviate
+
+- Items and labels in the database you already run, versioned with the code.
+- Code checks in the test framework you already use; judges as plain API calls with pinned model ids.
+- One domain expert as the quality owner. The FAQ calls this person the "benevolent dictator": a single
+  expert who decides what passes, rather than a committee.
+- Add a second labeller and an agreement measure (**Cohen's kappa**, which scores agreement between two
+  labellers after removing the agreement you'd get by chance) when the domain is contested or regulated. Move
+  to a hosted platform when non-engineers need to run reviews without you.
+
+### What it costs
+
+For the bank assistant's suite, one candidate run costs **about $13** in tokens, or **$26** if you also
+re-run the baseline. Ten gated changes a week is **$130–260 a week**. Labelling 300 traces takes about 10
+hours of an expert's time, roughly **$930** once, plus a few hours a month.
+
+The tokens are cheap next to the labelling time and the engineer. Spend the money on labels.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+List prices fetched 2026-10-11. Assume 200 items × 3 trials = 600 runs. Each run is about 4,000
+input and 400 output tokens on Claude Sonnet 5 ($2 in, $10 out per million). Two pass/fail judges per run,
+each about 4,500 input and 50 output tokens on Claude Haiku 4.5 ($1 in, $5 out). All token counts are
+assumptions.
+
+- Feature runs: 600 × (4,000 × $2 + 400 × $10) ÷ 10⁶ = **$7.20**.
+- Judges: 1,200 × (4,500 × $1 + 50 × $5) ÷ 10⁶ = **$5.70** (about $1.47 on gpt-5-mini at $0.25 / $2.00).
+- Total about **$13 per candidate run**, $26 with the baseline. Ten gated changes a week is $130–260 a week.
+- Human labels: 300 traces at an assumed 2 minutes each is 10 hours of expert time. At a loaded cost of about
+  $93 an hour (US Bureau of Labor Statistics median developer pay of $135,980 ÷ 0.70 ÷ 2,080 hours, research
+  11's method), about $930, a one-off plus a few hours a month.
+
+</details>
+
+### A realistic delivery plan
+
+- **Week 1**: tracing on, 100 production traces read and annotated, a list of failure modes, 50 items with
+  code checks running on every pull request.
+- **Weeks 2–3**: 200–300 items, one judge per open-ended failure mode, 50 failing and 50 passing labels per
+  judge (the FAQ's minimum) with a held-out split, and a paired comparison posted on every prompt or model
+  change.
+- **Week 4**: canary behind a flag, production dashboards for the outcome metrics, and a weekly 30-minute
+  trace review on the calendar.
+- **Ongoing**: every escaped failure becomes an item; judges re-checked monthly and on any judge change.
+
+### What you still verify yourself
+
+The labels on the set used to check judges, each judge's TPR and TNR before it blocks anything, the must-pass
+list, the rollback limits, and every diff to eval data, including the ones an agent wrote.
+
+### What small-company interviewers probe
+
+Whether you have done this rather than read about it: how many items, where they came from, the judge's
+agreement with people, a regression the gate caught, what the suite cannot detect at its size, and what it
+cost. Expect "you have no labellers and no data yet: what do you do in week one?" Answer with the week-1
+plan above.
+
+### Revisit when
+
+Traffic grows enough for live tests to measure small effects in days; a second team ships its own LLM
+feature (move the gate into a shared service); a regulator or customer contract asks for audit trails; or the
+judge bill passes the labelling budget.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Knowing whether it is good"
+  senior={[
+    "Turns complaints into counted failure modes, builds test sets from real traces with a held-out part, and puts code checks before LLM judges.",
+    "Reports pass rates with intervals, compares versions on the same items, and gates prompt and model changes in CI with a per-user canary behind it.",
+    "Watches production metrics as a set (containment with recontact and correct handoffs) so no single one can be gamed.",
+  ]}
+  staff={[
+    "Sizes the suite from the margin the business cares about, and says what the current suite and the current traffic cannot detect.",
+    "Treats judges as versioned gate configuration with measured agreement with people (TPR and TNR), and never changes the judge and the candidate in the same change.",
+    "Designs human checkpoints as release controls in regulated flows: code blockers, risk levels, a failure budget with its sample size, a named owner.",
+    "Measures the gate itself: escaped regressions, justified overrides, flake rate, cost per run.",
+  ]}
+/>
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="(Sierra prep guide) A model swap improves the average but breaks cases that used to work. What does your process do?">
+The must-pass items block it regardless of the average. The paired comparison lists the items that flipped,
+those transcripts go to error analysis, and the swap ships with a prompt fix or not at all. If the old model
+is being retired, the decision becomes which regressions you accept, in writing.
+  </FollowUp>
+  <FollowUp q="(OpenAI FDE prep guide) How do you know the assistant is good enough for the next team?">
+Agree the bar with that team before measuring: a task-success threshold judged by the lower end of its
+interval on their own questions, zero must-pass failures, a correct "the policies don't cover this" on
+questions the policies don't cover, then two weeks of live outcomes within limits. Check their document
+permissions before they get access.
+  </FollowUp>
+  <FollowUp q="(Anthropic FDE prep guide, practice prompt) Who is accountable when an unsafe message slips through?">
+A named release owner, not "the model". Show the chain: which check should have blocked it, why it didn't,
+and the item you add so it can't pass again. The failure budget and its sample size say when a category may
+send automatically at all.
+  </FollowUp>
+  <FollowUp q="(Reported, OpenAI candidate account seen second-hand) In your project, is there an eval framework, or is it vibes?">
+Answer with evidence: item count and where the items came from, the grader for each failure mode, the judge's
+agreement with people, the interval on the last comparison, and one regression the suite caught. If some piece
+is missing, say so and say what you would build first.
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) You have 600 questions a day. How do you run an A/B test?">
+You mostly don't. At 300 per group a day, a 3-point change takes about two weeks to measure. Rely on the
+offline paired suite and human review of a daily sample, and use the live phase to catch crashes, policy
+failures and cost blowups.
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) The judge model gets deprecated. What happens to your history?">
+Check the replacement judge on the same held-out labels, run both judges side by side on one suite version,
+and record the offset. Scores from different judges are not comparable without that bridge run.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Vibes.** "We tried it and it looked better" is the answer the reported challenge targets: is there a real
+  eval framework, or is it "vibes-based"? (<Cite id="s-9ffe6685c2" />). Bring item counts, intervals and judge
+  agreement instead.
+- **Trusting a judge before testing it.** Asked whether you would trust the judge before checking it against
+  people, the applied-AI guide says "The right answer is no" (<Cite id="s-7d03a572e0" />).
+- **Generic metrics as quality.** The FAQ's verdict on them is "Good scores on them don't mean your system
+  works."
+- **One overall score.** An average hides the cases that broke; keep must-pass items and per-mode results.
+- **Treating trials as independent items.** It shrinks intervals that should be wide.
+- **A 1% canary as the measurement.** At 40,000 conversations a day it needs about ten days to see a
+  3-point drop.
+- **Optimizing containment alone.** It rewards a bot that never hands off to a person.
+- **Shadowing an agent with live write tools.** The shadow copy acts on real accounts.
+
+## Prove it with a lab
+
+<LabRef lab="llm-eval" role="proof" note="Run bootstrap_ci and paired_bootstrap_test on two lists of per-item results, then extend the paired test to return the interval of the difference for a non-inferiority gate. Point it at a real model; the bundled server always answers A." />
+
+<LabRef lab="rag" role="proof" note="Rerun its BEIR bench and gate each stage (hybrid, then rerank) on the paired interval of the difference rather than on the averages." />
+
+<LabRef lab="feature-flags" role="proof" note="Bucket users for a canary with its SHA-256 percentage rollout, and join the evaluation log to outcomes by variant. Automatic rollback is on its list of what the toy misses." />
+
+<LabRef lab="cicd-engine" role="proof" note="Wire the tiers as a DAG with fail-fast. Its cache key covers the step name, environment and input hash but not the command or any external model, so add the model, judge and dataset versions to the key or never cache eval steps." />
+
+<LabRef lab="embedding-pipeline" role="proof" note="Its neighbour-overlap check is the retrieval-side gate for an embedding swap." />
+
+<LabRef lab="prompt-optimization" role="partial" note="Run the optimizer with a validation split and a held-out test split and watch the gap. With the mock LLM the accuracies mean nothing; the overfitting mechanics are the point." />
+
+The lab numbers quoted above measure the harness and its statistics (a power simulation), and retrieval on
+public datasets, all on one Apple M1 Ultra on 2026-10-11. None of them measures an assistant's quality. A
+lab for LLM-as-judge evals and one for LLM observability are planned.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-26f0cae3fe" />
+- <Cite id="s-a982325743" />
+- <Cite id="s-9116046d24" />
+- <Cite id="s-7d03a572e0" />
+- <Cite id="s-812dbc9385" />
+- <Cite id="s-9ffe6685c2" />
+- <Cite id="s-d7a8e88bf0" />
+- [Demystifying evals for AI agents](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents), Anthropic engineering blog, 2026-01-09 (official; fetched 2026-10-12)
+- [AI Evals: everything you need to know (FAQ)](https://hamel.dev/blog/posts/evals-faq/), Hamel Husain and Shreya Shankar, published 2026-09-18, modified 2026-09-21 (practitioner; fetched 2026-10-12)
+- [Your AI product needs evals](https://hamel.dev/blog/posts/evals/), Hamel Husain, 2024-03-29 (practitioner)
+- [A postmortem of three recent issues](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues), Anthropic, 2025-09-17 (official)
+- [Tech brief: AI sycophancy and OpenAI](https://www.law.georgetown.edu/tech-institute/insights/tech-brief-ai-sycophancy-openai/), Georgetown Law Tech Institute, 2025-07-30 (secondary; quotes OpenAI's postmortem)
+- [Cursor's AI support bot invented a policy](https://fortune.com/article/customer-support-ai-cursor-went-rogue), Fortune, April 2025 (news)
+- [Air Canada chatbot ruling](https://www.law360.ca/ca/articles/1804075), Law360 Canada, February 2024 (news)
+- [Langfuse joins ClickHouse](https://langfuse.com/blog/joining-clickhouse), Langfuse, 2026-01-16 (official)
+- Prices and loaded-cost method: `docs/ai-interviews/research/11-small-team-lens.md` §7 (provider pricing pages and BLS, fetched 2026-10-11)

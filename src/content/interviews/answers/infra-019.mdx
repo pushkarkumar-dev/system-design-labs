@@ -1,0 +1,166 @@
+---
+question: infra-019
+family: multipart-practical-coding
+status: published
+labs: [observability]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll replay the events with a call stack. For each function I keep a depth counter, start its clock when the
+> depth goes from 0 to 1 and stop it when it returns to 0, so recursion is counted once. Before coding I'll state a
+> policy for each kind of bad input: an end for a function that isn't on top means the frames above it never
+> returned, so I close and flag them; an end with no start is ignored; anything still open at the end of the trace
+> is closed there and flagged. Then I'll ask whether 'slowest' means with or without the time spent in callees."
+>
+> The rest of this page explains each part of that answer.
+
+A profiler gives you a stream of events: "function X started at t", "function X ended at t". The question is which
+function is slowest, and whether your answer survives broken input.
+
+On clean input this is a stack exercise you have seen before, like matching brackets. What makes it a Staff-level
+question is that real traces are not clean. A function throws and never logs its end. The trace is cut off while a
+call is running. A function calls itself, and a naive sum counts the same time twice. The interviewer adds these
+one at a time, and the signal is whether you raise them first.
+
+A Staff/L6 Anthropic infra candidate described this as their weakest round: "this version kept shifting", and the
+interviewer "started breaking it with edge cases like cycles, infinite loops, and functions that never return".
+Their own reading: "I wasn't proactively naming all those failure modes the way they'd expect at staff level"
+(<Cite id="s-2348518c66" />). That is the signal: raise the edge cases before the interviewer does.
+
+## Clarify first
+
+- **"Slowest" means what?** Time including the functions it called (**inclusive** time), or only time spent in its
+  own code (**exclusive**, or self, time)? Total across all calls, or the single longest call? Assume total
+  inclusive, and offer exclusive.
+- **Recursion:** if `fib` calls `fib`, count the outer call's span once, not every nested one, or inclusive time
+  double-counts. Assume that.
+- **Never returns:** a start with no matching end. Close it at the trace end and flag it, or exclude it? Assume
+  close and flag.
+- **Mismatched end:** an end for a function that isn't on top of the stack means the frames above it never returned
+  (an exception or a lost event). Pop them and flag them.
+- **Threads:** one stack per thread id.
+
+Say it like this: "Before I write code, here are the four ways this input can be broken and what I'll do with each.
+Tell me if you want a different policy for any of them."
+
+## Answer
+
+### Words you need first
+
+- **Inclusive time** of `main` is everything from its start to its end, including every function it called.
+  **Exclusive time** subtracts the time spent in callees.
+- **Depth** here means how many calls of the same function are currently open. While `fib` is inside `fib`, its
+  depth is 2.
+
+### Why the depth counter
+
+If `fib` starts at 1, calls itself at 2, the inner call ends at 3 and the outer at 5, naive inclusive time adds 4
+(outer) plus 1 (inner) and reports 5 for a function that ran for 4. Counting time only while the depth goes from 0
+up and back to 0 gives 4: one stretch of wall time, counted once.
+
+### The code
+
+Keep a call stack and a per-function depth. Start the clock when a function's depth goes from 0 to 1 and stop it
+when it returns to 0, which handles recursion.
+
+```python
+def slowest(events, trace_end=None):
+    stack, depth, total, start_of, open_flag = [], defaultdict(int), defaultdict(int), {}, set()
+    last_ts = 0
+    for kind, fn, ts in events:
+        last_ts = ts
+        if kind == "start":
+            stack.append(fn)
+            if depth[fn] == 0:
+                start_of[fn] = ts
+            depth[fn] += 1
+        else:
+            while stack and stack[-1] != fn:          # frames that never returned
+                lost = stack.pop()
+                open_flag.add(lost)
+                depth[lost] -= 1
+                if depth[lost] == 0:
+                    total[lost] += ts - start_of[lost]
+            if not stack:
+                continue                              # end with no start: ignore it
+            stack.pop()
+            depth[fn] -= 1
+            if depth[fn] == 0:
+                total[fn] += ts - start_of[fn]
+    end = trace_end if trace_end is not None else last_ts
+    while stack:                                      # still open at the end of the trace
+        fn = stack.pop()
+        open_flag.add(fn)
+        depth[fn] -= 1
+        if depth[fn] == 0:
+            total[fn] += end - start_of[fn]
+    best = max(total, key=total.get) if total else None
+    return best, dict(total), open_flag
+```
+
+The three loops map to the three policies. The inner `while` closes frames that never returned. The `if not stack`
+check ignores an end with no start. The final `while` closes whatever is still open when the trace stops.
+
+### One trace through it
+
+`main` calls `fib`, which recurses once; then `hang` starts and never ends; `main` ends at 9 and the trace at 10.
+(These results come from running the function above.)
+
+| Time | Event | Stack after | What the code does | What to say in the interview |
+|---|---|---|---|---|
+| 0 | start main | main | main's clock starts | |
+| 1 | start fib | main, fib | fib's clock starts (depth 0 → 1) | |
+| 2 | start fib | main, fib, fib | depth 2; clock already running | "Recursion: don't restart the clock." |
+| 3 | end fib | main, fib | depth back to 1; no time added | |
+| 5 | end fib | main | depth 0: fib total **4** | "Counted once, from 1 to 5." |
+| 6 | start hang | main, hang | hang's clock starts | |
+| 9 | end main | (empty) | hang is on top, not main: close hang at 9 and **flag** it (total **3**); then main total **9** | "An end for a frame below the top means the frames above it never returned." |
+| 10 | trace ends | (empty) | nothing left open | |
+
+The result: main is slowest at 9, fib 4 (outer call only), hang 3, with hang flagged. The test with exactly this
+trace passed when run on 2026-10-12.
+
+### The likely follow-ups
+
+**Exclusive time.** When a frame is pushed, pause its parent's clock; when it pops, resume it. Say it like this: "For
+self time, every push pauses the caller's clock and every pop resumes it."
+
+**"Cycles" and "infinite loops".** "Cycles" in the report most likely means recursion, direct (`fib → fib`) or
+mutual (`a → b → a`); the per-function depth handles both. An "infinite loop" in a trace is a function that never
+returns, handled by the end-of-trace close.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Slowest function"
+  senior={["Stack matching with correct inclusive time, recursion counted once, unclosed calls handled."]}
+  staff={["Lists the malformed-input cases before coding, decides and states a policy for each (close, flag, ignore), and offers exclusive time and per-thread stacks."]}
+/>
+
+## Small-team version
+
+The everyday version is reading a trace of one request to a feature built on a language model. The request is made
+of **spans**: timed records with a start, an end and a parent, one for retrieval, one for the model call, one for
+each tool the model used. The question is the same: which span took the time, and which spans never closed because
+a call timed out.
+
+Use your tracing tool's views rather than writing this. What you own is making sure every span is closed on error
+paths too (a `finally` block, or the tracing library's context manager). A span left open on a timeout makes the
+"slowest" answer wrong, exactly as `hang` would have without the end-of-trace rule.
+
+## Pitfalls
+
+- **Double-counting recursive calls.** Inclusive time then exceeds the wall time the function actually ran.
+- **Crashing on bad input.** An end without a start, or a trace that ends mid-call, should be handled by a stated
+  policy, not an exception.
+- **Not asking inclusive versus exclusive.** The two give different "slowest" answers on the same trace.
+- **Waiting for the interviewer to raise the edge cases.** At Staff level, naming them first is the signal.
+
+## Go deeper
+
+- Family walkthrough: [Multi-part practical coding](/system-design-labs/interviews/walkthroughs/multipart-practical-coding/), especially Senior vs Staff.
+- Producing the events from samples: [infra-018](/system-design-labs/interviews/questions/infra-018/).
+- Spans with start, end and parents: <LabRef lab="observability" inline />.

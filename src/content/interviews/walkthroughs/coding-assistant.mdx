@@ -1,0 +1,819 @@
+---
+title: "Design an AI coding assistant: repository context, edit application, latency"
+summary: "Pick which code the model sees under a size budget, apply its suggested change without breaking the file, keep suggestions fast, and keep customer code private. Plus what a small team buys instead."
+track: ai-engineer
+format: design
+family: coding-assistant
+smallTeamFocus: "Buy IDE assistants, check their data terms, and measure whether they help. Build only narrow internal tools that let a model change your code or config, reusing the same pick, apply and check steps."
+rounds: [ml-system-design, practical-coding]
+level: both
+timeboxMin: 45
+order: 348
+status: published
+basedOn: [eng-014, eng-065, r2b-007]
+askedAt: [cursor, meta]
+labs:
+  - { lab: rag, role: proof, note: "Dense, hybrid and reranked retrieval measured on BEIR. Its BM25 tokenizer ablation is the same lesson as code search: how you split tokens changes what you find." }
+  - { lab: search-engine, role: background, note: "An inverted index with BM25 and compressed postings in Rust: the lexical half of code retrieval. Not audited for this guide; its benchmark rows are estimates." }
+  - { lab: speculative-decoding, role: partial, note: "The acceptance math behind speculative decoding is correct and tested; the draft and target are mock models, so its speedups say nothing about real models." }
+  - { lab: llm-inference, role: partial, note: "A real KV cache on GPT-2, which is why a stable prompt prefix is cheap to reuse. Its batching is sequential and it has no streaming or TTFT measurement." }
+gapLabs: [llm-gateway]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "The repository is far too big to show the model, so the first problem is choosing which few thousand lines it
+> sees: the code around the cursor, what the user just edited, the definitions of names they're using, and search
+> results, ranked and cut to a fixed budget. The second problem is that the model's suggested change is usually
+> right and sometimes subtly wrong, so I apply it like untrusted input: find the exact old text, check the file
+> still parses, and refuse loudly when anything doesn't match. The third problem is speed: completions are
+> requested on almost every pause in typing, so I keep the prompt's start stable so it can be reused, use a small
+> model, and cancel requests the user has already typed past. Privacy decides what code may leave the machine at
+> all."
+>
+> The rest of this page explains each part of that answer.
+
+A typical version of the prompt reads like this. Design a coding assistant, built on a large language model, for a
+large repository. Decide
+what goes into the model's input under a size limit (open files, recent edits, which functions call which, search
+results). Apply the model's suggested edit to a file without breaking the code around it. Meet a latency target for
+suggestions. Keep the customer's code private.
+
+### Why this is not an ordinary backend design
+
+You have built search features, caches and request pipelines. This problem uses all of them, but three things
+are different, and a good answer is built around them.
+
+1. **The input has a hard size limit, and you pay for every bit of it.** A large language model (LLM) reads text
+   and writes text. It can only read a limited amount per request, and the provider charges for every piece it
+   reads. A big repository is many times larger than that limit. So before you call the model, you run a small
+   search engine whose job is to pick the most useful code and stop at a budget.
+2. **The output is untrusted.** The model returns a suggested change. Most of the time it is correct. Some of the
+   time it quotes the old code slightly wrong, matches the wrong place, or leaves out a chunk with a comment like
+   "rest unchanged". Applying it is closer to accepting input from a buggy client than to calling a library.
+3. **The model writes slowly, and users don't wait.** The model produces its answer piece by piece, so a long
+   answer takes seconds. Meanwhile the user keeps typing, and most suggestions are out of date before they arrive.
+   Latency work is about writing less, reusing work and cancelling early.
+
+If you explain those three things and walk one request through the system, you have the core of the answer.
+
+### Words you need first
+
+- **Token.** Models read and write text in small pieces called tokens. In code, a token is often a short
+  identifier, part of a long identifier, an operator or some indentation. Code comes out at about **8 tokens per
+  line** with modern tokenizers (measured below).
+- **Context window.** The most tokens the model can read in one request. Everything you send (instructions, code,
+  the user's question) is called the **prompt**, and it must fit inside the window.
+- **Input and output tokens.** Providers charge per token read (input) and per token written (output). Output
+  tokens are also what makes a request slow, because the model writes them one after another.
+
+### Where the question comes from
+
+Three questions in the bank are parts of this one problem. Two are example problems from a prep article about
+Cursor's interview loop, and one is a reported Meta title whose body is locked (<Cite id="s-c29d429c3c" />,
+<Cite id="s-be19e40ea6" />):
+
+<QuestionRow id="eng-014" />
+<QuestionRow id="eng-065" />
+<QuestionRow id="r2b-007" />
+
+The Cursor article words its two problems as "Build a small context-retrieval step: given a query and a repo,
+return the chunks worth sending to a model" and "Implement a syntax-aware edit that applies a model's suggested
+change to a file without mangling the code around it". It cites no candidates, so treat these as likely shapes,
+not recorded questions. The Meta title, "Design an LLM-Based Coding Assistant", is from a Machine Learning Engineer
+loop, dated Jun 27, 2026 on PracHub and tagged ML System Design, LLM Applications, and LLM Inference & Serving.
+
+Two neighbours live in other families: Meta's "prevent private code leakage in coding agents"
+([r2b-008](/system-design-labs/interviews/questions/r2b-008/)), and the same Cursor article's problem of parsing a
+stream of model output ([eng-066](/system-design-labs/interviews/questions/eng-066/)).
+
+## What is being tested
+
+Four skills, each one a backend skill with a twist.
+
+**Choosing context under a budget, and proving the choice is good.** The repository doesn't fit in the context
+window, so this is a ranking and packing problem, like building a search results page with a hard size limit. The
+Cursor article says graders look at whether you "prompt with the right context" and that "What they're grading is
+judgment" (<Cite id="s-c29d429c3c" />). Judgment here means saying which signals you'd use, in what order, and how
+you'd know the chosen code was the right code.
+
+**Applying a change that fails safely.** Applying an edit is a text-transformation problem where the input is
+usually right and occasionally subtly wrong. Interviewers want to hear how you locate the change, how you check the
+result, and what you do when it doesn't fit. A regex that works on the demo is not enough.
+
+**A latency budget broken into stages.** The article mentions "how you keep an editor responsive while work runs in
+the background". Meta's tags put model serving in scope too, so expect to explain where the milliseconds go and
+which tricks shave them.
+
+**Privacy as a design input.** Customer code is the most sensitive data the product touches. You decide what
+leaves the developer's machine, what is stored, and whether anything is used to train a model.
+
+My reading: the round rewards engineers who treat the model as one unreliable component inside a predictable
+pipeline. Backend instincts (budgets, idempotency, validation, cancellation) carry most of it.
+
+## Clarify and scope
+
+Spend a minute on these questions. Each one changes the design.
+
+1. **Which features?** Inline completion as you type, chat about the repository, multi-file edits, an autonomous
+   agent that runs commands? Each has a different latency budget.
+2. **What does the repository look like?** Size, languages, one big repository or many, how much generated code,
+   how often people switch branches.
+3. **Latency targets.** For completion, how soon after the user stops typing should a suggestion appear? For an
+   edit, how long will a user watch a spinner?
+4. **Deployment and privacy.** Do we call a hosted model over the internet, or must code stay inside the
+   customer's network? How long may anyone keep it, and may it be used for training?
+5. **Which model?** A vendor's API, an open model we host ourselves, or both (a small one for completion and a large
+   one for edits)?
+
+Say your assumptions out loud: "I'll assume a 2-million-line repository in Python, Go and TypeScript. Completion,
+chat and edits are in scope; agents are out. I'll aim for a suggestion a few hundred milliseconds after a typing
+pause and an edit within a few seconds. Those are my assumptions, not quoted targets. We call hosted model APIs,
+and privacy terms are a hard requirement."
+
+### The example we follow through this page
+
+One developer, one file, two requests. The names are illustrative.
+
+- The developer is editing `payments/client.py`, a 400-line file. Inside the `charge()` method they start typing a
+  new line. The assistant should offer a **completion**: a few words or a line of grey text they can accept with
+  Tab.
+- A minute later they open the chat panel and type: *"Add retries with exponential backoff to charge()."* The
+  assistant should propose an **edit**: a change of about 30 lines to that method, shown as a diff the developer can
+  accept.
+
+Every section below comes back to these two requests: what context each one gets, how the edit is applied, and
+where the time goes.
+
+## Back-of-envelope
+
+### How big is the repository in tokens?
+
+First, measure what a line of code costs. Tokens per line were measured on 2026-10-12 over this site's own lab
+code (98 Python, 146 Go and 80 Rust files) with three tokenizers. A **tokenizer** is the program that splits text
+into a model's tokens; each model family has its own, with a fixed **vocabulary** of pieces it knows.
+
+| Tokenizer (vocabulary size) | Python | Go | Rust |
+|---|---|---|---|
+| Llama-3.1 (128,256) | 7.9 tokens/line | 7.8 | 8.4 |
+| Qwen3 (151,669) | 8.0 | 8.0 | 8.6 |
+| GPT-2 (50,257) | 13.6 | 10.4 | 15.7 |
+
+Modern tokenizers land near **8 tokens per line**. GPT-2's older, smaller vocabulary needs up to twice as many,
+because it has to spell more identifiers out in small pieces.
+
+So the assumed 2-million-line repository is about **16 million tokens**, roughly **80 times** a 200,000-token
+context window. (For scale, this site's lab code alone, about 75,000 lines, is about 600,000 tokens.) You cannot
+send the repository. Choosing what to send is not an optimisation; it is the core of the product.
+
+Say: "At about 8 tokens a line, the repository is 16 million tokens, about 80 context windows. So retrieval is
+required, and the budget forces choices."
+
+### How much context does each request get?
+
+A bigger prompt costs more and takes longer to read, and irrelevant code can distract the model. So each feature
+gets a fixed budget. For the completion in our example, assume 8,000 tokens, split like this:
+
+| Slice of the prompt | Tokens (assumed) | What it is in our example | What to say in the interview |
+|---|---|---|---|
+| Code around the cursor | 3,000 | The lines of `payments/client.py` before and after the cursor | "The cursor's surroundings are reserved first; they matter most." |
+| Definitions of names used nearby | 2,000 | The `HttpSession` class and the `ChargeRequest` type that `charge()` uses | "The model can't call a function correctly if it hasn't seen its signature." |
+| Recent edits | 1,500 | The two functions the developer changed in the last few minutes | "What you just touched predicts what you'll touch next." |
+| Similar code found by search | 1,500 | Another client in the repo that already has a retry loop | "Search fills whatever room is left." |
+
+The split is an assumption to tune with an **eval** (a fixed set of test cases you rerun after every change,
+described later). The point is that it is decided, not left to
+"as much as fits".
+
+### How long does it take to write an edit?
+
+An edit's latency is dominated by how many tokens the model must write. There are two common ways to ask for the
+change:
+
+- **Rewrite the whole file.** The model writes out all 400 lines of `payments/client.py` with the change included.
+  That is about **3,200 output tokens**.
+- **Write only the changed part.** The model writes a *search/replace block*: the old lines to find, then the new
+  lines to put in their place. For a 30-line change that is about **480 tokens** (old plus new text).
+
+At an assumed 50 output tokens per second, the whole-file rewrite takes about **64 seconds** and the block takes
+about **10 seconds**. In 2024 Cursor reported about 1,000 tokens per second for a model built only to apply edits
+([Cursor, 2024-05-14](https://cursor.com/blog/instant-apply)). At that speed the same two options take about
+**3.2 s** and **0.5 s**. That gap is why the edit format matters, and why fast "apply" became its own model in some
+products.
+
+### A trick that suits edits: guessing tokens ahead
+
+Most of an edited file is the old file, unchanged. That makes edits a good fit for **speculative decoding**. The
+idea in plain words: something cheap guesses the next few tokens, and the big model checks all the guesses in a
+single step instead of writing them one at a time. It keeps the guesses up to the first one it disagrees with. The
+cheap guesser is usually a small **draft model**. The fraction of guesses the big model agrees with is the
+**acceptance rate**, written α.
+
+For an edit there is an even cheaper guesser: the original file. Cursor's 2024 post says its "speculative edits"
+guess future tokens "using a deterministic algorithm rather than a draft model"
+([Cursor, 2024-05-14](https://cursor.com/blog/instant-apply)). Where the file is unchanged, almost every guess is
+accepted.
+
+How many tokens do you get per big-model step? With 5 guesses and 80% acceptance, about **3.7**. For an edit that
+mostly copies the file, acceptance is high: 8 guesses at 95% give about **7.4**, and 16 guesses at 99% give about
+**15.7** (illustrative values, computed 2026-10-12). Tokens per step is not the same as speedup, though. Making and
+checking guesses costs something, and when a server is already busy with many users, speculation can leave total
+throughput flat.
+
+### What does completion cost?
+
+Assume each developer triggers 500 completions a day, each with 8,000 input tokens and 30 output tokens. At list
+prices fetched 2026-10-11, that is about **$1.03 per developer per day** on gpt-5-mini, roughly **$22 a month**
+over 21 working days, and about **$86 a month** on Claude Haiku 4.5. Almost all of it is input. So reusing the
+stable start of the prompt and cancelling stale requests cut cost as well as latency.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Repository size:** 2,000,000 lines × 8 tokens/line = 16,000,000 tokens; 16,000,000 ÷ 200,000 = **80**
+  context windows. Lab code: 75,000 × 8 ≈ 600,000 tokens.
+- **Edit output:** whole file 400 lines × 8 = 3,200 tokens; a 30-line change as old plus new text is
+  (30 + 30) × 8 = 480 tokens.
+- **Time to write an edit:** time for an edit ≈ wait before the first token + output tokens ÷ writing speed. Ignoring the wait:
+  3,200 ÷ 50 = 64 s and 480 ÷ 50 = 9.6 s at an assumed 50 tokens/s; 3,200 ÷ 1,000 = 3.2 s and 480 ÷ 1,000 ≈ 0.5 s
+  at Cursor's reported ~1,000 tokens/s.
+- **Speculative decoding:** expected tokens per big-model step E = (1 − α^(K+1)) ÷ (1 − α), where K is the number
+  of guesses and α the per-token acceptance, assuming independent, equal acceptance (formula from
+  <Cite id="s-4525fcd815" />). α = 0.8, K = 5: (1 − 0.8⁶) ÷ 0.2 = 3.69. α = 0.95, K = 8: (1 − 0.95⁹) ÷ 0.05 = 7.40.
+  α = 0.99, K = 16: (1 − 0.99¹⁷) ÷ 0.01 = 15.71.
+- **Completion cost on gpt-5-mini** ($0.25 per million input tokens, $2 per million output, fetched 2026-10-11):
+  500 × (8,000 × $0.25 + 30 × $2) ÷ 1,000,000 = 500 × $0.00206 = **$1.03** a day; × 21 days ≈ **$22** a month.
+- **On Claude Haiku 4.5** ($1 in, $5 out per million, fetched 2026-10-11): 500 × (8,000 × $1 + 30 × $5) ÷ 1,000,000
+  = $4.08 a day; × 21 ≈ **$86** a month.
+
+</details>
+
+## High-level design
+
+Here is the system, top to bottom. The left column runs on the developer's machine; the rest can run either there
+or on your servers, which is one of the privacy decisions.
+
+```
+Developer's editor (IDE client)
+   │  cursor position, open files, recent edits
+   │  waits for a typing pause; cancels stale requests
+   ▼
+Context engine ───────────────► Indexes
+   │  rank, remove duplicates,    • word index over code
+   │  pack into the budget        • symbol graph (who defines / calls what)
+   │                              • optional embeddings
+   ▼
+Model router
+   │  completion ──► small, fast model
+   │  chat / edit ──► large model
+   ▼
+Apply engine (edits only)
+   │  find the old text, apply, re-parse, run quick checks
+   ▼
+Diff shown in the editor  ──► Telemetry (acceptance, latency, apply failures)
+```
+
+**The editor (IDE client).** A plugin inside the developer's editor (the IDE, integrated development environment).
+It watches the cursor, the open files and recent edits. It waits for a short pause in typing before asking for a
+completion; this wait is called a **debounce**. The moment the user types again, it cancels any request whose
+context is now stale. It streams results into the editor as they arrive.
+
+**Indexes.** Three kinds, kept up to date as files are saved and branches switch. A **lexical index** is a word
+index over code, like the inverted index behind any search box. A **symbol graph** records where each function,
+class and variable (each *symbol*) is defined, who calls it and what each file imports; you get it from the
+language's parser or from a **language server**, the same background process that powers "go to definition" in
+your editor. Optionally, **embeddings**: each chunk of code turned into a list of numbers so that chunks with
+similar meaning sit close together, which lets you search by meaning rather than by exact words.
+
+**Context engine.** Gathers candidate pieces of code from every source, ranks them, removes duplicates and packs
+them into the feature's token budget. This is the search engine from the opening.
+
+**Model router.** Sends each request to the right model. Completion goes to a small, fast model, because it runs on
+almost every pause. Chat and planning an edit go to a large model. Applying an edit can go to a fast specialised
+model, as in Cursor's design.
+
+**Apply engine.** Turns the model's proposed edit into a checked change. It locates the old text, applies the new
+text, re-parses the whole file, runs quick checks and shows a diff. It refuses, with a clear reason, when anything
+doesn't fit.
+
+**Telemetry.** Records how often users accept suggestions, how much accepted code is still there later, latency for
+each stage, and which apply failures happen. Without it you can't tell whether a change helped.
+
+### Two more words before we time anything
+
+When the model receives a prompt, it works in two phases:
+
+- **Prefill.** The model reads the whole prompt in one big pass. This sets how long you wait for the first token of
+  the answer, the **time to first token (TTFT)**.
+- **Decode.** The model then writes the answer one token at a time. Each token needs another pass. This sets how
+  long the rest of the answer takes.
+
+During prefill the model saves a summary of every token it read, so it doesn't have to re-read them for each new
+token it writes. That saved summary is the **KV cache**. If two requests start with exactly the same text, a server
+can keep the KV cache for that shared start and skip re-reading it. This is called **prefix caching**, and hosted
+APIs offer it as cheaper "cached input" tokens. It only works if the start of the prompt stays byte-for-byte the
+same, which is why prompt order matters.
+
+### Follow the completion through the system
+
+Back to the developer typing inside `charge()`. Here is the completion's clock. Every duration is an assumption for
+illustration, not a measurement:
+
+| Clock | Step | What happens | What to say in the interview |
+|---|---|---|---|
+| 0 ms | **Debounce** | The editor waits 50 ms after the last keystroke. If the user types again, nothing is sent. | "Most keystrokes should never become a request." |
+| 50 ms | **Context** | The context engine gathers the cursor's surroundings, definitions, recent edits and search hits, and packs 8,000 tokens. Takes about 20 ms. | "Context gathering is local and cheap if the indexes are already built." |
+| 70 ms | **Network** | The request travels to the model endpoint and back: about 60 ms. | "Place endpoints near users; this is a fixed tax." |
+| 130 ms | **Prefill** | The model reads the 8,000-token prompt: about 150 ms. | "This is where prefix caching pays: a stable prompt start is read once and reused." |
+| 280 ms | **Decode** | The model writes a 30-token suggestion at 200 tokens per second: 150 ms. | "Short outputs keep decode small; I'd stream the first line." |
+| ~430 ms | **Shown** | Grey text appears at the cursor. | "That's about 430 ms, and I know which term each lever moves." |
+
+If the user typed again at any point, the editor cancels the request and the clock restarts. For a fast typist,
+most requests end that way, which is good: a cancelled request costs little.
+
+## Deep dives
+
+### Context selection under a token budget (eng-014)
+
+Return to the edit request: *"Add retries with exponential backoff to charge()."* The model needs to see
+`charge()`, the session object it calls, how errors are raised, and ideally an example of how retries are already
+done elsewhere in the repository. Here is where candidates come from, roughly from cheapest and most reliable to
+most expensive:
+
+1. **The cursor's surroundings.** The current file's text before and after the cursor, and the enclosing function
+   and class. For our edit, all of `charge()` and the top of `payments/client.py`.
+2. **Recency.** Files and changes the user edited or viewed in the last few minutes.
+3. **The symbol graph.** Definitions of the names used near the cursor, their callers, and the imports of the
+   current file. For our edit, the definition of `HttpSession.post()` and the exception types it raises. The
+   open-source tool Aider builds a "repo map" this way: files and their key symbols, ranked by "a graph ranking
+   algorithm" over a graph of which files depend on which, within a budget set by `--map-tokens`, which "defaults
+   to 1k tokens" ([Aider docs](https://aider.chat/docs/repomap.html), fetched 2026-10-12).
+4. **Lexical search.** A word search over the code. In code, exact names matter: a search for `retry` should find
+   `retry_with_backoff`. That only works if identifiers are split into their words (`parseToolCall` becomes
+   `parse tool call`) before indexing. The usual scoring function for this kind of search is **BM25**, the same
+   relevance formula behind most text search engines: it rewards chunks that contain the query's rarer words.
+5. **Embedding search** (also called **dense** search). Search by meaning, using the embeddings described above. It helps most for
+   natural-language questions such as "where do we retry payments?", where the words in the question may not
+   appear in the code.
+
+Lexical and structural signals carry more of the load in code than in prose, because code is full of exact names.
+Cursor's codebase-indexing documentation, fetched 2026-10-12, says its Instant Grep index is built and queried on
+the user's machine and that Cursor "does not store embeddings of your codebase for search"
+([Cursor docs](https://cursor.com/docs/context/codebase-indexing)).
+
+**Chunk by structure.** Before indexing, split each file into **chunks**, the units you rank and send. Use one
+chunk per function or class, found with the language's parser, not fixed windows of N lines. A fixed window cuts
+functions in half, and half a function is little use to the model.
+
+**Rank and pack.** Each source produces its own ranked list. To combine them, use **reciprocal rank fusion
+(RRF)**: each chunk scores the sum of 1 ÷ (60 + its rank) over the lists it appears in, so a chunk near the top of
+several lists wins. A learned ranker can replace this later. Then pack:
+
+- Reserve the cursor's surroundings first.
+- Remove chunks that overlap ones already chosen.
+- Add the rest greedily by score per token, so a short, relevant chunk beats a long, slightly more relevant one.
+- Stop at the budget, and place the most relevant code closest to the cursor in the prompt.
+
+Here is what that might produce for our edit request, with an 8,000-token budget (illustrative):
+
+| Candidate | Source | Tokens | Kept? | Why |
+|---|---|---|---|---|
+| `charge()` and the class header | cursor | 900 | yes | Reserved first |
+| `HttpSession.post()` and its exception types | symbol graph | 700 | yes | Called by `charge()` |
+| `refunds/client.py: _retry()` | lexical search ("retry", "backoff") | 600 | yes | Shows the house retry pattern |
+| Two recently edited functions | recency | 1,500 | yes | Fits the budget |
+| A long design document mentioning payments | embedding search | 6,000 | no | Low score per token |
+| A second copy of `charge()` from search | lexical search | 900 | no | Duplicate |
+
+Say: "I'd rank by several signals, pack greedily by value per token, and reserve the cursor's own code first. Then
+I'd measure whether the right code made it in."
+
+**A small run on this site's code.** On 2026-10-12, 14 hand-written questions (for example "split the reply into
+sentences before speech synthesis") were run over the 98 Python files in `labs/*/src`, split into 532 function and
+class chunks. Each method was scored on whether the target file came first, and whether it was in the top 5:
+
+| Method | Target file first | In top 5 |
+|---|---|---|
+| BM25, whitespace tokens | 7 of 14 | 12 of 14 |
+| BM25, identifier-split tokens | 6 of 14 | 12 of 14 |
+| Dense (embeddings, MiniLM-L6 model) | 10 of 14 | 12 of 14 |
+| Hybrid (RRF of the two) | 9 of 14 | 13 of 14 |
+
+Fourteen questions written by someone who knows the code can't separate these methods: one question is 7
+percentage points. The honest lesson is the method, not the ranking, and saying so in the interview is a strong
+signal.
+
+The rag lab shows the same effect on a public benchmark large enough to measure it. **BEIR SciFact** is a set of
+scientific claims, each with labelled relevant documents. **Hit@3** means the share of queries where a relevant
+document is in the top 3 results. There, dense, hybrid (with the lab's whitespace tokenizer) and reranked retrieval
+scored <LabNumber lab="rag" metric="hit@3 on BEIR SciFact, dense v0 / hybrid v1 / rerank v2" />. (A **reranker** is
+a second, slower model that re-scores the top few results.) Hybrid with a better BM25 tokenizer, one that splits on
+word characters (`\w+`), gave <LabNumber lab="rag" metric="BM25 tokenizer (SciFact)" />. How you split text into
+searchable words changes what you find, which is the identifier-splitting lesson for code.
+
+**How to evaluate the pack.** You don't need hand labels. Use what users do: after a chat question or an edit, the
+files and symbols the user (or the accepted edit) touched next are weak labels for "this should have been in
+context". The share of those that your packer included is **context recall** at your budget. Compare two packers
+on the same requests (a *paired* comparison), so differences in the requests don't hide differences in the
+packers.
+
+### Applying an edit without breaking the file (eng-065)
+
+Now the model has answered our edit request. How do you turn its answer into a change in `payments/client.py`?
+
+**Pick an edit format.** There are three common ones. Aider's documentation describes them: "whole" returns "a
+full, updated copy of each source file"; "diff" returns search/replace blocks; "udiff" is a simplified *unified
+diff* (the format `git diff` prints), which Aider used with GPT-4 Turbo because it reduced the model's habit of
+skipping code and leaving placeholder comments
+([Aider edit formats](https://aider.chat/docs/more/edit-formats.html), fetched 2026-10-12). Cursor's 2024 post
+explains why its default was a full-file rewrite: "Diffs force the model to think in fewer tokens", and "models are
+notoriously bad at counting line numbers" ([Cursor, 2024-05-14](https://cursor.com/blog/instant-apply)).
+
+So: diffs that point at line numbers are the fragile option. A search/replace block quotes the old text instead, so
+nothing needs counting. For our 30-line change in a 400-line file, a search/replace block is the natural choice.
+
+**Apply it safely.** Treat the block as untrusted input. This sketch ran on 2026-10-12, and six tests passed: an
+exact match; a block the model quoted without its class indentation; an ambiguous match (refused); a block that
+isn't in the file (refused); an edit that breaks the parse (refused); and a file the user changed after the model
+saw it (refused).
+
+```python
+def apply_edit(text: str, base_sha: str, search: str, replace: str, path: str) -> str:
+    if hashlib.sha256(text.encode()).hexdigest() != base_sha:
+        raise EditError("file changed since the model saw it; rebuild context and retry")
+    lines, s_lines = text.split("\n"), search.split("\n")
+    i = _locate(lines, s_lines)          # exact match, else whitespace-insensitive; must be unique
+    new_block = _reindent(replace.split("\n"), lines[i], s_lines[0])
+    out = "\n".join(lines[:i] + new_block + lines[i + len(s_lines):])
+    if path.endswith(".py"):
+        try:
+            ast.parse(out)               # use tree-sitter or the language's parser for others
+        except SyntaxError as e:
+            raise EditError(f"edit breaks the parse at line {e.lineno}") from None
+    return out
+```
+
+Two pieces of the code need a word. `base_sha` is a hash of the file as the model saw it; if the file has changed
+since, the edit was planned against old text. `ast.parse` is Python's own parser: it builds the file's syntax tree
+(the **AST**, abstract syntax tree) and fails if the file is no longer valid Python. For other languages,
+**tree-sitter**, a widely used parser library with grammars for most languages, plays the same role.
+
+Here is our edit going through it:
+
+| Step | What happens to the retry edit | What to say in the interview |
+|---|---|---|
+| 1. Base check | The hash matches: the developer hasn't touched the file since the request. | "Every edit carries the version it was planned against." |
+| 2. Locate | The model's "search" text is the old body of `charge()`. It is found exactly once. | "Anchor on text, never line numbers, and require exactly one match." |
+| 3. Re-indent | The model quoted the method without its 4-space class indent. The replacement is shifted to match. | "Tolerate whitespace drift, nothing else." |
+| 4. Splice | The old 30 lines are replaced by the new ones. | "Apply in memory first; nothing touches disk yet." |
+| 5. Validate | The whole new file is parsed. It parses. | "Check the whole file, not just the changed lines." |
+| 6. Show | The developer sees a diff and accepts it. | "Never apply silently." |
+
+The rules it encodes: **anchor on text, not line numbers; require a unique match; tolerate whitespace and
+indentation drift but nothing else; validate the whole file after the change; and refuse when the base changed.**
+Every refusal is a typed error that the next step can act on.
+
+**The fallback ladder.** When a step refuses, don't guess. Climb a ladder:
+
+1. Try an exact match, then a match that ignores whitespace.
+2. On "not found" or "ambiguous", send the error and the current text of that region back to the model and ask for
+   a corrected block, once.
+3. Ask the model to rewrite just the enclosing function or class in full, and replace it by its location in the
+   parsed syntax tree.
+4. Rewrite the whole file (with speculative edits if available, so it's fast), and diff the result against the
+   original so any unintended change is visible.
+5. Give up and show the user the proposed change to merge by hand. Never apply silently.
+
+**After applying:** format the file, run a fast type check or linter on it, and show the diff. For an agent that
+acts on its own, also run the affected tests in a **sandbox** (an isolated environment that can't harm the real
+machine) before proposing the change.
+
+Say: "The model is usually right, so the happy path is cheap. The work is in the refusals: each one has a name,
+and each name has a next step."
+
+### Latency: completion, chat and apply
+
+The completion clock above adds up like this:
+
+**latency ≈ debounce + context gathering + network + prefill + output tokens ÷ decode speed**
+
+With the assumed values that was about **430 ms**. Writing it this way lets you say which lever moves which term.
+Halving prefill with a cached prompt start saves **75 ms**, the same as doubling the model's writing speed. A
+stable prompt start is usually far cheaper to get than a model twice as fast.
+
+The levers for completion, in order of payoff:
+
+1. **Keep the start of the prompt stable**, so the provider or your own server can reuse its KV cache. Put
+   instructions and slow-changing context first and the text around the cursor last.
+2. **Use a small model.** Completions are short and frequent; a large model is wasted here.
+3. **Cancel stale requests.** Most are stale, because users keep typing.
+4. **Stream the first line**, so the user sees something before the whole suggestion is done.
+5. **Place endpoints near users**, to shrink the network term.
+
+For edits, the output length dominates, so the edit format and speculative edits are the levers: 480 tokens instead
+of 3,200, written several tokens per step. For chat, stream the answer and show which files were retrieved while
+the model works, so the wait feels shorter and the user can spot missing context.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- All terms are assumptions: debounce 50 ms, context 20 ms, network 60 ms, prefill 150 ms, 30 output tokens at
+  200 tokens/s = 150 ms. Total: 50 + 20 + 60 + 150 + 150 = **430 ms**.
+- Halving prefill: 150 → 75 ms saves 75 ms. Doubling decode speed: 30 ÷ 400 = 75 ms instead of 150 ms, also 75 ms.
+
+</details>
+
+### Privacy and what leaves the machine
+
+Decide each of these, and write the decision down:
+
+- **What is sent.** Only the packed context, never the whole repository.
+- **Where the index lives.** On the developer's machine, or on your servers (which then store customer code).
+- **Retention.** How long your servers and the model provider keep requests.
+- **Training.** Whether anything is used to train a model.
+
+Then build the guards: scan outgoing context for secrets such as API keys and passwords, and honour ignore files
+that mark code as off-limits. Offer an enterprise mode with **zero retention** (the provider keeps nothing after
+answering) and no training. For customers who can't send code anywhere, offer a self-hosted model inside their
+network. The same problem for autonomous agents is its own question,
+[r2b-008](/system-design-labs/interviews/questions/r2b-008/).
+
+Say: "Privacy is a product setting with a documented default, not a footnote: it decides which providers and
+features we can use at all."
+
+## Failure modes and overload
+
+Each row is something that will happen in production, how you'd see it, and what the system does about it.
+
+| What breaks | How you notice | What the system does |
+|---|---|---|
+| Stale context after a branch switch | Apply refusals for "not found" spike | Re-index the changed files on checkout; the base-hash check refuses edits against old text |
+| Edit lands in the wrong place | Ambiguous-match refusals; users undo right after applying | Require a unique anchor; ask the model for more surrounding lines |
+| Model leaves placeholders such as "rest of code unchanged" | The diff deletes large spans | Reject edits that delete more than they replace without saying so; switch format |
+| Provider slow or down | Completion p95 and error rate | Fail over to a second model that passed the same eval; otherwise show no suggestion, never a wrong one |
+| Request storm from fast typists | Requests per user per minute | Debounce, cancel, and cap requests in flight per user |
+| Secrets sent to the model | Outbound scanner hits | Block and redact before sending |
+| Cost spikes from long chats or agents | Tokens per user per day | Per-user budgets and context caps |
+
+<Pitfall title="Stuffing the window">
+A long context window tempts you to send everything that might help. More context costs latency and money on every
+request, and irrelevant code distracts the model. Decide a budget per feature, measure context recall at that
+budget, and grow it only when the eval says recall is the bottleneck.
+</Pitfall>
+
+## Evals and observability
+
+An **eval** is a fixed set of test cases you run every time you change a model, prompt or packer, the way a
+regression suite guards code. You need offline evals before shipping and online metrics after.
+
+**Offline, before shipping.**
+
+- **Retrieval:** context recall at the budget, on requests labelled by what users touched next.
+- **Apply:** the success rate on a corpus of (file, proposed edit) pairs, broken down by fallback step, plus "did
+  the result parse and pass the file's tests". Cursor's 2024 post describes building "~450 full-file edits of files
+  under 400 lines", graded by another model, Claude-3 Opus. It notes that grader may favour Claude outputs. Using a
+  model as the grader is called **LLM-as-judge**, and this is the general warning: check any model judge against
+  human labels before trusting it.
+- **End to end:** a set of real tasks with tests, each run several times, because a code change must work every
+  time, not on average.
+
+**Online, after shipping.**
+
+- **Acceptance rate:** how often users accept a suggestion.
+- **Retained code:** how much accepted code is still there after some minutes. Acceptance alone rewards
+  suggestions users accept and then delete.
+- **Latency per stage**, at the median (p50) and at p95.
+- **Cancellation rate**, apply failures by fallback step, and undo right after applying.
+
+**Comparing versions.** Compare a new packer, model or prompt paired on the same requests. Small differences need
+a lot of data. The llm-eval lab's paired test shows how much: with 500 test items, the smallest true gap it detects
+80% of the time (its **power**) is <LabNumber lab="llm-eval" metric="Smallest true gap with 80% power, paired test, n=500" />.
+Acceptance-rate A/B tests on live traffic usually have far more samples, which is one reason online metrics matter
+so much for this product.
+
+## Trade-offs
+
+- **Word search and the symbol graph, or embeddings.** Identifiers make word search strong in code, and it keeps
+  the index on the client. Embeddings help natural-language questions. Use both, fuse them, then measure.
+- **Whole file, search/replace or unified diff.** Whole files are robust and slow. Anchored blocks are fast and
+  sometimes fail to apply. Line-number diffs fail most. Pick by file size and keep the fallback ladder.
+- **One model or a router.** A router cuts cost and latency, but each path needs its own eval.
+- **Index on the client or the server.** Client-side keeps code local and is limited by the laptop. Server-side
+  scales, but you then store customer code.
+- **Quality or privacy.** Zero retention and no training can rule out some providers or features. Make it a
+  setting with a documented default.
+
+<AINative title="The assistant writes the code; you decide whether it is right">
+This is the one design where the product and the interview format are the same thing. An agent can produce the
+retriever, the edit applier and the benchmark harness quickly. The hard part is the checks: a unique-anchor rule, a
+parse-and-test gate, a held-out task set, and an online metric that can't be gamed by suggestions users accept and
+delete. Evidence on productivity is mixed: METR's 2025 study found 16 experienced developers 19% slower with AI on
+their own repositories, while they believed they were about 20% faster
+([METR, 2025-07-10](https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/)). Measuring, not
+assuming, is the design principle.
+</AINative>
+
+## Small-team version
+
+Say you own AI at a 50–500 person company with a few engineers plus agents. You will almost never build a coding
+assistant. You will buy one, and you will build narrow internal tools that let a model change code or
+configuration. Those tools face the same two problems as this page: which context to send, and how to apply the
+change safely.
+
+### Buy
+
+IDE assistants are a per-seat purchase. List prices fetched 2026-10-12: Cursor Teams is "$40 / user / mo", with a
+team-wide privacy mode under which, per its FAQ, code data is not used for training
+([Cursor pricing](https://cursor.com/pricing)). GitHub's plans page shows individual tiers at $10, $39 and $100 a
+month and "Contact sales" for organizations, and says "GitHub does not use either Copilot Business or Enterprise
+data to train its models" ([GitHub Copilot plans](https://github.com/features/copilot/plans)).
+
+Does a seat pay for itself? A $40 seat breaks even if it saves an engineer about **26 minutes a month**. The seat is
+cheap. The real risk is time lost reviewing almost-right code, so measure on your own tasks rather than assuming a
+gain (see the METR result above).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Loaded cost: the BLS median software developer wage, $135,980 (May 2025), ÷ 0.70 for benefits and overhead
+  (an assumption) ≈ $194,000 a year; ÷ 2,080 working hours ≈ **$93 an hour**, or about $1.55 a minute.
+- Break-even: $40 ÷ $1.55 a minute ≈ **26 minutes** saved per month.
+- Internal tool, one change: three model calls, each 15,000 input and 800 output tokens, on Claude Sonnet 5
+  ($2 in, $10 out per million, fetched 2026-10-11): 3 × (15,000 × $2 + 800 × $10) ÷ 1,000,000 = 3 × $0.038 ≈
+  **$0.11**.
+
+</details>
+
+What you still own after buying: the data terms (privacy mode on, which providers see code, retention), secret
+scanning, which repositories are allowed, and review rules for AI-written changes.
+
+### Build (only this)
+
+Build narrow tools where your own context matters: a bot that opens pull requests for config or feature-flag
+changes, a codemod for a migration, a dependency-bump fixer, an agent that answers questions about your services.
+Reuse this page's pipeline. Pack context from your own symbol graph and docs. Ask for anchored search/replace edits.
+Apply them with the uniqueness and parse checks. Run CI, and require a person to approve the pull request.
+
+One change made this way, with three model calls on Claude Sonnet 5, costs about **$0.11** in tokens (worked out in
+the box above). Token cost is not the constraint; review time is.
+
+### Skip
+
+Your own completion model, your own IDE plugin, fine-tuning a model on your code, and a vector database for code
+search before word search and the symbol graph have been shown to fall short.
+
+### Default stack and delivery plan
+
+Bought IDE assistants with privacy mode on. For internal tools: a managed model API, plain code (no agent
+framework), the language's own parser or tree-sitter for validation, and CI as the gate.
+
+A realistic plan for a config-change bot (a plan, not a benchmark):
+
+1. **Week 1:** collect 30 past config changes, with their final diffs, as an eval set.
+2. **Week 2:** a prototype that proposes a diff for each, scored on exact match and on whether CI passes.
+3. **Weeks 3–4:** run it in shadow on new requests while a person still makes the change.
+4. **Then:** let it open pull requests that a person approves.
+
+### What you verify yourself
+
+That edits apply only with a unique anchor; that CI runs on every AI-opened pull request; that secrets never reach
+the model; that the vendor's privacy setting is on for every seat; and that the eval set grows every time the bot
+gets one wrong. Mitchell Hashimoto describes turning each agent mistake into a rule or a tool
+([2026-02-05](https://mitchellh.com/writing/my-ai-adoption-journey)).
+
+### What small-company interviewers probe
+
+Hands-on use rather than architecture. One founding-AI-engineer posting asks applicants for a short note on
+something built with AI. A recruiting vendor recommends a session on a short-lived repository with a broken agent
+pipeline and an AI assistant allowed (job postings and hiring playbooks from 2025–2026). A candidate on
+Hacker News reports being rejected for using Claude on a startup take-home and was advised to ask about AI policy
+first ([HN, 2025-02-28](https://news.ycombinator.com/item?id=43210255)). Expect "how do you check what the
+assistant wrote?" more than "design Cursor".
+
+### Revisit when
+
+Customers require that code never leave their network (then you need a self-hosted model and a client-side index);
+an internal tool's volume makes review time the bottleneck (invest in its eval, and auto-merge only low-risk
+changes); or a vendor changes its data terms.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Coding assistant"
+  senior={[
+    "Sizes the repository in tokens and splits a per-feature context budget across cursor, recency, symbol graph and search.",
+    "Applies edits with text anchors, a uniqueness rule, a re-parse and a base-version check, with a fallback ladder.",
+    "Breaks completion latency into stages and uses prefix caching, a small model and cancellation.",
+    "Names acceptance and retention of accepted code as online metrics.",
+  ]}
+  staff={[
+    "Defines how context quality is measured (weak labels from what users touch next) before arguing about embeddings.",
+    "Chooses the edit format per file size from apply-failure data, and owns the data terms as a product decision.",
+    "Says which metric would show a change is wrong: retained code, not raw acceptance.",
+    "Separates what to build from what to buy, and costs a self-hosted mode for customers who can't send code.",
+  ]}
+/>
+
+In plain words: a Senior answer builds the pipeline correctly and puts numbers on it. A Staff answer also decides
+how you would know it works, which metric would catch a bad change, and what not to build. No published rubric
+separates the levels for this question; the contrast is a synthesis. The Cursor article's line that graders look at
+"judgment" (<Cite id="s-c29d429c3c" />) points the same way.
+
+## Follow-ups
+
+<FollowUps>
+<FollowUp q="PracHub title (Meta): how would you stop a coding agent from leaking private source code?">
+
+Send only the packed context, never the repository. Scan for secrets and honour ignore files. Use zero retention
+and no training with the provider. Give the agent scoped, read-only credentials, and no outbound network from its
+sandbox except the model endpoint. The full answer is on the
+[r2b-008 page](/system-design-labs/interviews/questions/r2b-008/).
+
+</FollowUp>
+<FollowUp q="Cursor prep article: parse a stream of tokens that arrives partial or malformed.">
+
+Buffer until a structural boundary (a closed block, a complete line). Never apply a half-received edit. Treat a
+stream that ends mid-block as a failed edit and hand it to the fallback ladder. See
+[eng-066](/system-design-labs/interviews/questions/eng-066/).
+
+</FollowUp>
+<FollowUp q="Not reported; a natural next push: the user keeps typing while the edit is being generated.">
+
+The edit carries the hash of the text it was planned against. If the region changed, re-locate the anchor on the
+new text. If it is no longer unique or present, refuse and regenerate. Never overwrite the user's keystrokes.
+
+</FollowUp>
+<FollowUp q="Not reported; a natural next push: how do you know context retrieval is good?">
+
+Measure context recall at the budget, on labels from what users touched next, and compare packers paired on the
+same requests. Online, compare acceptance and retained code by retrieval variant. The 14-question run above shows
+why a handful of hand-written queries proves nothing.
+
+</FollowUp>
+<FollowUp q="Not reported; a natural next push: when is a full-file rewrite the right edit format?">
+
+For small files, for edits that touch most of the file, and for models that fail to produce valid anchors. With
+speculative edits the cost of copying unchanged lines drops, which is the trade Cursor described in 2024.
+
+</FollowUp>
+<FollowUp q="Not reported; a natural next push: a customer can't send code to any third party.">
+
+Ship a self-hosted mode: an open-weight code model (one whose weights you can download and run) on their GPUs, the
+index on their side, and telemetry that contains no code. Price it honestly: someone has to evaluate that model
+against your hosted default.
+
+</FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Starting with embeddings.** Identifiers, the symbol graph and recency often matter more in code, so measure
+  before reaching for a vector store.
+- **Line-number diffs.** Models are bad at counting lines, as Cursor's post says, so anchor on text instead.
+- **Applying without validation.** An edit that isn't parsed and checked can break a file the user didn't look at,
+  so re-parse and refuse on a changed base.
+- **Silent fallback.** Guessing where an edit belongs puts wrong code in the file without anyone noticing, so show
+  the user any edit that didn't apply cleanly.
+- **A latency number without stages.** A single number can't tell you which lever to pull; break it into debounce,
+  context, network, prefill and decode.
+- **Raw acceptance as the quality metric.** Suggestions users accept and then delete look like wins, so track
+  retained code.
+- **The paste-and-retry habit in the round itself.** Pasting model output, pasting the error back and repeating
+  shows no judgment; the Cursor article calls that loop "the fastest rejection in the building"
+  (<Cite id="s-c29d429c3c" />).
+
+## Prove it with a lab
+
+<LabRef lab="rag" role="proof" note="Retrieval measured with confidence intervals; the tokenizer ablation is the code-search lesson in miniature." />
+
+<LabRef lab="search-engine" role="background" note="Build the lexical index: postings, BM25, compression. Add identifier splitting and try it on a code corpus." />
+
+<LabRef lab="speculative-decoding" role="partial" note="Work through the acceptance formula and the choice of K; then reason about why an edit's draft (the original file) has high acceptance." />
+
+<LabRef lab="llm-inference" role="partial" note="See why a stable prompt prefix is cheap to reuse: the KV cache is real here, though batching and streaming are not." />
+
+No lab covers edit application yet; the sketch on this page with its six tests is the exercise.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-c29d429c3c" />
+- <Cite id="s-be19e40ea6" />
+- <Cite id="s-4525fcd815" />
+- Cursor engineering blog, fast apply and speculative edits, 2024-05-14: [https://cursor.com/blog/instant-apply](https://cursor.com/blog/instant-apply)
+- Cursor docs, codebase indexing, fetched 2026-10-12: [https://cursor.com/docs/context/codebase-indexing](https://cursor.com/docs/context/codebase-indexing)
+- Cursor pricing, fetched 2026-10-12: [https://cursor.com/pricing](https://cursor.com/pricing)
+- GitHub Copilot plans, fetched 2026-10-12: [https://github.com/features/copilot/plans](https://github.com/features/copilot/plans)
+- Aider, repository map, fetched 2026-10-12: [https://aider.chat/docs/repomap.html](https://aider.chat/docs/repomap.html)
+- Aider, edit formats, fetched 2026-10-12: [https://aider.chat/docs/more/edit-formats.html](https://aider.chat/docs/more/edit-formats.html)
+- METR, early-2025 study of experienced open-source developers, 2025-07-10: [https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/](https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/)
+- Mitchell Hashimoto, "My AI adoption journey", 2026-02-05: [https://mitchellh.com/writing/my-ai-adoption-journey](https://mitchellh.com/writing/my-ai-adoption-journey)
+- Hacker News, candidate rejected for AI use on a take-home, 2025-02-28: [https://news.ycombinator.com/item?id=43210255](https://news.ycombinator.com/item?id=43210255)
+- Model list prices: Anthropic [https://platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) and OpenAI [https://developers.openai.com/api/docs/pricing](https://developers.openai.com/api/docs/pricing), fetched 2026-10-11
+- BLS, software developers (median wage, May 2025): [https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm](https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm)

@@ -1,0 +1,186 @@
+---
+question: eng-019
+family: agentic-workflow-design
+status: published
+labs: [agent-framework, dist-lock, llm-eval]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Scoring only reads the file, so I run one model call per rule in parallel, each returning a verdict and the
+> exact text it relied on, and code checks that text is really in the file. The final label comes from code,
+> not from a model, so it is reproducible. Fixes are proposed as patches against a version of the file, and one
+> writer applies them in priority order. Then I re-score the merged file, because two clean edits can still
+> contradict each other. I'd avoid several agents writing the same file at all."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants two things. Can you turn a set of rules into a verdict that comes out the same every time
+and can be explained? And do you know when several agents help, and when they create the problem you then have to
+solve?
+
+### What makes this different from a normal rules engine
+
+A normal rules engine checks structured fields: "amount is under 10,000", "country is in this list". Each check
+is code, so it gives the same answer every time.
+
+Here the rules are written in plain language and the file is a long document. "The contract must cap liability"
+can't be checked with a regular expression. A large language model (LLM) can read the clause and judge it. But a
+model can also be confidently wrong, or give a different verdict on a second run. So the design has to make a
+probabilistic reader produce a reproducible, explainable label.
+
+Then there is the second half: suggesting fixes. If several **agents** (model loops that choose their own next
+action) each edit the same file, their edits can conflict. That is a concurrency problem, and you already know
+how to think about those from databases.
+
+The candidate reports a long discussion about avoiding conflicts between agents, and wrote afterwards: "I may have
+short-circuited here. In the end, it would have been enough to let one person make the changes"
+(<Cite id="s-74265be7ec" />). That is the candidate's hindsight, not interviewer feedback, but it points at the
+answer.
+
+## Clarify first
+
+- **What is a "file" here?** A contract, a policy document, code? Assume a legal document of 20–50 pages.
+- **How many rules, and are they independent?** Assume 30 rules, mostly independent, some with priority.
+- **What separates "acceptable" from "unqualified"?** Assume: any critical rule failed means unqualified; only
+  minor failures means acceptable.
+- **Must the verdict be reproducible and explainable?** Assume yes: every failed rule cites the text it relied on.
+- **Who applies suggested changes?** Assume the system drafts and a person approves.
+
+Say it like this: "I'll assume the label has to be explainable to a lawyer, so every verdict needs quoted
+evidence from the file."
+
+## Answer
+
+### Words you need first
+
+- **Structured output**: the model must answer in a fixed JSON shape, so code can check it.
+- **Patch against a base version**: a proposed edit that records which version of the file it was written for
+  (a hash of the file). If the file has changed since, the patch is stale.
+- **Lease and fencing token**: a lease is a lock that expires unless renewed. A fencing token is a number that
+  goes up each time the lease changes hands; storage rejects writes carrying an old number.
+
+### The shape
+
+```
+File (version v1)
+   │
+   ▼
+Per-rule calls, in parallel (read-only) ── 30 calls
+   each returns {rule_id, verdict, quoted_evidence, confidence}
+   │
+   ▼
+Code: is each quote really in the file?  no → re-run or mark as unsure
+   │
+   ▼
+Code: label ── any critical fail → unqualified; only minor → acceptable; all pass → qualified
+   │
+   ▼
+Per failed rule: a patch proposal against v1
+   │
+   ▼
+One writer applies patches in rule-priority order
+   base changed? → regenerate the patch against the new version
+   │
+   ▼
+Re-score the merged file (v2) ── any new failures?
+   │
+   ▼
+Person approves the changes
+```
+
+**Scoring only reads, so parallelize it.** Make one model call per rule (or per small group of related rules).
+Each returns `{rule_id, verdict, quoted_evidence, confidence}`. Code checks that the quoted evidence really
+appears in the file. For long files, find the relevant sections for each rule instead of sending the whole file
+every time.
+
+**The label comes from code,** not from a model. A critical failure means unqualified, minor failures only means
+acceptable, and all passing means qualified. The rules about the label are then auditable and testable.
+
+**Suggestions are a second step,** one per failed rule: a proposed patch against a base version hash, with the
+rule it fixes.
+
+### Conflicting edits
+
+Several agents writing the same file is where conflicts come from, so avoid it.
+
+1. **One writer** applies patches in rule-priority order.
+2. A patch whose base changed is **regenerated** against the new version. This is *optimistic concurrency*, the
+   same idea as a version column on a database row.
+3. **If parallel writers are unavoidable,** split the file by section, give each writer a lease, and have storage
+   reject writes with a stale fencing token. That way a writer that paused past its lease can't overwrite newer
+   work.
+4. **Re-score the merged file.** Two patches can merge cleanly as text and still contradict each other in meaning.
+   The scorer is the check that closes the loop.
+
+Cognition, the company behind the Devin coding agent, puts the general principle as "Actions carry implicit decisions, and conflicting decisions carry bad
+results" ([2025-06-12](https://cognition.com/blog/dont-build-multi-agents)).
+
+Say it like this: "Many agents reading in parallel is fine. Many agents writing to the same file is a concurrency
+problem, so I use one writer and re-check the result."
+
+### Follow one contract
+
+Say a 32-page supplier contract arrives (an illustrative example).
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| Score | 30 parallel calls. 27 pass. Rule 4 (liability cap, critical) and rules 12 and 19 (minor) fail, each with a quote. | "One call per rule, each with evidence." |
+| Check quotes | All three quotes appear in the file. | "A made-up quote would fail here." |
+| Label | A critical rule failed, so code says **unqualified**. | "The label is code, so it is reproducible." |
+| Patches | Three patches against version v1. | "Proposals, not writes." |
+| Apply | Rule 4's patch goes first. Rule 19's patch touches the same clause, so it no longer applies; it is regenerated against v2. | "Optimistic concurrency, like a version column." |
+| Re-score | Rule 4 now passes, but the new wording breaks rule 7. One more patch round. | "A clean text merge can still break meaning." |
+| Approve | A lawyer reviews the final changes with the evidence. | "The system drafts; a person decides." |
+
+### How you evaluate it
+
+Use files labelled by domain experts. Measure agreement on each rule and on the final label. Then run each file
+three times and check the label doesn't flip. If one run gives the expert's label 90% of the time, three runs
+agree with it only about **73%** of the time. A reviewer who sees the verdict change on refresh stops trusting it.
+
+<details>
+<summary>The arithmetic behind the numbers</summary>
+
+- **Label stability across reruns:** P(label identical in k runs) ≈ p^k, where p is the chance one run gives the
+  expert label (assumed independent). p = 0.9, k = 3: 0.9 × 0.9 × 0.9 ≈ **0.73**.
+- **Model cost per file:** an assumed 30 rule calls of 3,000 input and 300 output tokens at Claude Sonnet 5 list
+  price ($2 / $10 per 1M, fetched 2026-10-11): 30 × ($0.006 + $0.003) = **$0.27** per file.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Rule scoring"
+  senior={["Parallel per-rule calls with evidence, a label computed in code, and patches applied by one writer."]}
+  staff={["Asks who owns the rule set and how rules change, measures label stability, and keeps multi-writer designs out unless a throughput number demands them."]}
+/>
+
+In plain words: a Senior answer builds a correct, reproducible pipeline. A Staff answer also asks who maintains the
+rules over time and refuses complexity that no number justifies.
+
+## Small-team version
+
+Build it as one service: a fan-out of per-rule calls, a rules table, and a review screen that shows the evidence
+and the patches. A legal reviewer applies patches; the system never writes the source file. Skip agents entirely
+for scoring.
+
+The model cost is small, about **$0.27 per file** (worked out in the box above). The expensive part is the
+expert-labelled eval set, perhaps 50 files. Budget the expert's time before the model's.
+
+## Pitfalls
+
+- **One giant prompt that returns the label directly.** You can't see which rule failed or why, and the label can
+  flip between runs.
+- **Evidence that isn't checked against the file.** A model can invent a quote that sounds right, and the verdict
+  then rests on nothing.
+- **Several agents editing one file with no base version.** Later writes silently overwrite earlier ones.
+- **Merging edits without re-scoring.** Two edits can each be fine alone and contradict each other together.
+
+## Go deeper
+
+- Family walkthrough: [Agent or workflow?](/system-design-labs/interviews/walkthroughs/agentic-workflow-design/), section "Several agents: when they pay, and how they avoid conflicting edits".
+- Leases and fencing tokens: <LabRef lab="dist-lock" inline />. Paired comparison of two prompts: <LabRef lab="llm-eval" inline />.

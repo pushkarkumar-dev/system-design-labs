@@ -1,0 +1,189 @@
+---
+question: infra-024
+family: cache-coding
+status: published
+labs: [kv-cache]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "In an LRU cache, `get` is a write: every hit moves the entry to the front of the list. So a read-write lock
+> doesn't help, and I start with one mutex around both `get` and `put`. If that lock becomes the bottleneck, I
+> split the cache into shards by key hash, each with its own lock and its own share of the capacity. That trades
+> exact LRU for per-shard LRU. Past that, I'd approximate recency, or use a proven library like Caffeine rather
+> than write a lock-free cache."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you understand what a least-recently-used (LRU) cache's operations actually change, and whether
+you pick a locking scheme from that.
+
+Most caches you have used are read-mostly. A read looks something up and changes nothing, so many readers can run
+at once and only writers need exclusive access. An **LRU** cache (least recently used: evict the entry that has gone
+longest without a use) is different. To know which entry is least recent, it keeps its entries in a linked list
+ordered by use, and every successful `get` moves the entry to the front. So every read rewires pointers. That is
+the trap in this question, and the round is decided by whether you see it, then by what you trade away to reduce
+waiting.
+
+This was the follow-up in an NVIDIA Senior candidate's first screen: "How would you make this work in a
+multi-threaded setting if needed?", plus variants that change the cache's behaviour (<Cite id="s-7dd221b925" />).
+
+### Words you need first
+
+- A **mutex** is a lock only one thread can hold at a time. Everyone else waits.
+- A **read-write lock** lets many readers hold it together, but a writer holds it alone.
+- **Contention** is threads waiting on the same lock. You see it as lock wait time in a profiler and as a slower
+  p99 for `get`.
+- **Lock striping** (or sharding) splits one structure into N parts, each with its own lock, so threads that touch
+  different parts don't wait for each other.
+
+## Clarify first
+
+Spend one minute on the setup. Say your assumptions out loud:
+
+- **Language?** Another NVIDIA report asked for C/C++ (<Cite id="s-21ef4a7dbc" />). "I'll assume C++17 unless you
+  want something else."
+- **Read/write mix and thread count?** "I'll assume mostly reads and 8 to 32 threads."
+- **Must eviction be exact?** "Does it have to be exact global LRU, or is LRU per shard acceptable?" Ask this one,
+  because it decides the design.
+- **Are values large or expensive to copy?** "If they are, `get` returns a `shared_ptr` or a copy made under the
+  lock, never a reference into the cache, because another thread could evict it."
+
+## Answer
+
+### Follow two threads through one cache
+
+Say the cache holds three entries, most recent first: `a`, `b`, `c`. Thread 1 calls `get c` at the same moment
+thread 2 calls `put d`, which has to evict the least recent entry, `c`.
+
+| Moment | Without a lock | What to say in the interview |
+|---|---|---|
+| 1 | Thread 1 finds `c` in the map and starts moving it to the front. It has rewired `b` to skip `c`, but `tail` still points back at `c`. | "A hit rewires several pointers. It is a write, not a read." |
+| 2 | Thread 2 reads `tail.prev`, which still says `c`, and unlinks it to evict it. | "The two threads now disagree about where `c` is." |
+| 3 | Thread 1 finishes linking `c` at the front. Thread 2 deletes `c` from the map. | "Now the list holds a node the map doesn't know about: a ghost that can never be evicted." |
+
+With one mutex, step 1 finishes before step 2 can start, and the problem disappears. That is the argument for
+starting with a mutex, and the argument against a read-write lock: under a read lock, two `get` calls could
+interleave exactly like this.
+
+### Step 1: one mutex
+
+Wrap `get` and `put` in one mutex. It is correct and simple, and at modest thread counts it is often fast enough.
+Say: "A read-write lock looks attractive here, but readers splice the list, so they need exclusive access too."
+
+### Step 2: lock striping when contention shows
+
+Split the cache into N shards by key hash. Each shard has its own mutex and `capacity / N` entries. Threads that
+touch different shards no longer wait for each other. The cost is that eviction is per shard: a shard full of hot
+keys evicts while another shard still holds cold ones. Say: "Striping trades exact LRU for less waiting. I'd only
+do it once lock wait time shows up in a profile."
+
+Here is the C++ version. The inner `LRU` is not thread-safe on its own; `StripedLRU` puts a mutex in front of each
+shard.
+
+```cpp
+template <class K, class V>
+class LRU {
+    using List = std::list<std::pair<K, V>>;
+    size_t cap_;
+    List order_;                                            // front = most recent
+    std::unordered_map<K, typename List::iterator> map_;
+public:
+    explicit LRU(size_t cap) : cap_(cap) {}
+    std::optional<V> get(const K& k) {
+        auto it = map_.find(k);
+        if (it == map_.end()) return std::nullopt;
+        order_.splice(order_.begin(), order_, it->second);  // O(1), iterators stay valid
+        return it->second->second;                          // copy out while locked
+    }
+    void put(const K& k, V v) {
+        if (auto it = map_.find(k); it != map_.end()) {
+            it->second->second = std::move(v);
+            order_.splice(order_.begin(), order_, it->second);
+            return;
+        }
+        if (map_.size() == cap_) { map_.erase(order_.back().first); order_.pop_back(); }
+        order_.emplace_front(k, std::move(v));
+        map_[k] = order_.begin();
+    }
+};
+
+template <class K, class V, size_t N = 16>
+class StripedLRU {
+    struct Shard { std::mutex mu; LRU<K, V> lru; explicit Shard(size_t c) : lru(c) {} };
+    std::vector<std::unique_ptr<Shard>> shards_;
+    Shard& shard(const K& k) { return *shards_[std::hash<K>{}(k) % N]; }
+public:
+    explicit StripedLRU(size_t cap) {
+        for (size_t i = 0; i < N; i++)
+            shards_.push_back(std::make_unique<Shard>(std::max<size_t>(1, cap / N)));
+    }
+    std::optional<V> get(const K& k) { auto& s = shard(k); std::lock_guard g(s.mu); return s.lru.get(k); }
+    void put(const K& k, V v) { auto& s = shard(k); std::lock_guard g(s.mu); s.lru.put(k, std::move(v)); }
+};
+```
+
+`std::list::splice` moves a node to a new position without invalidating iterators, so the iterators stored in the
+map stay valid after every move. That is why the list plus map pairing works in C++. This code ran clean under
+ThreadSanitizer (a compiler option that reports data races at run time) with 8 threads × 200,000 mixed operations,
+and the shard invariants held (scratch run, 2026-10-12, Apple clang 21). An **invariant** is a fact that must
+always be true, such as "the map and the list hold the same keys, and never more than the capacity".
+
+### Step 3: options past striping
+
+- **Buffer hits.** Record hits in a per-thread buffer and apply them to the list in batches under the lock. Reads
+  stop taking the lock on every hit.
+- **Sample instead of ordering.** Keep no list at all. When you need a victim, sample a few keys and evict the
+  oldest of the sample, the approximation Redis uses according to the kv-cache lab's notes.
+
+Both take the list update off the hot read path in exchange for approximate recency. Say: "Exact LRU is expensive
+under threads. Most production caches approximate it, and that's usually fine."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Thread-safe LRU"
+  senior={["Uses one mutex, explains why reads need it, then stripes by key hash and tests invariants under threads."]}
+  staff={["Says which metric would justify each step (lock wait time, p99 get latency), what exact LRU costs, and when a library (Caffeine, a sharded concurrent map) beats writing it."]}
+/>
+
+In plain terms: a Senior candidate gets to a correct, tested, striped cache. A Staff candidate says what
+measurement would make them take each step, and when they would stop writing code and use a library.
+
+## Small-team version
+
+On the JVM, use Caffeine. In Go, use a sharded cache library or a mutex-guarded map. In Python, don't assume the
+**GIL** (the global interpreter lock, which lets only one thread run Python bytecode at a time) protects a
+multi-step update. In the family's scratch run, an unlocked cache broke its invariants in 6–9 of 20 runs at the
+default thread switch interval. Striping didn't speed Python up either, because the GIL already lets only one
+thread run at a time.
+
+What you still write is the stress test that checks invariants under threads. You also want **single flight** when
+the cached value is a paid call to a large language model: when many workers miss the same key at once, only one
+makes the call and the rest wait for its result. Without it, ten workers missing the same key at once cost about
+**10 cents instead of 1 cent**, at an assumed cost of about 1 cent per uncached call.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **One uncached call:** an assumed 3,000 input and 400 output tokens (a token is roughly ¾ of a word) at a list
+  price of $2 per million input tokens and $10 per million output tokens (Claude Sonnet 5, fetched 2026-10-11):
+  (3,000 × $2 + 400 × $10) ÷ 1,000,000 = **$0.010**.
+- **Ten workers missing at once:** 10 × $0.010 = $0.10 without single flight, $0.01 with it.
+
+</details>
+
+## Pitfalls
+
+- **A read-write lock, with `get` under the read lock.** Two readers then rewire the list at the same time.
+- **Returning a reference or iterator to a value.** Another thread may evict it while the caller is still using it.
+- **Holding the lock while computing a missing value.** Every other key then waits behind one slow computation.
+- **Claiming striping is faster without naming the runtime.** In Python it was slower; measure before you claim it.
+
+## Go deeper
+
+- Family walkthrough: [Caches in coding rounds](/system-design-labs/interviews/walkthroughs/cache-coding/#complexity-and-performance), stage 3 and the measured lock comparison.
+- For lower-level concurrency primitives: [systems concurrency primitives](/system-design-labs/interviews/walkthroughs/systems-concurrency-primitives/).
+- Lab: <LabRef lab="kv-cache" inline /> (one coarse mutex around a whole cache, with the reasoning written up).

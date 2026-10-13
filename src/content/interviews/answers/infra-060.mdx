@@ -1,0 +1,205 @@
+---
+question: infra-060
+family: rate-limits-admission
+status: published
+labs: [rate-limiter, kv-cache]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "It's a classic distributed rate limiter with one twist: LLM requests are not equal, so I limit tokens as well
+> as requests. I use a token bucket per rule. Because I don't know how long the reply will be, I reserve the
+> prompt plus the maximum reply up front and refund the difference when it finishes. All of a request's rules are
+> checked and debited in one atomic script in a shared store. For very busy customers, each gateway takes a lease
+> of tokens and spends it locally, and I size the lease from the overshoot I'm willing to accept."
+>
+> The rest of this page explains each part of that answer.
+
+You already know how to rate-limit a normal API: count requests per key per minute in Redis and return 429 when
+the count is too high. That works because normal requests cost about the same.
+
+A request to a large language model (**LLM**), a program that reads and writes text, does not. The model reads
+and writes text in pieces called **tokens**, roughly ¾ of an English word each. One request might send 100
+tokens; another might send 100,000. Both are "one request", but the second costs the GPU (the chip that runs the
+model) far more work. So the interviewer wants to see three things a normal limiter doesn't need:
+
+1. **Limits in tokens**, not only requests.
+2. **A plan for the unknown reply length.** You can count the tokens the caller sends. You can't know how many
+   the model will write back until it is done.
+3. **A number for accuracy.** A distributed limiter either pays a network round trip per request or lets some
+   extra traffic through. You should say how much extra.
+
+(The question comes from an OpenAI Senior software-engineer loop. The evidence is a Glassdoor search snippet from
+a page that returned HTTP 403, so only the title is known <Cite id="s-3b9dae2c4c" />.)
+
+## Clarify first
+
+Say your assumptions out loud, so the numbers mean something:
+
+- **Who is limited?** "API keys belong to projects, projects to organizations. I'll also have a pool per model."
+- **In what units?** "Requests, input tokens and output tokens per minute, and tokens per day."
+- **How much traffic?** "Assume 2,000 requests a second, each with 1,500 input and 300 output tokens. That's 216
+  million tokens a minute."
+- **How exact?** "Assume letting through up to about 5% over a per-minute limit is acceptable."
+- **What if the store is down?** "I'd ask. My default is to let traffic through (fail open) for paid per-minute
+  limits."
+
+## Answer
+
+### Words you need first
+
+- **Input tokens** are what the caller sends (the prompt). **Output tokens** are what the model writes back.
+  Providers count them separately.
+- **`max_tokens`** is a field on each request: the most output tokens the model may write. It is the only thing
+  you know about the output when the request arrives.
+- **TPM** means tokens per minute; **RPM** means requests per minute.
+
+### The algorithm: a token bucket per rule
+
+A **token bucket** holds up to N units and refills at a steady rate. Each request takes units out and is refused
+when there aren't enough. Here the units are LLM tokens. Keep one bucket for each rule and each thing it applies
+to: "this key's TPM", "this organization's TPM", and so on.
+
+Why not a counter that resets every minute? A **fixed window** lets a caller spend the whole limit at 0:59 and
+again at 1:00, so up to 2× the limit in two seconds. A bucket refills continuously. Anthropic documents the same
+choice for its API: capacity "continuously replenished up to your maximum limit, rather than being reset at fixed
+intervals" ([rate limits](https://platform.claude.com/docs/en/api/rate-limits), fetched 2026-10-12).
+
+### One request, start to finish
+
+Follow one request from a customer we'll call Acme (made up), whose organization limit is 40 M TPM (assumed):
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| **Arrives** | 1,500 input tokens, `max_tokens` = 1,000. | "I can count the input now. The output is unknown." |
+| **Reserve** | The gateway takes 1,500 + 1,000 = **2,500** tokens from every matching bucket, in one atomic script. | "Reserve the worst case, so we never go over." |
+| **Runs** | The model writes **300** tokens. | "Now the real cost is known: 1,800." |
+| **Settle** | The meter refunds **700** tokens to each bucket. | "Refund the rest, so the customer gets what they paid for." |
+| **Refused?** | If any bucket lacked room, nothing was debited and the reply is 429 naming the rule, with `Retry-After`. | "The wait is the missing tokens divided by the refill rate." |
+
+**Why the refund matters.** If Acme were charged 2,500 per request, its 40 M limit would admit 16,000 requests a
+minute. Charged the real 1,800, it admits about 22,200. Without refunds Acme loses about **28%** of its throughput.
+
+**Two providers, two designs.** OpenAI documents counting "the maximum of `max_tokens` and the estimated number of
+tokens" ([OpenAI rate limits](https://developers.openai.com/api/docs/guides/rate-limits), fetched 2026-10-12),
+which is a reservation like the one above. Anthropic instead counts output tokens in real time as they are
+written. Reserving never goes over the limit but holds capacity back; counting live uses capacity fully but can
+overshoot while long replies are still running. Knowing both is a strong signal.
+
+### Making it distributed
+
+```
+Client
+   │
+   ▼
+Gateway node (one of 20) ── for most keys: one script call per reserve and per settle
+   │                     ── for a hot key: spend from a local lease of 50,000 tokens
+   ▼
+Shared store (Redis or similar) ── one bucket per (rule, scope); refills using its own clock
+```
+
+**Gateway node.** Each node handles requests and talks to the shared store. For most customers it calls the
+store twice per request: once to reserve, once to settle. At 2,000 requests a second that is **4,000 store
+operations a second**.
+
+**Shared store.** It holds the buckets and runs each reserve as one server-side script, so no other request can
+slip in between the check and the debit. It also refills buckets using its own clock, because gateways whose
+clocks disagree would refill at different rates.
+
+**Leases for hot keys.** Acme at 40 M TPM sends about 370 requests a second, so about **741 store operations a
+second on one key**, all on one shard. Instead, each of 20 gateway nodes takes a **lease**, a block of 50,000
+tokens from Acme's bucket, and spends it locally. The worst case is every node holding a full unused lease when
+Acme hits its limit, so the overshoot is at most **1 M tokens, 2.5% of a minute's limit**, inside our 5% budget.
+The store sees about **13 renewals a second** instead of 741.
+
+Say: "I pick the overshoot I can accept first, then size the lease from it."
+
+**Crashes.** A gateway that dies between reserve and settle never refunds. Give each reservation an id and a
+time-to-live; a sweeper refunds expired ones. Settle is **idempotent** on the reservation id (running it twice has
+the same effect as once), so a late settle after the sweep doesn't refund twice.
+
+**The response.** Return 429 with the rule that blocked, the remaining tokens, and a `Retry-After` from that
+bucket's refill rate.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Cost of not refunding"
+  expr="requests per minute = TPM limit ÷ tokens charged per request"
+  vars={[
+    { sym: 'TPM limit', meaning: '40 M (assumed)' },
+    { sym: 'tokens charged', meaning: 'reserve 1,500 + 1,000 = 2,500, or actual 1,500 + 300 = 1,800' },
+  ]}
+  example="40 M ÷ 2,500 = 16,000 vs 40 M ÷ 1,800 ≈ 22,200: 28% less throughput without refunds"
+/>
+
+- **Gateway traffic:** 2,000 × 1,800 × 60 = 216 M tokens per minute.
+- **Store load:** 2 × 2,000 = 4,000 operations per second.
+- **Hot key:** 40 M ÷ 60 ≈ 666,667 tokens per second; ÷ 1,800 ≈ 370 requests per second; × 2 ≈ 741 operations
+  per second.
+- **Lease overshoot:** 20 nodes × 50,000 = 1 M tokens = 2.5% of 40 M. Renewals: 666,667 ÷ 50,000 ≈ 13 per
+  second.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Distributed LLM rate limiter"
+  senior={["Token buckets in tokens and requests, reserve and refund, atomic multi-rule script, 429 with Retry-After."]}
+  staff={["Derives lease size from an accepted overshoot, picks fail-open or fail-closed per rule, and compares reservation with real-time output counting by throughput cost."]}
+/>
+
+In plain words: a Senior answer builds a correct limiter. A Staff answer also puts a number on each trade-off
+(how much overshoot, how much throughput) and decides per rule what happens when the store fails.
+
+## Small-team version
+
+You are more likely to use a limiter like this than build one. Your job is three things:
+
+- **Per-customer token quotas in your own database.** One row per customer per month, with "reserved" and "used"
+  columns, updated in one transaction at reserve and at settle.
+- **Stay under the provider's limits.** All your users share your organization's limit at the provider, so keep
+  your own total a little under it.
+- **Tell the two kinds of 429 apart** on Anthropic's API. A rate-limit 429 has `retry-after`: wait and retry. A
+  spend-cap 429 has none and clears at month end: alert a human, don't retry.
+
+**Size it before you build anything.** At an assumed 50,000 requests a day, reserve and settle are about **1.2
+writes a second**. Any database you already run absorbs that; you don't need a Redis cluster or leases.
+
+**The spend cap bites before the rate limits do.** An assumed feature with 3,000 input tokens (2,000 cached) and
+400 output tokens per request costs about $0.0064 per request on Claude Sonnet 5, so about **$9,600 per 30 days**
+at list prices (fetched 2026-10-11). Anthropic's monthly caps are $500 (Start), $1,000 (Build) and $200,000
+(Scale). Request the tier before launch.
+
+**When to move up.** Move minute-level counters to Redis when several app instances must share one limit, and to
+a gateway product (LiteLLM-style) when several teams or providers share keys.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Writes:** 2 × 50,000 ÷ 86,400 ≈ 1.2 per second.
+- **Cost per request** at $2 / $0.20 / $10 per million input / cached input / output tokens: 1,000 × $2 ÷ 1 M +
+  2,000 × $0.20 ÷ 1 M + 400 × $10 ÷ 1 M = $0.0020 + $0.0004 + $0.0040 = $0.0064.
+- **Per 30 days:** 50,000 × 30 × $0.0064 = $9,600.
+
+</details>
+
+## Pitfalls
+
+- **Counting requests only.** A 100-token and a 100,000-token request are not the same load.
+- **Debiting one rule before checking the next.** A request refused by a later rule has already spent the earlier
+  ones.
+- **No refund, or a refund that can run twice.** The first wastes 28% of the limit here; the second gives capacity
+  away.
+- **Refilling with each gateway's own clock.** Gateways that disagree on the time refill the same bucket at
+  different rates.
+
+## Go deeper
+
+- Family walkthrough: [Rate limits, credits and admission control](/system-design-labs/interviews/walkthroughs/rate-limits-admission/), especially "Exact, fast, or regional".
+- Where the limiter sits in a chat product: [ChatGPT-style serving](/system-design-labs/interviews/walkthroughs/chat-serving-streaming/).
+- Labs: <LabRef lab="rate-limiter" inline /> (make `Allow` take a token cost), <LabRef lab="kv-cache" inline />.

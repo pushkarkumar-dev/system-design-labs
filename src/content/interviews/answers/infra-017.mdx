@@ -1,0 +1,184 @@
+---
+question: infra-017
+family: rate-limits-admission
+status: published
+labs: [load-balancer, rate-limiter]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "When the GPUs are full, I accept a request only if there is GPU memory for it, queue it by priority with a
+> deadline, and reject it straight away when the queue is already longer than the deadline allows. I drop queued
+> requests whose callers have gone, and I shrink free and batch traffic before I reject paid traffic. Rejections
+> use a different error from rate limits, and I cap retries, because otherwise every rejection comes back as more
+> load. I judge it by goodput: requests finished within their deadline per second."
+>
+> The rest of this page explains each part of that answer.
+
+You know overload on a normal web service: requests pile up, latency climbs, and you add servers or shed load.
+Serving a large language model (**LLM**), a program that reads and writes text, is overload with two differences.
+
+**First, "full" means out of memory, not out of CPU.** The model runs on GPUs (specialised, expensive chips). It
+writes each reply in small pieces called **tokens** (roughly ¾ of a word), one after another, which takes many
+seconds. For all that time the GPU keeps a working memory for the conversation, called the **KV cache**. A GPU
+node can only hold so many conversations' KV caches at once. When that memory is used up, a new request can't
+start, however fast the chips are.
+
+**Second, a late answer is a wasted answer.** A user who waited too long has left. If you serve their request
+anyway, the GPUs spend seconds on a reply nobody reads, while requests that could still make their deadline wait
+behind it.
+
+So the interviewer wants a policy that decides **accept, queue or reject** for each request, with deadlines, and
+that keeps the fleet doing useful work instead of collapsing.
+
+(A PracHub prep guide for Fireworks AI lists admission control among technical-review topics, next to reading a
+time-to-first-token timeline. It is the site's own guide, not a candidate report <Cite id="s-b6632d5df9" />.)
+
+## Clarify first
+
+- **Traffic classes?** "Assume paid interactive, free interactive and batch."
+- **Deadlines?** "Assume the first token of the reply must appear within 1 second for paid and 2 seconds for free.
+  Batch has hours." The delay to the first token is called **time to first token (TTFT)**.
+- **What limits how many requests a GPU node runs at once?** "Assume KV-cache memory."
+- **Can we give a smaller answer?** "Assume yes for free and batch: shorter replies or a smaller model."
+- **Do clients retry?** "Assume yes, so the design must survive its own retries."
+
+## Answer
+
+### Limits and admission are different questions
+
+**Limits** decide whether a caller is entitled: rate limits and credits. **Admission** decides whether the fleet
+can serve this request in time. A caller well under its limits can still get "not now".
+
+Say: "Rate limits are about fairness between customers. Admission is about whether the GPUs can do this in time."
+
+### The decision for each request
+
+```
+Request arrives (already passed rate limits)
+   │
+   ▼
+Free GPU memory for prompt + reply reserve, and a free slot? ── yes ──► Accept: start now
+   │ no
+   ▼
+Queue for its class shorter than the deadline allows? ── no ──► Reject now: 503 + Retry-After
+   │ yes                                                     (or degrade first, for free and batch)
+   ▼
+Wait in its class queue (paid, free, batch), deadline attached
+   │   caller disconnected? ──► drop it before it costs any GPU work
+   ▼
+Admitted when memory frees up
+```
+
+1. **Accept** when free KV-cache memory covers the prompt plus a reserve for the reply, and a slot is free (a
+   **slot** is one of the places for conversations the node works on at the same time).
+2. **Queue** by class, each request carrying its deadline. **Weighted fair queueing** (serving the queues in
+   proportion to set weights) keeps free traffic from starving paid traffic, and the reverse.
+3. **Reject now** when the queue is longer than the deadline allows. The next section shows how long that is.
+4. **Drop** queued requests whose client disconnected, before they cost any GPU time.
+5. **Degrade** before rejecting: cap `max_tokens` (the most tokens the reply may have) and the context length (how much earlier
+   conversation the model reads), or
+   route free and batch traffic to a smaller model.
+6. **Batch traffic** goes to a durable queue and runs when interactive traffic is low, not in the interactive pool.
+
+### How long can a queue usefully be?
+
+Follow one free-tier request on a busy GPU node. Assume the node runs 699 conversations at once and each reply
+takes about 20 seconds (the family walkthrough's example). It finishes about **35 requests a second**. The free
+deadline is 2 seconds to first token; reading the prompt takes some of that, which leaves about **1.5 seconds**
+for waiting (assumed).
+
+| Position in the free queue | Expected wait | What happens | What to say in the interview |
+|---|---|---|---|
+| 1st | about 0.03 s | Admitted almost at once | "Short queues are fine." |
+| 30th | about 0.9 s | Still makes its deadline | "Queueing smooths short bursts." |
+| 52nd | about 1.5 s | Just makes it | "This is the useful maximum." |
+| **53rd** | over 1.5 s | Will miss its deadline | "Reject it now with a 503. Making it wait helps nobody." |
+
+Say: "A queue longer than completion rate times wait budget just means everyone times out together."
+
+### Survive the retries
+
+Every rejected request comes back as a retry. The Google SRE book measures uncontrolled retries growing load "to
+somewhere just below 3X", a 10% per-client retry budget reducing it "to just 1.1x", and says to retry only "at
+the layer immediately above the layer that is rejecting them"
+([Handling Overload](https://sre.google/sre-book/handling-overload/), fetched 2026-10-12).
+
+Return **503 with `Retry-After`** for overload and **429** for limits, so clients can tell "slow down" from "try
+elsewhere".
+
+### Measure goodput, not throughput
+
+**Goodput** is requests finished within their deadline per second. Throughput can stay high while goodput
+collapses, because the GPUs are busy finishing replies nobody is waiting for.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Useful queue length"
+  expr="max queue ≈ completion rate × wait budget"
+  vars={[
+    { sym: 'completion rate', meaning: 'slots ÷ seconds per reply: 699 ÷ 20 s ≈ 35 per second (family example)' },
+    { sym: 'wait budget', meaning: 'TTFT budget minus prefill; 1.5 s for free (assumed)' },
+  ]}
+  example="35 × 1.5 ≈ 52: the 53rd free request will miss its deadline, so return 503 at once"
+/>
+
+This is Little's law. "Prefill" is the model reading the prompt before it writes the first token. Expected wait
+for position n is n ÷ 35 seconds: 1 ÷ 35 ≈ 0.03 s, 30 ÷ 35 ≈ 0.86 s, 52 ÷ 35 ≈ 1.49 s.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Admission control"
+  senior={["Admits by KV memory, queues by class with deadlines, rejects when the queue can't meet them, and drops abandoned requests."]}
+  staff={["Separates entitlement from capacity with distinct errors, bounds retry amplification with budgets and client throttling, and judges the policy by goodput per class."]}
+/>
+
+In plain words: a Senior answer gets the accept, queue and reject rules right. A Staff answer also keeps limits
+and capacity apart, makes sure rejections don't turn into a retry storm, and measures success per class.
+
+## Small-team version
+
+If you call a provider's API instead of running GPUs, your "fleet" is your provider quota. Admission control
+becomes four things:
+
+- **A shared budget** a little under the provider's per-minute limits, across all your app instances.
+- **A priority order** for your own features: customer-facing work before background jobs.
+- **A queue for batch work**, or the provider's batch API.
+- **A retry rule:** a provider 429 with `retry-after` means wait, or route to another deployment. Never retry in a
+  tight loop.
+
+**The batch lane is also where the money is.** Take the family walkthrough's assumed feature: 50,000 requests a
+day at about $0.0064 each on Claude Sonnet 5, about **$9,600 per 30 days** at list prices (fetched 2026-10-11). If
+half of that traffic is background work that can wait for the provider's batch API at about 50% off, the bill
+drops by about a quarter, roughly **$2,400 a month** (ignoring how batch and cache discounts combine).
+
+Build the full KV-aware admission controller above only when you run the model on your own GPUs.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Per 30 days:** 50,000 × 30 × $0.0064 = $9,600.
+- **Batch saving:** half the traffic × 50% off = 25% of the bill: $9,600 × 0.25 = $2,400.
+
+</details>
+
+## Pitfalls
+
+- **An unbounded queue.** Everyone waits past their deadline and times out together.
+- **Serving requests whose callers already left.** The GPUs do work nobody reads.
+- **One error code for "over your limit" and "we are overloaded".** Clients can't choose between waiting and
+  going elsewhere.
+- **Retries at every layer.** Each layer multiplies the load on an already full fleet.
+
+## Go deeper
+
+- Family walkthrough: [Rate limits, credits and admission control](/system-design-labs/interviews/walkthroughs/rate-limits-admission/), especially "Admission control when the GPUs are full".
+- The scheduler under a KV budget: [continuous batching](/system-design-labs/interviews/walkthroughs/continuous-batching/).
+- Labs: <LabRef lab="load-balancer" inline /> (breaker and 20% retry budget), <LabRef lab="rate-limiter" inline />.

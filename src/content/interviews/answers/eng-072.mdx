@@ -1,0 +1,224 @@
+---
+question: eng-072
+family: design-doc-critique
+status: published
+labs: [llm-inference, load-balancer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll answer the three parts of the title in order. The flaws: I'd rank the ones that cause an incident first,
+> which here are the unbounded queue, retries at several layers and no lease on batches. The throughput: the doc
+> sizes for full batches and 100% busy GPUs; at a 70% utilization target it needs about 45 GPUs, not 32. The mixed
+> models: dispatching by request count starves the big model, because it sends 10% of the requests but needs
+> about half the GPU-time, so I'd give each model its own pool."
+>
+> The rest of this page explains each part of that answer.
+
+You are given a design doc for a service that runs machine-learning models on GPUs (graphics processors used for
+the heavy math a model needs) and are asked to find what's wrong with it. The title names three things to check:
+flaws, throughput and mixed-model GPUs.
+
+What makes this different from reviewing a normal backend design? A web server answers a request in a few
+milliseconds, and you can add servers in seconds when traffic grows. Here each request is expensive and runs on
+GPUs you can't add quickly. To use them well, the service groups requests together and runs them in one go.
+That group is a **batch**, and **batch size** is how many requests it holds. Batching makes the GPU efficient,
+but it creates new ways for the design to be wrong: the doc can assume batches are fuller than they are, and it
+can share GPUs between models that cost very different amounts.
+
+Only the title is reported, from an Anthropic onsite: "Review a Batched GPU Inference API Design Doc: Flaws,
+Throughput, Mixed-Model GPUs". PracHub's page says "The real document was not reported"; its body is the site's
+illustrative stand-in, with a load balancer, a batching layer, a response cache and GPU workers
+(<Cite id="s-f24bae1f6b" />). (**Inference** means running a trained model to get an answer.)
+
+## Clarify first
+
+Ask these before you critique. If the doc doesn't answer one, that's a finding.
+
+- **Batch time, batch size and peak traffic?** PracHub's write-up uses 100 ms per batch and 10,000 QPS (queries
+  per second).
+- **Is the stated batch size achieved, or the maximum?** "Up to 32" and "32 on average" give very different
+  fleet sizes.
+- **Model sizes, and how many GPUs one batch uses?** The write-up uses 8 GPUs for a large model and 1 for a small
+  one.
+- **Realtime callers only, or offline traffic too?** Offline work can wait in a deep queue; realtime work can't.
+
+Say it like this: "Is 32 the batch size we actually see at peak, or the most a batch can hold? The answer
+changes the fleet size by about four times."
+
+## Answer
+
+Here is the stand-in design as a picture, so you have something to walk through:
+
+```
+Clients
+   │
+   ▼
+Load balancer
+   │
+   ▼
+Batching layer ───── holds requests, sends up to 32 every 100 ms
+   │            └─── response cache: same input → reuse stored answer
+   ▼
+GPU workers ──────── two models, large (8 GPUs per batch) and small (1 GPU)
+```
+
+**Clients** are other services waiting for answers. The **load balancer** spreads requests across the batching
+layer. The **batching layer** queues requests and every 100 ms sends up to 32 of them as one batch. Next to it,
+a **response cache** stores answers so a repeated input can skip the GPU. The **GPU workers** run the batches,
+and two models of very different size share them.
+
+### Part 1: the flaws, ranked
+
+Walk one request through the picture, asking at each box how long it can wait and what happens if that box
+fails. You will find more flaws than you have time for. Rank the two or three that would cause an incident. The
+common ones:
+
+- **Unbounded queue.** Under a burst, requests pile up until every caller times out, and the GPUs keep computing
+  answers nobody is waiting for.
+- **Retries at several layers.** If the load balancer and the batching layer each make up to 3 attempts, one
+  failing request can become 9 attempts, at the moment the GPUs are already struggling.
+- **No lease on dispatched batches.** A **lease** means a worker holds a batch for a limited time and must report
+  back. Without one, a GPU that dies mid-batch silently loses every request in it.
+- **A response cache that ignores sampling settings.** Models that generate text use some randomness, controlled
+  by a setting called **temperature**. At temperature 0 the model always picks its most likely next word, so answers
+  repeat; above 0 they vary. Caching is safe only for deterministic requests, such as temperature 0 with the same model version.
+  Otherwise the cache hands every user the same "random" answer.
+- **Monitoring that shows only GPU utilization.** A GPU at 100% could be healthy or drowning; you can't tell which.
+
+Say it like this: "The three I'd fix first are the unbounded queue, the stacked retries and the missing lease,
+because each one turns an ordinary bad day into an outage. The cache and the monitoring come next."
+
+### Part 2: the throughput math
+
+The idea first. One GPU serves (batch size ÷ batch time) requests per second. Divide peak traffic by that and you
+get the GPUs needed if every GPU is 100% busy. Then allow headroom: the fraction of time a GPU is busy is its
+**utilization**, written **ρ**, and a fleet sized for 100% has nowhere to put a burst. A common target is 0.7.
+
+Worked through for the write-up's numbers:
+
+| Assumption | GPUs needed | What to say |
+|---|---|---|
+| Full batches of 32, 100% busy (the doc) | **31.25, so 32** | "This is the doc's number. It has no headroom." |
+| Full batches of 32, ρ = 0.7 | **45** | "With headroom for bursts, 45." |
+| Batches fill to only 8, ρ = 0.7 | **about 179** | "If batches don't fill, it's closer to 180. I'd want the batch-fill numbers." |
+
+Real throughput falls short even of the corrected formula, for four reasons:
+
+- **Batches don't fill at low load.** A batch of 8 still takes the full 100 ms.
+- **Padding.** Inputs of different length are usually padded to the longest in the batch, so short inputs waste
+  their slot.
+- **Failures redo work.** A failed batch's GPU time is lost.
+- **Uneven routing.** Some GPUs sit idle while others have a queue.
+
+Realtime traffic needs that headroom. Offline traffic can run near full utilization, because a deep queue keeps
+every batch full and nobody is waiting on the other end.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="GPUs the doc's numbers require"
+  expr="GPUs = QPS × T_batch ÷ (B × ρ)"
+  vars={[
+    { sym: 'B', meaning: 'achieved batch size' },
+    { sym: 'ρ', meaning: 'target utilization (assumed 0.7)' },
+  ]}
+  example={[
+    '10,000 × 0.1 ÷ 32 = 31.25 GPUs fully busy; ÷ 0.7 ≈ 45',
+    'Batches filling to only 8: 125 fully busy, about 179 at 0.7',
+  ]}
+/>
+
+</details>
+
+### Part 3: two models on the same GPUs
+
+The write-up evaluates a proposal to keep two queues, one per model, and dispatch between them "in proportion to
+each model's QPS". The mistake is counting requests. Count **GPU-time** instead: how many GPUs a request ties up,
+for how long.
+
+Follow an assumed mix: 9,000 QPS for the small model and 1,000 QPS for the large one, both in batches of 32 that
+take 100 ms. A small-model request costs about 3 GPU-milliseconds. A large-model request costs 25, eight times as
+much, because its batch holds 8 GPUs instead of 1.
+
+So the large model sends **10%** of the requests but needs **47%** of the GPU-time. Dispatching by QPS gives it
+about 10%, and its queue grows without limit.
+
+There is a second problem. A large batch needs all 8 GPUs of a machine free at the same moment. If small batches
+are scattered across the machine, that moment rarely comes, so the large model waits even when the machine looks
+half idle.
+
+The fix: give the large model whole machines of its own, run the small model on separate GPUs, and size each
+pool by GPU-time.
+
+Say it like this: "QPS-proportional dispatch gives the large model 10% when it needs 47% of the GPU-time, and its
+batches need a whole machine free at once. Separate pools, each sized by GPU-time."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Small model: 1 × 100 ÷ 32 = 3.1 GPU-ms per request.
+- Large model: 8 × 100 ÷ 32 = 25 GPU-ms per request.
+- Large model's share of GPU-time: (1,000 × 25) ÷ (1,000 × 25 + 9,000 × 3.125) = 25,000 ÷ (25,000 + 28,125) = **47%**.
+- Large model's share of requests: 1,000 ÷ 10,000 = **10%**.
+
+</details>
+
+### PracHub's write-up follow-ups
+
+These are the site's own follow-ups, not reported ones, but they are good practice:
+
+- **A tenant (one customer) sends 60% of traffic.** Give each tenant a token bucket (a counter that refills at
+  the tenant's agreed rate; empty means reject) and dequeue fairly across tenants.
+- **A canary for a new model.** Run it in a separate pool, route a small share of users to it by hashing the user
+  id, compare it on an eval set (a fixed set of test inputs), and roll back automatically on a regression.
+- **The three first metrics.** Queue-wait p99, rejection rate and batch fill.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Doc review with throughput and mixed models"
+  senior={["Computes fleet size at achieved batch and utilization, and finds the queue, retry and cache flaws."]}
+  staff={["Shows QPS-proportional dispatch starves the 8-GPU model by GPU-time arithmetic, and restructures placement into separate pools."]}
+/>
+
+A Senior answer gets the numbers and the flaws right. A Staff answer also sees that the mixed-model problem is
+structural: no tweak to the dispatcher fixes it, so the placement itself has to change.
+
+## Small-team version
+
+The skill that transfers is checking a design's numbers before its boxes. When a teammate proposes running a
+model on your own GPUs (**self-hosting**), ask for the measured traffic, the expected utilization and the
+comparison with paying a provider per token on a **serverless endpoint** (the provider runs the same open model;
+you pay per token).
+
+Cohorte's analysis (2026-09-20) finds that a rented machine with 2 H100 GPUs, used during business hours, can't
+break even against the same open model on a serverless endpoint
+([Cohorte](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even)).
+
+In money: for an assumed 50,000 requests a day, this guide's small-team research puts self-hosting gpt-oss-120B
+on 2× H100 at **about $8,550 a month** (GPUs at Lambda's $4.19 an hour, plus 15% of an engineer), against **about
+$1,035 a month** for the same model on Together's serverless endpoint (list prices fetched 2026-10-11).
+
+Say it like this: "Before I read the architecture, what does the same model cost per token from a provider? At
+our volume, self-hosting is roughly eight times the price, so the comparison is the first number I'd ask for."
+
+## Pitfalls
+
+- **Treating PracHub's illustrative doc as the reported one.** Only the title was reported; the numbers are the
+  site's practice material.
+- **Sizing at the maximum batch and 100% utilization.** The real fleet needs 40% more GPUs or more, and the doc's
+  leaves no room for bursts.
+- **Splitting GPUs by request share across models of different cost.** The expensive model starves because its
+  requests cost eight times as much GPU-time.
+- **Caching answers that were generated with randomness.** Users get each other's "random" answers; cache only
+  deterministic requests.
+
+## Go deeper
+
+- Family walkthrough: [Critique a batch-inference design doc](/system-design-labs/interviews/walkthroughs/design-doc-critique/), back-of-envelope sections.
+- Many models on shared GPUs: [infra-043](/system-design-labs/interviews/questions/infra-043/).
+- <LabRef lab="load-balancer" inline /> and <LabRef lab="llm-inference" inline />.

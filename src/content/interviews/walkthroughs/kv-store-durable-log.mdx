@@ -1,0 +1,1029 @@
+---
+title: "Key-value store to durable log: transactions, snapshots, WAL and group commit"
+summary: "Build a key-value store, add nested transactions, save it to a file, make it survive a crash with a write-ahead log, then let many threads share one log with group commit. Code in stages, with crash tests."
+track: ai-infra
+format: coding
+family: kv-store-durable-log
+smallTeamFocus: "Keep durable state in Postgres or SQLite and know their commit settings. Hand-roll a log only for a local spool or a hot telemetry path, and kill -9 test it first."
+rounds: [practical-coding, system-design]
+level: both
+timeboxMin: 60
+order: 223
+status: published
+basedOn: [eng-119, infra-025, infra-026, infra-031, r2a-021, r2b-020, r2b-021]
+askedAt: [openai, baseten, databricks]
+labs:
+  - { lab: wal, role: proof, note: "A Rust write-ahead log in three built stages: in-memory, file-backed with CRC32 framing and fsync, and group commit. Its recovery stops at a torn record but does not cut the file there (see Common mistakes)." }
+  - { lab: kafka-lite, role: proof, note: "A Go segmented log that fsyncs every 64 appends. It acknowledges a produce before that fsync, so it shows the durability window you accept when you do not wait." }
+  - { lab: kv-cache, role: background, note: "A Redis-style cache, not an LLM KV cache. Its v2 append-only file replays on start-up but never calls fsync." }
+  - { lab: lsm-kv, role: background, note: "Where the log goes next: a memtable flushed to sorted files. Not audited for this guide." }
+gapLabs: []
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll keep the data in a dictionary and model nested transactions as a stack of small dictionaries on top of
+> it. To survive a restart I'll save it in a length-prefixed format with a checksum, written to a temporary file
+> and renamed into place. To survive a crash I'll append every committed change to a log and force it to disk
+> before I say 'done', and on start-up I'll replay the log and cut off any half-written record at the end. When
+> many threads write, one background thread forces a whole batch to disk at once, so each caller waits a little
+> longer but the disk keeps up."
+>
+> The rest of this page explains each part of that answer, and builds it in code, stage by stage.
+
+### What makes this different from the storage code you already write
+
+You have used databases for years. You call `INSERT`, the call returns, and you trust that the row is safe. In
+this round **you are the database**, and that trust becomes your job. Three things make it harder than it looks.
+
+1. **"Done" has an exact meaning.** When your `set` returns, the caller will tell a user the write happened. If
+   the machine loses power one millisecond later, the write must still be there. Most of this round is about
+   *when* you are allowed to return.
+2. **A crash can land between any two lines.** Not just between requests: halfway through writing a file, after
+   the data but before the rename, after the log record but before the in-memory update. Every design choice
+   below is chosen so that every one of those cut points leaves something you can recover.
+3. **The disk is slow in a specific way.** Writing bytes into a file is fast, because the operating system just
+   copies them into memory. Forcing them onto the drive takes milliseconds. On the machine used for this page,
+   one forced write took about 5 ms, so a single thread can only commit about 200 times a second. The last part
+   of the round is about sharing that slow step across many callers.
+
+The interviewer is not testing whether you have heard of a write-ahead log. They want to see whether you put the
+few lines that matter in the right order, and whether you can prove it with a test.
+
+### Words you need first
+
+- When you call `write()` on a file, the bytes land in the **page cache**: memory the operating system keeps for
+  file data. They reach the drive later, in the background. If your process dies, the page cache survives. If
+  the machine loses power, it does not.
+- **fsync** is the system call that says "push this file's bytes from the page cache to the drive, and don't
+  return until the drive has them". It is the slow step. On macOS, plain `fsync` hands the bytes to the drive but
+  the drive may still hold them in its own cache; a separate call, **`F_FULLFSYNC`**, asks the drive to flush that
+  cache too.
+- To **acknowledge** a write is to return success to the caller. The whole durability promise is: never
+  acknowledge a write before it is safe.
+- A **write-ahead log** (WAL) is a file you only ever append to. Every change is written there, and forced to
+  disk, *before* it is applied anywhere else, so after a crash you can rebuild the state by replaying it.
+- A **torn write** is a record the crash cut off partway: the first 30 bytes of a 48-byte record made it to the
+  file, the rest did not. Recovery has to recognise it and throw it away.
+- A **checksum** is a short number computed from a block of bytes. **CRC32** is a common 4-byte one. If any byte
+  changes, the number almost certainly stops matching, which is how recovery spots damaged or torn data.
+- The **LSN** (log sequence number) is a counter that numbers each log record: 1, 2, 3 and so on.
+
+Two more terms, tombstone and group commit, are defined where they first come up.
+
+### The prompt as it is given
+
+You are asked to build a small database in one sitting, and each part adds a requirement. Start with an
+in-memory key-value store with `get`, `set` and `delete`. Add transactions you can nest: `begin`, `commit`,
+`rollback`. Make the store survive a restart by writing a serializer and a deserializer. Then make it survive a
+crash: no write the caller saw acknowledged may be lost, and no write may be half applied. Finally, thousands
+of threads share one log writer, and you have to batch their appends so the disk keeps up.
+
+No single report covers all of this. The parts come from seven questions reported at OpenAI, Baseten and
+Databricks; what each source says is in the next section.
+
+<QuestionRow id="eng-119" />
+<QuestionRow id="infra-025" />
+<QuestionRow id="infra-026" />
+<QuestionRow id="infra-031" />
+<QuestionRow id="r2a-021" />
+<QuestionRow id="r2b-020" />
+<QuestionRow id="r2b-021" />
+
+### The worked example that runs through this page
+
+Picture a small credit-tracking service built on this store. User `alice` has 100 credits and `bob` has 100. Alice
+sends Bob 30 credits. That is two writes that must happen together or not at all:
+
+```
+begin
+set alice 70
+set bob   130
+commit
+```
+
+Follow this one transfer through every stage:
+
+| Stage | What happens to the transfer | What to say in the interview |
+|---|---|---|
+| 1–2. Store and transactions | The two writes sit in a private layer until `commit`; other code still reads 100 and 100. | "Each open transaction is a dictionary on a stack. `get` reads the newest layer first." |
+| 3. Snapshot | After the commit, a save writes the whole store as a 49-byte file, then renames it into place. | "A crash during the save leaves the old file or the new one, never half of one." |
+| 4. Write-ahead log | The commit becomes **one** log record, LSN 42, forced to disk before `commit` returns. | "Two keys, one record. A crash can't apply half the transfer." |
+| 4. Crash | Power fails while record 42 is being written; only 30 of its 48 bytes reach the file. | "Recovery finds the torn record, cuts it off, and the transfer never happened. It was never acknowledged, so that's allowed." |
+| 5. Many threads | The transfer arrives while about 124 other writes are waiting. All 125 go to disk with one forced write. | "Each caller waits a bit longer, but the disk does 125 commits for the price of one." |
+
+All the code below was run on 2026-10-12 on an Apple M1 Ultra (macOS, Python 3.13.7, Go 1.26.9). The Python
+suite has 20 tests and the Go suite 2, all passing, with the Go tests run under `-race`.
+
+## What is being tested
+
+### The skills, in the order the parts arrive
+
+1. **State modelling.** Nested transactions are a stack, and `get` has to read through it correctly. A clean model
+   makes the next part a small change.
+2. **Serialization that cannot be fooled.** Keys and values are arbitrary strings, so a format that separates
+   fields with a character such as `:` or a newline breaks the first time a key contains that character.
+3. **Durability semantics.** Exactly when a write is safe, what `fsync` does and does not promise, and what
+   recovery does with a half-written record.
+4. **Concurrency with a cost model.** Batching writes trades each caller's wait for throughput. You should be able
+   to say how big the batch gets on its own and how long each caller then waits.
+
+An AI-platform title on the role does not mean the round is about models. The Databricks Staff account below
+reports no LLM questions at all in that loop (<Cite id="s-d6af500d84" />).
+
+### What the reports say
+
+The rounds reward working code. Hello Interview's OpenAI guide says the challenge "is often the amount of
+working code you need to produce within the session", that candidates run code and tests in CoderPad (a shared online code editor), and that
+OpenAI's stated criteria include "solution design, code quality, performance, and test coverage"
+(<Cite id="s-4d55d9b987" />). A first-hand Research Engineer account adds that "the real challenge was modeling
+the state and its transitions cleanly" (<Cite id="s-7fa103b073" />). Hello Interview's 2025 piece on practical
+rounds groups "implementing a key-value store, or designing an in-memory database to handle transactions" with
+tasks that "directly mirror the actual engineering challenges you'd face on the job" (<Cite id="s-e3c1bbce6c" />).
+
+Per company, the evidence is uneven:
+
+- **OpenAI.** The same guide describes the live coding as "small databases, credit-tracking services, and
+  resumable iterators, with several behaviors to implement", and lists "KV Store Serialize/Deserialize" among
+  common titles (<Cite id="s-4d55d9b987" />). Aced (a site that aggregates reported questions) tags a store with "transactional begin, commit, and abort" to
+  OpenAI and xAI, with no level or date (<Cite id="s-d7a8e88bf0" />). The Research Engineer account has the
+  serializer in the final round, with the follow-ups "How would you store the state of the system and restore it
+  correctly after shutdown?" and what should happen if the state is queried while the system is shut down
+  (<Cite id="s-7fa103b073" />). The phone-screen row (infra-026) rests on a summary behind a login wall
+  (<Cite id="s-401c185c20" />).
+- **Baseten.** A title on PracHub (another site that collects reported questions), "Build a Crash-Consistent Single-Server Key-Value Store", dated 2026-07-26 on the
+  page when it was read on 2026-10-12 (<Cite id="s-fa7d3ae628" />). Only the title is candidate-reported.
+- **Databricks.** One first-hand Staff account (AI platform team, interviewed May 2026, no offer) describes a
+  low-level design round on "WAL log batch writes", an added round switched to the same topic, and a key-value
+  store round where "I finished the basic implementation and locking, and then batch write came up again"
+  (<Cite id="s-d6af500d84" />). The candidate's own view is that batch write is "always top of mind for Databricks
+  interviewers"; that is one candidate's reading, not a company statement. PracHub's Databricks list adds
+  "Thread-Safe Durable Event Writer Shared by Thousands of Threads" and "Implement a Concurrent Buffered File
+  Logger" as titles (<Cite id="s-6db00549b3" />).
+
+## Clarify and scope
+
+Ask these before writing code. If the interviewer does not answer, write each assumption at the top of the file
+and say it out loud.
+
+- **Value types.** Strings only, or raw bytes? Assume UTF-8 strings, stored as bytes.
+- **Nested commit semantics.** Does an inner `commit` make writes permanent, or only visible to the enclosing
+  transaction? Assume the usual rule: an inner commit merges into its parent, and nothing is permanent until the
+  outermost commit. Some versions of this problem commit every open transaction at once. Ask.
+- **Errors.** `commit` or `rollback` with no open transaction: raise, or return a status? Assume raise.
+- **Durability target.** Process crash only, or power loss too? This is the most important question. A process
+  crash leaves the page cache intact, so a plain `write` survives it. Power loss needs `fsync`. Assume power
+  loss, because that is what "no acknowledged write is lost" means.
+- **Concurrency.** One caller, or many threads? Start with one; the last stage adds many.
+- **Shutdown behaviour.** A reported follow-up asks what happens when the store is queried while it is shut down
+  (<Cite id="s-7fa103b073" />). Assume it raises a clear error rather than serving stale memory.
+
+Say: "I'll assume power loss is in scope, so a write isn't acknowledged until it has been through `fsync`. If you
+only care about the process dying, I can drop the `fsync` and everything gets much faster."
+
+Out of scope: replication, compaction of a growing log beyond a simple checkpoint, range queries, several
+processes sharing one file, and isolation between concurrent transactions (the transaction stages are
+single-threaded).
+
+## Plan before code
+
+### A picture of the finished system
+
+Say the plan in two minutes. Drawing the end state first helps, even though you will build it bottom-up:
+
+```
+ Many caller threads
+      │  get / set / delete / begin / commit / rollback
+      ▼
+┌───────────────────────────────────────────┐
+│ Store (in memory, behind one short lock)  │  base dict + one overlay dict per open transaction
+└───────────────────────────────────────────┘
+      │  one record per committed write or transaction, numbered 1, 2, 3 …
+      ▼
+┌───────────────────────────────────────────┐
+│ Group-commit log writer                   │  callers add records to an open batch and wait
+└───────────────────────────────────────────┘
+      │  one write + one fsync per batch, then wake that batch's callers
+      ▼
+┌───────────────────────────────────────────┐
+│ wal file                                  │  length | checksum | payload, appended forever
+└───────────────────────────────────────────┘
+      │  checkpoint: save a snapshot, then empty the log
+      ▼
+┌───────────────────────────────────────────┐
+│ snapshot file                             │  the whole store + the last record number it holds
+└───────────────────────────────────────────┘
+
+ On start-up: load snapshot → read wal → cut off a torn last record → replay records newer than the snapshot
+```
+
+**The store** holds the committed data in memory, in a dictionary called the **base**, and answers reads.
+Transactions live here too: each open transaction is a small private dictionary on top of the base, called an
+**overlay**, and its writes only become real at the outermost commit. Its lock is held only for the in-memory work, never while waiting
+for the disk.
+
+**The log writer** owns the log file. Callers hand it a record and wait. A single background thread takes
+everything that is waiting, writes it, forces it to disk once, and wakes all those callers together. Sharing
+one forced write across many callers like this is called **group commit**.
+
+**The wal file** is the source of truth for recent writes. Each record carries its length and a checksum, so
+recovery can tell a complete record from a torn one.
+
+**The snapshot file** is the whole store at one moment, plus the number of the last log record it includes. It
+exists so the log does not grow forever and start-up does not replay years of history.
+
+### The build order
+
+Build it in this order, and keep each stage runnable so you always have something that passes its tests:
+
+| Stage | Adds | Data structure | Key invariant |
+|---|---|---|---|
+| 1 | `get`, `set`, `delete` | dict | none |
+| 2 | nested transactions | stack of overlay dicts with tombstones | `get` reads top overlay first |
+| 3 | serializer and snapshot | length-prefixed bytes plus a CRC32 | a crash leaves the old snapshot or the new one, never half |
+| 4 | crash consistency | framed write-ahead log, fsync before acknowledging | a transaction is one log record |
+| 5 | many threads | one flusher thread, one fsync per batch | acknowledged only after its batch is durable |
+
+A **tombstone** (stage 2) is a marker meaning "this key was deleted here"; the stage explains why a delete needs
+one. A **flusher** (stage 5) is the one background thread that writes the log.
+
+### Two choices to say out loud early
+
+Two design choices are worth naming in the first minutes, because they make later stages small.
+
+**Overlays, not undo logs, for transactions.** There are two ways to support rollback. An **undo log** writes
+changes straight into the main dictionary and remembers the old values, so it can put them back on rollback.
+That keeps `get` at O(1) and makes rollback cost O(writes in the transaction). An **overlay** keeps each
+transaction's writes in its own small dictionary on top of the main one. That makes `get` cost O(depth) and
+rollback O(1): you just throw the overlay away. Overlays win here for a different reason. At the outermost
+commit, the top overlay is exactly the set of writes to log as one record in stage 4. In the worked example, it is
+`alice → 70, bob → 130`, ready to write.
+
+**One log record per committed transaction.** Recovery replays whole records or drops a torn one. If the
+two-key transfer is one record, it is all-or-nothing on disk for free. If it were two records, a crash between
+them would leave Alice with 70 and Bob with 100: thirty credits gone. That half-applied state is the exact
+failure the Baseten title names.
+
+## Solution in stages
+
+The full module is about 520 lines with comments; the parts below are the ones you would write in the round.
+
+### Stage 1 and 2: the store and nested transactions
+
+The store is a dictionary called the **base**. Each `begin` pushes an empty overlay dictionary onto a stack.
+Writes go to the top overlay if one exists, otherwise to the base. A read walks the overlays from newest to
+oldest and falls back to the base.
+
+Deletes need one extra idea. Deleting `alice` inside a transaction cannot just remove `alice` from the top
+overlay, because she might not be there, and `get` would then fall through to her old balance in the base. So
+the delete writes a special marker meaning "this key is deleted here". That marker is called a **tombstone**.
+
+```python
+_TOMBSTONE = object()
+
+class NoTransaction(Exception):
+    pass
+
+class TxKV:
+    def __init__(self, data=None):
+        self._base = dict(data or {})
+        self._layers = []                      # one overlay dict per open transaction
+
+    def get(self, key):
+        for layer in reversed(self._layers):   # newest overlay wins
+            if key in layer:
+                v = layer[key]
+                return None if v is _TOMBSTONE else v
+        return self._base.get(key)
+
+    def set(self, key, value):
+        (self._layers[-1] if self._layers else self._base)[key] = value
+
+    def delete(self, key):
+        if self._layers:
+            self._layers[-1][key] = _TOMBSTONE  # must hide the key in lower layers
+        else:
+            self._base.pop(key, None)
+
+    def begin(self):
+        self._layers.append({})
+
+    def rollback(self):
+        if not self._layers:
+            raise NoTransaction()
+        self._layers.pop()
+
+    def commit(self):
+        if not self._layers:
+            raise NoTransaction()
+        top = self._layers.pop()
+        if self._layers:
+            self._layers[-1].update(top)        # inner commit: visible to the parent only
+            return None
+        self._apply(top)                         # outermost commit
+        return top                               # stage 4 logs exactly this
+
+    def _apply(self, writes):
+        for k, v in writes.items():
+            if v is _TOMBSTONE:
+                self._base.pop(k, None)
+            else:
+                self._base[k] = v
+```
+
+Walk the transfer through it. After `begin`, the stack holds one empty overlay. After the two `set` calls, the
+overlay is `alice → 70, bob → 130` and the base still says 100 and 100. A `get("alice")` inside the transaction
+finds 70 in the overlay. A `rollback` now would drop the overlay and leave both at 100, at O(1) cost. The
+`commit` pops the overlay, applies it to the base, and returns it, which is what stage 4 will log.
+
+The tombstone is the detail candidates miss most. Say: "A delete inside a transaction writes a tombstone, not a
+removal, or the old value shows through from below."
+
+How do you know nesting is right? Hand-picked cases miss the odd combinations. The test that earns trust is a
+**reference model**: a slow, obviously correct version (it copies the whole dictionary on every `begin`) run
+side by side with the real one on random operations. This test runs 300 random sequences of 60 operations and
+compares every key after every operation:
+
+```python
+def test_transactions_match_a_reference_model():
+    rng = random.Random(7)
+    for _ in range(300):
+        kv, ref = TxKV(), [{}]
+        for _ in range(60):
+            op, key = rng.choice("sssddbbcr"), rng.choice("abcd")
+            if op == "s":
+                v = str(rng.randint(0, 9)); kv.set(key, v); ref[-1][key] = v
+            elif op == "d":
+                kv.delete(key); ref[-1].pop(key, None)
+            elif op == "b":
+                kv.begin(); ref.append(dict(ref[-1]))
+            elif op == "c" and len(ref) > 1:
+                kv.commit(); top = ref.pop(); ref[-1] = top
+            elif op == "r" and len(ref) > 1:
+                kv.rollback(); ref.pop()
+            for k in "abcd":
+                assert kv.get(k) == ref[-1].get(k)
+```
+
+### Stage 3: serializer, deserializer and an atomic snapshot
+
+Now the store must survive a restart. That needs two things: a byte format that cannot be fooled by its
+contents, and a way of saving that cannot leave half a file behind.
+
+**The format.** Instead of separating fields with a character, write each key's and value's **length** before
+its bytes (a **length prefix**). The reader then knows exactly how many bytes to take, whatever those bytes are.
+A fixed tag at the front (`KVS1`, a **magic number** that also carries a version) catches the wrong kind of
+file. A **checksum** at the end catches damage: a CRC32 is a 4-byte number computed from all the other bytes,
+and if any byte changes, the number almost certainly no longer matches. The snapshot also records the **log
+sequence number** (LSN), the number of the last log record it includes, which stage 4 needs.
+
+```python
+import os, struct, zlib
+
+MAGIC = b"KVS1"
+
+def encode(data: dict[str, str], lsn: int = 0) -> bytes:
+    out = [MAGIC, struct.pack("<QI", lsn, len(data))]
+    for k, v in data.items():
+        kb, vb = k.encode(), v.encode()
+        out += [struct.pack("<II", len(kb), len(vb)), kb, vb]
+    body = b"".join(out)
+    return body + struct.pack("<I", zlib.crc32(body))
+
+def decode(buf: bytes) -> tuple[dict[str, str], int]:
+    if len(buf) < 20 or buf[:4] != MAGIC:
+        raise CorruptSnapshot("bad magic or too short")
+    body, (crc,) = buf[:-4], struct.unpack("<I", buf[-4:])
+    if zlib.crc32(body) != crc:
+        raise CorruptSnapshot("checksum mismatch")
+    lsn, n = struct.unpack_from("<QI", body, 4)
+    pos, data = 16, {}
+    for _ in range(n):
+        kl, vl = struct.unpack_from("<II", body, pos); pos += 8
+        k = body[pos:pos + kl].decode(); pos += kl
+        data[k] = body[pos:pos + vl].decode(); pos += vl
+    if pos != len(body):
+        raise CorruptSnapshot("trailing bytes")
+    return data, lsn
+```
+
+In the worked example, the store after the transfer encodes to **49 bytes**: 4 for the tag, 12 for the LSN and
+the key count, 15 for `alice`/`70`, 14 for `bob`/`130`, and 4 for the checksum. Flip any one of those bytes and
+`decode` raises instead of loading a wrong balance.
+
+**The save.** Never overwrite the snapshot in place: a crash halfway would leave half a file. Write the new
+snapshot to a temporary file, force it to disk, then rename it over the old one. A rename within one directory
+is **atomic**: anyone looking sees either the old file or the new one, never a mix.
+
+```python
+def save_snapshot(path, data, lsn):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(encode(data, lsn))
+        f.flush()
+        os.fsync(f.fileno())          # the new file's bytes are on disk
+    os.replace(tmp, path)             # atomic rename over the old snapshot
+    fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+    try:
+        os.fsync(fd)                  # the rename itself is on disk
+    finally:
+        os.close(fd)
+```
+
+The last `fsync` is on the directory, and it is the line people forget. A rename changes the directory, not the
+file, so forcing the file to disk does not force the rename. The Linux `fsync(2)` page says that calling
+`fsync()` on a file "does not necessarily ensure that the entry in the directory containing the file has also
+reached disk", and that "an explicit fsync() on a file descriptor for the directory is also needed"
+([man-pages 6.19, 2026-02-08](https://man.archlinux.org/man/fsync.2.en)). Redis writes its RDB snapshots the
+same way, to a temporary name renamed into place "atomically using rename(2) only when the new snapshot is
+complete" ([Redis persistence docs, read 2026-10-12](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)).
+
+**The shutdown follow-up** is a question about state. Keep an `open` flag and make every method raise
+`ClosedError` once `close` has run. Serving reads from memory after shutdown would hide the fact that writes are
+no longer accepted, and the answers would disagree with what a restart loads.
+
+A snapshot on its own loses every write since the last save. If the service saves once a minute and crashes 50
+seconds after the transfer, the transfer is gone. That is the gap stage 4 closes.
+
+### Stage 4: a write-ahead log, fsync before acknowledging
+
+The rule of this stage fits in one sentence: **write the change to the log, force it to disk, then apply it, then
+return.**
+
+Each record in the log is **framed**: a 4-byte length, a 4-byte CRC32, then the payload. The checksum covers the
+length bytes too, so a length field that was itself torn cannot pass as valid. Reading the log then works like
+this: read a header, check that the whole payload is there, check the checksum, move on. The first record that
+fails either check is where the good part of the file ends.
+
+```python
+HDR = struct.Struct("<II")   # length, crc32(length bytes + payload)
+
+def frame(payload: bytes) -> bytes:
+    lb = struct.pack("<I", len(payload))
+    return HDR.pack(len(payload), zlib.crc32(lb + payload)) + payload
+
+def read_frames(path):
+    """Complete, checksummed records and the offset where the valid prefix ends."""
+    if not os.path.exists(path):
+        return [], 0
+    buf = open(path, "rb").read()
+    out, pos = [], 0
+    while pos + HDR.size <= len(buf):
+        n, crc = HDR.unpack_from(buf, pos)
+        end = pos + HDR.size + n
+        if end > len(buf):
+            break                                         # torn: payload missing
+        payload = buf[pos + HDR.size:end]
+        if zlib.crc32(struct.pack("<I", n) + payload) != crc:
+            break                                         # torn or corrupt
+        out.append(payload)
+        pos = end
+    return out, pos
+
+def recover_log(path):
+    records, good = read_frames(path)
+    if os.path.exists(path) and os.path.getsize(path) != good:
+        with open(path, "r+b") as f:
+            f.truncate(good)          # cut the torn tail BEFORE appending again
+            os.fsync(f.fileno())
+    return records
+```
+
+**The crash, in the worked example.** Say (as an illustration) the log holds 41 earlier records ending at byte
+2,000, and the transfer's record is 48 bytes: an 8-byte header and a 40-byte payload. Power fails after 30 of
+those 48 bytes reach the disk. On restart, `read_frames` reads the header at byte 2,000, sees a 40-byte payload,
+finds only 22 bytes after the header, and stops. `recover_log` cuts the file back to 2,000 bytes and forces that
+to disk. The transfer is gone, and that is correct: `commit` never returned, so nobody was told it happened.
+
+The `truncate` line matters more than it looks. Without it, the next write is appended *after* the 30 garbage
+bytes. The following recovery stops at the garbage again and never reaches the new record, so an acknowledged
+write disappears. Say: "Recovery has to cut the torn tail before the log accepts new writes."
+
+The store logs before it applies. A write outside a transaction becomes a one-write record. The outermost
+`commit` logs the whole top overlay as one record:
+
+```python
+class DurableKV:
+    def __init__(self, dirpath):
+        self.snap_path = os.path.join(dirpath, "snapshot")
+        self.log_path = os.path.join(dirpath, "wal")
+        data, snap_lsn = load_snapshot(self.snap_path)
+        self.lsn = snap_lsn
+        for payload in recover_log(self.log_path):
+            lsn, writes = decode_ops(payload)
+            if lsn <= snap_lsn:
+                continue                       # already in the snapshot: replay stays idempotent
+            tmp = TxKV(data); tmp._apply(writes); data = tmp.committed()
+            self.lsn = lsn
+        self.kv = TxKV(data)
+        self._log = SyncLog(self.log_path)     # one write + one fsync per append
+        self._open = True
+
+    def _durable(self, writes):
+        self.lsn += 1
+        self._log.append(encode_ops(self.lsn, writes))   # returns after fsync
+
+    def set(self, key, value):
+        self._check_open()
+        if self.kv.depth:
+            self.kv.set(key, value)            # buffered in the transaction
+        else:
+            self._durable({key: value})        # log first...
+            self.kv.set(key, value)            # ...then apply
+
+    def commit(self):
+        self._check_open()
+        if self.kv.depth == 1 and self.kv._layers[-1]:
+            self._durable(self.kv._layers[-1]) # the whole transaction, one record
+        self.kv.commit()
+
+    def checkpoint(self):
+        save_snapshot(self.snap_path, self.kv.committed(), self.lsn)
+        self._log.reset()                      # only after the snapshot is durable
+```
+
+`delete` mirrors `set` with a tombstone, and `rollback` never touches the log, because nothing was logged yet.
+
+Two orderings matter, and both are worth saying.
+
+- **Log before apply**, so memory never holds a committed write the disk lacks. If the transfer were applied
+  first and the crash came before the log write, a reader could have seen Alice at 70 and then, after restart,
+  at 100.
+- **Snapshot before emptying the log.** `checkpoint` saves a snapshot that says "I include everything up to
+  record 42", and only then resets the log. If the crash comes between the two, the old records are still in the
+  log, and replay skips every record numbered 42 or below because the snapshot already holds them. Replaying is
+  then **idempotent**: doing it twice gives the same result as doing it once.
+
+### Stage 5: one log, many threads, group commit
+
+With one `fsync` per append, every caller pays a full forced write, and they queue behind each other. At about
+5 ms each, the whole store tops out near 200 commits a second however many threads you add.
+
+**Group commit** fixes this by sharing the forced write. One background thread, the **flusher**, owns the file.
+A writer puts its framed record into the currently open batch and waits on that batch's event. The flusher swaps
+the open batch for an empty one, writes the full batch with one `write` and one `fsync`, and releases every
+waiter in the batch at once. While one flush runs, the next batch fills, so the batch size follows the load
+without any timer: with 2 writers waiting you get batches of about 2, with 125 waiting you get about 125.
+
+In the worked example, the transfer's record joins an open batch with about 124 others. One `fsync` makes all
+125 safe, and all 125 callers return together.
+
+```python
+class _Batch:
+    def __init__(self):
+        self.frames, self.nbytes = [], 0
+        self.done, self.err = threading.Event(), None
+
+    def wait(self):
+        self.done.wait()
+        if self.err:
+            raise LogFailed() from self.err
+
+class GroupCommitLog:
+    def __init__(self, path, max_batch_bytes=1 << 20, sync=os.fsync):
+        recover_log(path)
+        self._f = open(path, "ab", buffering=0)
+        self._sync, self._max = sync, max_batch_bytes
+        self._lock = threading.Lock()
+        self._has_work = threading.Condition(self._lock)
+        self._has_room = threading.Condition(self._lock)
+        self._open, self._closed, self._failed = _Batch(), False, None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def submit(self, payload) -> _Batch:
+        fr = frame(payload)
+        with self._lock:
+            while True:
+                if self._failed:
+                    raise LogFailed() from self._failed
+                if self._open.nbytes == 0 or self._open.nbytes + len(fr) <= self._max:
+                    break
+                self._has_room.wait()              # backpressure: open batch is full
+            b = self._open
+            b.frames.append(fr); b.nbytes += len(fr)
+            self._has_work.notify()
+        return b
+
+    def append(self, payload):
+        self.submit(payload).wait()                # acknowledged = durable
+
+    def _run(self):
+        while True:
+            with self._lock:
+                while not self._open.frames and not self._closed:
+                    self._has_work.wait()
+                if not self._open.frames:
+                    return
+                b, self._open = self._open, _Batch()
+                self._has_room.notify_all()
+            try:
+                self._f.write(b"".join(b.frames))
+                self._sync(self._f.fileno())       # ONE fsync for the whole batch
+            except BaseException as e:
+                with self._lock:                   # fail-stop: never retry fsync
+                    self._failed = e
+                    rest, self._open = self._open, _Batch()
+                b.err = rest.err = e
+                b.done.set(); rest.done.set()
+                return
+            b.done.set()
+```
+
+Three details in this code are worth pointing at:
+
+- **Backpressure.** The open batch has a byte cap (1 MiB by default). When it is full, new writers wait in
+  `submit` instead of piling up memory. A slow disk slows the producers down.
+- **Fail-stop.** If a write or `fsync` fails, the log fails every waiting caller and refuses all later writes.
+  It never retries the `fsync`; the Follow-ups explain why a retry can lie.
+- **One wake-up per batch.** Each batch has its own event, so a flush wakes only the callers in that batch, not
+  every thread in the process.
+
+A store on top of this needs one more rule. Under the store's lock, assign the LSN, `submit` the record and apply
+it in memory, so log order equals LSN order. Outside the lock, wait for the batch. That keeps the lock short:
+holding it across the `fsync` would put every writer back in a single-file queue behind the disk. The cost is
+that other threads may read a value a moment before it is durable. Say so, and offer the alternative: track
+the highest LSN known to be on disk (the **durable LSN**) and show a write to readers only once the durable LSN
+has reached it.
+
+The Go version is shorter because a channel is the queue. One goroutine drains whatever is waiting, writes it,
+syncs once and answers every request on that request's own reply channel:
+
+```go
+type req struct {
+	frame []byte
+	done  chan error
+}
+
+func (w *Writer) Append(p []byte) error {
+	r := req{frame: Frame(p), done: make(chan error, 1)}
+	w.reqs <- r // bounded channel: a full queue blocks the caller
+	return <-r.done
+}
+
+func (w *Writer) flusher() {
+	var failed error
+	for first := range w.reqs {
+		batch := []req{first}
+	drain:
+		for len(batch) < w.maxB {
+			select {
+			case r, ok := <-w.reqs:
+				if !ok {
+					break drain
+				}
+				batch = append(batch, r)
+			default:
+				break drain
+			}
+		}
+		err := failed
+		if err == nil {
+			var buf []byte
+			for _, r := range batch {
+				buf = append(buf, r.frame...)
+			}
+			if _, err = w.f.Write(buf); err == nil {
+				err = w.f.Sync()
+			}
+			failed = err // sticky: after one failure, every later append fails
+		}
+		for _, r := range batch {
+			r.done <- err
+		}
+	}
+}
+```
+
+The full Go file also guards `Append` against a closed writer with a read-write mutex so a send never races
+`close(w.reqs)`.
+
+### The buffered logger variant
+
+"Implement a concurrent buffered file logger" (<Cite id="s-6db00549b3" />) has the same shape with the opposite
+promise: callers never wait for the disk. A background thread writes the buffer when it passes a size threshold,
+every interval, and on `close`. A crash loses what is still buffered, by design. Say that promise first, because
+it decides everything else. The interesting choices are what to do when the buffer is full (block the caller, or
+drop the line and count drops) and how `close` drains without losing the last lines. The answer card for
+[r2b-021](/system-design-labs/interviews/questions/r2b-021/) has the code.
+
+## Verification
+
+### What was run
+
+The Python suite (pytest, 20 tests, about 14 s) covers:
+
+- The reference-model test above, plus nested commit and rollback cases and errors without a transaction.
+- A snapshot round trip over 500 random keys and values built from `:`, `=`, `,`, newlines, quotes, backslashes,
+  a NUL, accented and CJK characters and an emoji. A flipped byte and a truncated file both raise
+  `CorruptSnapshot`.
+- **Every truncation point.** Twenty framed records are written, then the file is cut at every byte offset from 0
+  to its full length. Recovery must return exactly the records that fit and leave the file at their end. This is
+  the worked example's crash, tried at every possible byte.
+- **Append after a torn tail.** Recover, append, recover again: the new record must survive. The same test then
+  skips the truncate on purpose and shows the acknowledged record vanishing behind the garbage.
+- A crash between writing a checkpoint snapshot and resetting the log: replay must skip the old records by LSN.
+- Group commit with 64 threads × 50 appends: all 3,200 records present after reopening, each thread's records
+  in its own order, and fewer fsyncs than appends.
+- An fsync that fails with `EIO` (the operating system's input/output error) on the third call: the waiter gets
+  `LogFailed`, and so does every later append.
+- Backpressure: with fsync blocked and a 100-byte batch limit, at most four 48-byte frames are accepted (two in
+  flight, two in the open batch) and the other writers wait.
+- **`kill -9`.** A child process appends from 32 threads and prints each LSN only after `set` returns. The parent
+  kills it with SIGKILL (a signal the process cannot catch or clean up after) at a random moment between 0.2 and
+  1.0 s, 15 times. After each kill, every printed LSN must be in the recovered store.
+
+The Go suite runs 2,000 goroutines × 10 appends under `-race` (Go's data-race detector), three times: all 20,000
+records present, no duplicates, 41 fsyncs per run, and no race reports. A second test checks that a failed sync
+is sticky.
+
+### What the tests cannot show
+
+A process kill leaves the page cache intact, so the `kill -9` test proves the code never acknowledges a write
+before handing it to the operating system. It does not prove the bytes survive power loss. That depends on
+`fsync` being honest, and on macOS plain `fsync` is not: Apple's man page says the drive "may not actually write
+the data to the platters for quite some time" and offers the `F_FULLFSYNC` fcntl for applications that need
+ordering ([Apple fsync(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html), read 2026-10-12).
+Go's `File.Sync` on macOS already issues `F_FULLFSYNC` (Go 1.26 source, `internal/poll/fd_fsync_darwin.go`);
+Python's `os.fsync` does not. Real power-loss testing needs a fault-injecting block device or a virtual machine
+you can cut the power to, which is beyond a 60-minute round.
+
+Say: "My kill test proves I never acknowledge before the write reaches the operating system. It doesn't prove
+power-loss safety; that needs a fault-injecting disk."
+
+## Complexity and performance
+
+### Operations
+
+`get` is O(d) for d open transactions; `set`, `delete` and `begin` are O(1); `rollback` is O(1); `commit` is O(w)
+for w writes in the top overlay. Serialization is O(total bytes). Recovery is O(log bytes) plus O(snapshot
+bytes).
+
+### What group commit buys, and what it costs
+
+The idea first. With one `fsync` per write, throughput is one write per flush time, about **200 a second** at
+5 ms. Group commit puts B writes into each flush, so throughput is roughly B times higher. The price is the wait:
+a caller that arrives just after a flush starts has to wait for that flush to finish and then for its own, so
+each caller waits between one and two flush times, about **5 to 10 ms**. With 125 callers per batch, that is
+about **25,000 writes a second** in the simple model.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Group-commit throughput and wait"
+  expr="X ≈ B ÷ t_sync     wait per caller ≈ (time to the next flush) + t_sync ≤ 2 × t_sync (fixed t_sync, no CPU limit)"
+  vars={[
+    { sym: 'X', meaning: 'acknowledged appends per second' },
+    { sym: 'B', meaning: 'records per fsync; under load it tends towards the number of waiting writers' },
+    { sym: 't_sync', meaning: 'time for one write + fsync, roughly independent of a small batch size' },
+  ]}
+  example="Assumed t_sync = 5 ms: B = 1 gives 200/s; B = 125 gives 125 ÷ 0.005 = 25,000/s, while each caller waits between 5 and 10 ms."
+/>
+
+The model assumes the flush time does not grow with batch size (true while batches are small compared with the
+drive's bandwidth) and that the CPU is not the limit. In Python, thread wake-ups and the GIL (the lock that lets
+only one Python thread run at a time) break the second assumption, which is one likely reason measured callers
+waited longer than 10 ms.
+
+</details>
+
+### What was measured
+
+The assumed 5 ms is close to what this machine showed. A Python benchmark appended 100-byte records on the M1
+Ultra's internal SSD on 2026-10-12, three runs each, on a machine other agents were also using:
+
+| Setup | Records per fsync | Appends per second (3 runs) | Caller p50 latency |
+|---|---|---|---|
+| `F_FULLFSYNC` per append, 1 thread | 1 | 193–205 | about 5 ms |
+| Group commit, `F_FULLFSYNC`, 16 threads | 8 | 975–1,181 | 14–15 ms |
+| Group commit, `F_FULLFSYNC`, 256 threads | about 125 | 12,500–19,900 | 11–19 ms |
+| Plain `os.fsync` per append, 1 thread | 1 | 28,200–32,900 | not measured |
+
+Three readings. First, batching bought roughly 60–100× throughput at 256 threads, and the price was each caller
+waiting two to four times longer than a lone flush. Second, records per fsync tracked the number of waiting
+threads (8 at 16 threads, 32 at 64, about 125 at 256), which is the self-sizing the design promised. Third,
+plain `fsync` on macOS ran over a hundred times faster than `F_FULLFSYNC` because it does not wait for the drive
+cache. A benchmark that forgets this measures the wrong thing. At 4 to 16 threads the Python numbers were noisy
+(the GIL and thread wake-ups dominate), so treat them as the shape, not a constant.
+
+Say: "Batching took us from about 200 to over 12,000 writes a second, and each caller's typical wait went from
+5 ms to 11–19 ms. That's the trade."
+
+### Tuning knobs
+
+A maximum batch size bounds the write size and memory. An optional **linger** (the flusher waits a little for
+more writers before flushing) helps only when commits are concurrent and fsync is the limit. PostgreSQL's
+documentation says the same of its `commit_delay`, and warns that a value too high "can increase transaction
+latency by so much that total transaction throughput suffers"
+([PostgreSQL 18 docs, WAL configuration](https://www.postgresql.org/docs/current/wal-configuration.html), read 2026-10-12).
+
+<AINative title="What an agent drafts and what you check">
+Practise the round without AI first. Hello Interview's OpenAI guide tells candidates to "assume you'll code
+without AI assistance" in live coding and to turn off AI autocomplete while practising
+(<Cite id="s-4d55d9b987" />), and none of Baseten, Databricks or NVIDIA has a reported AI policy as of
+2026-10-11. Once the timed version is solid, an agent is useful for the parts that are tedious to type and easy
+to check: the reference-model test, the every-truncation-point loop and the `kill -9` harness. Do not accept its
+durability ordering without reading it. Check four lines yourself: log before apply, fsync before acknowledge,
+truncate the torn tail before appending, and snapshot before resetting the log. An agent will also happily
+"fix" a failing fsync by retrying it; the PostgreSQL wiki explains why that can report success for data that
+never reached disk ([PostgreSQL wiki, Fsync Errors](https://wiki.postgresql.org/wiki/Fsync_Errors), edited
+2023-07-05).
+</AINative>
+
+## Small-team version
+
+You own AI at a 50–500 person company. Your durable state is job queues, ingestion progress, agent run logs and
+audit trails. You almost never write a log format for any of it. But you do choose the commit settings of the
+systems that hold it, and a wrong choice loses customer data quietly.
+
+The short version: **use Postgres or SQLite with their safe defaults; turn durability down per table only when
+you have measured a commit-rate problem; hand-roll a log only for a local spool, and test it with `kill -9`
+first.**
+
+### Use what you already run
+
+- **Postgres** for queues, run state and audit rows. It already does group commit: with the default
+  `commit_delay` of zero, "it is still possible for a form of group commit to occur"
+  ([PostgreSQL 18 docs](https://www.postgresql.org/docs/current/wal-configuration.html)). If a high-volume,
+  low-value table (agent step traces, say) is limited by commit rate, `synchronous_commit = off` per transaction
+  is the knob: Postgres then acknowledges before its log is forced to disk. The docs bound the risk window at
+  "three times `wal_writer_delay`" and say the risk "is of data loss, not data corruption"
+  ([PostgreSQL 18 docs, asynchronous commit](https://www.postgresql.org/docs/current/wal-async-commit.html)).
+  Stage 5 buys throughput by making callers wait a little longer; this setting buys it by letting the newest
+  commits be lost. You choose it per table with one setting instead of hand-building a log.
+- **SQLite** for a single-process tool, a local spool on a GPU worker or an edge box. In WAL mode "there can only
+  be one writer at a time" ([sqlite.org/wal](https://www.sqlite.org/wal.html), read 2026-10-12). With
+  `synchronous=NORMAL`, WAL mode "is always consistent" but a committed transaction "might roll back following a
+  power loss or system crash", while transactions are "durable across application crashes regardless"
+  ([sqlite.org/pragma](https://www.sqlite.org/pragma.html), read 2026-10-12). That is the process-crash versus
+  power-loss split from Clarify, in a setting. Pick FULL for anything a customer would notice losing.
+- **Redis** as a cache or a lightweight queue, knowing its default: `appendfsync everysec`, where "you may lose 1
+  second of data if there is a disaster" ([Redis persistence docs](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)).
+  A queue of paid GPU jobs should not live only there.
+
+Small teams do build this layer. A 2026 Supabase posting for an AI Platform Engineer asks for an event-triggered
+queue, durable state and full run logging, and says "You will be the only engineer on this platform"
+([Supabase job board](https://api.ashbyhq.com/posting-api/job-board/supabase), posted 2026-07-31, via research
+11). A two-person team in a ZenML case summary ran about a dozen self-hosted models behind a Redis queue
+([ZenML summary](https://www.zenml.io/llmops-database/scaling-llm-and-ml-models-to-300m-monthly-requests-with-self-hosting),
+secondary). In both, the job is configuring and verifying a durable queue, not inventing one.
+
+### Size it before tuning anything
+
+Take an assumed load of 50,000 requests a day, with an
+assumed 10 trace rows of about 1 KB per request. That is about **6 inserts a second** on average and about
+**15 GB a month** of trace rows. Even a 10× peak of 60 commits a second is well inside what one Postgres
+instance's group commit absorbs. So the default `synchronous_commit = on` costs you nothing, and a separate log
+system would only add a bill and an on-call surface. The cost that does grow is storage: set a retention period
+for trace rows (30 days here is about 15 GB) before the table becomes the largest thing you back up.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Rows a day: 50,000 requests × 10 rows = 500,000 inserts.
+- Average rate: 500,000 ÷ 86,400 seconds ≈ 5.8, so about 6 per second; a 10× peak is about 60 per second.
+- Volume: 500,000 × 1 KB ≈ 0.5 GB a day, so about 15 GB over 30 days.
+
+</details>
+
+### When hand-rolling is justified
+
+- A local append-only spool where the database is unreachable (a GPU box buffering results through a network
+  outage). Even then, SQLite is usually the better file format.
+- A telemetry or trace path where one database insert per event costs too much and losing the last second is
+  acceptable. That is the buffered logger, not the durable writer.
+- A single-binary tool that cannot take a database dependency.
+
+If you hand-roll, the tests in Verification are the minimum: every truncation point, append after a torn tail, a
+failed fsync, and repeated `kill -9`.
+
+### What you still own
+
+The durability promise for each kind of data (what may be lost, and how much), the setting that implements it, a
+restore drill from backup, and the alert when a disk or fsync error appears. Revisit the choice when a table's
+commit rate becomes the bottleneck (measure before reaching for `synchronous_commit = off`), when a compliance
+requirement says an audit row may never be lost, or when a second region appears.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="From a store to a durable log"
+  senior={[
+    "Builds the stages in order with tests at each step: overlays with tombstones, a length-prefixed format, a framed log with fsync before acknowledging, and recovery that truncates a torn tail.",
+    "Implements group commit with one flusher, explains why batch size grows with load, and can state the caller's wait.",
+  ]}
+  staff={[
+    "Fixes the durability contract first (process crash or power loss, what may be lost) and shows how each design choice follows from it, including when async commit is the right answer.",
+    "Names the failure semantics others skip: fsync errors are fail-stop, macOS needs F_FULLFSYNC, the directory needs an fsync, and a clean kill -9 test does not prove power-loss safety.",
+    "Says what a team should run instead (Postgres, SQLite settings) and what evidence would justify a custom log.",
+  ]}
+/>
+
+In plain words: a Senior candidate builds every stage correctly and tests it. A Staff candidate starts from the
+promise ("what may be lost, in which kind of crash?"), derives the code from it, knows where the operating system
+and the drive can lie, and can say when the right answer is not to build this at all.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="What should happen if someone queries the store while it is shut down? (Reported, OpenAI)">
+    The first-hand account lists this follow-up next to "store the state of the system and restore it correctly
+    after shutdown" (<Cite id="s-7fa103b073" />). Model the store's lifecycle as states (opening, open, closing,
+    closed) and make every method check it. A query while closed raises a clear error. Opening runs recovery
+    before it accepts calls, so a caller can never read a half-recovered store.
+  </FollowUp>
+  <FollowUp q="Now add locking, then batch the writes. (Reported, Databricks)">
+    In the Databricks Staff account, batch write "came up again" right after the basic store and locking
+    (<Cite id="s-d6af500d84" />). Start with one lock around the store. For batching, keep the lock short: assign
+    the sequence number, submit to the log and apply in memory under the lock, then wait for the fsync outside it.
+    Holding the store lock across the fsync serializes every writer behind the disk and throws group commit away.
+  </FollowUp>
+  <FollowUp q="How do you choose the batch size or the flush timer?">
+    (Not reported; a natural next push.) Don't start with a timer. Flush whenever the previous fsync finishes; the
+    batch then equals the writers that arrived during one fsync. Add a byte cap for memory and write size. Add a
+    linger only if measurements show many tiny batches under concurrent load, and cap it below the latency budget.
+  </FollowUp>
+  <FollowUp q="fsync returned EIO. Retry it?">
+    (Not reported; a natural next push.) No. On Linux, failed writeback could leave pages marked clean, so "retrying
+    fsync() can falsely report success", and PostgreSQL now PANICs on fsync failure and recovers from its log
+    ([PostgreSQL wiki](https://wiki.postgresql.org/wiki/Fsync_Errors)). A 2020 USENIX ATC study of five systems
+    found "none are sufficient" in their handling of fsync failures
+    ([Rebello et al.](https://www.usenix.org/conference/atc20/presentation/rebello)). Fail every pending writer,
+    refuse new writes, restart and recover.
+  </FollowUp>
+  <FollowUp q="The log grows forever. What now?">
+    (Not reported; a natural next push.) Checkpoint: write a snapshot that records the last LSN it covers, make it
+    durable, then drop log records at or below that LSN. With one file, stop writers briefly and reset. With
+    segment files (the log split into numbered files), roll to a new segment and delete old ones once a snapshot covers them; replay skips by LSN, so
+    a crash in the middle is harmless.
+  </FollowUp>
+  <FollowUp q="A bad checksum in the middle of the log, with valid records after it. Same as a torn tail?">
+    (Not reported; a natural next push.) No. A torn write can only be the last record. Valid records after a bad
+    one mean media corruption or a bug, and silently truncating there would delete acknowledged writes. Stop,
+    alert and keep the file for inspection.
+  </FollowUp>
+  <FollowUp q="How would thousands of threads share this writer without a thundering herd?">
+    (Not reported; a natural next push, from the Databricks event-writer title, <Cite id="s-6db00549b3" />.) A
+    thundering herd is thousands of threads woken at once only to find nothing for them. Avoid it with one
+    event per batch, so a flush wakes only that batch's writers, or one reply channel per request as in the Go
+    version. Bound the queue so a slow disk pushes back on producers instead of growing memory without limit.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Not truncating the torn tail before appending.** The next acknowledged write lands behind the garbage, where
+  the next recovery never reaches it. The wal lab's v1 `open()` has this shape: it recovers up to the first bad
+  record and reopens the file with `append(true)` without cutting it (read on 2026-10-12). The fix is two lines;
+  the test is "append after a torn tail, then recover again".
+- **Logging a transaction as one record per key.** A crash between records leaves a half-applied transaction,
+  like Alice at 70 and Bob still at 100.
+- **Acknowledging before fsync.** That is a valid design (kafka-lite does it on purpose), but then the answer has
+  to state the loss window instead of claiming none.
+- **Calling an append-only file "everysec" without the fsync.** The kv-cache lab's v2 comment compares its
+  append-only file to Redis's `everysec`, but the code never calls fsync, while Redis runs fsync once a second on
+  a background thread ([Redis docs](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)).
+- **Delimiter-based serialization.** It breaks the first time a key contains the delimiter; length-prefix it.
+- **Forgetting the directory fsync after a rename or a new file.** The rename can be lost even though the file's
+  bytes are safe ([fsync(2)](https://man.archlinux.org/man/fsync.2.en)).
+- **Holding the store lock across fsync.** Every writer then waits in single file, and it is not group commit
+  any more.
+- **Benchmarking plain `fsync` on a Mac.** It skips the drive cache, so it makes durability look nearly free.
+
+## Prove it with a lab
+
+<LabRef lab="wal" role="proof" note="Read v1 (framing, CRC32, recovery) and v2 (one fsync for N records). Then add the torn-tail truncation and the append-after-recovery test from this page; that is the most useful change you can make to it." />
+
+<LabRef lab="kafka-lite" role="proof" note="Its segment append fsyncs every 64 messages and returns the offset before that fsync. Change it to wait for the batch's fsync and measure what that costs." />
+
+<LabRef lab="kv-cache" role="background" note="A Redis-style store with an append-only file. Add a once-a-second background fsync so its comment becomes true." />
+
+<LabRef lab="lsm-kv" role="background" note="Where a write-ahead log sits in a storage engine: in front of the memtable." />
+
+The wal lab's own page reports group-commit throughput on an M2 MacBook Pro, with no date and no re-run for this
+guide. Quote the shape from your own run, not its numbers.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-4d55d9b987" />
+- <Cite id="s-d7a8e88bf0" />
+- <Cite id="s-7fa103b073" />
+- <Cite id="s-401c185c20" />
+- <Cite id="s-fa7d3ae628" />
+- <Cite id="s-d6af500d84" />
+- <Cite id="s-6db00549b3" />
+- <Cite id="s-e3c1bbce6c" />
+- PostgreSQL 18 documentation, [Asynchronous Commit](https://www.postgresql.org/docs/current/wal-async-commit.html) and [WAL Configuration](https://www.postgresql.org/docs/current/wal-configuration.html), read 2026-10-12.
+- SQLite, [Write-Ahead Logging](https://www.sqlite.org/wal.html) and [PRAGMA synchronous](https://www.sqlite.org/pragma.html), read 2026-10-12.
+- Redis, [persistence documentation](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/), read 2026-10-12.
+- Linux man-pages 6.19, [fsync(2)](https://man.archlinux.org/man/fsync.2.en), 2026-02-08.
+- Apple, [fsync(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html), read 2026-10-12.
+- PostgreSQL wiki, [Fsync Errors](https://wiki.postgresql.org/wiki/Fsync_Errors), last edited 2023-07-05.
+- Rebello et al., [Can Applications Recover from fsync Failures?](https://www.usenix.org/conference/atc20/presentation/rebello), USENIX ATC 2020.

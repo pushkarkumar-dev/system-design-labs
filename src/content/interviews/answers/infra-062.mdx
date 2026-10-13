@@ -1,0 +1,170 @@
+---
+question: infra-062
+family: rate-limits-admission
+status: published
+labs: [rate-limiter]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "One request can match five limits at once: per key, per organization, per model, per minute and per day. I
+> keep a token bucket for each rule, and I apply them in one atomic step: refill every bucket, check that every
+> one has room, and only then debit all of them. If any rule fails, nothing is debited and I tell the caller which
+> rule blocked and how long to wait. In a shared store that step is one Redis script, and I keep each request's
+> keys on the same shard so one script can cover them."
+>
+> The rest of this page explains each part of that answer.
+
+You already know a single rate limit: "this key may make 100 requests a minute". The hard part of this question
+is having **several** limits on the same request.
+
+Picture an API in front of a large language model (**LLM**), a program that reads and writes text. The model
+works in pieces of text called **tokens**, roughly ¾ of a word each. The API limits each key's requests per
+minute, each key's tokens per minute, each organization's tokens per minute, each model's total tokens per minute
+across all customers, and each organization's tokens per day. One request touches all five.
+
+Checking them one at a time goes wrong in two ways:
+
+1. **Wasted capacity.** The request passes the key rule, which gets debited, then fails the organization rule.
+   The key's capacity is spent on a request that never ran.
+2. **Races.** Two requests arrive together. Both see "room for one more" on the organization bucket, both debit,
+   and the organization goes over its limit. The check and the debit were separate steps, and another request ran
+   between them. This is called a **check-then-act race**.
+
+So the core of the answer is **atomicity**: check every rule, then debit every rule, as one step that nothing
+can interrupt.
+
+(The question was listed for xAI in a university career-blog post that we could see only as a snippet, so the
+expected depth is a guess <Cite id="s-a297e9309b" />.)
+
+## Clarify first
+
+- **Which rules?** "Assume key RPM, key TPM, organization TPM, model-pool TPM and organization tokens per day."
+  (**RPM** is requests per minute, **TPM** tokens per minute.)
+- **Different units?** "Yes: request rules cost 1, token rules cost the estimated tokens."
+- **Same kind of rule at several levels?** "Yes, key TPM and organization TPM both apply."
+- **What store?** "Assume a sharded Redis-like store."
+- **What do we report on refusal?** "The first rule that fails, with its wait time."
+
+## Answer
+
+### Model each rule the same way
+
+Each rule has four fields: which part of the request it is keyed on (key, organization, model), its unit
+(requests or tokens), its size, and its period. Keep one **token bucket** per rule and per scope: a bucket holds up
+to N units, refills at a steady rate, and each request takes units out.
+
+### One request, five buckets
+
+Follow one request from a customer we'll call Acme (made up). It sends a prompt the gateway estimates at **2,500
+tokens** (the prompt plus the most the reply may write). The buckets before the request (assumed):
+
+| Rule | Unit | Room left | Cost of this request | Passes? |
+|---|---|---|---|---|
+| Key RPM | requests | 12 | 1 | yes |
+| Key TPM | tokens | 40,000 | 2,500 | yes |
+| Org TPM | tokens | 1,800 | 2,500 | **no** |
+| Model-pool TPM | tokens | 3,000,000 | 2,500 | yes |
+| Org tokens per day | tokens | 9,000,000 | 2,500 | yes |
+
+In one atomic step the limiter:
+
+1. **Refills** every matching bucket using the store's clock.
+2. **Checks** each one has room for its cost. The org TPM bucket has 1,800 and needs 2,500.
+3. **Fails without debiting anything.** It returns "org TPM" and a wait time: the missing 700 tokens divided by
+   the bucket's refill rate. That becomes the `Retry-After` header.
+4. If all had passed, it would **debit all five** and return a reservation id, so the unused part can be refunded
+   when the reply finishes. The refund goes back to the token buckets only, never the request count, because the
+   request really happened.
+
+Say: "Check all, then debit all. If any rule says no, nothing changes."
+
+### Tested code
+
+A Python version of exactly this lives in the family walkthrough. Four tests passed on 2026-10-12 under Python
+3.13.7: a request that fits the key rule but not the organization rule debits nothing; a refund restores tokens
+but not the request count; buckets refill continuously; and 16 threads hammering one organization are granted
+exactly its capacity, no more.
+
+### In a shared, sharded store
+
+```
+Gateway
+   │ reserve(request, 2,500 tokens)
+   ├──► 1. Model-pool shard ── reserve 2,500 in the pool for this model
+   │
+   ├──► 2. Acme's shard ── one Lua script: refill, check, debit
+   │         keys {acme}:key:k1:rpm, {acme}:key:k1:tpm, {acme}:org:tpm, {acme}:org:day
+   │
+   └──► 3. if step 2 refused: release the pool reservation from step 1
+```
+
+**Step 2 is the main script.** In a single Redis it is one **Lua script**: Redis runs a script from start to
+finish without interleaving other commands, so it plays the role of the lock. In Postgres it would be one
+transaction.
+
+**Why the braces in the key names.** A sharded Redis can only run a script on keys that live on one shard. Wrapping
+the organization id in braces makes it a **hash tag**: Redis uses only that part to choose the shard, so all of
+Acme's counters land together and one script covers them.
+
+**Step 1 and step 3 handle the model pool.** The pool is shared by every organization, so it can't live on Acme's
+shard. Reserve it first, run Acme's script, and release the pool reservation if Acme's script refuses. Say
+plainly that this pair is not one transaction, and that the pool can briefly look fuller than it is.
+
+**A request that can never fit.** If a request costs more than a bucket's whole size, it will never pass, however
+long it waits. Reject it at once with a clear error.
+
+**Rule interactions are policy.** The most restrictive rule wins, and a lower-level limit never raises a higher
+one. Anthropic documents that last rule for its own workspaces: "Organization-wide limits always apply, even if
+Workspace limits add up to more" ([rate limits](https://platform.claude.com/docs/en/api/rate-limits), fetched
+2026-10-12).
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Compound rules"
+  senior={["Check-all-then-debit in one script, bucket per rule and scope, blocking rule and Retry-After in the response."]}
+  staff={["Handles rules that cross shards with an explicit reserve-then-release protocol, states its failure window, and tests the no-overshoot property under concurrency."]}
+/>
+
+In plain words: a Senior answer makes the check atomic. A Staff answer also handles the rule that can't share a
+shard, says what can go wrong in the gap, and proves the "never over" property with a many-thread test.
+
+## Small-team version
+
+You meet compound rules mostly from the consumer side. Your provider applies requests, input-token and
+output-token limits per model, plus a monthly spend cap. Your own plans add per-customer quotas on top.
+
+- **Your own quotas:** one database transaction that checks the customer's minute counter and month counter
+  together and debits both. At an assumed 50,000 requests a day, reserve plus settle is about **1.2 writes a
+  second**, which any database you already run handles.
+- **The provider's limits:** read its `*-remaining` response headers and slow down before you hit them.
+  Anthropic's Start tier for Sonnet 5 lists 1,000 RPM, 2M input and 400K output tokens per minute; keep your own
+  shared budget a little under those numbers, so one heavy customer hits your limit before everyone hits the
+  provider's.
+- **When to move up:** to a Lua script in Redis when several app instances share minute-level limits, and to a
+  sharded design only if one store can't keep up.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Writes:** 2 operations × 50,000 requests ÷ 86,400 seconds ≈ 1.2 per second.
+- **Wait time in the example:** (2,500 − 1,800) ÷ refill rate. At an assumed 40 M TPM organization limit the
+  refill rate is about 666,667 tokens per second, so the wait is about 1 ms; at an assumed 100,000 TPM it is
+  700 ÷ 1,667 ≈ 0.42 s.
+
+</details>
+
+## Pitfalls
+
+- **Checking and debiting rule by rule.** A later refusal leaves earlier rules already spent.
+- **Separate store calls per rule.** Concurrent requests interleave between the calls and overshoot.
+- **No way to tell the caller which rule refused.** The caller can't back off correctly without it.
+- **A request bigger than a bucket waiting forever.** It can never fit; reject it at once.
+
+## Go deeper
+
+- Family walkthrough: [Rate limits, credits and admission control](/system-design-labs/interviews/walkthroughs/rate-limits-admission/), especially "Compound rules in one atomic step".
+- Lab: <LabRef lab="rate-limiter" inline />. Its intermittently failing concurrency test is a check-then-act race, the same bug in miniature.

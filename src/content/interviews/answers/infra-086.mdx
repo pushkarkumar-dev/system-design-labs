@@ -1,0 +1,143 @@
+---
+question: infra-086
+family: quant-specdec-moe
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Each of the three hot experts is getting about 27% of tokens instead of about 3%, so 8.5 times its share. What
+> breaks depends on whether experts have a capacity limit. With a limit, most tokens overflow and skip the layer:
+> nothing looks slow, but quality drops quietly. Without a limit, whichever GPU holds the hot experts does several
+> times the work, and every step waits for it. I'd first check the skew is real, then fix placement at serving
+> time, and then look at the balancing term in training."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see you turn a routing statistic into its system effect, and know the fixes at both
+training and serving time.
+
+Some background. A **mixture-of-experts (MoE)** model has, in each layer, many parallel blocks called **experts**,
+and a small scoring layer called the **router**. For each **token** (roughly ¾ of a word), the router scores every
+expert and sends the token to the best one (or best few). The idea is that each token does only a fraction of the
+model's work.
+
+For a backend engineer, this is a **hot-key problem** in a sharded system. The router is a partitioner, the experts
+are shards, and 80% of traffic is landing on 3 of 32 shards. You already know the two ways that fails: either you
+shed load (requests get dropped), or you don't, and the hot shard becomes the straggler everyone waits on. MoE
+systems fail in exactly those two ways, with one twist: a "dropped" token isn't an error the user sees. It just gets
+a worse answer.
+
+The prompt is an example from a techinterview.org MoE prep guide, not a candidate report <Cite id="s-9e6b455b13" />.
+
+## Clarify first
+
+- **Training or serving?** "Is this during training or in production serving?" A penalty term in training is a
+  training fix; where you put experts, and how many copies, are serving fixes.
+- **Top-1 or top-k?** "Does each token go to one expert or several?" Assume one (top-1) for the arithmetic.
+- **Capacity:** "Is there a cap on tokens per expert that drops the overflow?" Ask; it changes the symptom.
+- **Placement:** "How are the 32 experts placed on GPUs?" Assume 8 GPUs with 4 experts each.
+- **Scope:** "Is the skew global, or from one customer's or one language's traffic?"
+
+## Answer
+
+### First, the size of the skew
+
+With uniform routing, each of 32 experts gets 100 ÷ 32 = **3.125%** of tokens. Here, each hot expert gets 80 ÷ 3 =
+**26.7%**, which is **8.5×** its share. The other 29 experts split the remaining 20%, about 0.69% each.
+
+### What breaks depends on capacity
+
+A **capacity limit** caps how many tokens each expert accepts per step. In the Switch Transformer design, capacity
+is (tokens ÷ experts) × a **capacity factor**, and overflow tokens are "passed directly to the next layer through
+the residual connection" ([Fedus et al.](https://arxiv.org/abs/2101.03961)). The **residual connection** is the side
+path that carries a token's vector around each block unchanged, so an overflowing token simply skips the expert.
+
+| Setup | What happens | What to say in the interview |
+|---|---|---|
+| With a capacity limit, factor 1.25 | Each expert accepts about 3.9% of tokens. Each hot expert overflows by about 22.8 points, so about **68%** of all tokens skip the layer. | "Latency looks fine. Quality drops quietly." |
+| No limit; hot experts on different GPUs | The GPU with one hot and three cold experts does 28.7% of all tokens, against 12.5% balanced: **2.3×**. | "Every step waits for the busiest GPU." |
+| No limit; all three hot experts on one GPU | That GPU does 80.7% of tokens: **6.5×** the balanced load. | "Placement can make the same skew three times worse." |
+
+Without a limit there is a second cost. When experts live on different GPUs (**expert parallelism**), each token is
+shipped to its expert's GPU and back, an exchange called an **all-to-all**. The traffic to the hot GPU grows too.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Capacity:** 1.25 ÷ 32 = 3.9% of the batch per expert. Each hot expert overflows by 26.7 − 3.9 = 22.8 points.
+  With top-1 routing, 3 × 22.8 ≈ 68% of tokens skip the layer.
+- **Balanced load per GPU:** 4 experts × 3.125% = 12.5%.
+- **One hot expert per GPU:** 26.7 + 3 × 0.69 = 28.7%; 28.7 ÷ 12.5 = 2.3×.
+- **All three hot on one GPU:** 80 + 0.69 = 80.7%; 80.7 ÷ 12.5 = 6.5×.
+- **Balance term:** with Pᵢ ≈ fᵢ, N × Σ fᵢ × Pᵢ = 32 × (3 × 0.267² + 29 × 0.0069²) = **6.87**.
+
+</details>
+
+### Diagnose with the right numbers
+
+During training, a model minimizes an error score called the **loss**. Switch adds an extra **auxiliary loss** that
+penalizes uneven routing: N × Σ fᵢ × Pᵢ, where N is the number of experts, fᵢ the fraction of tokens sent to expert
+i, and Pᵢ the router's average probability for it. It equals 1.0 for uniform routing. At this skew it is **6.87**.
+
+Say it like this: "I'd track the balance term, tokens per expert and the dropped-token rate, per layer, with an
+alert when they move."
+
+### Fix, in order
+
+1. **Check it's real.** Break it down per layer and per customer. A narrow traffic mix, such as one language, can
+   legitimately favour a few experts.
+2. **Serving:** make extra copies of the hot experts on other GPUs, and re-place experts by observed load so no GPU
+   holds two hot ones. The guide names both <Cite id="s-9e6b455b13" />.
+3. **Training:** check the balancing term. Switch weights its auxiliary loss at α = 10⁻²; the guide warns that
+   weighting it too strongly hurts quality. DeepSeek-V3 instead adds a per-expert bias used only for choosing
+   experts. After each step it lowers the bias by a small amount γ for overloaded experts and raises it for
+   underloaded ones ([arXiv 2412.19437](https://arxiv.org/abs/2412.19437), §2.1.2).
+4. **Stability:** run the router in 32-bit floats (Switch casts the router input to float32) and consider router
+   z-loss, a second penalty that keeps router scores from growing too large, which the guide lists.
+5. **Capacity factor:** raising it reduces drops but costs memory and wasted padding. It treats the symptom, not the
+   cause.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Router imbalance"
+  senior={["Computes the 8.5× skew, explains capacity drops versus stragglers, and names the auxiliary loss and replication."]}
+  staff={["Separates who owns the fix (training versus serving), defines the per-layer metrics and alert, and asks whether the skew reflects the traffic rather than a bug."]}
+/>
+
+## Small-team version
+
+You won't train an MoE router or place experts. If you host an MoE model yourself on a serving engine, what you
+can do is watch per-request latency tails and quality on your own **eval** (a fixed set of your real prompts,
+scored) when your traffic mix changes, and report problems upstream.
+
+Otherwise, call the model as a service and let the provider own placement. That is the default, and it is cheap: an
+MoE such as gpt-oss-120b on Together costs about **$0.0007** for a request with 3,000 input and 400 output tokens.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Per request** at $0.15 in and $0.60 out per 1M tokens (fetched 2026-10-11): 3,000 × 0.15 ÷ 10⁶ = $0.00045, plus
+  400 × 0.60 ÷ 10⁶ = $0.00024, total **$0.00069**.
+
+</details>
+
+Revisit only if you self-host for data residency or volume.
+
+## Pitfalls
+
+- **Treating imbalance only as a speed problem.** With a capacity limit, dropped tokens make it a quality problem
+  that no latency graph shows.
+- **Cranking the auxiliary-loss weight until balance is perfect.** Quality falls when the penalty fights the
+  router's real preferences.
+- **Ignoring placement.** Three hot experts on one GPU is far worse (6.5×) than the same skew spread out (2.3×).
+
+## Go deeper
+
+- Family walkthrough: [Quantization, speculative decoding and MoE](/system-design-labs/interviews/walkthroughs/quant-specdec-moe/), worked example 6 and the MoE core concepts.
+- The spec-reading question: [infra-085](/system-design-labs/interviews/questions/infra-085/).
+- Log tokens per expert from an MoE block added to <LabRef lab="transformer" inline />.

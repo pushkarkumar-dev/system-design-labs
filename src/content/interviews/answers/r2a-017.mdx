@@ -1,0 +1,186 @@
+---
+question: r2a-017
+family: kv-cache-memory-math
+status: published
+labs: [llm-inference, transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "When a model writes a reply, each new token has to look back at every earlier token. To do that it uses a
+> key and a value for each earlier token, at every layer. Those never change once computed, so the KV cache
+> keeps them in GPU memory instead of recomputing them. That makes each new token cost one token's worth of
+> work instead of re-running the whole conversation. The price is memory: the cache grows with every token, and
+> it is what limits how many conversations a GPU can hold."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The interviewer wants to know whether you understand what happens inside one step of text generation, or only
+know the name. It is a quick filter at the start of a round.
+
+A backend engineer already knows caching: you keep the result of an expensive computation so you don't redo it.
+The KV cache is that idea, with three twists that make it different from a Redis cache in front of a database:
+
+1. **It is always correct.** A normal cache can go stale. This one can't, because of how the model works
+   (explained below). So there is no invalidation problem.
+2. **It is per conversation and it only grows.** Every active conversation has its own cache on the GPU, and it
+   gets bigger with every token. It is freed only when the conversation ends.
+3. **It lives in the scarcest memory you have.** GPU memory is fixed at 80 GB on a large card. So the cache,
+   not the speed of the GPU, decides how many users one machine can serve.
+
+A strong answer says what is stored, why storing it is valid, what work it saves, and what it costs. The cost is
+what the follow-ups chase.
+
+(This was reported as the first question of an Apple GenAI round, in a short Glassdoor snippet, so treat it as
+low confidence <Cite id="s-1b8091345c" />.)
+
+## Clarify first
+
+Ask one or two quick questions, then answer:
+
+- **Inference only?** "I'll assume we're generating text with a decoder-only model, the GPT or Llama kind, not
+  training it."
+- **Mechanism or sizing?** "I'll explain the mechanism, then put one number on it."
+- **Which model, if sizing?** "I'll use Llama-3.1-8B: 32 layers, 8 KV heads, head size 128, unless you have one
+  in mind."
+
+## Answer
+
+### Words you need first
+
+- **Token**: the unit the model reads and writes, roughly ¾ of a word.
+- **Prefill and decode**: the model first reads the whole prompt in one pass (**prefill**). Then it writes the
+  reply one token at a time, one pass per token (**decode**).
+- **Layer**: the model is a stack of repeated blocks (32 in Llama-3.1-8B). Every token passes through all of them.
+- **Attention**: the step inside each layer where a token looks back at earlier tokens to decide what matters.
+
+### What the cache stores
+
+Inside attention, each token is turned into three short lists of numbers (vectors):
+
+- a **query**: "what is this token looking for?"
+- a **key**: "what does this token contain?"
+- a **value**: "what does this token pass on?"
+
+To produce the next token, the newest token's query is compared with the keys of all earlier tokens. The better
+the match, the more of that token's value is mixed into the result.
+
+Now the property that makes a cache valid. These models are **causal**: a token can look at earlier tokens but
+never at later ones. So adding new tokens never changes an earlier token's key or value. Once computed, they are
+final. The **KV cache** keeps them, for every layer, so they are computed once.
+
+There is one more detail you will need for sizing. Each layer runs several independent attention lookups side by
+side, called **heads**. Modern models let groups of query heads share one set of keys and values, which is called
+**grouped-query attention** (**GQA**). Only the shared **KV heads** are cached: 8 per layer for the Llama models
+here.
+
+### Follow one reply through it
+
+Say the prompt is 1,000 tokens and the model writes a 1,000-token reply.
+
+```
+Without a cache                           With a KV cache
+---------------                           ---------------
+step 1: run tokens 1..1000   → next        prefill: run tokens 1..1000 once,
+step 2: run tokens 1..1001   → next                 save keys and values
+step 3: run tokens 1..1002   → next        step 1: run 1 new token, read saved K/V
+  ... every step redoes all                step 2: run 1 new token, read saved K/V
+      earlier tokens                         ... cache grows by one token per step
+```
+
+| What | Without a cache | With a cache | What to say in the interview |
+|---|---|---|---|
+| Work per step | The whole conversation again | One new token | "Each step does one token of matrix work." |
+| Total work | about **1.5 million** token passes | about **2,000** | "About 750× less matrix work." |
+| Memory held | almost nothing | **262 MB** for the 8B model at 2,000 tokens | "We trade recomputation for memory." |
+| What limits speed | computing | reading memory | "Decode becomes memory-bound." |
+
+The last row is the deep point. With the cache, each step does very little math but must read every weight and
+the whole cache from GPU memory. So decode speed is set by memory bandwidth (bytes per second the GPU can read),
+not by the GPU's math speed.
+
+### What it costs
+
+The cache size per token follows from what it stores: one key and one value, per layer, per KV head, each a
+vector of 128 numbers, each number 2 bytes in the usual 16-bit format (bf16). For Llama-3.1-8B that is
+**128 KiB per token**. For Llama-3.1-70B it is **320 KiB per token**, so one 8,000-token conversation holds
+**2.68 GB**.
+
+Say it like this: "Two, for K and V, times layers, times KV heads, times head size, times bytes per number. For
+the 70B that's 320 KiB a token, 2.7 GB for an 8K conversation."
+
+That trade, recomputation for memory capacity and memory bandwidth, is why serving engines manage the cache
+carefully. It limits how many requests fit on a GPU, and paged allocation exists to stop it being wasted. A
+Together AI interview article sums it up as "the KV cache, not the weights, is what eats your VRAM"
+(<Cite id="s-9597947584" />). VRAM is another name for GPU memory.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Count **token-forwards**: one token pushed through every weight matrix. Prompt p tokens, reply n tokens.
+
+- **Without a cache**: Σ (p + t) for t = 0 … n − 1. For p = 1,000, n = 1,000: 1,000 × 1,000 + 999 × 1,000 ÷ 2 =
+  **1,499,500**.
+- **With a cache**: the prompt once, then one token per later step: p + (n − 1) = **1,999**.
+- Ratio: 1,499,500 ÷ 1,999 ≈ **750×**.
+- **KV bytes per token** = 2 × layers × KV heads × head_dim × bytes per number.
+  - Llama-3.1-8B: 2 × 32 × 8 × 128 × 2 = **131,072 B = 128 KiB**. 2,000 tokens = **262 MB**.
+  - Llama-3.1-70B: 2 × 80 × 8 × 128 × 2 = **327,680 B = 320 KiB**. 8,192 tokens = **2.68 GB**.
+- **Wrong form**: using the hidden size (8,192 for the 70B) instead of KV heads × head_dim gives 2 × 80 × 8,192 × 2
+  = 2,621,440 B, which is **8× too high** (64 query heads ÷ 8 KV heads).
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="What is the KV cache?"
+  senior={["Explains what is cached and why it's valid, gives the formula with KV heads, and one sized example."]}
+  staff={["Adds the consequence: the cache bounds batch size and concurrency, so it drives GPU choice, paging and per-tenant context limits."]}
+/>
+
+## Small-team version
+
+On a hosted API you never see the cache, but you pay for its effect. Long prompts cost more, and providers charge
+less for a prompt prefix they have cached. So put the long, stable part of your prompt (system instructions,
+reference text) first and keep it identical between requests.
+
+If you self-host, this number decides your box. Here is one worked case:
+
+- **The box**: an 8B model in bf16 on one 48 GB L40S GPU.
+- **What fits**: 48 GB − 16.06 GB of weights − 5 GB of overhead (assumed) = 26.94 GB for the cache, room for
+  about **25 conversations at 8K tokens**.
+- **What it costs**: $0.79–$1.09 an hour on RunPod (fetched 2026-10-11), **$577–$796 a month**, about
+  **$0.03–$0.04 per 8K slot-hour**.
+- **What you configure**: turn on the engine's prefix caching for a shared system prompt, cap context per request,
+  and compare the cache capacity the engine prints at startup with your arithmetic.
+
+Default: the hosted API. Revisit self-hosting only with steady volume, a residency requirement, or an 8B model
+that passes your eval.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Free for the cache: 48 − 16.06 − 5 = 26.94 GB. 26.94 × 10⁹ ÷ 131,072 B = 205,536 tokens ÷ 8,192 = **25**.
+- Monthly: $0.79–$1.09 × 730 hours = **$577–$796**.
+- Per slot-hour: $0.79–$1.09 ÷ 25 = **$0.032–$0.044**.
+
+</details>
+
+## Pitfalls
+
+- **"It stores previous outputs" or "attention scores".** It stores keys and values; the scores are recomputed
+  every step.
+- **Using the hidden-size formula.** It treats every query head as having its own keys and values, which is 8×
+  too high for Llama-3.1-70B.
+- **Stopping at "it makes decoding cheap".** It makes the math cheap and the step memory-bound; say what that
+  memory costs.
+- **Mixing GB and GiB.** 128 KiB is not 128 KB; say which unit you mean in every number you give.
+
+## Go deeper
+
+- Family walkthrough: [KV cache and GPU memory math](/system-design-labs/interviews/walkthroughs/kv-cache-memory-math/#derivations), sections 1 and 2.
+- Why decode is memory-bound: [Roofline and sharded-matmul math](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/).
+- Add a cache to <LabRef lab="transformer" inline /> (its `generate()` re-runs the whole context), and read the cache code in <LabRef lab="llm-inference" inline />.

@@ -1,0 +1,189 @@
+---
+question: infra-032
+family: cache-coding
+status: published
+labs: [cdn-edge, kv-cache]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "When two containers miss the same chunk at once, only the first one fetches it. The second waits on the same
+> in-flight fetch, so the backend sees one request. The fetch runs outside the lock, and if it fails, every waiter
+> gets the error and nothing is cached, so the next caller retries. With 200 MB chunks I count capacity in bytes,
+> pin a chunk while someone is reading it so eviction can't free it under them, cap how many downloads run at
+> once, and keep the chunks on local disk rather than in the program's memory."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you see two problems before they bite: many callers fighting over the same
+missing chunk, and memory running out.
+
+The cache you know best holds small values: a user record, a rendered page. A miss costs a database query of a few
+milliseconds, and if two requests miss together, two queries run and nobody notices. This question changes both
+facts. A **container image** (the packaged files a container starts from) is stored remotely and split into large
+pieces called **chunks**. A miss is a slow network download. Many containers start at the same moment and want the
+same chunks. And a single chunk may be 200 MB, so "the cache holds 20 entries" says nothing useful about memory.
+
+The prompt comes from a techinterview.org prep guide that describes it as a Modal coding question and cites no
+first-hand sources, so treat it as a likely shape, not a confirmed question (<Cite id="s-86890a1069" />). The
+guide frames it as "a plain LRU cache" at first. Then come two follow-ups: two containers miss the same chunk at
+once, and "What if the chunk is 200 MB and you're memory constrained?". Its summary: "The code stays small. The
+reasoning gets deep."
+
+### Words you need first
+
+- **LRU** (least recently used): when the cache is full, evict the entry unused for longest.
+- A **stampede** is many callers fetching the same missing item at the same time, each paying for the same
+  download.
+- **Single flight** is the fix: one caller fetches, the others wait for its result. This is also called request
+  **coalescing**.
+- A **future** is an object one thread can wait on until another thread puts a result or an error into it
+  (Python's `concurrent.futures.Future`).
+- To **pin** a chunk is to mark it as in use by a reader, so eviction skips it until the reader is done.
+
+## Clarify first
+
+Spend one minute on the setup. Say your assumptions out loud:
+
+- **Do chunks ever change?** "I'll assume chunks are immutable and content-addressed (named by a hash of their
+  bytes), so a cached chunk never goes stale and I don't need expiry times (TTLs)."
+- **Memory budget and chunk size?** "I'll assume 200 MB chunks and a budget of a few GB, so I count capacity in
+  bytes."
+- **Whole chunks or ranges?** "I'll assume readers want byte ranges, read by offset."
+- **What happens on a fetch failure?** "I'll fail every waiter, not cache the failure, and let the next caller
+  retry."
+
+## Answer
+
+### Follow one chunk through the cache
+
+Two containers, A and B, start at the same moment and both need chunk 7 of the same image. The cache is empty.
+
+| Clock | What happens | What to say in the interview |
+|---|---|---|
+| t = 0 | A takes the lock, finds no chunk 7 and no fetch in progress. It registers a future for chunk 7 and releases the lock. | "The first caller to miss becomes the leader." |
+| t ≈ 0 | B takes the lock, finds the future, releases the lock and waits on it. | "Followers wait on the same future. No second download." |
+| t = 0 → done | A downloads 200 MB with no lock held. Other keys are served normally meanwhile. | "No I/O under the lock, or every miss for every key queues behind this one." |
+| done | A takes the lock, evicts unpinned chunks until 200 MB fits, stores chunk 7, removes the future, and sets its result. | "Eviction is by bytes, and it skips pinned chunks." |
+| done | A and B each pin chunk 7, copy their bytes, and unpin. | "While they copy, eviction can't free the memory under them." |
+| if it fails | A removes the future and sets the exception. B's wait raises the same error. The next caller starts a fresh fetch. | "Errors reach every waiter, and a failure is never cached." |
+
+### Single flight in code
+
+The guide calls this "a single-flight pattern so you don't stampede the backend" (<Cite id="s-86890a1069" />). The
+code below is the heart of it: a hit returns at once, the first miss becomes the leader, and everyone else waits on
+the leader's future.
+
+```python
+def _acquire(self, key):
+    with self.lock:
+        if key in self.data:                      # hit: bump recency, pin, return
+            self.data.move_to_end(key)
+            self.pins[key] = self.pins.get(key, 0) + 1
+            return self.data[key]
+        fut = self.inflight.get(key)
+        leader = fut is None
+        if leader:
+            fut = self.inflight[key] = Future()
+    if leader:
+        try:
+            blob = self.fetch(*key)               # network I/O outside the lock
+        except BaseException as e:
+            with self.lock:
+                del self.inflight[key]            # failure not cached
+            fut.set_exception(e)
+            raise
+        with self.lock:
+            self._evict_until_fits(len(blob))     # by bytes, skipping pinned chunks
+            self.data[key] = blob
+            self.used += len(blob)
+            del self.inflight[key]
+        fut.set_result(blob)
+    blob = fut.result()                           # followers wait; errors re-raise
+    with self.lock:
+        self.pins[key] = self.pins.get(key, 0) + 1
+    return blob
+```
+
+In the family's scratch run on 2026-10-12, 50 threads missing the same chunk caused exactly one fetch. A failed
+fetch reached all 10 waiters and the next read retried.
+
+### The 200 MB part
+
+Once a chunk is 200 MB, four things change. Say each one with its reason:
+
+- **Evict by bytes, not count.** A count limit of 20 entries could mean 4 GB or 40 GB depending on what is in it.
+- **Pin a chunk while a reader holds it.** Otherwise eviction can drop a chunk that is still in use, and the byte
+  count says memory is free when it isn't. The guide's phrase is "whether you pin hot chunks".
+- **Bound concurrent downloads with a semaphore** (a counter that lets only N threads past at once). Each
+  download holds up to 200 MB in a buffer before the cache admits it, so those bytes come on top of the budget.
+  With an assumed 4 GB budget and 16 parallel downloads, the real peak is about **7.2 GB**, not 4 GB.
+- **Keep chunks on local disk and memory-map them** (ask the operating system to make a file look like memory).
+  The operating system's **page cache**, the memory it keeps for recently read file data, then decides what stays
+  in RAM, and your budget becomes disk bytes.
+
+Two numbers tell you whether this works in production. **Origin fetches per miss** counts downloads from the
+remote store (the **origin**) for each cache miss; with single flight it should stay near one. **Peak RSS**
+(resident set size) is the most memory the process held at any moment; it shows whether the budget really holds.
+
+Say: "The budget isn't the peak. Downloads in flight sit on top of it, so I cap them."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Peak memory** ≈ budget + downloads in flight × chunk size (+ any overshoot when every chunk is pinned).
+- With an assumed 4 GB budget (4,000 MB ÷ 200 MB = 20 chunks) and 16 downloads at once: 16 × 200 MB = 3.2 GB in
+  buffers, so peak ≈ 4 + 3.2 = **7.2 GB**.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Chunk cache"
+  senior={["Writes single flight correctly (no I/O under the lock, errors to all waiters, not cached) and evicts by bytes."]}
+  staff={["Raises the stampede and the memory peak before being asked, bounds in-flight fetches, chooses overshoot or wait when everything is pinned, and names the metric for each (origin fetches per miss, peak RSS)."]}
+/>
+
+In plain terms: a Senior candidate writes the coalescing code correctly. A Staff candidate brings up the
+stampede and the memory peak unprompted and says how they would measure each.
+
+## Small-team version
+
+The same shape appears when a small team runs its own model. A large language model's **weights** (the learned
+numbers that make up the model) are files of many gigabytes. When several replicas start together on one machine,
+they all pull the same files from object storage, which is a stampede.
+
+- **Use your platform's image or volume caching where it exists.** That is the cheapest fix.
+- **Where it doesn't, keep a local disk cache with one download per file per node.** In Go,
+  `golang.org/x/sync/singleflight` gives you the pattern; in Python it is the 30 lines above.
+
+With assumed numbers for a 70-billion-parameter model: one copy of the weights takes about **70 s** to download.
+Four replicas each pulling their own copy over the same link take about **280 s**. One shared download takes about
+**70 s** for all four.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Weights:** about 140 GB for a 70B model in bf16 (2 bytes per parameter), at an assumed 2 GB/s from object
+  storage: 140 ÷ 2 = **70 s**.
+- **Four replicas, four copies, one shared 2 GB/s link:** 4 × 140 GB = 560 GB ÷ 2 GB/s ≈ **280 s**.
+- **One download into a shared local cache:** **70 s**, then each replica reads from local disk.
+
+</details>
+
+## Pitfalls
+
+- **Holding the lock during the fetch.** It serializes every miss, for every key.
+- **Caching the exception.** A transient error then sticks until something clears it.
+- **Evicting a chunk a reader is still using.** The byte count then lies about free memory.
+- **Treating the stampede as a capacity problem.** More origin bandwidth only makes the duplicate downloads
+  faster; single flight removes them.
+
+## Go deeper
+
+- Family walkthrough: [Caches in coding rounds](/system-design-labs/interviews/walkthroughs/cache-coding/), stage 6 and its worst-case memory formula.
+- Cold starts and weight distribution: [move big bytes fast](/system-design-labs/interviews/walkthroughs/move-big-bytes/).
+- Labs: <LabRef lab="cdn-edge" inline /> (request coalescing; its coalescing test passes), <LabRef lab="kv-cache" inline />.

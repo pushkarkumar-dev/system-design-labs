@@ -1,0 +1,191 @@
+---
+question: eng-004
+family: enterprise-rag-acl
+status: published
+labs: [search-engine, vector-index, rag]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll split indexing from serving. Indexing pulls changes from each source into a durable log and builds a
+> keyword index and a vector index, plus a copy of who may read each document. Serving searches both indexes,
+> merges the results by rank, reranks them, and applies permissions. On access control I pick a side: filter
+> inside the search, not after ranking, and pay for it by keeping permissions beside the index and updating them
+> in their own fast lane. For freshness I use change events, and after an outage I replay permission changes and
+> deletes before content."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see whether you can build a search system over data you don't own, whose access rules
+you don't own either.
+
+A normal internal search runs over your own database, where permissions are checked on every read. Enterprise
+search is different. The documents live in Drive, Slack, the wiki and email. You copy them into your own indexes
+so you can search them quickly, and you copy their sharing rules too. Every copy can fall behind the original.
+The two questions that follow are where the permission check runs, and how fresh the copies stay, including
+after a source has been unreachable for hours.
+
+The source is a Glean prep guide (published 2026-07-20), which says candidates commonly report this round but
+cites no reports, so treat it as low confidence (<Cite id="s-768711771a" />). It wants answers that "start by
+splitting indexing from serving", says interviewers push on "Where do you enforce access control?", and says
+"Being able to name that tension, and pick a side with a reason, is most of the round."
+
+## Clarify first
+
+- **Which sources, and how do they report changes?** "A **connector** pulls documents and permissions from one
+  source. Does each source push change events, or can we only list files and compare?"
+- **Permission model.** "Inherited folder sharing, nested groups, 'anyone with the link'?"
+- **Freshness targets, split in two.** "How fast must an edit show up, and separately, how fast must a revoked
+  share take effect?" The guide's target for edits is "within minutes, not on the next daily crawl".
+- **Load and latency.** "Queries per second at peak, and the time budget for results."
+
+## Answer
+
+### Words you need first
+
+- **Keyword search**: the inverted index you know from Lucene or Elasticsearch, scored with a formula called
+  **BM25**. It finds exact words, names and ticket ids.
+- **Embedding**: a list of numbers a small model computes from a passage, so passages with similar meaning get
+  similar vectors. **Vector search** finds passages close in meaning to the query, even with different words.
+  Combining the two is **hybrid retrieval**.
+- **Chunk**: a passage of a few hundred words. Both indexes store chunks, not whole documents.
+- **ACL** (access control list): the users and groups (**principals**) allowed to read a document.
+
+### Indexing versus serving
+
+```
+INDEXING (throughput-bound, background)
+  Drive · Slack · Wiki connectors
+        │ change events, each with a source version
+        ▼
+  Change log ── one cursor per connector
+        │ content lane                    │ ACL + delete lane
+        ▼                                 │ (never waits)
+  Parse ─► chunk ─► keyword index         │
+                 └► embed ─► vector index │
+                                          ▼
+                                     ACL store
+SERVING (latency-bound, user waits)
+  Query ─► user's groups ─► keyword + vector search, filtered ─► merge by rank ─► rerank ─► results
+```
+
+**Indexing** is asynchronous and measured in throughput. Connectors write change events into a durable log with a
+cursor per connector. Workers parse, chunk, and write both a keyword index and a vector index.
+
+**Serving** is measured in latency. It sends the query to both indexes, merges the two lists, reranks, applies
+permissions, and returns.
+
+Splitting them means a backlog makes results older without making queries slower. Say it like this: "Indexing
+can fall behind; serving must not slow down because of it."
+
+### Keyword plus vector, merged by rank
+
+In the guide's words, "BM25-style keyword matching catches exact terms and names, semantic vectors catch
+meaning". The two return scores on different scales, so merge by rank, not by score. The usual method is
+**reciprocal rank fusion (RRF)**: each passage scores 1 ÷ (60 + its rank) in each list, and the sums decide the
+order. Then a **reranker** (a slower model that reads the query and one passage together) reorders the top few
+dozen.
+
+The keyword side has to be decent for hybrid to pay. In the rag lab, splitting text on whitespace gave hybrid no
+gain over vectors alone on the SciFact dataset, while splitting on word characters (`\w+`) reached
+<LabNumber lab="rag" metric="BM25 tokenizer (SciFact)" /> **hit@3** (the share of questions with a correct
+passage in the top 3).
+
+### Access control: pick a side with a reason
+
+Follow one example. Dana, a sales engineer at an invented company called Northwind, searches "Kestrel discount".
+The best match is a document in a folder only the group `sales-leads` can open. Dana was removed from that group
+this morning. Three places could stop her seeing it:
+
+| Where the check runs | What happens to Dana's search | Verdict |
+|---|---|---|
+| After the results are shown (hide links) | The snippet already showed the discount | Leaks |
+| After ranking: take the top 20, drop forbidden ones | If 18 of 20 are forbidden for her, she gets 2 results; anything that saw the top 20 first (a cache, result counts) can leak; a timeout "fallback" can skip the check | "simple and wrong at scale", in the guide's words |
+| Inside the search | Forbidden chunks are never scored; she gets the best 20 she may read | The side to pick |
+
+The cost of filtering inside the search is that permissions must sit beside the index and change fast. The guide
+puts it as permission data that "has to update the moment someone's permissions change". That is why ACL changes
+get their own lane that never waits behind embedding: re-tagging a chunk is cheap, re-embedding it is not.
+
+Choose the mechanism by how much the user can see. Large vector indexes use a graph (**HNSW**) that finds near
+neighbours approximately by walking a few hundred nodes. A filter applied only after that walk can leave too few
+results. So: if the user can see a small slice, compare against every allowed chunk exactly; if they see most of
+the company, use a graph search that applies the filter during the walk.
+
+Keep a final re-check against the live ACL store for the few dozen results, treat any error as "deny" (this is
+called **failing closed**), and watch how many results it drops. A rising count means the ACL copy is falling
+behind.
+
+Say it like this: "I filter during retrieval, because filtering after ranking starves narrow users and leaks
+through anything that runs first. The price is fresh ACLs beside the index, so permission changes get their own
+fast lane."
+
+### Freshness and the six-hour outage
+
+The guide calls freshness "the other lever". Prefer change events over periodic crawls. A source you can only poll
+shows a deletion as an absence, so also reconcile the full list of document ids periodically to catch deletions.
+
+Now the guide's failure case: a connector goes down "for six hours and comes back with a backlog to replay".
+Walk the recovery in order:
+
+1. **Resume from the cursor.** The log remembers the last event committed for that connector.
+2. **Permission changes and deletes first.** They are cheap and they are the security risk. Dana's removal from
+   `sales-leads`, if it happened during the outage, lands before any content.
+3. **Content after, keyword first.** Edited and new documents become searchable by keyword before their
+   embeddings are ready.
+4. **Duplicates and reordering are harmless.** Writes are upserts keyed by (tenant, document id, source version),
+   and an older version never overwrites a newer one.
+5. **Show the lag.** Citations say "synced 6 h ago" until the connector catches up, and an alert fires on lag.
+
+One decision isn't yours to make alone. While a connector is down, its revocations are invisible to you. Agree
+with the customer whether that source keeps serving with a banner, or is hidden past a threshold.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Glean-style search"
+  senior={["Splits indexing and serving, filters inside retrieval, replays connectors idempotently."]}
+  staff={["Gives revocations their own lane and a stated bound, and raises the outage permissions policy as a product decision with an owner."]}
+/>
+
+In plain words: a Senior answer gets the architecture and the filter placement right. A Staff answer also puts a
+number on how long a revocation can lag, and names who decides what users see while a source is down.
+
+## Small-team version
+
+For an internal search over a few sources, start with content every employee can already open, in Postgres:
+built-in full-text search for keywords and the pgvector extension for vectors. The connector work dominates the
+effort: polling plus id reconciliation for each source, a cursor table, and a lag metric.
+
+Model cost is small at that size. For 300 employees, 150,000 documents and 10 questions a person a day (all
+assumed), the family walkthrough works out about **$6** to embed everything and **$162** (gpt-5-mini) to
+**$1,080** (Claude Sonnet 5) per 30 days for answers, at list prices fetched 2026-10-11.
+
+<details>
+<summary>The arithmetic behind the costs</summary>
+
+- 150,000 documents × 5 chunks of 400 tokens = 750,000 chunks ≈ 300M tokens to embed; at $0.02 per 1M tokens
+  (text-embedding-3-small) that is $6.
+- 300 × 10 = 3,000 questions a day at about 4,000 input and 400 output tokens. Claude Sonnet 5 at $2 / $10 per 1M:
+  $0.008 + $0.004 = $0.012 each, $36 a day, about $1,080 per 30 days. gpt-5-mini at $0.25 / $2: $0.0018 each, about
+  $162 per 30 days.
+
+</details>
+
+Before buying a product instead, ask the vendor in writing two things: how it enforces each source's permissions
+per user, and how long a revocation takes to apply.
+
+## Pitfalls
+
+- **Access control as a detail for the end.** It decides the index layout, so it comes first.
+- **One queue for content and permissions.** A burst of edits then delays every revocation.
+- **Assuming the next crawl handles deletions.** A polling connector sees a deletion only as an absence; you need
+  reconciliation.
+- **Adding raw scores from two engines.** They aren't on the same scale; merge by rank.
+
+## Go deeper
+
+- Family walkthrough: [Permission-aware enterprise RAG](/system-design-labs/interviews/walkthroughs/enterprise-rag-acl/#where-the-permission-check-runs) and [freshness after an outage](/system-design-labs/interviews/walkthroughs/enterprise-rag-acl/#freshness-after-a-connector-outage).
+- Build the keyword side: <LabRef lab="search-engine" inline />; filtered search: <LabRef lab="vector-index" inline />.

@@ -1,0 +1,173 @@
+---
+question: infra-002
+family: batcher-to-fleet
+status: published
+labs: [rate-limiter, message-queue, llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll treat the model as a black box with a cost per batch, and put the depth around it. The API has a
+> synchronous or streaming call with a deadline and an idempotency key, and a separate batch endpoint for offline
+> work. Behind it, API pods check each tenant's quota and enqueue onto a queue per model with priority classes.
+> GPU workers pull batches when they're free, drop expired work, and send results back to the caller's pod. Each
+> tenant gets a fair share, interactive work goes before offline work, the queue is bounded by waiting time, and
+> errors tell the client whether and when to retry."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see whether you can design the API and the scheduling around a model you are not allowed
+to open. The signal is depth inside the frame: request contracts, queues, fairness and failure, not how the model
+computes.
+
+Some words first. An **LLM** (large language model) is the kind of model behind chat assistants. It writes a
+reply one **token** at a time (a token is roughly three quarters of a word). Producing a reply from the model is
+called **sampling**, because at each step the model picks the next token at random from a set of likely ones.
+
+How this differs from a normal API you already know:
+
+1. **Requests are expensive and run in batches.** A GPU runs many requests together in one pass of the model, and
+   a batch costs about the same as one request. So the system wants to group requests from many customers.
+2. **Requests vary enormously in cost.** A one-word reply and a 2,000-token essay are both "one request".
+3. **The same request can give a different answer.** At a **temperature** (randomness setting) above 0, the
+   model's output changes from run to run. That matters for retries and idempotency.
+4. **Capacity is scarce and slow to add.** You cannot spin up more GPUs in seconds, so fairness and load
+   shedding matter more than in a stateless web tier.
+
+This version comes from a 2025 Anthropic inference-team candidate. They say the interviewer wanted the model
+treated as a black box, with the focus on API shape, scheduling and queueing. They also say some assumptions
+"didn't feel realistic", that they "pushed on that too directly", and that, in hindsight, they should have
+accepted the setup faster (<Cite id="s-4e04a1689c" />).
+
+## Clarify first
+
+- **Interactive callers, offline jobs, or both?** "I'll assume both, with very different latency needs."
+- **Streaming?** "I'll assume interactive calls can stream the reply as it is written."
+- **Tenants and quotas?** "Several tenants (customer accounts) with contracted limits."
+- **Black-box cost model?** Ask for one. Otherwise: "I'll assume a fixed cost per batch plus a cost per token,
+  and I'll say where that assumption matters."
+- **Are retries safe?** "Sampling has no side effects, but at temperature above 0 a retry returns different text,
+  so the client must know which answer it got."
+
+## Answer
+
+### The API shape
+
+- **`POST /v1/sample`**: `model`, `input`, `max_tokens` (the longest reply allowed), `temperature`, `n` (how many
+  replies), `stream`, `priority`, `deadline_ms`, and an `Idempotency-Key` header so a retried call is recognised
+  as the same call. It answers synchronously, or streams tokens back as they are produced.
+- **`POST /v1/batches`**: takes a file of inputs and returns a job id. It runs on spare capacity from a separate,
+  deep queue, and the client polls or gets a callback. Offline work never competes with interactive deadlines.
+- **Errors that tell the client what to do:** `429` plus `Retry-After` (this tenant is over quota), `503` plus
+  `Retry-After` (the fleet is shedding load), `504` (the deadline passed before work started), and a
+  non-retryable error for an input that crashed a worker twice.
+
+Say it like this: "Every error answers two questions for the client: should I retry, and when?"
+
+### The orchestration
+
+```
+Clients
+   │  POST /v1/sample (deadline, idempotency key)
+   ▼
+API pods ── authenticate, check tenant's token bucket,
+   │        park a future (or open a stream)
+   ▼
+Queue per model ── priority classes, fair across tenants,
+   │               bounded by estimated wait
+   │  a free GPU worker pulls a batch, under a lease
+   ▼
+GPU workers ── drop expired items, run the batch,
+   │           send tokens or results to the caller's pod
+   ▼
+API pod ── completes the future or forwards the stream
+```
+
+**API pods** authenticate the caller and check the tenant's **token bucket** (a per-tenant counter that refills
+at a fixed rate and limits how fast they may send). Then they park a **future** (an object the handler waits on,
+completed later with the answer) and enqueue the request.
+
+**The queue** is one per model, because a batch can only hold one model. Inside it are priority classes, and
+within a class, tenants are served fairly.
+
+**GPU workers** pull a batch whenever they are free, so nothing has to track which GPU has capacity. They take
+items under a **lease**: if a worker dies before confirming them, the items reappear. Workers drop expired items,
+run the batch, and send each result to the pod that holds the caller's connection. With streaming, the worker
+sends tokens to the pod as they are produced. If the client disconnects, the pod sends a cancel that frees the
+slot in the batch.
+
+### Follow one request through it
+
+Tenant Acme sends an interactive call with a 2-second deadline while Beta has just dumped a burst of requests.
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| Arrive | The pod checks Acme's token bucket: there is room. It parks a future. | "Quota is checked before any GPU time is spent." |
+| Queue | Acme's request joins the interactive class. Beta's burst is ahead in time, but the dequeue alternates fairly between tenants. | "One tenant's burst only delays that tenant." |
+| Pull | A free worker takes a batch that includes Acme's request and some of Beta's. | "GPUs pull work, so capacity tracking is free." |
+| Run | The batch runs. Tokens stream back to Acme's pod as they are produced. | "Streaming starts with the first token, not the whole reply." |
+| Done | The pod finishes the stream; the worker acks its lease. | "If the worker had died, the lease would expire and the request would be retried once." |
+
+### Scheduling
+
+- **Weighted fair dequeue** across tenants inside a priority class, so one tenant's burst only delays that tenant.
+- **Interactive before batch.** Offline jobs fill idle slots and can be **preempted** (paused or pushed back) when
+  interactive work arrives.
+- **A bound on the queue** by estimated wait. Past the bound, return `503` rather than queue a request that will
+  miss its deadline.
+
+### Failure
+
+Lease each batch. A dead worker's lease expires, and its items are requeued once if their deadlines allow. A
+batch that fails twice probably contains a **poison input** (one that crashes any worker), so split the batch in
+halves until you find it. Retries happen at one layer only, inside a budget, so they don't multiply during an
+incident.
+
+At temperature above 0, a retry produces different text. The idempotency key lets the server return the stored
+first answer if the client retries after a result was already produced.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Sampling API, model as a black box"
+  senior={["Defines a clear request and error contract, separates sync and batch paths, and adds per-tenant limits and leases."]}
+  staff={["Accepts the framing quickly, then shows depth in fairness across tenants, preemption of batch work and the retry and idempotency semantics at temperature above zero."]}
+/>
+
+## Small-team version
+
+At a small company you are more likely to call this kind of API than build it. Two things carry over.
+
+First, the same contract belongs in your internal LLM gateway: deadlines, idempotency keys, per-team budgets and
+clear retryable errors.
+
+Second, offline work belongs on a provider's batch endpoint. Anthropic, OpenAI and Google each price their batch
+APIs at about 50% off (pricing pages fetched 2026-10-11). Take an assumed nightly job of 20 million input
+tokens and 2 million output tokens on Claude Sonnet 5 ($2 per million input, $10 per million output). That is
+**$60 a day** at the interactive price and about **$30 a day** on batch: roughly **$900 a month** saved.
+
+Build your own scheduler only if you self-host, and then inside an engine such as vLLM, which already batches.
+The answer changes when a data-residency rule or steady high volume makes self-hosting worth a GPU bill that
+starts in the thousands of dollars a month.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+20 × $2 + 2 × $10 = $60 a day. At 50% off: $30 a day. Saving: $30 × 30 days = $900 a month.
+
+</details>
+
+## Pitfalls
+
+- **Opening the black box after being asked not to.** The interviewer wants depth in the frame they set.
+- **One queue for interactive and offline traffic.** A big offline job then blows every interactive deadline.
+- **Error codes that don't say whether or when to retry.** Clients guess, and usually retry too fast.
+- **Retries at several layers.** Each layer multiplies the others, so load grows fastest during an incident.
+
+## Go deeper
+
+- Family walkthrough: [From one GPU batcher to a fleet](/system-design-labs/interviews/walkthroughs/batcher-to-fleet/), section "The API, when the model is a black box".
+- Admission: <LabRef lab="rate-limiter" inline />. Leases: <LabRef lab="message-queue" inline />. Sync-over-async in one process: <LabRef lab="llm-inference" inline />.
+- Cancellation and streaming inside the engine: [Continuous batching](/system-design-labs/interviews/walkthroughs/continuous-batching/).

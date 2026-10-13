@@ -1,0 +1,167 @@
+---
+question: eng-065
+family: coding-assistant
+status: published
+labs: []
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I treat the model's edit as untrusted input. It quotes the old code and gives the new code, and I find that old
+> text, never a line number. I require exactly one match, tolerate indentation drift and nothing else, re-parse the
+> whole file afterwards, and refuse if the file changed since the model saw it. Every refusal has a name, and each
+> name has a next step: ask the model once more, rewrite the whole function, rewrite the file, or hand it to the
+> user. Nothing is ever applied silently."
+>
+> The rest of this page explains each part of that answer.
+
+The task: a large language model (LLM) has suggested a change to a file. Write the code that applies it without
+damaging the code around it. It looks like string replacement. What makes it hard is the input.
+
+A normal patch comes from `git diff` and is exact. The model's suggested change is usually right and sometimes
+subtly wrong. It may quote the old code without its indentation. The old text may appear twice in the file. It may
+replace a block with a comment like "rest of function unchanged", which deletes real code. Or the user may have
+kept typing while the model worked, so the file no longer matches what the model saw. So this is defensive text
+transformation: apply the change when it is safe, and fail loudly and usefully when it isn't.
+
+This problem is an example from a prep article about Cursor's interview loop, worded as "a syntax-aware edit that
+applies a model's suggested change to a file without mangling the code around it"; it is the article's example,
+not a candidate report (<Cite id="s-c29d429c3c" />).
+
+## Clarify first
+
+Ask, and state an assumption for each:
+
+- **What format does the model emit?** The whole file, search/replace blocks, or a unified diff? "I'll assume
+  search/replace blocks."
+- **Which languages must we validate?** "I'll assume Python, using its own parser."
+- **Can the file change while the model works?** "Yes; the user keeps typing."
+- **What happens on failure?** "One retry with the model, then show the user."
+
+### The example we follow
+
+A developer asked: *"Add retries with exponential backoff to charge()."* The file is `payments/client.py`, 400
+lines. The model returns one search/replace block: the current 30-line body of `charge()` (the *search* text) and
+a new body with a retry loop (the *replace* text). It quoted the method without its 4-space class indent. The names
+are illustrative.
+
+## Answer
+
+### Words you need first
+
+- **Edit format:** how the model writes its change. **Whole file** means it writes the entire new file. A
+  **search/replace block** quotes the old text to find and the new text to put there. A **unified diff** is the
+  format `git diff` prints, with line numbers and `+`/`-` lines.
+- **Anchor:** the text you use to find where the change goes. Here, the search text.
+- **Parse:** run the language's parser over the file to build its syntax tree, the **AST** (abstract syntax tree).
+  If the parse fails, the file is no longer valid code.
+
+### Anchor on text, never line numbers
+
+Cursor's 2024 post says "models are notoriously bad at counting line numbers"
+([Cursor, 2024-05-14](https://cursor.com/blog/instant-apply)). A line-number diff from a model often points at the
+wrong lines. A search/replace block avoids counting: you look for the quoted text.
+
+### Apply in steps, each able to refuse
+
+Here is our retry edit going through the steps:
+
+| Step | What happens to the retry edit | What to say in the interview |
+|---|---|---|
+| 1. **Base check** | The edit carries a hash of the file the model saw. It matches the file now. | "If the file changed, I re-locate on the new text or refuse." |
+| 2. **Locate** | Exact match fails because of the missing indent. A match that ignores leading whitespace finds the body exactly once. | "Zero matches is 'not found'. Two or more is 'ambiguous, need more context'. Only one is safe." |
+| 3. **Re-indent** | The replacement is shifted right by 4 spaces, the difference between the file and the model's quote. | "Models often drop a class's indent. That drift is the only one I tolerate." |
+| 4. **Splice** | The 30 old lines are replaced by the new lines, in memory. | "Nothing touches disk yet." |
+| 5. **Validate** | The whole new file is parsed with `ast.parse` (Python's parser); then formatted and linted. | "Check the whole file. A change can break code outside the lines it touched." |
+| 6. **Show a diff** | The developer sees the change and accepts it. | "Never apply silently." |
+
+For languages other than Python, **tree-sitter**, a widely used parser library with grammars for most languages,
+does the validation.
+
+A sketch of exactly these steps ran on 2026-10-12, and six tests passed: an exact match, a block quoted without its
+class indent, an ambiguous match (refused), a missing block (refused), a parse-breaking edit (refused) and a changed
+base (refused). The code is in the family walkthrough.
+
+Say: "The model is usually right, so the happy path is cheap. The work is in the refusals: each one is a typed
+error the next step can act on."
+
+### The fallback ladder
+
+When a step refuses, don't guess where the change belongs. Climb a ladder:
+
+1. **Retry once with the model.** Send the error ("not found" or "ambiguous") and the current text of that region,
+   and ask for a corrected block.
+2. **Rewrite one function.** Ask the model for the whole enclosing function or class, and replace it by its
+   position in the parsed syntax tree. No text matching needed.
+3. **Rewrite the whole file**, then diff it against the original so any unintended change is visible.
+4. **Hand it to the user** to merge by hand.
+
+### Watch for placeholder edits
+
+A replacement such as "rest of function unchanged" deletes code. Reject edits that delete large spans without
+replacing them. Aider, an open-source coding assistant, notes that its unified-diff format reduced GPT-4 Turbo's
+habit of leaving such placeholders ([Aider edit formats](https://aider.chat/docs/more/edit-formats.html)).
+
+### Why the format matters for speed too
+
+The model writes its answer one token (a short piece of text, about an eighth of a line of code) at a time, so
+output length sets how long an edit takes. Rewriting our 400-line file is about 3,200 output tokens. The
+search/replace block is about 480. Choosing the block makes the edit several times faster, as long as it applies,
+which is what this page's checks make safe.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Code averages about 8 tokens per line with modern tokenizers (measured 2026-10-12 over this site's lab code).
+- Whole file: 400 lines × 8 = **3,200** output tokens. Search/replace for a 30-line change, old plus new text:
+  (30 + 30) × 8 = **480** tokens.
+- At an assumed 50 output tokens per second: 3,200 ÷ 50 = 64 s versus 480 ÷ 50 ≈ 10 s.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Applying a model's edit"
+  senior={["Anchors on unique text, re-indents, re-parses, checks the base version and refuses with typed errors."]}
+  staff={["Chooses the edit format from measured apply-failure rates per rung, and treats silent misapplication as the metric that must stay at zero."]}
+/>
+
+In plain words: a Senior answer applies edits safely. A Staff answer also logs how often each step of the ladder
+is used, picks the edit format from that data, and names the one number that must never rise above zero: edits
+applied in the wrong place without anyone noticing.
+
+## Small-team version
+
+You'll meet this in any internal tool that lets a model change code or config: a feature-flag bot, a codemod, a
+dependency fixer. Reuse these rules. Put CI and a person's pull-request approval after the apply step. Log every
+refusal; the log tells you whether to switch formats.
+
+Build the apply step yourself: it is a few dozen lines plus the language's parser. Buy the model. The tokens are
+cheap: a change that takes three model calls, each with 15,000 input and 800 output tokens, costs about **$0.11** on
+Claude Sonnet 5 (list prices fetched 2026-10-11). Review time is the real cost, so auto-merge only low-risk changes,
+and only once the refusal and CI-failure rates are low.
+
+<details>
+<summary>The arithmetic behind the cost</summary>
+
+Claude Sonnet 5 at $2 per million input tokens and $10 per million output tokens:
+3 × (15,000 × $2 + 800 × $10) ÷ 1,000,000 = 3 × $0.038 ≈ **$0.11**.
+
+</details>
+
+## Pitfalls
+
+- **Line-number diffs.** Models miscount lines, so the change lands in the wrong place.
+- **Taking the first of several matches.** An ambiguous anchor is a guess, and a wrong guess edits the wrong code.
+- **Validating only the changed lines.** A change can break the parse elsewhere, for example by leaving a bracket
+  open; parse the whole file.
+- **Overwriting the user's typing.** If the file changed while the model worked, applying the old plan destroys
+  their keystrokes; check the base hash.
+
+## Go deeper
+
+- Family walkthrough: [Design an AI coding assistant](/system-design-labs/interviews/walkthroughs/coding-assistant/), "Applying an edit without breaking the file" and its back-of-envelope on edit formats.
+- Related: parsing a token stream that arrives partial or malformed, [eng-066](/system-design-labs/interviews/questions/eng-066/).

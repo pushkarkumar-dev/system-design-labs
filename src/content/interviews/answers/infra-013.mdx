@@ -1,0 +1,211 @@
+---
+question: infra-013
+family: gpu-cluster-control-plane
+status: published
+labs: [observability, gossip, container-orchestrator]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I won't drain a GPU on its first memory error, because small numbers of corrected errors are normal. I'll track
+> errors per GPU over time and mark a GPU suspect on a burst or a rising trend. Whether I then drain depends on
+> what is running there: under a training job on a thousand GPUs, a failure costs hundreds of GPU-hours, so I
+> drain at about a 1% chance of failure; under independent inference replicas I can wait. I move work off at its
+> next checkpoint, re-test the node automatically, return it on probation, and cap how many nodes the automation
+> may drain per hour, so a telemetry bug can't empty a site."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you can treat a health threshold as a **cost trade-off**, and whether you can
+automate drains without automating an outage.
+
+### What makes this different from a sick web server
+
+In a normal backend, a server that throws errors is cheap to replace. You take it out of the load balancer, a
+health check fails, a new instance starts, and users barely notice. Being trigger-happy costs little.
+
+A GPU fleet is different in three ways.
+
+1. **Errors come and go.** GPU memory can throw a few errors, recover, and do it again for days before the GPU
+   actually dies. Many errors need no action at all.
+2. **What a failure costs depends on the job.** A large training job runs on hundreds or thousands of GPUs in
+   lockstep. If one GPU fails, all of them stop and go back to their last saved state. The same GPU serving one
+   independent inference replica would cost a few retried requests.
+3. **Pulling a GPU out is not free.** Testing a node takes up to half an hour of all its GPUs, and each GPU is
+   expensive. Draining every node that sneezes burns capacity faster than the hardware fails.
+
+So the good answer is not "drain on error". It is "decide when draining is cheaper than waiting, for this job".
+
+The prompt comes from a Fluidstack prep guide, which calls it "a representative prompt" and its fleet-health focus
+"a well-grounded prior, not gospel" (<Cite id="s-747377636a" />).
+
+### Words you need first
+
+- **ECC** (error-correcting code): the check GPU memory runs on every read. A **single-bit** error is corrected on
+  the fly and is normal in small numbers. A **double-bit** error can't be corrected and usually crashes whatever is
+  running.
+- **Xid**: the numbered error events the NVIDIA driver logs. NVIDIA publishes a catalog saying what each number
+  means and what to do.
+- **Checkpoint**: a training job's saved progress, written every so often. After a crash the job restarts from its
+  last checkpoint and loses the work since then.
+- **Drain**: stop placing new work on a node (**cordon**), then move its running work elsewhere, so the node can be
+  tested or repaired.
+- **DCGM** (Data Center GPU Manager): NVIDIA's tool for monitoring GPUs and running diagnostics at several levels,
+  from a seconds-long check to a multi-hour memory test.
+
+## Clarify first
+
+- **What runs on the GPUs?** "Large synchronous training jobs or independent inference? That sets the cost of a
+  miss, and so the threshold."
+- **How often do training jobs checkpoint?** "I'll assume every 30 minutes."
+- **What telemetry exists?** "Do we have Xid events, ECC counters and DCGM on every node?"
+- **How many nodes may be out at once per site?** "That's the budget the automation must respect."
+
+## Answer
+
+### Which errors matter
+
+NVIDIA's Xid catalog separates noise from action
+([Xid catalog](https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html)):
+
+| Xid | What it means | What the catalog says to do |
+|---|---|---|
+| 63 | Memory remapping event: the GPU swapped a bad memory row for a spare | No action |
+| 92 | High single-bit ECC error rate | No immediate action |
+| 48 | Double-bit ECC error | Reset the GPU, or drain and reset alongside 63/64 |
+| 95 | Uncontained memory error | Reset the GPU |
+| 79 | GPU has fallen off the bus | Restart the machine |
+
+Say it like this: "Several of these need no action. So the pipeline can't be 'any error, drain'."
+
+### A state machine per GPU
+
+Each GPU, and the node that holds it, moves through five states:
+
+1. **Healthy.** Count correctable errors per time window and keep a trend.
+2. **Suspect.** A burst or a rising trend. Stop placing new long jobs on the node; let short work finish.
+3. **Draining.** Cordon, then move work off without killing it.
+4. **Re-qualifying.** Reset and run diagnostics.
+5. **Returned on probation, or RMA.** RMA (return merchandise authorization) means the part goes back to the
+   vendor.
+
+### Follow one GPU through it
+
+Assume a fleet of 5,000 GPUs in nodes of 8. On one node, GPU 3 starts reporting single-bit errors. The times and
+error counts below are illustrative.
+
+| Clock | What happens | What to say in the interview |
+|---|---|---|
+| Day 1 | A handful of corrected errors, spread out. The GPU stays **healthy**. | "This is normal background noise." |
+| Day 3, 11:40 | A burst: Xid 92, high single-bit error rate. The node becomes **suspect**: no new long jobs. | "A burst or a trend is the signal, not one error." |
+| 11:40 | The node is running part of a **1,024-GPU training job** that checkpoints every 30 minutes. The threshold for that job is about **1%**. The estimate for this GPU is above it. | "Under a job this big, a failure costs about 427 GPU-hours. Draining costs about 5." |
+| 12:00 | The job writes its checkpoint and moves off the node. The node is cordoned. | "Drain at the checkpoint, so nothing is lost." |
+| 12:01 | Reset, DCGM level r3 (under 35 minutes on 8 GPUs), and a single-node test of GPU-to-GPU communication. | "The node proves itself before it comes back." |
+| 12:36 | It passes, and returns on **probation** for a week with a tighter threshold. | "If it fails again inside the week, it goes to RMA." |
+
+Now change one thing. If the same node were running **eight independent one-GPU inference replicas**, a failure
+would cost a few retried requests. The threshold would be far higher, and the right move would be to keep watching.
+
+### The threshold, from cost
+
+The rule is: drain when the expected loss from waiting is bigger than the cost of draining. The expected loss is
+the chance of failure times what a failure costs. So the threshold is simply **the cost of a drain divided by the
+cost of a miss**.
+
+For the 1,024-GPU job that ratio is about **1.1%**. Say it like this: "Under a big training job I drain at about a
+1% chance of failure. Under single-GPU inference I wait for more evidence."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Drain when expected loss beats drain cost"
+  expr="p* = C_drain ÷ C_miss"
+  vars={[
+    { sym: 'C_miss', meaning: 'GPU-hours lost if the GPU fails inside running work' },
+    { sym: 'C_drain', meaning: 'GPU-hours to drain and re-test a healthy node' },
+  ]}
+  example={[
+    "Miss in a 1,024-GPU job: (15 min average lost work + 10 min assumed restart) × 1,024 = 25,600 GPU-min",
+    "Drain: DCGM r3 runs in under 35 min on 8 GPUs: 280 GPU-min. p* = 280 ÷ 25,600 ≈ 1.1%",
+  ]}
+/>
+
+The 15 minutes is the average work lost with a 30-minute checkpoint interval: a failure lands, on average, halfway
+between two checkpoints. 25,600 GPU-minutes is about 427 GPU-hours; 280 GPU-minutes is about 4.7.
+
+</details>
+
+### Drain without killing work
+
+Cordon first, so nothing new lands. Then let a checkpointed training job move off at its next checkpoint, rather than
+killing it now and losing up to 30 minutes on every GPU. For inference, start replacement replicas elsewhere first,
+then stop the old ones, so capacity never dips.
+
+### Re-qualify, then return on probation
+
+Reset the GPU, then run DCGM diagnostics: level r3 takes under 35 minutes on 8 GPUs, and level r4, with a memory
+test, under 2.25 hours ([DCGM Diagnostics](https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/dcgm-diagnostics.html)).
+Add a single-node NCCL test (NCCL is NVIDIA's GPU-to-GPU communication library; its tests check that the GPUs and
+links inside the node work together). Pass: the node returns on probation with a tighter threshold. Fail, or fail
+again inside the probation window: RMA.
+
+Say it like this: "Probation is what stops the same bad GPU cycling between the fleet and the test bench."
+
+### Bound the automation
+
+Cap the share of a site's nodes that may be drained per hour without a human. A bad driver rollout or a telemetry
+bug looks exactly like fleet-wide hardware failure. Without a cap, the health controller drains the site, and the
+cure is worse than the disease.
+
+Say it like this: "The health controller is the most dangerous thing in this design, so it gets a budget."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="ECC health pipeline"
+  senior={["Knows which Xids matter, builds the state machine and drains without killing work."]}
+  staff={["Sets thresholds per workload from cost, adds probation and an automation budget, and replays past telemetry before changing a threshold."]}
+/>
+
+In plain words: a Senior answer knows the errors and the mechanics. A Staff answer sets the threshold from money,
+limits its own automation, and tests a new threshold against last month's data before shipping it.
+
+## Small-team version
+
+On rented GPUs the provider owns this pipeline. Your part is small:
+
+- **Run a short health check before a long job.** DCGM level r1 takes under 2.5 seconds.
+- **Checkpoint your training runs.** This is the lever you own.
+- **Report bad nodes with evidence.** Open a ticket with the Xid logs when a node misbehaves.
+
+Build nothing more. Checkpointing is where the money is. On 8 rented H100s at $3.99 an hour each (Together's
+on-demand cluster price, fetched 2026-10-11), a failure 6 hours into a run with no checkpoints wastes about
+**$192**. With a 30-minute checkpoint the expected loss is about **$8** plus the restart.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- No checkpoint: 8 GPUs × 6 hours × $3.99 ≈ $192.
+- 30-minute checkpoints: on average 15 minutes lost, so 8 × 0.25 hours × $3.99 ≈ $8, plus the restart.
+
+</details>
+
+Say it like this: "At our size the provider finds bad GPUs. What we own is checkpoints, a two-second health check
+before a long job, and good bug reports."
+
+## Pitfalls
+
+- **Draining on the first correctable error.** Small numbers of corrected errors are normal, so you burn capacity
+  for nothing.
+- **One threshold for all workloads.** The same error risks 427 GPU-hours under a big training job and a few
+  retries under inference.
+- **Returning nodes with no probation.** Repeat offenders cycle back into the fleet and fail the next job.
+- **No limit on automated drains.** A telemetry bug turns into a site-wide outage.
+
+## Go deeper
+
+- Family walkthrough: [fleet health](/system-design-labs/interviews/walkthroughs/gpu-cluster-control-plane/#deep-dives) and its back-of-envelope.
+- Labs: <LabRef lab="observability" inline />, <LabRef lab="gossip" inline />.

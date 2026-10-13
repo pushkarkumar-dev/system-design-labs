@@ -1,0 +1,901 @@
+---
+title: "Design a RAG system end to end and justify every knob"
+summary: "Answer questions over private documents, with sources: when to skip retrieval, how to parse and chunk, hybrid search, reranking, choosing how many passages to send, citations and refusals, and how to measure each choice."
+track: ai-engineer
+format: design
+family: rag-system-design
+smallTeamFocus: "Build it, on the database you already run: Postgres full-text plus pgvector, a hosted embedding API and a managed LLM. Spend the effort on parsing, a 50–200 question eval set and citation checks, not on a vector database."
+rounds: [ml-system-design, domain-deep-dive]
+level: both
+timeboxMin: 45
+order: 106
+status: published
+basedOn: [eng-001, eng-003, eng-006, eng-007, eng-008, eng-017, r2a-001, r2a-003]
+askedAt: [openai, google, databricks, google-deepmind, promptlayer, applied-ai-generic]
+labs:
+  - { lab: rag, role: proof, note: "Dense, hybrid (BM25 + dense with RRF) and cross-encoder reranked retrieval, measured on two BEIR datasets. Its fixed 512-token chunks are the baseline to beat." }
+  - { lab: embedding-pipeline, role: proof, note: "Batched embedding, an exact-match cache, and model versioning with a neighbour-overlap check before you swap embedding models." }
+  - { lab: vector-index, role: proof, note: "Flat, HNSW and IVF-PQ indexes; shows what an approximate index trades for speed. Its benchmark rows are estimates." }
+  - { lab: llm-eval, role: proof, note: "Bootstrap confidence intervals and a paired test, so you can tell whether a retrieval change helped or only looked like it did." }
+  - { lab: search-engine, role: background, note: "Inverted index and BM25 from scratch: the lexical half of hybrid retrieval." }
+gapLabs: [llm-judge-evals]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "First I'd check whether we need retrieval at all. One 200-page PDF is about 80,000 tokens (a token is roughly
+> ¾ of a word), which fits in the model's input, so with prompt caching we can send the whole document. Once there
+> are too many documents to fit, we split them into passages along their headings and index each passage two
+> ways: by its words and by its meaning. At question time we fetch the best candidates from both, reorder them
+> with a more careful model, and give the top few to the LLM with ids it must cite. Code checks every citation,
+> and the system says 'not in the documents' when the evidence is weak. Every knob gets a starting value and a
+> measurement on 50–200 questions that a domain expert has answered."
+>
+> The rest of this page explains each part of that answer.
+
+The question, as interviewers pose it: a customer has private documents and wants an assistant that answers
+questions over them, with sources. Start small: one 200-page PDF and one user question. Walk everything that
+happens from the moment the question is entered to the final answer. Then grow it to a large, steady stream of
+mixed-format files (PDFs, slides, HTML, spreadsheets), and keep the answers correct as the documents and the
+models change. Along the way the interviewer pushes on the knobs: how big the passages are, which model turns
+text into searchable vectors, how many passages to send, whether to reorder them, how to cite, what to do when
+the documents don't contain the answer, and when retrieval is the wrong tool altogether.
+
+### What makes this different from a search feature you've built
+
+You have probably built search: a box, a query, a list of ten links. The user reads the list and decides which
+result is right. If the right result is fourth, they scroll.
+
+Retrieval for an AI assistant looks similar, but the reader of the results is a model, not a person. The model
+reads the passages you hand it and writes one answer. That changes three things.
+
+1. **A search miss becomes a confident wrong answer.** When the right passage is missing, the model rarely says
+   "I couldn't find it". It writes something fluent from whatever it was given. The user never sees the list,
+   so they can't spot the miss.
+2. **Every passage you send costs money and attention.** The model's input is limited and billed per token.
+   Sending more passages makes each answer more expensive and slower. Past a point, the extra passages also
+   distract the model.
+3. **You can't judge quality by looking.** Right and wrong answers read equally well. The only way to know is to
+   keep a set of questions with known answers and measure against it.
+
+So the design is a normal backend pipeline (ingest, index, query), but every choice has to be defended with a
+number and a way to measure it. That is what the round is about.
+
+### Words you need first
+
+- **LLM** (large language model): the model that writes the answer, such as Claude or GPT. You call it through
+  an API. It reads text in **tokens**, pieces of words about ¾ of a word long, and you pay per token in and out.
+- **Context window**: the most tokens the LLM can read in one request. Everything it knows about your documents
+  must fit in there.
+- **RAG** (retrieval-augmented generation): before calling the LLM, search your documents for the passages most
+  likely to answer the question, and put only those in the prompt. "Retrieval" is the search; "generation" is
+  the LLM writing the answer.
+- **Chunk**: one passage cut from a document, usually a paragraph to a section long. Chunks are what you index,
+  retrieve and cite.
+- **Embedding**: a list of numbers (a **vector**, for example 1,536 numbers long) that a small model computes from
+  a piece of text. Texts with similar meaning get vectors that point in similar directions. Searching by
+  embeddings finds passages that mean the same thing as the question even when they share no words.
+
+Eight reported questions share this problem; most are titles from question banks, and a few are first-hand
+accounts.
+
+<QuestionRow id="eng-001" />
+<QuestionRow id="eng-006" />
+<QuestionRow id="eng-007" />
+<QuestionRow id="eng-008" />
+<QuestionRow id="eng-017" />
+<QuestionRow id="eng-003" />
+<QuestionRow id="r2a-001" />
+<QuestionRow id="r2a-003" />
+
+## What is being tested
+
+Everyone draws the same pipeline: chunk, embed, retrieve, generate. The diagram earns little. My reading (not a
+sourced rubric) is that the round checks three things:
+
+- **Can you give each knob a value and a reason tied to this corpus?** "Passages of about 300 tokens, because
+  most questions are single facts" beats "it depends".
+- **Can you tell a search failure from a writing failure, and measure each?** A wrong answer either had the
+  evidence in front of the model or didn't. The fixes are different.
+- **Do you know when to skip retrieval?** For one document, or for questions like "how many contracts expire this
+  quarter?", search is the wrong tool.
+
+What the sources say, briefly, separated by who is saying it:
+
+- **A first-hand OpenAI forward-deployed engineer account** (year not shown) had a deep dive with "Deep questions
+  on RAG architecture (embedding selection, chunking, retrieval methods, reranking)". The take-home follow-ups
+  asked "why this chunking strategy, why not a different retrieval method" and "what would I change if the dataset
+  was 100x larger." In another round the interviewer stopped an early architecture dive with "what questions
+  would you ask the customer before designing anything?" (<Cite id="s-812dbc9385" />).
+- **PromptLayer, writing from the interviewer side** (July 2025), uses the sample question "Explain how
+  embeddings enable semantic search. How would you handle documents that exceed context limits?" It wants
+  "practical applications and trade-offs, not just memorized definitions", and lists "Red flags: Boring textbook
+  answers." (<Cite id="s-1205b0cc50" />).
+- **A first-hand Google AI Infrastructure Engineer account** (2026, rejected, no reason given) had one technical
+  round that opened with "Design an enterprise-level RAG system", with questions during the walk-through and
+  "some troubleshooting questions" after (<Cite id="s-3da5e3fd6a" />). An infra title does not exempt you.
+- **A first-hand DeepMind Applied AI Engineer post** (2025-09-30, before the interview) lists what the recruiter
+  flagged, including "Retrieval (RAG) Factuality, grounding, implementation" and "Evaluation Aligning evals with
+  problem formulation" (<Cite id="s-5ce95dc021" />). No one reported the actual question.
+- **A 2026 applied-AI prep guide** (its examples are its own, not candidate reports) says "Within about ninety
+  seconds the interviewer knows whether you've shipped a retrieval system or only read about one", that "The
+  interviewer is waiting for the second layer", and that "The strongest signal in this round is knowing when
+  retrieval is the wrong tool." It calls "Fixed 512-token windows" "the lazy default", and warns: "If you can't
+  name what “good retrieval” means as a number, the interviewer assumes you tuned yours by feel."
+  (<Cite id="s-7d03a572e0" />).
+
+## Clarify and scope
+
+Spend two or three minutes here. In the OpenAI account above, the interviewer asked for exactly this before any
+boxes. Ask these, and say an assumption out loud for each one the interviewer won't answer:
+
+1. **The documents.** How many, what formats, how long, how fast do they change? Are the PDFs **born-digital**
+   (made by software, so the text can be extracted) or scanned images that need **OCR** (optical character
+   recognition, software that reads text out of an image)? Are there tables, slides, code?
+2. **The questions.** Single facts ("what is the notice period?"), procedures ("how do I file a claim?"),
+   comparisons across documents, or questions about the whole corpus ("summarise every contract with a
+   change-of-control clause")? The last kind is not a search problem, which matters later.
+3. **Who may see what.** One user, one customer's staff, many customers? If documents carry permissions, say you
+   will treat that as its own design (see the
+   [permission-aware enterprise RAG walkthrough](/system-design-labs/interviews/walkthroughs/enterprise-rag-acl/)).
+4. **The answer contract.** Must every claim cite a passage? What should happen when the documents don't answer
+   the question?
+5. **Latency and cost.** How long until the first words appear, and a cost ceiling per question or per month.
+6. **Who can grade answers.** Is there a domain expert who can write down 50 questions with the correct answer and
+   where in the documents it lives? That list is the **eval set** (evaluation set). Almost every number later on
+   this page is measured against it.
+
+### The example used on this page
+
+One question runs through the whole page. Say it out loud as your assumption so your numbers mean something.
+
+- **v1:** one 200-page, born-digital employee handbook (an invented example). An employee first asks *"What is
+  the notice period?"*, gets an answer, then asks *"What about for contractors?"*
+- **v2:** the same handbook is now one of 50,000 company documents averaging 4,000 tokens each, and the set keeps
+  growing. Users ask 5,000 questions a day over an 8-hour working day, mostly facts and procedures. Citations are
+  required, and the system must refuse when the documents don't support an answer. (All assumed.)
+
+Out of scope for 45 minutes: fine-tuning the answering model, multi-step research agents, and per-user
+permissions. Name them and move on.
+
+## Back-of-envelope
+
+The point of this section is not the arithmetic. It is three decisions: whether to retrieve at all, where the
+index can live, and which part of each question costs the money and the time. Each answer is in bold; the working
+is in the boxes.
+
+### Does the 200-page PDF even need retrieval?
+
+Anthropic's contextual-retrieval post says a knowledge base "smaller than 200,000 tokens", about 500 pages, can
+simply go into the prompt whole ([Anthropic, 2024-09-19](https://www.anthropic.com/news/contextual-retrieval)).
+That works out to about 400 tokens per page, so our 200-page handbook is about **80,000 tokens**. It fits.
+
+Sending 80,000 tokens with every question sounds wasteful, and without help it is. The help is **prompt
+caching**: the provider keeps the processed start of your prompt for a few minutes (five, on Anthropic's default),
+and later requests that begin with the same text pay about a tenth of the normal input price for it. The first
+request pays a little extra to write the cache.
+
+Compare one question asked three ways, at Claude Sonnet 5 list prices fetched 2026-10-11:
+
+| Approach | Cost per question | What to say |
+|---|---|---|
+| Whole handbook, cache cold | **about $0.16–$0.20** | "Fine for a demo, painful at volume." |
+| Whole handbook, cache warm | **about $0.020** | "Simple, and the model sees every page." |
+| RAG: 8 passages plus instructions | **about $0.012** | "Cheaper, but now I own a search system." |
+
+So with a warm cache the whole document costs about **1.7×** RAG per question, and with a cold cache about
+**14×**. For one document, long context is the simpler v1 when questions arrive often enough to keep the cache
+warm. Retrieval wins once the documents outgrow the window or questions are sparse. Say it like this: "For one
+document I'd skip the vector store and send the whole thing with caching. I'd add retrieval when the corpus
+stops fitting or the cache keeps going cold." The prep guide makes the same point: for one uploaded document,
+"you don't need a vector store, you need the whole doc in the context window" (<Cite id="s-7d03a572e0" />).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Cost per question ≈ uncached input × input price + cached input × cache-hit price + cache writes × cache-write
+price + output × output price.
+
+- Claude Sonnet 5 list prices, fetched 2026-10-11, per 1M tokens: $2 input, $0.20 cache hit, $10 output. A cache
+  write on a 5-minute cache costs 1.25× base input, so $2.50. Prices from Anthropic's pricing page as recorded on
+  2026-10-11; re-check before quoting.
+- Output: 400 tokens × $10 ÷ 1M = $0.004 in every case.
+- Whole PDF, uncached: 80,000 × $2 ÷ 1M + $0.004 = **$0.164**.
+- Whole PDF, cache write: 80,000 × $2.50 ÷ 1M + $0.004 = **$0.204**.
+- Whole PDF, cache hit: 80,000 × $0.20 ÷ 1M + $0.004 = **$0.020**.
+- RAG with 8 chunks of 400 tokens plus 800 tokens of instructions = 4,000 input tokens: 4,000 × $2 ÷ 1M +
+  $0.004 = **$0.012**.
+- Ratios: $0.020 ÷ $0.012 ≈ 1.7; $0.164 ÷ $0.012 ≈ 14.
+
+</details>
+
+### Index size and ingest cost at 50,000 documents
+
+Now the v2 corpus. To search 50,000 documents you cut each into chunks, compute an embedding for every chunk,
+and store the vectors in an **index**, a structure that finds the vectors nearest to a query vector quickly. Two
+facts decide where that index can live: how many chunks there are, and how many bytes each vector takes.
+
+Assume chunks of 400 tokens, where each chunk repeats the last 50 tokens of the previous one (the **overlap**,
+so a sentence on a boundary appears whole in at least one chunk). Each 4,000-token document becomes **12
+chunks**, so the corpus is **600,000 chunks**. Embedding them all through a hosted API costs about **$4.80**,
+once. The vectors take about **3.7 GB** stored as 4-byte numbers (**float32**), or 1.8 GB at half precision.
+A common index type is **HNSW** (a graph in which each vector links to a few near neighbours, so search can hop
+toward the query instead of comparing against everything); its links add only about 77 MB here.
+
+That fits in an ordinary Postgres instance with the **pgvector** extension, which adds a vector column type and
+HNSW indexes to Postgres. Say it like this: "At 600,000 chunks the index is a few gigabytes, so it lives in the
+Postgres we already run."
+
+At 100 times the documents the picture changes. 10M documents become 120M chunks, cost about $960 to embed
+through the API, and take **737 GB** of float32 vectors (184 GB stored as 1-byte integers, **int8**). That needs
+a dedicated vector store, an index split across machines, and a plan for re-embedding. That is the
+Databricks-scale version of the question. Re-embedding 120M chunks takes about **12 days on one CPU process** at
+the rate the embedding-pipeline lab measured, or about **17 GPU-hours** at an assumed GPU rate.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Chunks per document = ceil((T − o) ÷ (c − o)), with T = 4,000 tokens per document, c = 400 chunk size, o = 50
+  overlap: ceil(3,950 ÷ 350) = **12**. 50,000 documents × 12 = **600,000 chunks**.
+- Embedding cost: 600,000 × 400 tokens = 240M tokens × $0.02 per 1M (text-embedding-3-small, fetched
+  2026-10-11) = **$4.80**.
+- Vector bytes = chunks × dimensions × bytes per value. At d = 1,536: 600,000 × 1,536 × 4 B = **3.69 GB**
+  float32; × 2 B = 1.84 GB half precision. HNSW links: 2 × 16 × 4 B = 128 B per vector, about 77 MB.
+- At 10M documents: 120M chunks; 48B tokens × $0.02 per 1M = **$960**; 120M × 1,536 × 4 B = **737 GB** float32,
+  184 GB int8.
+- Re-embedding speed: the embedding-pipeline lab measured
+  <LabNumber lab="embedding-pipeline" metric="1 vs 32 chunk-length texts per call (CPU)" /> (one text per call vs
+  32 per call, 256-token texts). 120M ÷ 112 per second ≈ 1.07M seconds ≈ **12.4 days** on one CPU process. At an
+  assumed 2,000 chunks/s per GPU: 120M ÷ 2,000 = 60,000 s ≈ **17 GPU-hours**.
+
+</details>
+
+### Query cost and latency at 5,000 questions a day
+
+Embedding the questions themselves is nearly free. The bill is the LLM call. At 5,000 questions a day with the
+4,000-token-in, 400-token-out request above, that is **about $1,800 per 30 days** on Claude Sonnet 5, or
+**about $270** on gpt-5-mini. Pick between them with the eval set, not the price list.
+
+Latency is a different story. The provider controls how fast the LLM starts writing. The part you control is the
+search, and inside it the slowest step is the **reranker**: a second, more careful model that rereads the top 20
+or so candidates together with the question and reorders them (explained in the deep dives). In the rag lab, on
+one machine, the whole two-way search over 5,852 chunks took
+<LabNumber lab="rag" metric="Hybrid retrieve() v1" /> (CPU / Apple GPU), while reranking 20 candidates took
+<LabNumber lab="rag" metric="Cross-encoder rerank, 20 candidates" />. The reranker is ten times slower than the
+search.
+
+Load is light: the busiest hour needs about **10 reranker pairs per second**, and one CPU process handles about
+48 (derived). So capacity is not the question. The question is whether about 0.4 seconds of extra waiting is
+worth the better ordering, and the eval set answers it.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Sonnet 5: 5,000 × $0.012 = $60 a day, × 30 = **$1,800**.
+- gpt-5-mini ($0.25 input, $2 output per 1M, fetched 2026-10-11): 4,000 × $0.25 ÷ 1M + 400 × $2 ÷ 1M = $0.001 +
+  $0.0008 = **$0.0018** per question; × 5,000 × 30 = **$270**.
+- Arrival rate: 5,000 ÷ 28,800 s (8 hours) = 0.17 questions/s; at an assumed 3× peak, 0.52/s. Reranking 20
+  candidates each: 0.52 × 20 = **10.4 pairs/s**.
+- Reranker capacity (derived from the lab's CPU figure): 20 pairs ÷ 0.412 s ≈ **48.5 pairs/s** per CPU process.
+
+</details>
+
+## High-level design
+
+The system has two halves that share a store. **Ingestion** runs whenever a document arrives or changes.
+**Query** runs on every question. Draw this, top to bottom; each box is explained below the picture:
+
+```
+INGESTION (per document, when it arrives or changes)
+
+  Sources (uploads, syncs, crawls)
+     │  document id + version
+     ▼
+  Parser ── text with headings, lists, tables, page numbers
+     │
+     ▼
+  Chunker ── split on headings; title + heading path on every chunk
+     │       hash each chunk; only changed hashes go on
+     ▼
+  Embedder ── one vector per new chunk
+     │
+     ▼
+  ┌──────────────────────────────────────────────────────┐
+  │ Chunk store (text, path, doc id, version, hash, page) │
+  │ Keyword index (BM25)      Vector index (HNSW)         │
+  └──────────────────────────────────────────────────────┘
+                 ▲ read by hybrid search below
+
+QUERY (per question)
+
+  Question ── "what about for contractors?"
+     │
+     ▼
+  Rewriter ── "notice period for contractors" (standalone)
+     │
+     ▼
+  Hybrid search ── keyword list + vector list, fused by rank (RRF)
+     │
+     ▼
+  Reranker ── rereads the top 20–50 with the question, reorders
+     │
+     ▼
+  Packer ── takes the best chunks until the token budget is full
+     │
+     ▼
+  LLM ── answers, citing chunk ids
+     │
+     ▼
+  Citation check ── every cited id was in the context?
+     │
+     ▼
+  Answer with sources, or "not found in the documents"
+```
+
+**Sources.** A document arrives by upload, sync or crawl, with a source id and a version.
+
+**Parser.** Turns the file into text that keeps its structure: headings, lists, tables, page numbers. This is the
+step candidates skip and the one that breaks most often.
+
+**Chunker.** Splits on that structure and puts the document title and heading path at the top of each chunk, so a
+chunk still makes sense on its own. Each chunk gets a content hash, and only chunks whose hash changed are
+re-embedded. Writes are idempotent upserts keyed by (document id, chunk position, version), and the document's
+old chunks are deleted in the same transaction, so a re-run never leaves orphans.
+
+**Embedder.** Computes one vector per new chunk, in batches. This is a hosted API call or a small model you run.
+
+**Stores.** Three things: a chunk store with the text and its metadata, a keyword index, and a vector index. The
+keyword index uses **BM25**, the standard scoring formula of keyword search engines: it ranks a chunk higher when it contains the query's rarer words, more than once. At v2 scale all
+three can live in one Postgres database, using its full-text search for the keyword side and pgvector for the
+vectors.
+
+**Rewriter.** In a conversation, follow-up questions lean on what came before. "What about for contractors?"
+means nothing alone, so a cheap LLM call rewrites it into a standalone query: "notice period for contractors".
+
+**Hybrid search.** Runs the keyword search and the vector search (called **dense retrieval**, because it compares
+dense vectors) side by side, then merges the two ranked lists with **reciprocal rank fusion** (RRF), which scores
+each chunk by its positions in the two lists. The deep dives explain why both halves are needed.
+
+**Reranker.** Rereads the top 20 to 50 candidates together with the question and reorders them. It is slower and
+better than either search.
+
+**Packer.** Takes chunks in reranked order until a token budget is full. The number of chunks it ends up sending is
+called **k**.
+
+**LLM and citation check.** The prompt lists each chunk with an id and tells the model to cite ids and to say when
+the chunks don't answer the question. Code then checks every cited id was really in the context before the
+answer is shown.
+
+### Follow one question through it
+
+Here is the contractor question in the v2 system, with invented but realistic values. The handbook section
+"Contractors > Ending a contract" says that either party may end a contractor agreement with 14 days' written
+notice.
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| **Ingestion, earlier** | The handbook was parsed and chunked. The contractor section became chunk `c-412`, starting with "Employee Handbook > Contractors > Ending a contract". | "The heading path is what makes this chunk findable and citable on its own." |
+| **1. Rewrite** | "What about for contractors?" becomes "notice period for contractors". | "Follow-ups are rewritten into standalone queries before search." |
+| **2. Keyword search** | BM25 ranks `c-087` (the employee notice section) 1st, because it repeats "notice period". `c-412` is 3rd. | "Keywords catch exact terms, but they can't tell which notice period I mean." |
+| **3. Vector search** | Dense retrieval ranks `c-412` 3rd and `c-087` 10th. | "Meaning-based search catches paraphrases like 'ending a contract'." |
+| **4. Fuse (RRF)** | `c-412`, 3rd in both lists, scores 0.0317. `c-087`, 1st and 10th, scores 0.0307. `c-412` moves ahead. | "Agreement between the two searches beats one search's favourite." |
+| **5. Rerank** | The reranker reads the question with each of the top 20 and puts `c-412` 1st. | "This costs about 0.4 s on one CPU; I add it only if the eval shows it helps." |
+| **6. Pack** | The 8 best chunks, about 3,200 tokens, plus 800 tokens of instructions: 4,000 tokens in. | "k comes from a token budget, capped in code." |
+| **7. Generate** | The model answers: "Contractors get 14 days' written notice [c-412]." | "About 1.2 cents on Sonnet 5 for this request shape." |
+| **8. Check** | Code confirms `c-412` was in the context and that any quoted words appear in it. The answer is shown with a link to page and section. | "If the check fails, I block the answer or strip the claim." |
+
+If the handbook didn't cover contractors, step 5 would return only weak matches. The pipeline would then skip the
+LLM and reply "not found in the documents", listing the closest sections.
+
+### The chunker, in code
+
+Here is the chunker in about 40 lines. It splits on headings, packs paragraphs up to a token budget, never splits
+a table, and puts the heading path on every chunk. `pack_context` is step 6 above. It was run on 2026-10-12
+against a sample handbook with a long section and a table (Python 3.13); token counts are approximate.
+
+```python
+import re
+
+def approx_tokens(text: str) -> int:
+    # Assumed 1.3 tokens per English word. Use your embedder's tokenizer in production.
+    return int(len(text.split()) * 1.3) + 1
+
+def split_long(block: str, max_tokens: int) -> list[str]:
+    if block.lstrip().startswith("|") or approx_tokens(block) <= max_tokens:
+        return [block]                       # tables stay whole, even when long
+    out, cur = [], []
+    for s in re.split(r"(?<=[.!?])\s+", block):
+        if cur and approx_tokens(" ".join(cur + [s])) > max_tokens:
+            out.append(" ".join(cur))
+            cur = []
+        cur.append(s)
+    return out + ([" ".join(cur)] if cur else [])
+
+def chunk(doc_title: str, text: str, max_tokens: int = 350) -> list[dict]:
+    """Split on headings, pack paragraphs up to max_tokens, and prefix every
+    chunk with its heading path so it still makes sense on its own."""
+    path, chunks, buf = [], [], []
+
+    def flush():
+        if buf:
+            header = " > ".join([doc_title, *path])
+            chunks.append({"section": header, "text": header + "\n\n" + "\n\n".join(buf)})
+            buf.clear()
+
+    for block in re.split(r"\n\s*\n", text.strip()):
+        heading = re.match(r"^(#+)\s+(.*)", block)
+        if heading:                          # a new section always starts a new chunk
+            flush()
+            del path[len(heading.group(1)) - 1:]
+            path.append(heading.group(2).strip())
+            continue
+        limit = max_tokens - approx_tokens(" > ".join([doc_title, *path]))
+        for piece in split_long(block, limit):
+            if buf and sum(map(approx_tokens, buf)) + approx_tokens(piece) > limit:
+                flush()
+            buf.append(piece)
+    flush()
+    return chunks
+
+def pack_context(ranked: list[dict], budget_tokens: int, k_max: int = 20) -> list[dict]:
+    """Take reranked chunks in order until the token budget or k_max is reached."""
+    picked, used = [], 0
+    for c in ranked[:k_max]:
+        t = approx_tokens(c["text"])
+        if used + t > budget_tokens:
+            break
+        picked.append(c)
+        used += t
+    return picked
+```
+
+## Deep dives
+
+Pick one or two of these, depending on where the interviewer pushes. Each one ends with how you would measure
+the choice.
+
+### Parsing and chunking: the knob candidates skip
+
+Most bad answers start with bad text. A scanned PDF needs OCR. A two-column PDF read in the wrong order mixes
+sentences from both columns. A table flattened into one line of numbers can't answer anything. Before tuning
+anything, open the parsed output of your 20 ugliest files and read it. That is a 30-minute check, and it catches
+failures no retrieval metric will explain.
+
+Then choose chunk size from the questions, not from a default:
+
+- **Fact lookups** ("what is the notice period?") want small, precise chunks, roughly a paragraph (200–400
+  tokens). A big chunk dilutes its embedding: one relevant sentence inside 1,500 tokens of other text scores
+  lower than it should, because the vector describes the whole chunk.
+- **Procedures and explanations** want the whole section, because a step list cut in half produces a half-right
+  answer.
+- **Tables** stay whole, with the column headers repeated if you must split rows.
+
+The prep guide's point is the same: fixed 512-token windows "cut sentences in half", and splitting on headings
+while keeping tables intact "usually beats them, at the cost of more code" (<Cite id="s-7d03a572e0" />).
+
+Two less obvious limits:
+
+- **The embedder reads only so much.** Each embedding model has a maximum input length. The small open model
+  all-MiniLM-L6-v2 reads at most 256 **word pieces** (its own tokens). The rag lab's v0 chunks are 512
+  approximate tokens, so most of them are cut short before they are embedded, with no error, while BM25 and the
+  reranker still read the whole chunk. Check `max_seq_length` (or your API's limit) before picking a chunk size.
+- **Chunks must stand alone.** A chunk that says "this does not apply to them" is useless without its heading.
+  The chunker above adds the title and heading path. Anthropic's contextual retrieval goes further and has an LLM
+  write a short context for each chunk. In its eval, contextual embeddings plus contextual BM25 cut the top-20
+  retrieval failure rate by 49%, and adding reranking cut it by 67%, at an estimated one-time cost of $1.02 per
+  million document tokens with prompt caching
+  ([Anthropic, 2024-09-19](https://www.anthropic.com/news/contextual-retrieval)). Those are its numbers on its
+  datasets; measure on yours.
+
+Overlap matters less than people think. The rag lab compared 200 characters of overlap against none and saw no
+measurable difference on its benchmark. Boundaries that follow the document's structure make overlap mostly
+unnecessary.
+
+**How to measure it.** Use the eval set: 50–200 questions with the correct answer and its location. For each
+chunking strategy, compute **recall@k**: the share of questions where the chunk holding the answer is among the
+k chunks the model would see. Compare two or three strategies on the same questions, looking at the
+per-question differences rather than two separate averages. That is a **paired test**, and it detects smaller
+differences than comparing averages. Say it like this: "I'd sweep three chunkers on the eval set and keep the one
+with the best recall@8, if the gap is bigger than the noise."
+
+### Retrieval: hybrid search and why the lexical side decides it
+
+The two kinds of search fail in opposite ways. Dense retrieval finds paraphrases that share no words: "ending a
+contract" matches "termination". **Lexical** search (keyword search, here BM25) finds the exact strings that
+embeddings blur: names, error codes, part numbers, clause numbers. Running both and merging is called **hybrid
+search**.
+
+Merging is the awkward part, because BM25 scores and vector similarities are on different scales. Reciprocal rank
+fusion avoids the problem by ignoring scores and using only positions. Each chunk gets 1 ÷ (60 + its rank) from
+each list it appears in, and the two parts are added. The 60 is a damping constant; the rag lab uses it, after
+Cormack et al. (2009). In the contractor example, a chunk ranked 3rd by both searches (0.0317) beats one ranked
+1st by keywords and 10th by vectors (0.0307). Agreement wins.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+score(d) = Σ over retrievers i of 1 ÷ (k + rank_i(d)), where rank_i(d) is the 1-based rank of chunk d in
+retriever i's list (no term if absent), and k = 60. (This k is RRF's constant, not the number of chunks sent.)
+
+- Ranked 1st by BM25 and 10th by dense: 1/61 + 1/70 ≈ **0.0307**.
+- Ranked 3rd by both: 2/63 ≈ **0.0317**.
+
+</details>
+
+The rag lab shows why "add BM25" is not automatically a gain. It measured **hit@3**: the share of questions where
+at least one correct document appears in the top 3. It ran on two **BEIR** datasets (public benchmark sets of
+questions with known relevant documents): SciFact, about scientific claims, and NFCorpus, about nutrition. On
+SciFact, hit@3 for dense, hybrid, and hybrid plus rerank was
+<LabNumber lab="rag" metric="hit@3 on BEIR SciFact" />. Hybrid was no better than dense. The reason is small:
+the lab's BM25 splits text on spaces, so "cells," and "cells" are different words. With a tokenizer that splits on
+word characters (`\w+`), hybrid reached <LabNumber lab="rag" metric="BM25 tokenizer (SciFact)" />. On NFCorpus the
+three stages scored <LabNumber lab="rag" metric="hit@3 on BEIR NFCorpus" />.
+
+Two lessons carry over. Check the keyword side's tokenizer before concluding that hybrid doesn't help. And with
+about 300 questions, a gap of a few points is noise: on SciFact only the tokenizer fix and the reranker cleared
+their paired intervals (their gains were bigger than the measurement noise), and on NFCorpus no single step did. Say it like this: "Hybrid usually helps on corpora
+with codes and names, but I'd check it on our eval set, and I'd check the tokenizer first."
+
+**Choosing the embedding model.** Pick it on your eval set, not on a public leaderboard. Try two hosted models and
+one open model, compare recall@k with a paired test, and put cost and vector size in the same table. Changing the
+model later means re-embedding everything, because vectors from two models can't share an index. The
+embedding-pipeline lab measured how far two closely related models disagree. Between MiniLM-L6 and MiniLM-L12,
+the **cosine distance** (how far apart two vectors point; 0 is identical) between the two models' vectors for the
+same text is <LabNumber lab="embedding-pipeline" metric="Matched-pair cosine distance" />, and the overlap of
+each text's 10 nearest neighbours is <LabNumber lab="embedding-pipeline" metric="Neighbour overlap@10" />. About a
+third of each text's nearest neighbours change, even between sibling models.
+
+### Reranking and k
+
+The embedder looks at the question and each chunk separately; that is why chunk vectors can be computed once, in
+advance. A **cross-encoder** reads the question and one chunk together, as one input, and outputs a relevance
+score. It judges relevance much better, but it needs one model call per (question, chunk) pair, so you can only
+afford it on a short list. Used this way it is called a **reranker**. Two facts frame the decision:
+
+- **It can only reorder what search found.** In the rag lab, hit@20 was the same before and after reranking on
+  both datasets. Every gain came from promoting a relevant chunk into the top 3. So measure recall at the
+  candidate depth N (what the reranker sees) separately from recall at k (what the model sees). If the answer
+  isn't in the top N, reranking can't help; fix search.
+- **It costs latency.** <LabNumber lab="rag" metric="Cross-encoder rerank, 20 candidates" /> per question for 20
+  candidates on one machine (CPU / Apple GPU). Rerank when your eval shows the right chunk is in the top 50 but
+  not the top 5.
+
+**Choosing k.** Start from a token budget, then check it against data. The prep guide puts it as "Bigger k buys
+recall and burns context budget and latency" (<Cite id="s-7d03a572e0" />), and past a point it adds distractors
+rather than signal. A procedure:
+
+1. Fix a budget for retrieved text, for example 4,000 tokens. With 400-token chunks that allows k = 10.
+2. Plot recall@k on the eval set for k = 1 to 20. Where the curve flattens is the most a bigger k can buy.
+3. Plot answer correctness against k on a sample. If correctness drops while recall rises, the extra chunks are
+   distracting the model. Cut k, or rerank harder.
+4. Cap k in code (the rag lab's server caps `top_k` at 20), so a bug can't send 200 chunks.
+
+Anthropic found the top 20 chunks beat the top 10 or 5 in its tests
+([2024-09-19](https://www.anthropic.com/news/contextual-retrieval)); other corpora flatten earlier. Say it like
+this: "k is an outcome of the measurement, not a default. I'd start at 8 and let the recall curve move it."
+
+### Generation: citations, refusals and "I don't know"
+
+The model can cite a source that isn't there, or quote words the source never said. Both are cheap to catch in
+code. Put chunk ids in the context, ask for an id after each claim, and check that every cited id was in the
+context. If the answer quotes text, check the quote appears word for word in the cited chunk. These checks are
+deterministic, so run them on every answer, and block the answer (or strip the claim) when they fail.
+
+Refusal needs two layers. The prompt tells the model to say what it can't answer from the sources. The pipeline
+adds a search-side check: if the best reranker score is below a threshold, skip the LLM and return "not found in
+the documents" with the closest sources. Set the threshold on a set of questions the documents can't answer.
+Then measure both kinds of error: **false refusals** (it said "not found" but the answer was there) and **false
+answers** (it answered when it shouldn't have).
+
+### Re-indexing when documents or the embedding model change
+
+A stale index hands back "confident, wrong answers" (<Cite id="s-7d03a572e0" />). Three kinds of change need a
+plan:
+
+- **Document edits.** Re-chunk the document, hash each chunk, re-embed only new hashes, and delete chunks that no
+  longer exist, in one transaction per document. Track **index lag** per source: how long between a change at the
+  source and the change being searchable.
+- **Deletions.** A source that only lists its current files shows a deletion as an absence. Reconcile ids on a
+  schedule. Remember derived copies too: caches, logs and eval sets.
+- **Embedding-model change.** Build a second index alongside the first (a **shadow index**), run the eval set
+  against both, then switch an alias that the query path reads. Never mix vectors from two models in one index.
+  The embedding-pipeline lab's registry and pinning policy implement this pattern.
+
+### When retrieval is the wrong tool
+
+The prep guide calls this "The strongest signal in this round". Search returns k passages. Some questions need
+something else:
+
+- **The whole corpus fits in context**, as with the 200-page handbook and a warm cache.
+- **Aggregate questions** ("how many contracts expire this quarter?"). Search returns k passages, not all of them.
+  Extract structured fields into a table at ingestion, and answer with SQL.
+- **Summarise everything.** Use **map-reduce**: summarise or extract per document or section, offline, then
+  combine.
+- **Live data** (order status, today's on-call). Call the system of record as a tool.
+- **Behaviour or format problems.** If answers are wrong in style rather than in facts, retrieval won't fix it.
+  That is a prompting or fine-tuning question.
+
+## Failure modes and overload
+
+Most RAG failures are silent. Nothing throws; the answer is just worse. So each failure below comes with the
+signal that reveals it.
+
+- **Parser failures.** Silent and common. Track the share of pages with little or no extracted text, per file
+  type, and send those files to OCR or a person.
+- **Search miss vs writing error.** A wrong answer either had the evidence in its context or didn't. Log the
+  retrieved chunk ids with every answer, so you can tell which on each ticket.
+- **Embedding truncation.** Chunks longer than the embedder's window lose their tail without any error. Count
+  them at ingestion.
+- **Ingestion backlog.** A bulk import of 10,000 files should not starve the steady trickle of edits. Use a queue
+  per source with a fair share of embedding capacity. Keep new documents searchable through BM25 before their
+  vectors land.
+- **Provider outage or rate limit.** With the LLM down, return the ranked passages and their links without a
+  generated answer. With the embedding API down, queue ingestion and fall back to BM25 for queries.
+- **Cost blow-up.** A bug that raises k, or retries in a loop, multiplies cost silently. Cap k and output tokens,
+  and alert on cost per question from traces.
+
+<Pitfall title="Tuning the prompt to fix a retrieval miss">
+A user reports a wrong answer and the first instinct is to edit the prompt. If the right chunk wasn't in the
+context, no prompt fixes it, and the edit may break other questions. Look at the logged chunk ids first; fix
+retrieval when the evidence was missing, fix generation only when it was there.
+</Pitfall>
+
+## Evals and observability
+
+An **eval** is a repeatable test of answer quality: a fixed set of questions, a way to score each answer, and a
+number you track over time. Interviewers go here next. In the Harvey account, after a bare-bones RAG build in
+Colab, the follow-up was about improving its evaluation, with metrics "such as recall or hit rate"
+(<Cite id="s-74265be7ec" />). Build the eval in this order:
+
+1. **Read failures first.** Read 20–50 real or realistic question-and-answer traces with a domain expert, and
+   write down the kinds of failure you see (missed table, wrong document version, invented clause). Hamel Husain's
+   evals FAQ makes this the starting point ([hamel.dev, modified 2026-09-21](https://hamel.dev/blog/posts/evals-faq/)).
+2. **Search metrics on the eval set.** recall@k or hit@k answer "was the evidence in what the model saw?". When
+   the order inside the top k matters, use **MRR** (mean reciprocal rank: 1 ÷ the position of the first correct
+   chunk, averaged) or **nDCG** (a score that rewards correct chunks more the higher they sit)
+   (<Cite id="s-7d03a572e0" />). Break the numbers down by document type and question type.
+3. **Answer checks.** Citation validity (in code, on every answer). **Faithfulness**: is each claim supported by
+   the chunk it cites? Correctness against the expert's answer. Refusal correctness on questions the documents
+   can't answer. Faithfulness is often scored by an **LLM judge**, a second model prompted to grade answers. Use
+   one only after checking that it agrees with human labels on 30 to 50 items. Asked whether to trust a judge
+   before that, the prep guide answers "The right answer is no."
+4. **A regression gate.** Every change to chunking, embedding model, k, reranker or prompt runs the eval set in
+   CI and is compared with the previous version on the same questions.
+
+**Report intervals, not single numbers.** With 50 questions, a measured recall of 80% could easily be 70% or 90%
+on another 50. A **95% confidence interval** says how wide that wobble is. At 50 questions it is about **±11
+points**; at 200 questions, about **±5.5 points**. So a 3-point gain between two chunking strategies needs a
+paired comparison on the same questions, and even pairing has limits. In the llm-eval lab's simulation, with 500
+questions, the smallest true gap a paired test catches 80% of the time is
+<LabNumber lab="llm-eval" metric="Smallest true gap with 80% power, paired test, n=500" />, when the two
+configurations disagree on 20% or 40% of the questions. Say it like this: "With 200 questions each recall number
+wobbles by about 5 points, so I'd treat a smaller gap as noise unless a paired test on the same questions clears it."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+95% half-width for a proportion ≈ 1.96 × √(p × (1 − p) ÷ n), where p is the observed recall@k and n is the number
+of questions.
+
+- p = 0.8, n = 50: 1.96 × √(0.16 ÷ 50) = 1.96 × 0.0566 ≈ **±11.1 points**.
+- p = 0.8, n = 200: 1.96 × √(0.16 ÷ 200) = 1.96 × 0.0283 ≈ **±5.5 points**.
+
+</details>
+
+**In production**, trace every request: the rewritten query, the retrieved and reranked chunk ids with scores,
+the packed context size, tokens and cost, latency per stage, citation-check results, and whether the system
+refused. Watch the refusal rate, the share of answers that failed a citation check, the thumbs-down rate, cost per
+question, and index lag per source. Read 20 sampled traces every week.
+
+## Trade-offs
+
+| Decision | What you gain | What you give up | Choose differently when |
+|---|---|---|---|
+| Long context for a single document | No search to tune; the model sees the whole document | Cost per question (about 1.7× warm, 14× cold in the example) and a longer wait for the first words | The corpus outgrows the window or questions are sparse |
+| Chunks split on headings, with the heading path | Chunks that stand alone; better citations | A parser per format; more code | Short uniform records (tickets, FAQs): one chunk per record |
+| Hybrid BM25 + dense with RRF | Both exact terms and paraphrases are found | A second index; tokenizer care | Plain-language corpora with no codes or names: test dense alone |
+| Cross-encoder reranking | Better ordering of the top k | About 0.2–0.4 s per question on one machine; a model to host | Your eval shows the right chunk is already in the top 3 |
+| k from a token budget, capped | Predictable cost and fewer distractors | Possible recall loss on broad questions | Comparison questions: search once per entity instead of raising k |
+| Postgres + pgvector | One database, transactions, joins | Index builds and filtering need care past a few million vectors | Millions of vectors with heavy updates and filters |
+
+<AINative title="Where an agent helps, and what you still check">
+Agents do the volume work well: writing parsers for each file type, generating candidate questions from
+documents for the eval set, writing the sweep scripts and the citation checker. Three things stay yours. Read the
+parsed output of the ugliest files yourself, because an agent will report success on text that is garbled. Have a
+domain expert confirm the eval answers, since a model writing both the questions and the grades will agree with
+itself. And keep the regression gate's thresholds in your hands: an agent asked to "make the eval pass" can edit
+the eval.
+</AINative>
+
+## Small-team version
+
+You own AI at a 50–500 person company, and this is probably the first AI feature you ship: an assistant over the
+support docs, the handbook or a customer's contract set. The plan below assumes one engineer with coding agents
+and two weeks for v1 (a planning assumption, not a sourced figure). The work is mostly parsing, evaluation and
+operations, not infrastructure.
+
+### Build
+
+- **The pipeline itself**, in plain code: parser, chunker, two searches, RRF, prompt, citation check. Anthropic
+  advises starting with direct API calls rather than a framework
+  ([2024-12-19](https://www.anthropic.com/engineering/building-effective-agents)), and a few hundred lines are
+  easier to debug than a framework's defaults.
+- **Search inside Postgres** if you already run it: full-text search for keywords and pgvector for vectors. Chip
+  Huyen suggests starting retrieval with term-based search because it works well out of the box, and adding
+  components only when needed ([2024-07-25](https://huyenchip.com/2024/07/25/genai-platform.html)). The
+  600,000-chunk example (3.7 GB of float32 vectors, 1.8 GB as pgvector's `halfvec`) fits on the database you
+  already pay for.
+- **The eval set and the regression gate.** 50–200 questions with answers in a file in the repo, a recall@k
+  script, the citation checks, and a CI job that runs them on every change.
+
+### Buy
+
+- **The LLM and the embeddings**, as managed APIs. Embedding 600,000 chunks costs about **$5** at $0.02 per 1M
+  tokens (text-embedding-3-small, OpenAI pricing fetched 2026-10-11). Generation is the real bill: about
+  **$1,800 per 30 days** at 5,000 questions a day on Claude Sonnet 5, or about **$270** on gpt-5-mini, for the
+  request shape above. Pick the model with the eval, not the price list.
+- **Tracing**, from day one: an open-source, self-hostable tool such as Langfuse, or your provider's dashboard.
+
+### Skip, for now
+
+- **A dedicated vector database.** Most surveyed teams use one (Amplify's 2025 report: 65%), so it is not wrong,
+  but it is not where a small team's first month should go. Move when you reach millions of vectors with frequent
+  updates and filtered queries. Alex Jacobs, writing from production, says HNSW builds on a few million vectors
+  can take 10+ GB of RAM on the production database, and sums up the scale guide with "Millions? Good luck."
+  ([2025-10-29](https://alex-jacobs.com/posts/the-case-against-pgvector/)). Managed options start at $50/month
+  (Pinecone Standard) or $16/month (turbopuffer Launch), prices fetched 2026-10-11.
+- **A reranker**, until the eval shows the right chunk sitting at ranks 4–20. Then add a small open cross-encoder
+  on CPU (the rag lab's takes about 0.4 s for 20 candidates) or a hosted rerank API.
+- **Fine-tuning** anything. "Don't finetune until you've proven it's necessary" ([applied-llms.org,
+  2024-06-08](https://applied-llms.org/)).
+
+### Delivery plan
+
+- **Week 1.** Get 50 real questions, with answers and source locations, from the person who answers them today.
+  Parse the corpus and read the 20 worst files. Ship a baseline: Postgres full-text plus dense search, RRF, k = 8,
+  citations, a refusal prompt. Measure recall@k and read 30 traces.
+- **Week 2.** Fix parsing on the worst file types, switch to chunks split on headings, add the citation check and
+  a set of questions the documents can't answer, put the eval in CI, and release to ten internal users with a
+  thumbs button and tracing.
+- **Later, only if the numbers ask for it**: a reranker, contextual chunk prefixes, a vector store, a second
+  embedding model behind a shadow index.
+
+### What to verify yourself
+
+The parsed text of the ugliest files, by eye. Recall@k with its interval. Citation validity on every answer.
+Refusals on 20 questions the documents can't answer. Cost per question from traces, against a monthly cap set in
+the provider console. After every re-index, a count check that no document has two versions of its chunks.
+
+### Revisit when
+
+The corpus passes a few million chunks, documents change faster than you can re-embed nightly, permissions appear
+(then read the [enterprise RAG walkthrough](/system-design-labs/interviews/walkthroughs/enterprise-rag-acl/)), or
+a customer contract requires data to stay in a region or on your own hardware.
+
+### What small-company interviewers probe instead
+
+Evidence from 50–500 person companies is thin and mostly employer-side. What exists points to work samples over
+whiteboards: Harvey's bare-bones RAG build followed by an evaluation follow-up (<Cite id="s-74265be7ec" />), and
+an Elicit hiring manager describing a coding exercise on a small app that probes error handling, retries,
+fallbacks and timeouts, with no ML-focused round for AI engineers
+([Latent Space, 2024-06-21](https://www.latent.space/p/hiring)). A recruiting vendor's playbook suggests scenario
+questions such as a chatbot giving outdated facts ([Dover, updated
+2026-08-24](https://www.dover.com/blog/how-to-hire-ai-engineer-startups)). Expect "what does it cost per
+question?" and "how do you know it works?" more than "how does HNSW work?".
+
+## Senior vs Staff
+
+<LevelContrast
+  title="RAG end to end"
+  senior={[
+    "Draws the ingestion and query paths, and gives each knob a starting value with a reason: chunks split on headings, hybrid search with RRF, k from a token budget, rerank when ranks 4–20 hold the answer.",
+    "Separates search failures from answer failures in the eval: recall@k on an expert-labelled set, citation checks in code, refusals tested on questions the documents can't answer.",
+    "Re-embeds only changed chunks and handles deletions.",
+  ]}
+  staff={[
+    "Opens with whether retrieval is needed at all, and prices long context against RAG for the actual corpus.",
+    "Makes every knob an experiment with an interval: says how many labelled questions it takes to see a 3-point gain, and which metric would prove the design wrong.",
+    "Plans for change: a shadow index for embedding-model swaps, index lag per source, fair ingestion queues, and a degraded mode when the LLM or the embedder is down.",
+  ]}
+/>
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="(Reported, OpenAI FDE take-home) Why this chunking strategy, and why not a different retrieval method?">
+Tie the chunk size to the question types (paragraph chunks for lookups, whole sections for procedures, tables
+whole) and to the embedder's input limit. Then show the sweep: two or three strategies compared on recall@k with a
+paired test on the same questions. For the retrieval method, show hybrid against dense on the same set and say what
+the keyword side catches (codes, names).
+  </FollowUp>
+  <FollowUp q="(Reported, OpenAI FDE take-home) What would you change if the dataset were 100x larger?">
+Redo the envelope. At 10M documents the example becomes 120M chunks and 737 GB of float32 vectors. That means a
+vector store split across machines, int8 or half-precision vectors, parallel re-embedding (about 12 days on one CPU
+process, or about 17 GPU-hours at an assumed 2,000 chunks/s), fair ingestion queues, and incremental re-indexing
+by content hash. Say plainly: "Query cost doesn't change with corpus size; ingestion and storage do."
+  </FollowUp>
+  <FollowUp q="(PromptLayer, interviewer side) How do you handle documents bigger than the context window?">
+Chunk and retrieve for questions about parts of the document. For questions about the whole document, use
+map-reduce: summarise or extract per section, then combine. For long documents that almost fit, test long context
+with prompt caching against RAG on cost and correctness.
+  </FollowUp>
+  <FollowUp q="(Reported, Google AI Infrastructure) Users say answers are wrong. How do you troubleshoot?">
+Pull the trace for each bad answer and ask, in order: was the document parsed correctly, was the right chunk in the
+top N candidates, was it in the top k after reranking, and did the answer follow it? Each "no" names the stage to
+fix. Then add those questions to the eval set so the fix stays fixed.
+  </FollowUp>
+  <FollowUp q="(Applied-AI prep guide) When is retrieval the wrong tool?">
+When the corpus fits in context, when the question is an aggregate over all documents (use extraction and SQL),
+when it needs live data (call the system of record), or when the problem is the model's behaviour rather than
+missing facts.
+  </FollowUp>
+  <FollowUp q="(Reported, DeepMind recruiter list) Where do quantization or distillation fit in a RAG system?">
+On the parts you host yourself. Quantization stores a model's numbers with fewer bits; distillation trains a small
+model to copy a big one. A smaller or quantized embedding model or reranker cuts ingestion time and query latency,
+and int8 or half-precision vectors cut index memory by 4× or 2×. Each one is a trade measured on the eval set
+(recall@k before and after), not assumed free.
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) A document was updated but the bot still quotes the old version. Why?">
+Look for the stale copy: the old chunks weren't deleted on re-index, an answer cache served it, or the source
+connector hasn't synced. Fix it with chunk replacement in one transaction per document, cache keys that include the
+document version, and a per-source lag metric.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Reciting the pipeline without numbers.** The prep guide says the interviewer "is waiting for the second
+  layer" (<Cite id="s-7d03a572e0" />), and PromptLayer's interviewer-side post lists "Boring textbook answers" as
+  a red flag (<Cite id="s-1205b0cc50" />). Give each knob a value, a reason and a measurement.
+- **Designing before asking.** In the OpenAI FDE account the interviewer redirected an early architecture dive to
+  the customer questions (<Cite id="s-812dbc9385" />). Ask about the documents and the questions first.
+- **Fixed 512-token chunks by default.** The prep guide calls them "the lazy default". Tie size to the document's
+  structure and to the embedder's input limit.
+- **An unbounded or untested k.** Plot recall and answer quality against k, and cap it in code.
+- **"We'll evaluate with an LLM."** Without human-checked labels and an interval, you are measuring the judge.
+- **Never asking whether retrieval is needed.** For one document, long context with caching is the simpler v1.
+- **Fixing search misses with prompt edits.** Check the logged chunk ids first.
+
+## Prove it with a lab
+
+<LabRef lab="rag" role="proof" note="Rerun the BEIR bench for v0 to v2, then replace the fixed 512-token chunker with a structure-aware one and measure hit@3 with a paired interval." />
+
+<LabRef lab="embedding-pipeline" role="proof" note="Measure batched encode throughput on your hardware, then use the registry and neighbour-overlap check to plan an embedding-model swap behind a shadow index." />
+
+<LabRef lab="vector-index" role="proof" note="Compare flat and HNSW search recall at your corpus size before deciding you need an approximate index at all." />
+
+<LabRef lab="llm-eval" role="proof" note="Use its bootstrap interval and paired test to decide whether a chunking or k change really moved recall." />
+
+<LabRef lab="search-engine" role="background" note="Build the BM25 side yourself and see how much the tokenizer decides." />
+
+Every lab number above was measured on one Apple M1 Ultra on 2026-10-11, with small open models (MiniLM-L6, a
+MiniLM cross-encoder) on public BEIR datasets. Use them for the shape of the result (the tokenizer decides whether
+hybrid helps, reranking costs latency, a few points is noise at 300 questions), not as a forecast for your corpus.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-812dbc9385" />
+- <Cite id="s-1205b0cc50" />
+- <Cite id="s-3da5e3fd6a" />
+- <Cite id="s-5ce95dc021" />
+- <Cite id="s-7d03a572e0" />
+- <Cite id="s-ee91b6c25d" />
+- <Cite id="s-d7a8e88bf0" />
+- <Cite id="s-74265be7ec" />
+- Anthropic, "Introducing Contextual Retrieval", 2024-09-19: [https://www.anthropic.com/news/contextual-retrieval](https://www.anthropic.com/news/contextual-retrieval) (fetched 2026-10-12)
+- Anthropic, "Building effective agents", 2024-12-19: [https://www.anthropic.com/engineering/building-effective-agents](https://www.anthropic.com/engineering/building-effective-agents)
+- Chip Huyen, "Building A Generative AI Platform", 2024-07-25: [https://huyenchip.com/2024/07/25/genai-platform.html](https://huyenchip.com/2024/07/25/genai-platform.html)
+- Alex Jacobs, "The case against pgvector", 2025-10-29: [https://alex-jacobs.com/posts/the-case-against-pgvector/](https://alex-jacobs.com/posts/the-case-against-pgvector/)
+- Hamel Husain and Shreya Shankar, evals FAQ, modified 2026-09-21: [https://hamel.dev/blog/posts/evals-faq/](https://hamel.dev/blog/posts/evals-faq/)
+- Yan, Bischof, Frye, Husain, Liu, Shankar, "What We've Learned From A Year of Building with LLMs", 2024-06-08: [https://applied-llms.org/](https://applied-llms.org/)
+- Latent Space, hiring AI engineers (Elicit), 2024-06-21: [https://www.latent.space/p/hiring](https://www.latent.space/p/hiring)
+- Dover, how to hire an AI engineer at a startup, updated 2026-08-24: [https://www.dover.com/blog/how-to-hire-ai-engineer-startups](https://www.dover.com/blog/how-to-hire-ai-engineer-startups)
+- Pricing pages fetched 2026-10-11: Anthropic [https://platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing), OpenAI [https://developers.openai.com/api/docs/pricing](https://developers.openai.com/api/docs/pricing), Pinecone [https://www.pinecone.io/pricing/](https://www.pinecone.io/pricing/), turbopuffer [https://turbopuffer.com/pricing](https://turbopuffer.com/pricing)
+- Amplify Partners, 2025 AI Engineering Report, 2025-06-24: [https://amplifypartners.com/blog-posts/the-2025-ai-engineering-report](https://amplifypartners.com/blog-posts/the-2025-ai-engineering-report)

@@ -1,0 +1,179 @@
+---
+question: r2b-017
+family: systems-concurrency-primitives
+status: published
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "The pointer shares a small control block with an atomic count. Copying adds one, destroying subtracts one, and
+> whoever takes it to zero deletes the object. The increment can be relaxed, because you can only copy a pointer
+> you already safely hold. The decrement must be acquire-release, because every thread's use of the object has to
+> happen before the delete, and the deleting thread must see all of it. And thread-safe means separate copies in
+> separate threads, not two threads writing the same pointer."
+>
+> The rest of this page explains each part of that answer.
+
+### What makes this different from the concurrency you already write
+
+In service code you protect shared state with a lock, and you never think about the order in which memory writes
+become visible. A mutex handles that for you: everything one thread did before unlocking is visible to the next
+thread that locks.
+
+This question removes the lock. The count is an **atomic**: the hardware updates it in one indivisible step, so two
+threads can change it at once without losing an update. But an atomic on its own says nothing about *other*
+memory. On a modern processor, the compiler and the CPU reorder writes for speed, so another core can see your
+writes arrive in a different order than you wrote them. Every candidate makes the counter atomic. The interviewer
+is checking whether you can say which **memory ordering** each atomic operation needs, and why.
+
+The question appears as a PracHub title, "Implement a Thread-Safe Reference-Counted Smart Pointer in C++", tagged
+NVIDIA Senior+ and dated 2026-09-15 on the page (read 2026-10-12); a second title asks to "Implement and Explain a
+C++ Smart Pointer" (<Cite id="s-1f1d1ddaac" />). Only the titles are candidate-reported. Expect probing on the
+decrement, move semantics, self-assignment and what "thread-safe" covers.
+
+### Words you need first
+
+- A **reference-counted pointer** (C++'s `std::shared_ptr` is the standard one) counts how many pointers refer to an
+  object and deletes the object when the count reaches zero.
+- A **control block** is the small separate object that holds the count and a pointer to the real object. Every
+  copy of the smart pointer points at the same control block.
+- **Memory ordering** is the promise an atomic operation makes about other memory. In C++ there are three you need
+  here. `memory_order_relaxed`: the operation is atomic, and nothing more. `memory_order_release` on a write: every
+  write this thread made before it is published with it. `memory_order_acquire` on a read: if it sees a released
+  value, it also sees everything written before that release. `memory_order_acq_rel` is both, for an operation that
+  reads and writes, such as `fetch_sub` (subtract and return the old value).
+- **Happens-before** is the formal name for "this write is guaranteed to be visible before that read". Interviewers
+  use the phrase; be ready to say it in plain words.
+
+## Clarify first
+
+- **Control block, or a count stored inside the object (intrusive)?** Assume a control block, like `shared_ptr`.
+- **Weak pointers?** Assume no, and mention how they would change the design.
+- **Custom deleters, arrays?** Assume plain `delete` only.
+- **Which "thread-safe"?** Copies used in different threads, or one pointer object shared by threads? Assume copies.
+
+Say it like this: "I'll assume a shared_ptr-style control block with no weak count, and thread-safe meaning
+different copies in different threads. I'll say at the end what changes for the other cases."
+
+## Answer
+
+```cpp
+template <class T>
+class RcPtr {
+  struct Ctrl { std::atomic<long> refs; T* obj; };
+ public:
+  RcPtr() = default;
+  explicit RcPtr(T* p) : c_(p ? new Ctrl{{1}, p} : nullptr) {}
+  RcPtr(const RcPtr& o) : c_(o.c_) {
+    if (c_) c_->refs.fetch_add(1, std::memory_order_relaxed);
+  }
+  RcPtr(RcPtr&& o) noexcept : c_(std::exchange(o.c_, nullptr)) {}
+  RcPtr& operator=(RcPtr o) noexcept { std::swap(c_, o.c_); return *this; }
+  ~RcPtr() {
+    if (c_ && c_->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete c_->obj;
+      delete c_;
+    }
+  }
+  T* operator->() const { return c_->obj; }
+  T& operator*() const { return *c_->obj; }
+ private:
+  Ctrl* c_ = nullptr;
+};
+```
+
+### A worked example: one object's life
+
+Picture a service where several worker threads share one loaded model through this pointer.
+
+| Step | Thread | Operation | Count after | What to say in the interview |
+|---|---|---|---|---|
+| 1 | main | creates the pointer | 1 | "The control block starts at one." |
+| 2 | worker A | copies it (relaxed `fetch_add`) | 2 | "A got its copy through a queue or thread start, which already synchronized." |
+| 3 | main | writes some state into the model, then drops its copy (`fetch_sub` returns 2) | 1 | "Release publishes main's writes." |
+| 4 | worker A | uses the model, then drops its copy (`fetch_sub` returns 1) | 0 | "A reached zero, so A deletes. Acquire lets A see main's writes first." |
+
+**Increment: relaxed.** Look at step 2. Worker A could only copy the pointer because it already had one, handed to
+it by another thread. That handover (a queue, a lock, starting the thread) already synchronized the two threads, so
+the increment itself needs no ordering. Boost's documentation gives exactly this reasoning
+([Boost.Atomic usage examples](https://www.boost.org/doc/libs/1_86_0/libs/atomic/doc/html/atomic/usage_examples.html)).
+
+**Final decrement: ordered.** Look at steps 3 and 4. Main wrote into the model, then dropped its copy. Worker A
+deletes the model on a different core. Main's writes must be finished and visible before the delete runs, or the
+destructor can see half-written state. The release half of main's decrement publishes its writes. The acquire half
+of A's decrement, the one that reaches zero, sees them. Boost does it as a release `fetch_sub` plus an acquire
+**fence** (a standalone ordering instruction) only when the count hits zero. `acq_rel` on every decrement is
+simpler and slightly more expensive. cppreference notes that typical `shared_ptr` implementations increment relaxed
+while "decrementing requires stronger ordering"
+([cppreference](https://en.cppreference.com/w/cpp/memory/shared_ptr)).
+
+Say it like this: "Relaxed on the increment, because a copy can only come from a reference you already hold safely.
+Acquire-release on the decrement, because every use must happen before the delete."
+
+### Assignment and move
+
+**Copy-and-swap assignment.** `operator=` takes its argument by value, which makes a copy and adds one to the
+count. It swaps that copy in, and the old value is destroyed on the way out, subtracting one. Assigning a pointer to
+itself is safe, because the temporary copy keeps the count above zero, and the old object is released exactly once.
+
+**Move** steals the control-block pointer from the source and leaves the source empty. It never touches the count,
+so it costs no atomic operation at all.
+
+### What "thread-safe" covers
+
+Different copies of the pointer, used in different threads, are safe. One `RcPtr` instance written by two threads
+is a data race (two threads touching the same memory, at least one writing, with nothing coordinating them), as
+cppreference says of `shared_ptr`. That case needs a mutex or `std::atomic<shared_ptr>`. State this boundary before
+you are asked.
+
+### Weak pointers (the likely follow-up)
+
+A **weak pointer** can see the object but does not keep it alive. Add a weak count to the control block. Destroy the
+object when the strong count reaches zero; free the control block only when the weak count also reaches zero.
+`lock()`, which turns a weak pointer into a strong one, must use a CAS loop (compare-and-swap: "if it's still X,
+set it to Y") that increments only from a non-zero count. A plain `fetch_add` could bring a dead object back to life.
+
+### How it was checked, and what that proves
+
+The family walkthrough's test (2026-10-12): 200 rounds of 8 threads, each doing 1,000 copy, move and assign cycles
+while the owner drops its reference, under ThreadSanitizer (which reports data races) and AddressSanitizer (which
+reports use of freed memory). Result: 200 objects, each destroyed once.
+
+A deliberately wrong relaxed decrement also passed TSan in three runs. So argue the ordering; do not rely on the
+tool. A clean run means no bug was observed on that machine with that schedule, not that the code is right.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Reference counting"
+  senior={["Atomic count with relaxed increment and ordered final decrement, correct move and self-assignment."]}
+  staff={["Justifies each ordering in happens-before terms, separates per-copy from per-instance safety, sketches weak counts with a CAS-based lock, and knows a clean sanitizer run proves little here."]}
+/>
+
+## Small-team version
+
+Use `std::shared_ptr`, or `unique_ptr` when ownership is single, which is most of the time. Do not write your own.
+
+One performance habit transfers. Every copy of a shared pointer is an atomic update on one shared piece of memory,
+so copying it across many cores makes that memory a hot spot. Pass shared pointers by reference where ownership is
+not changing, and move them where it is.
+
+Low relevance to a small team's AI work; useful if you maintain C++ glue around a model server or GPU code
+written in CUDA.
+
+## Pitfalls
+
+- **`memory_order_relaxed` on the decrement.** Another thread's writes may not be visible when the object is
+  deleted, and tests may not catch it.
+- **`seq_cst` (the strongest ordering, and the default) everywhere with no reason given.** It is safe, but it avoids the question being asked.
+- **Self-assignment that frees the object first.** Releasing the old value before copying the new one deletes the
+  object you are about to copy.
+- **Claiming one shared instance is safe to reassign from two threads.** That is a data race, even for
+  `shared_ptr`.
+
+## Go deeper
+
+- Family walkthrough: [Systems-level concurrency primitives and race hunting](/system-design-labs/interviews/walkthroughs/systems-concurrency-primitives/), stage 3 and Verification.
+- Sibling: [multi-producer multi-consumer ring buffer](/system-design-labs/interviews/questions/r2b-018/).

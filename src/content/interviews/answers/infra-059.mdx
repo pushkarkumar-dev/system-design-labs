@@ -1,0 +1,164 @@
+---
+question: infra-059
+family: move-big-bytes
+status: published
+labs: [feature-flags, llm-eval]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "A model store is a registry of immutable versions, each with its training data, code, input schema and test
+> results. Names like 'prod' point at versions, so promotion and rollback move a pointer, never the bytes.
+> Each version declares the inputs it needs, and serving refuses to activate one it can't feed. A/B tests
+> split users by a hash of their id, and I size the test before starting. Moving batch scoring online buys
+> freshness at a per-request cost, so I'd run it in shadow first and keep the batch score as a fallback."
+>
+> The rest of this page explains each part of that answer.
+
+The task, from 2020: design a model store covering versioning, backward compatibility, A/B testing and easy
+prototyping. Then move hourly batch scoring into the request path. The models are small here, so this is not
+about moving bytes. It is about the control plane around versions, and the cost of going from batch to
+online. The same shape now governs large-model weights and prompt versions.
+
+### What makes this different from a normal artifact registry
+
+You already know artifact registries: a container registry or a package repository stores immutable builds,
+and a tag points at one. A model store looks the same, with two differences.
+
+First, a model has a hidden contract with its inputs. It was trained on certain **features** (the input
+values it reads, such as "user's clicks in the last 7 days"). If serving computes a feature differently, or
+not at all, the model still runs and returns numbers. They are just wrong. A code build fails loudly when an
+interface changes; a model fails quietly.
+
+Second, "is the new version better?" is a statistics question. You can't answer it from a test suite alone;
+you need an experiment on live users, and that experiment has a size.
+
+This question comes from a Blind commenter describing their own Facebook ML-infra round (an E6/E7 loop, in
+their words). They list a model store with "model versioning, backwards compatibility, a/b testing, easy
+prototyping", and moving hourly SparkML batch jobs into request-path inference. No answer details survive
+(<Cite id="s-e030bbd728" />).
+
+## Clarify first
+
+- **How many models, how big, how often retrained?** "I'll assume dozens of ranking models of a few MB to a few
+  GB, retrained daily."
+- **What does backward compatible mean here?** The input features, the output format, or both?
+- **A/B unit and metric.** Split by user, session or request? Which metric decides?
+- **For the online move:** request rate, latency budget, and which features exist at request time.
+- **Why move at all?** Is hourly staleness costing money, or is this about compute?
+
+## Answer
+
+### Words you need first
+
+- **Version**: one trained model, never changed after it is registered.
+- **Alias**: a name such as `prod`, `candidate` or `shadow` that points at a version.
+- **Feature schema**: the list of input features a version expects, with their types and how they are
+  computed.
+- **Shadow mode**: running a new version on real traffic and logging its answers without showing them to
+  anyone.
+
+### The store
+
+```
+Training job ──► register(version, metadata) ──► Model store (immutable versions + aliases)
+                                                    │
+                                                    ▼
+Serving ── reads alias "prod" ── checks the feature schema ── loads the version
+   │
+   └── A/B: hash(user id) → arm → version; log the version with every prediction
+```
+
+- **Immutable versions** with a content hash and metadata: the training data snapshot, the code commit, the
+  feature schema version, offline test results and the owner.
+- **Aliases** that point at versions. Promotion and rollback move an alias, never the bytes. Say: "Rollback
+  is moving a pointer."
+- **A compatibility contract.** Each version declares the feature schema and output it expects. Serving refuses
+  to activate a version whose features it can't produce. So an incompatible model fails at deploy time, not on
+  live traffic.
+- **A/B assignment** by a stable hash of the user id, so a user always sees the same arm. Log the version with
+  every prediction, and size the test before starting.
+- **Prototyping**: anyone can register a version and run it in shadow against production traffic without
+  affecting responses.
+
+### Size the A/B test before starting
+
+The question every A/B test must answer first: how many users do we need to see a real difference? Worked
+example: the current model's success rate is 60%, and you want to detect a change of 3 points. For a
+two-sided test at 80% power (the usual choice: an 80% chance of detecting a real 3-point change), you need
+about **4,180 users per arm**. Say: "I'd size the test before starting, so we know how long it must run."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+n ≈ 2 × p(1 − p) × (z_α + z_β)² ÷ δ², with p the baseline rate, δ the smallest change worth detecting, and
+z_α + z_β = 1.96 + 0.84 = 2.80 for two-sided 5% significance and 80% power.
+
+- p = 0.6, δ = 0.03: 2 × 0.24 × 7.84 ÷ 0.0009 ≈ **4,180 per arm**.
+
+</details>
+
+### Moving hourly batch scoring online
+
+Today a batch job scores every user once an hour. Its scores are up to an hour old, plus the job's runtime,
+but they cost one pass per user per hour. Scoring online, inside each request, is fresh but costs compute on
+every request and adds a latency budget. It also adds a new failure: **training/serving skew**, where
+features computed at request time differ from the ones the model was trained on.
+
+Roll it out in steps:
+
+1. Serve the batch score as today.
+2. Score online in shadow and compare with the batch score for the same users.
+3. Ramp traffic behind a flag.
+4. Keep the last batch score as the fallback when the online path times out.
+
+Decide on the measured gain in the business metric, not on freshness alone. Say: "Fresher isn't the goal;
+better outcomes are. If the online score doesn't move the metric, the per-request cost buys nothing."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Model store and online scoring"
+  senior={["Designs versions, aliases, compatibility checks and hash-based A/B assignment, and sizes the test."]}
+  staff={["Asks whether freshness is worth the per-request cost before migrating, and plans the shadow comparison and fallback that make the move reversible."]}
+/>
+
+In plain words: Senior builds a correct store. Staff questions whether the online move is worth doing, and
+makes it reversible if it is.
+
+## Small-team version
+
+A registry table (or your experiment tracker's model registry) plus a bucket of artifacts named by hash is
+enough. Keep the active version in config, canary on one replica, and use your feature-flag system for the
+split.
+
+For features built on a large language model, the "model" is often a prompt plus a provider's model name.
+Version them the same way, and gate them with an eval set (a fixed list of test cases) before any A/B test.
+
+Most small teams lack the traffic for 4,180 users per arm on a 3-point change. At an assumed 1,000 users a day
+split 50/50, that is 4,180 ÷ 500 ≈ **8.4 days**. A 10-point change needs only about **376 per arm**, under a
+day. So lean on offline evals, and A/B test only changes big enough to see. Revisit when traffic reaches tens
+of thousands of users a day.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- 4,180 per arm ÷ 500 users per arm per day ≈ 8.4 days.
+- δ = 0.10: 2 × 0.24 × 7.84 ÷ 0.01 ≈ 376 per arm.
+
+</details>
+
+## Pitfalls
+
+- **A mutable "latest" pointer with no record.** You can't tell which version served a prediction.
+- **Treating compatibility as a code concern.** It is a feature-schema contract, checked at deploy.
+- **Starting an A/B test without its size.** It may need weeks you don't have.
+- **Moving online with no shadow period or fallback.** The move then can't be undone safely.
+
+## Go deeper
+
+- Family walkthrough: [the 2020 control plane](/system-design-labs/interviews/walkthroughs/move-big-bytes/#integrity-staged-rollout-and-rollback-by-epoch).
+- Rollout and A/B assignment: <LabRef lab="feature-flags" inline />. Paired tests and confidence intervals: <LabRef lab="llm-eval" inline />.
+- Gates and A/B in depth: [eval-system walkthrough](/system-design-labs/interviews/walkthroughs/eval-system/).

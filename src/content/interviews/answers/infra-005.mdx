@@ -1,0 +1,181 @@
+---
+question: infra-005
+family: chat-serving-streaming
+status: published
+labs: [llm-inference, load-balancer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "A chat request goes through a gateway, gets routed to a GPU machine that holds the model, waits for free GPU
+> memory, then the model reads the whole prompt once and writes the reply one token at a time, streaming each
+> token back. The first word's delay comes from queueing and reading the prompt. The speed of the words after that
+> comes from how many users share the GPU. And the number of users one machine can hold is limited by GPU memory,
+> not GPU speed."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The interviewer wants to know one thing: do you understand that answering a chat message with a large language
+model (LLM) is **not** like serving a normal web request?
+
+A normal web request is cheap and stateless. A server reads a few rows from a database, builds a response in a
+few milliseconds, and forgets about you. Any server can take your next request.
+
+An LLM request is different in three ways, and a good phone-screen answer is built around them:
+
+1. **It is slow and has two parts.** The model first reads your whole prompt, then writes the reply one word at
+   a time. A reply of a few hundred words can take 10–20 seconds to finish.
+2. **It holds memory while it runs.** While the model writes your reply, the GPU keeps a working memory of
+   everything said so far. That memory is what limits how many users one machine can serve at once.
+3. **It runs on GPUs, which are scarce and expensive.** One large model fills a whole machine of 8 GPUs, so
+   every design choice is about keeping those GPUs busy without making users wait.
+
+If you explain those three things clearly and walk a request through the system in order, you have passed the
+screen. The details below are what to say at each step.
+
+(This question was reported for an OpenAI phone screen. The source is a forum summary we could only partly see,
+so treat the exact wording as approximate <Cite id="s-401c185c20" />.)
+
+## Clarify first
+
+Spend one minute pinning down the setup, so your numbers mean something. Say your assumptions out loud:
+
+- **Which model and hardware?** "Let's assume a 70-billion-parameter model, running on a machine with 8 GPUs."
+- **Chat or batch?** "It's interactive chat, so the reply streams to the user as it is written."
+- **Which delay matters?** "Two delays matter: how long until the first word appears, and how fast the words
+  keep coming after that. I'll treat them separately."
+- **How long do we have?** "In 30–45 minutes I'll cover the whole path first, then go deep on one part."
+
+## Answer
+
+### Two words you need first
+
+- **Prefill**: the model reads the entire prompt (system instructions, chat history and the new message) in one
+  big pass. This decides how long the user waits for the *first* word.
+- **Decode**: the model then produces the reply one token (roughly ¾ of a word) at a time. Each new token needs
+  another pass. This decides how fast the words *keep coming*.
+
+The interview names for these two delays are **TTFT** (time to first token) and **ITL** (inter-token latency,
+the gap between words).
+
+### The request, step by step
+
+Walk the interviewer through this path, top to bottom:
+
+```
+User's browser
+   │  1. message arrives (HTTPS)
+   ▼
+Edge / API gateway ── checks login, checks the user's token quota
+   │  2. build the prompt
+   ▼
+Prompt builder ── system prompt + chat history + new message, split into tokens
+   │  3. choose a GPU machine
+   ▼
+Router ── picks the least busy model server
+   │  4. wait for room
+   ▼
+Model server queue ── waits until there is GPU memory for this conversation
+   │  5. prefill (read the prompt)  → first token
+   │  6. decode (write the reply)   → one token at a time
+   ▼
+Stream back ── each token is sent to the browser as soon as it exists
+```
+
+### Follow one message through it
+
+Say a user types *"Explain how DNS works"* and presses Enter. Their conversation already has some history, and
+the app adds a long system prompt, so the full prompt is about 3,600 tokens. Here is what happens, with a rough
+clock (illustrative numbers for a busy 8-GPU machine, worked out in the box further down):
+
+| Clock | Step | What happens | What to say in the interview |
+|---|---|---|---|
+| 0 ms | **1. Edge** | The gateway checks the login and the user's quota. | "Limits should count tokens, not requests: one long request can cost a thousand times more than a short one." |
+| ~5 ms | **2. Prompt builder** | System prompt + history + new message are joined and split into 3,600 tokens. | "This is cheap. The expensive part is the model." |
+| ~6 ms | **3. Router** | Picks which GPU machine gets the request. | "Prefer a machine that recently saw the same system prompt, so it can reuse work it already did for that text." |
+| 6 ms → ? | **4. Queue** | The request waits until the machine has free GPU memory for it. | "When the system is busy, this is where the first-word delay grows." |
+| +64 ms or more | **5. Prefill** | The model reads all 3,600 tokens in one big pass. | "The hardware can't do this faster than about 64 ms; then the first token appears." |
+| every ~38 ms | **6. Decode** | The model writes one token per pass. It shares each pass with every other user on the machine. | "More users per pass means more throughput but slower words for each user." |
+| as produced | **7. Stream** | Each token goes to the browser right away over SSE (one long-lived HTTP response the server keeps writing to). | "The user sees the reply type itself out." |
+
+A 400-token reply at about 38 ms per token takes 400 × 0.038 ≈ **15 seconds** to finish. During those 15
+seconds the conversation occupies GPU memory, and that is the next part of the answer.
+
+### Why memory is the limit, not raw GPU speed
+
+While a reply is being written, the GPU keeps a saved summary of every token so far, so it does not have to
+re-read the whole conversation for each new word. This saved summary is called the **KV cache**.
+
+For our 70B model it costs about **320 KB per token**. A conversation of 4,000 tokens therefore holds about
+1.3 GB of GPU memory until the reply finishes. An 8-GPU machine has 640 GB of memory in total, but about 141 GB
+of that holds the model itself. The rest is shared by all active conversations.
+
+So the honest answer to "how are GPUs handled?" is:
+
+- The model is **split across the 8 GPUs** of one machine (called *tensor parallelism*), so they act as one big
+  GPU.
+- Each machine runs **one batch that is always changing**: finished conversations leave and new ones join between
+  passes (called *continuous batching*).
+- The number of conversations a machine can hold at once is set by **memory for the KV cache**, not by how fast
+  the GPUs compute.
+
+### If you have time for one deep point
+
+Say: "A very long new prompt can make everyone else's words stall while it is being read. The fix is to read
+long prompts in chunks, between decode passes, so other users keep getting words." This is called *chunked
+prefill*, and naming it shows you understand how prefill and decode compete for the same GPUs.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Prefill floor:** reading a prompt costs about 2 × parameters × prompt tokens of math:
+  2 × 70.55 × 10⁹ × 3,600 ≈ 5.1 × 10¹⁴ operations. An 8×H100 machine peaks at about 7.9 × 10¹⁵ operations per
+  second, so 5.1 × 10¹⁴ ÷ 7.9 × 10¹⁵ ≈ **64 ms**.
+- **KV cache per token:** 2 × 80 layers × 8 KV heads × 128 values × 2 bytes = 327,680 bytes ≈ **320 KB**.
+- **One decode pass:** every pass reads the model weights and every active conversation's KV cache from GPU
+  memory. With 699 conversations of 3,800 tokens each, that is about 17.6 GB of weights plus 108.8 GB of KV cache
+  per GPU, at 3.35 TB/s of memory speed: (17.6 + 108.8) ÷ 3,350 ≈ **38 ms per token** for every user. That is
+  why adding users eventually slows everyone's words down.
+
+</details>
+
+
+## Senior vs Staff
+
+<LevelContrast
+  title="GPT-like request flow"
+  senior={["Walks the request in order, explains prefill vs decode in plain terms, and says GPU memory (the KV cache) limits how many users a machine can hold."]}
+  staff={["Also puts rough numbers on both delays from first principles, and says what they would measure to find out whether memory or the per-word delay is the real bottleneck."]}
+/>
+
+## Small-team version
+
+At most companies you will not run the model yourself. You call a provider's API (Anthropic, OpenAI and so on),
+and steps 5 and 6 happen inside their system. Your part of the path is still real:
+
+- **Your hops:** login, per-customer token quota, building the prompt, and relaying the stream to the browser.
+  Keep these to a few milliseconds each.
+- **What to measure:** time to first token and total time for every request, plus tokens used and cost.
+- **What it costs:** at Claude Sonnet 5 list prices ($2 per million input tokens, $0.20 per million cached input
+  tokens, $10 per million output tokens; checked 2026-10-11), a request with 3,000 input and 400 output tokens
+  costs about **1 cent**, or about **0.64 cents** if a 2,000-token system prompt is cached.
+
+Running your own GPUs only starts to pay off at hundreds of millions of tokens a month of steady traffic. The
+family walkthrough works through that break-even.
+
+## Pitfalls
+
+- **Treating it like a stateless web request.** Model servers hold per-conversation memory; any-server routing
+  throws away reusable work.
+- **Lumping the two delays together.** First-word delay and word-to-word delay have different causes and
+  different fixes.
+- **Saying GPU compute limits the number of users.** Usually memory does.
+- **Spending the whole screen on one box.** Cover the full path first, then go deep on one point.
+
+## Go deeper
+
+- Family walkthrough: [Serve a ChatGPT-style assistant with streaming](/system-design-labs/interviews/walkthroughs/chat-serving-streaming/), the full design with sizing.
+- The bandwidth and math behind the numbers: [roofline and sharded matmul](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/).
+- Labs: <LabRef lab="llm-inference" inline /> (you build prefill, decode and a KV cache yourself), <LabRef lab="load-balancer" inline />.

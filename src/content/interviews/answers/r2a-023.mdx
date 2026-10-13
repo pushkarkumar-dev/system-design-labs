@@ -1,0 +1,181 @@
+---
+question: r2a-023
+family: agent-memory-context
+status: published
+labs: [agent-framework, mcp-server, llm-eval]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Agent memory has five parts: what the model sees in this call, the state of this conversation, facts about the
+> user, summaries of past sessions, and skills, meaning know-how about how to do a task. For each I'd say what it
+> stores, who writes it, how it's read and when it expires. For the skills pipeline: collect runs that really
+> succeeded, group them by task, have a strong model draft a skill, test it with and without on tasks it hasn't
+> seen, have a person approve it, and publish it only inside that customer's space. Then watch it and retire it
+> when it stops helping."
+>
+> The rest of this page explains each part of that answer.
+
+A Snowflake ML engineer candidate reports an "Expertise" round where "All the questions I got were about agents":
+first a pipeline that automatically extracts or distills agent skills for enterprise customers, then the common
+components of agent memory (<Cite id="s-5b59630431" />). The candidate's answers aren't on the page.
+
+### Why this is not just "save the logs and reuse them"
+
+In a normal backend, reusable know-how lives in code that engineers write and review. Logs record what happened;
+nobody expects the logs to become the next version of the service.
+
+An **agent** (a model running in a loop, calling tools until a task is done) is different. Much of its know-how
+is written in plain-language instructions, and those instructions can be learned from its own past runs. That is
+powerful, and it creates three problems a log pipeline never had:
+
+1. **You must know which runs really succeeded.** An agent that stopped is not an agent that finished the job.
+2. **A learned procedure can be wrong,** and the agent will follow it confidently next time.
+3. **On a platform with many business customers, a procedure learned from one customer can leak that customer's
+   data and internal processes to another.**
+
+The skills pipeline tests whether you can turn past runs into reusable procedures with evaluation, review and
+tenant isolation. The memory question tests vocabulary plus write and read paths.
+
+### Words you need first
+
+- **Token and context:** a token is roughly ¾ of a word; the context is everything sent to the model in one call.
+  The model remembers nothing between calls except what your code puts in the context.
+- **Trace:** the full record of one agent run: the messages, the tool calls, their results and the outcome.
+- **Skill:** a small package of know-how for one kind of task, such as a short instruction file plus optional
+  scripts, that the agent loads when it is relevant.
+- **Tenant:** one business customer of the platform, with its own data, users and rules.
+- **Distillation:** turning many successful traces into one short, reusable skill.
+
+## Clarify first
+
+- **What is a "skill" here:** instructions, a tool sequence, executable code, or all three? "I'll assume a folder
+  with instructions and optional scripts."
+- **Where do traces come from, and how do we know a run succeeded?** "I'll assume agent traces per customer, with
+  an outcome signal: task verified, or user approved."
+- **Are skills private to one customer or shared?** "Private by default."
+- **Who may approve a skill that runs code?** "A customer admin."
+
+## Answer
+
+### The example to keep in mind
+
+One tenant is an online shop using the platform's support agent. A customer, Maya, writes: "My order A-17 is
+late." The agent looks up the order, checks her identity, issues a replacement, and promises to email her the
+tracking number. Thousands of conversations like this happen every month. Some go well; some end with the agent
+giving up or the customer complaining.
+
+Memory is what lets the agent handle Maya well next week. Skills are what let it handle the *next thousand*
+delayed orders well, by learning "how to replace a delayed order" from the good runs.
+
+### Memory components
+
+The standard vocabulary comes from the CoALA paper's working, episodic, semantic and procedural memory
+([arXiv 2309.02427](https://arxiv.org/abs/2309.02427)). In plain words: working memory is what the model sees
+now; episodic is what happened before; semantic is facts; procedural is how to do things. Procedural memory also covers the model's weights (the numbers it learned in training). A production agent adds
+session state, the facts this conversation depends on.
+
+| Component | Stores | Written by | Read by | Maya's case |
+|---|---|---|---|---|
+| Working context | the current call's prompt | the orchestrator (your code) | the model, every call | instructions, recent turns, fetched memories |
+| Session state | ids, actions, promises | tool results and code | every call in the session | order A-17, replacement issued, promise to email |
+| Semantic | facts, preferences | post-session extraction | retrieval per turn | "prefers email" |
+| Episodic | summaries of past runs | end-of-session summarizer | similarity search | "replaced A-17 after a delay" |
+| Procedural | skills, code, weights | distillation pipeline, engineers | loaded when relevant | "how to replace a delayed order" |
+
+Say it like this: "For each component I can tell you what it stores, who writes it, how it's read and when it
+expires. If I can't answer all four, the design isn't done."
+
+### The skill-distillation pipeline
+
+```
+Agent traces, per tenant
+     │  1. keep only verified successes
+     ▼
+Cluster by task  ──  2. group similar tasks, keep big-enough groups
+     │
+     ▼
+Draft skill (strong model)  ──  3. instructions + tool sequence + known failures
+     │
+     ▼
+Evaluate: same held-out tasks, with vs without the skill  ──  4.
+     │  clear gain only
+     ▼
+Review (scrub data; person approves code)  ──  5.
+     │
+     ▼
+Tenant's skill registry (version, owner)  ──  6. monitor, retire
+```
+
+1. **Collect verified successes** per tenant: runs whose outcome was confirmed, not runs that merely stopped. For
+   the shop: conversations where the replacement actually shipped and the customer didn't come back angry.
+2. **Cluster by task.** Group traces using embeddings (lists of numbers a model produces so that similar texts
+   get similar numbers) of the task description plus the tool sequence. Keep clusters with enough runs.
+3. **Draft a skill** with a strong model: short instructions, the tool sequence, any script, and the failure
+   modes seen in unsuccessful runs of the same cluster. Anthropic's Agent Skills format loads only a skill's name
+   and description up front and reads the full file when relevant, which keeps many skills cheap to carry
+   ([2025-10-16](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)).
+4. **Evaluate** on **held-out tasks** (tasks from the cluster that were not used to write the skill). Run each one
+   with and without the skill. This is a **paired comparison**: the same tasks both ways, so any difference comes
+   from the skill, not from easier tasks. Ship only on a clear gain.
+5. **Review:** scrub customer data; a person approves anything that runs code or touches data. The same Anthropic
+   post advises installing skills only from trusted sources and auditing less-trusted ones.
+6. **Publish** with a version and owner to the tenant's registry; **monitor** how often it loads and how often
+   runs that load it succeed; **retire** skills whose success falls after an upstream change, for example when the
+   shop changes its order system.
+
+**Isolation.** A skill distilled from tenant A's traces can carry A's data and procedures. So it stays in A's
+namespace unless it is deliberately generalized, scrubbed and promoted to a shared library.
+
+### Is the skill worth publishing?
+
+Measure the gain: the success rate with the skill minus the success rate without it, on the same held-out tasks.
+For example (assumed numbers): on 40 paired tasks, 26 succeed with the skill and 20 without. That is a
+**15-point gain**. Before publishing, check that the gain is real and not luck, with a statistical interval.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+gain = success rate with skill − success rate without, on the same held-out tasks.
+
+- Assumed 40 paired tasks: 26 ÷ 40 = 65% with the skill, 20 ÷ 40 = 50% without, so the gain is **15 points**.
+- A **paired bootstrap** interval tells you whether that gain clears zero: resample the 40 task pairs with
+  replacement many times, recompute the gain each time, and look at the spread. Publish only if the interval
+  stays above zero. With only 40 tasks a 15-point gain may not clear zero, so expect to need more tasks.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Skills and memory"
+  senior={["Names the memory components with write and read paths, and builds a pipeline from verified traces to evaluated skills."]}
+  staff={["Owns tenant isolation, approval for code-running skills, and the retirement loop, and defines success so the pipeline doesn't learn from runs that only looked done."]}
+/>
+
+## Small-team version
+
+Most 50–500 person companies don't need automatic distillation. The small version is manual:
+
+- **When the agent handles a task well, ask it to write up its approach as a skill file.** Anthropic's post
+  describes exactly this capture step: users can ask Claude to "capture its successful approaches and common
+  mistakes" into a skill.
+- **Review the file** like a code change, add it to the repo, and run the eval with and without it.
+- **Keep skills in version control,** one folder per skill, with an owner.
+- **Automate only when you have many customers generating traces.** That is the platform-scale problem the
+  Snowflake question describes.
+
+## Pitfalls
+
+- **Learning from runs that ended, not runs that succeeded.** The skill then teaches the agent to stop early.
+- **Shared skills built from one customer's data.** It leaks one tenant's data and procedures to others.
+- **Publishing skills without a with/without comparison.** You can't tell a helpful skill from a harmful one.
+- **Listing memory products instead of components and their paths.** The question asks what is stored, written
+  and read, not which vendor to buy.
+
+## Go deeper
+
+- Family walkthrough: [Agent memory and context management](/system-design-labs/interviews/walkthroughs/agent-memory-context/), sections "Skills as procedural memory" and worked example 4.
+- Expose skills and memory as tools: <LabRef lab="mcp-server" inline />. Paired comparison: <LabRef lab="llm-eval" inline />. A loop to attach skills to: <LabRef lab="agent-framework" inline />.

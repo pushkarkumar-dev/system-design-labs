@@ -1,0 +1,1239 @@
+---
+title: "Implement LLM internals from scratch: attention, KV cache, GQA, decoding and BPE"
+summary: "The coding round, often with no AI tools, where you build a language model's parts by hand: attention, a cache for fast generation, decoding and a tokenizer, each tested against a trusted reference."
+track: cross
+format: coding
+family: llm-from-scratch
+smallTeamFocus: "Never ship your own attention or tokenizer. Know them well enough to lay out prompts for the provider's cache, budget tokens and latency, and debug a self-hosted model's tokenizer, sampling and KV memory."
+rounds: [practical-coding, debugging]
+level: both
+timeboxMin: 60
+order: 100
+status: published
+basedOn: [infra-064, infra-063, r2b-013, infra-069, infra-065, r2b-014, infra-068, r2b-005, eng-061, eng-060]
+askedAt: [anthropic, openai, meta, apple, google, nvidia, microsoft, perplexity, glean, together-ai]
+labs:
+  - { lab: transformer, role: proof, note: "Scaled dot-product attention, multi-head attention, a pre-norm block and a GPT trained on TinyShakespeare; its 10 tests passed on 2026-10-11. It has no GQA, a GELU (not SwiGLU) feed-forward, and its generate() re-runs the whole context because there is no KV cache." }
+  - { lab: llm-inference, role: partial, note: "A real KV cache on GPT-2 (prefill, then one token per step) and a KV-size formula that takes n_kv_heads. Its cache grows with torch.cat, and its throughput rows are estimates." }
+  - { lab: tokenizer, role: partial, note: "Byte-level BPE training, encoding and decoding. All 31 tests pass as of 2026-10-13. The v2 GPT-2-style tokenizer used to drop spaces because its split pattern matched no whitespace; it now uses GPT-2's pattern." }
+gapLabs: []
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll build it in small stages and test each stage before I add the next one. Attention is a weighted
+> average: each token scores the tokens before it, turns those scores into weights that add up to 1, and
+> mixes the earlier tokens' information using those weights. Bugs in this code rarely crash. They produce
+> numbers with the right shape that are simply wrong, so I'll write the shape on every line and keep three
+> tests: match PyTorch's built-in attention, check that changing the last token never changes an earlier
+> output, and check that generating with a cache gives exactly the same numbers as running the whole text at
+> once. The cache exists because the model writes one token at a time, and without it every new token would
+> re-read the whole text."
+>
+> The rest of this page explains each part of that answer.
+
+### What makes this round different
+
+In a normal coding round, a wrong answer usually fails loudly. An index goes out of range, a function returns
+the wrong integer, or a test prints a diff. You see the bug and you fix it.
+
+Model code fails quietly. Everything in it is a large array of floating-point numbers. If you swap two axes,
+put a mask on the wrong side, or normalize over the wrong dimension, you still get an array of the right size,
+full of plausible-looking numbers. Nothing crashes, and nothing looks odd when you print it. The only way to
+know the code is right is to compare it with something you already trust. This page calls that trusted thing
+an **oracle**: a reference implementation, a brute-force search, or a property that must always hold.
+
+Two more things set this round apart. Several of the companies that ask it ban AI tools for the round, so you
+write the code from memory. And the follow-up questions are rarely about syntax. They ask why a piece exists
+and what it costs in memory and speed. The page is built around those three facts: quiet bugs, no assistant,
+and "why" questions.
+
+### How a language model writes text
+
+You need a rough picture of the whole machine before the pieces make sense. A large language model (**LLM**)
+does one job: given some text, it predicts what comes next. It writes a reply by predicting one small piece,
+adding it to the text, and predicting again. Here is the path one prompt takes:
+
+```text
+"Olé"                       text typed by a user
+   │  1. tokenizer: text -> token ids
+   ▼
+[79, 108, 195, 169]         four tokens
+   │  2. embedding: each id -> a vector of d_model numbers, plus its position
+   ▼
+Block 1  ── attention (each token looks back at earlier tokens)
+         ── feed-forward (each token is transformed on its own)
+   │
+Block 2  ── same again; same shape in, same shape out
+   │  3. output head: last token's vector -> one score per vocabulary entry
+   ▼
+Decoding ── turn scores into probabilities, pick the next token
+   │  4. append the new token, run again (with a cache, only the new token runs)
+   ▼
+Tokenizer decode ── token ids -> text, streamed back to the user
+```
+
+**The tokenizer** turns text into a list of integers. Each integer is a **token**, a small piece of text such
+as a byte, a few letters or a whole word. The set of all possible tokens is the **vocabulary**. In the
+simplest tokenizer every UTF-8 byte is its own token, so "Olé" becomes four ids: `O` is 79, `l` is 108, and
+the two bytes of "é" are 195 and 169.
+
+**The embedding** looks up a learned vector of numbers for each token id, and adds a second vector that encodes
+the token's position. The vector length is called `d_model`. From here on, each token is a row of `d_model`
+numbers.
+
+**The blocks** are the body of the model, stacked one after another. Each block has two parts. **Attention**
+lets each token gather information from the tokens before it. The **feed-forward** layer then transforms each
+token's vector on its own. A model with this design is a **transformer**, and one that only ever looks
+backward is a **decoder**. All the learned numbers inside the embedding, the blocks and the head are the
+model's **parameters**, also called its **weights**.
+
+**The output head** turns the last token's vector into one score per vocabulary entry. These raw scores are
+called **logits**. Higher means "more likely to come next".
+
+**Decoding** turns the logits into probabilities with a **softmax** (a function that makes every score
+positive and scales them to add up to 1), then chooses the next token. You can always take the most likely
+one (**greedy** decoding), draw one at random by probability (**sampling**), or keep several candidate
+continuations and return the best (**beam search**).
+
+**Generation** repeats the loop. Reading the whole prompt in one pass is called **prefill**. Each later pass
+that adds one token is called **decode**. Most of the work done during a decode step would repeat work from
+earlier steps, so models save it in a **KV cache**, which [Stage 3](#stage-3-kv-cache) explains.
+
+### The task
+
+In one hour, usually without AI tools, implement the attention step with a **causal mask** (the rule that a
+token may only look at itself and earlier tokens) and a softmax that doesn't overflow. Extend it to several
+attention "heads" running side by side, then to a memory-saving variant called grouped-query attention
+(**GQA**). Add a KV cache so the model can decode one token at a time. Wrap it in a transformer block. Finish
+with decoding: always take the best token, sample, or run beam search and return the probability of the
+sequence it picks. Some versions start from the tokenizer instead, often byte-pair encoding (**BPE**,
+explained in Stage 7). Others hand you a few hundred lines of buggy transformer code and ask you to fix it
+before you add the cache.
+
+No company asks all of it at once. These questions were reported for OpenAI, Anthropic, Meta, Apple, Google,
+Microsoft, Perplexity, Glean, NVIDIA and Together AI, with evidence ranging from first-hand accounts to bare
+titles (the next section says which is which):
+
+<QuestionRow id="infra-064" />
+<QuestionRow id="infra-063" />
+<QuestionRow id="r2b-013" />
+<QuestionRow id="infra-069" />
+<QuestionRow id="infra-065" />
+<QuestionRow id="r2b-014" />
+<QuestionRow id="infra-068" />
+<QuestionRow id="r2b-005" />
+<QuestionRow id="eng-061" />
+<QuestionRow id="eng-060" />
+
+This walkthrough builds every piece in seven stages, in Python with NumPy (array maths) and PyTorch (the same,
+plus neural-network layers), and checks each stage against an oracle. All the code on this page is the code
+that was tested: a 39-test suite ran on 2026-10-12 on an Apple M1 Ultra (Python 3.13.7, PyTorch 2.14.1, NumPy
+2.5.4), and all 39 tests passed under ten different random seeds.
+
+## What is being tested
+
+The reports are thin, so here is exactly what each one says.
+
+**OpenAI, Research Engineer (first-hand, Aced).** The candidate got "roughly a few hundred lines of
+transformer code" and was "told there was a bug in each of four annotated chunks". After the fixes came
+"Now implement KV caching in this transformer", with the follow-up "What parts of the transformer need to
+change for KV caching, and what optimizations would you make?" The candidate's own summary: "That
+open-endedness was the tricky part." The page gives no time limit or grading criteria. The candidate was
+rejected after the technical rounds, and the account doesn't say why (<Cite id="s-7fa103b073" />).
+
+**Anthropic, ML Engineer (AI Safety Fellow, first-hand, Aced).** This was a 55-minute round in Colab (a hosted
+Python notebook). The notebook had "around 20 to 30 lines of Python skeleton code, basically two function
+shells", and the job was to complete part of an LLM inference (running the trained model) or output-processing step. The
+candidate says the round was "pretty standardized and strict about no LLM use", and that they were told to test the
+environment and GPU ahead of time (<Cite id="s-8f304f761b" />). That matches Anthropic's official guidance: no
+AI in live interviews unless Anthropic says otherwise (<Cite id="s-b4d190c38f" />).
+
+**A Blind post about lab loops.** The poster writes "Some places (Anthropic specifically) want you to handle KV
+cache + GQA in the same hour" and calls a hand-rolled transformer or multi-head attention "table stake".
+A commenter adds: "I got asked to implement transformer in my final nvidia interview two years ago". Several
+commenters say the post is an advertisement, so it is a weak signal (<Cite id="s-a129aa6451" />).
+
+**Titles only**, read on 2026-10-12, with no question body behind them:
+- Meta: "Implement the Forward Pass of Multi-Head Attention From Scratch" (Sep 2026) (<Cite id="s-be19e40ea6" />).
+- Apple: "Implement Masked Multi-Head Self-Attention" (Apr 2026) (<Cite id="s-0630fd2aff" />).
+- Google: "Implement a Transformer Block with SwiGLU" (Dec 2025) (<Cite id="s-4e3fbcaea8" />).
+- Microsoft: "Greedy and Top-k Beam Search Decoding That Returns the Sentence Probability" (Sep 2026)
+  (<Cite id="s-d302bba651" />).
+- Perplexity: "Byte Tokenizer" (online assessment, Jan 2026), a "ByteTokenizer" onsite challenge (Dec 2025)
+  and "Beam Search Decoding" (Jan 2026) (<Cite id="s-bebe1e8956" />).
+- Glean: "Implement BPE Tokenizer" in a tech phone screen (Jun 2026) (<Cite id="s-5a478c45c5" />).
+
+**A prep guide, not a report.** techinterview.org's Together AI guide says interviewers "watch for scaled
+dot-product mechanics, causal masking, and numerical stability in the softmax", and that "subtracting the row
+max before exponentiating is the step people skip under pressure". The guide cites no candidate for either
+claim (<Cite id="s-0457784328" />).
+
+My reading of what is being graded, from those reports:
+
+1. **Shape discipline.** Every bug in this family shows up as a wrong axis, a wrong transpose or a mask with
+   the wrong alignment. If you write the array shape on every line, you catch most of them before you run
+   anything.
+2. **Correct code without an assistant.** At least two of these rounds bar AI tools, so this is one of the few
+   places where typing speed and recall still matter.
+3. **Knowing why each piece exists.** The OpenAI follow-up asks what changes and what you would optimize.
+   That is a question about memory and bandwidth, not about syntax.
+4. **Verification.** Can you prove the cache is right? The cheap proof is an equivalence test: decoding with
+   the cache must produce the same logits as one full pass over the same tokens.
+
+## Clarify and scope
+
+Ask these before you write code. Each comes with the assumption to say out loud if the interviewer doesn't
+answer: "I'll assume PyTorch is fine and use its built-in attention only as a test oracle."
+
+- **What may I use?** NumPy only, or PyTorch? `nn.Linear` (PyTorch's matrix-multiply layer)? May I call
+  `F.scaled_dot_product_attention`, PyTorch's built-in attention, as a reference in my tests? Assume PyTorch
+  modules are fine and the built-in attention is allowed only as a test oracle.
+- **Layout.** Is the input shaped `(batch, time, d_model)`, batch first? Assume yes.
+- **Self- or cross-attention, causal or not?** Self-attention means the tokens attend to each other.
+  Cross-attention means they attend to a second input, such as a source sentence. Assume causal
+  self-attention for a decoder.
+- **Padding.** Do the rows in a batch have different lengths? Then the short rows are filled with padding
+  tokens, and you need a padding mask as well as the causal mask. Assume equal-length rows at first and
+  mention padding.
+- **Training or inference?** Assume inference: no dropout (random zeroing used only in training) and no
+  backward pass.
+- **Positions.** Learned position vectors, or RoPE (rotary position embeddings, which encode position by
+  rotating parts of each vector inside attention)? Assume learned vectors. RoPE changes where the position
+  offset is applied (see Follow-ups).
+- **GQA ratio.** How many KV heads? (Stage 4 explains them.) Assume `n_heads` is divisible by `n_kv_heads`.
+- **Decoding.** Is there an end-of-sequence token (**EOS**)? A maximum length? Should beam search adjust
+  for length? Return the probability or its logarithm? Assume an optional EOS, no length penalty, and a
+  returned probability computed from summed log-probabilities.
+- **Tokenizer.** Bytes or characters as the base alphabet? Special tokens (reserved ids such as "end of
+  text")? A pre-splitting regex like GPT-2's? Assume byte-level, two special tokens and no regex.
+
+Out of scope unless asked: training, hand-written GPU kernels, paged KV memory and splitting the model across
+GPUs. Name them in one sentence: "I'll leave training, custom kernels and multi-GPU serving out unless you want
+them."
+
+## Plan before code
+
+Write a shape legend at the top of the file and use it in every comment. A **tensor** is PyTorch's name for an
+n-dimensional array, and its **shape** is the size of each dimension.
+
+| Symbol | Meaning |
+|---|---|
+| `B` | batch rows (beams, in beam search) |
+| `T` | new tokens in this call (the whole prompt in prefill, 1 in decode) |
+| `S` | tokens visible to attention: cached plus new, so `S ≥ T` |
+| `h`, `h_kv` | query heads, KV heads (`h_kv` divides `h`) |
+| `d` | head dimension, `d_model ÷ h` |
+| `V` | vocabulary size |
+
+### The example that runs through this page
+
+Follow one prompt from start to finish. The model is the `TinyGPT` built in Stage 5, at its default size:
+`d_model` = 64, 4 query heads, 2 KV heads, 2 blocks, so each head works on `d` = 16 numbers. The prompt is
+"Olé", which the byte tokenizer of Stage 7 turns into the four ids `[79, 108, 195, 169]`. The model reads the
+prompt, then writes two new tokens:
+
+| Step | `T` (new) | `S` (visible) | Query shape | Cached K shape | Mask | What to say in the interview |
+|---|---|---|---|---|---|---|
+| Prefill | 4 | 4 | `(1, 4, 4, 16)` | `(1, 2, 4, 16)` | 4 × 4 lower triangle | "The whole prompt goes through in one pass." |
+| Decode 1 | 1 | 5 | `(1, 4, 1, 16)` | `(1, 2, 5, 16)` | 1 × 5, all allowed | "One new token in, attending to everything cached." |
+| Decode 2 | 1 | 6 | `(1, 4, 1, 16)` | `(1, 2, 6, 16)` | 1 × 6, all allowed | "The cache grew by one row per layer; nothing was recomputed." |
+
+The query has 4 heads and the cache holds only 2. That gap is grouped-query attention, and it is why the cache
+is half the size it would otherwise be. Each later stage comes back to this table.
+
+### Choose your oracles first
+
+Decide on your oracles before you build anything. They are what turns "looks right" into "is right", and
+three of them cover almost everything here:
+
+1. **Reference comparison.** Your attention must match `F.scaled_dot_product_attention(..., is_causal=True)`
+   on random inputs whenever the query and key lengths are equal.
+2. **Causality test.** Change the last token. No output at an earlier position may move.
+3. **Cache equivalence.** Prefill a few tokens, then decode the rest one at a time. The logits must equal one
+   full forward pass over the same tokens.
+
+For decoding, the oracle is brute force over a tiny vocabulary. For tokenizers it is the round trip
+`decode(encode(s)) == s` on random Unicode. Say: "If I fall behind, I'll keep the tests and cut features."
+
+The figure shows the one idea people most often get wrong. In prefill, the mask is the familiar lower
+triangle. In a decode step there is one query row, and that row sits at the *last* position, so it may see
+every key. In the running example, decode step 2 is exactly the right-hand picture: one query, six keys.
+
+<Figure caption="The causal mask is aligned to the bottom-right corner. In prefill (left) it is the familiar lower triangle. In a decode step (right) the single new query sits at the last position and may see every key. A top-left-aligned mask lets it see only key 0.">
+  <svg viewBox="0 0 520 170" role="img" aria-label="Left: a 4 by 4 lower-triangular mask for prefill. Right: a 1 by 6 row where every key is allowed for one decode step, with a note that a top-left mask would allow only the first key.">
+    <text x="80" y="18" text-anchor="middle">prefill: T = S = 4</text>
+    <g fill="none" stroke="currentColor">
+      <rect x="30" y="30" width="25" height="25" style="fill: var(--fig-accent)" />
+      <rect x="55" y="30" width="25" height="25" /><rect x="80" y="30" width="25" height="25" /><rect x="105" y="30" width="25" height="25" />
+      <rect x="30" y="55" width="25" height="25" style="fill: var(--fig-accent)" /><rect x="55" y="55" width="25" height="25" style="fill: var(--fig-accent)" />
+      <rect x="80" y="55" width="25" height="25" /><rect x="105" y="55" width="25" height="25" />
+      <rect x="30" y="80" width="25" height="25" style="fill: var(--fig-accent)" /><rect x="55" y="80" width="25" height="25" style="fill: var(--fig-accent)" />
+      <rect x="80" y="80" width="25" height="25" style="fill: var(--fig-accent)" /><rect x="105" y="80" width="25" height="25" />
+      <rect x="30" y="105" width="25" height="25" style="fill: var(--fig-accent)" /><rect x="55" y="105" width="25" height="25" style="fill: var(--fig-accent)" />
+      <rect x="80" y="105" width="25" height="25" style="fill: var(--fig-accent)" /><rect x="105" y="105" width="25" height="25" style="fill: var(--fig-accent)" />
+    </g>
+    <text x="80" y="152" text-anchor="middle" style="fill: var(--fig-muted)">rows: queries, columns: keys</text>
+    <text x="370" y="18" text-anchor="middle">decode step: T = 1, S = 6</text>
+    <g fill="none" stroke="currentColor">
+      <rect x="295" y="55" width="25" height="25" style="fill: var(--fig-accent)" /><rect x="320" y="55" width="25" height="25" style="fill: var(--fig-accent)" />
+      <rect x="345" y="55" width="25" height="25" style="fill: var(--fig-accent)" /><rect x="370" y="55" width="25" height="25" style="fill: var(--fig-accent)" />
+      <rect x="395" y="55" width="25" height="25" style="fill: var(--fig-accent)" /><rect x="420" y="55" width="25" height="25" style="fill: var(--fig-accent)" />
+    </g>
+    <text x="370" y="105" text-anchor="middle">bottom-right aligned: sees all 6 keys</text>
+    <text x="370" y="128" text-anchor="middle" style="fill: var(--fig-warn)">top-left aligned (is_causal=True): sees key 0 only</text>
+  </svg>
+</Figure>
+
+## Solution in stages
+
+### Stage 1: softmax and attention
+
+Start with the idea. For each token, attention asks: "which earlier tokens matter to me, and how much?" Think
+of it as a soft hash-map lookup. Each token produces three vectors from its own row:
+
+- a **query** (q): what this token is looking for;
+- a **key** (k): what this token offers to others;
+- a **value** (v): the information it hands over if chosen.
+
+The token's query is compared with every visible key by a dot product, giving one **score** per key. A
+**softmax** turns the scores into weights between 0 and 1 that add up to 1. The output is the weighted average
+of the values. Unlike a real hash map, every key contributes a little, and the best match contributes most.
+The usual name is **scaled dot-product attention**.
+
+In the running example, during prefill the third token (195, the first byte of "é") has a query that is
+scored against the keys of tokens 1, 2 and 3. The mask hides token 4. Its output is a mix of three value
+vectors.
+
+Start in NumPy, because the Together-style variant asks for exactly this, and because NumPy forces you to
+write the mask and the softmax yourself.
+
+```python
+import numpy as np
+
+def softmax(x, axis=-1):
+    # Subtract the row max first: exp() of a large logit overflows to inf, and inf/inf is nan.
+    # Shifting every logit by the same constant leaves the result unchanged.
+    m = np.max(x, axis=axis, keepdims=True)
+    e = np.exp(x - m)
+    return e / np.sum(e, axis=axis, keepdims=True)
+
+def causal_mask(t_q, t_k):
+    # True = may attend. Query i sits at absolute position (t_k - t_q + i), so the mask is
+    # aligned to the bottom-right corner. With t_q == t_k this is the usual lower triangle;
+    # with t_q == 1 (one decode step) the single query sees every key.
+    i = np.arange(t_q)[:, None]
+    j = np.arange(t_k)[None, :]
+    return j <= i + (t_k - t_q)                      # (t_q, t_k) bool
+
+def attention(q, k, v, mask=None):
+    # q: (..., t_q, d)   k: (..., t_k, d)   v: (..., t_k, d_v)   mask: (t_q, t_k), True = keep
+    d = q.shape[-1]
+    scores = q @ np.swapaxes(k, -1, -2) / np.sqrt(d)  # (..., t_q, t_k)
+    if mask is not None:
+        scores = np.where(mask, scores, -np.inf)     # mask BEFORE softmax, never after
+    return softmax(scores, axis=-1) @ v             # (..., t_q, d_v)
+```
+
+There are three decisions in those dozen lines, and you should say each one out loud.
+
+**Why subtract the max.** Softmax computes `exp(score)` for every score. A score of 1,000 overflows: `exp`
+returns infinity, and infinity divided by infinity is `nan` (not a number). Softmax doesn't change if you
+subtract the same constant from every score, so you subtract the largest one, which makes the biggest
+exponent zero. The test feeds scores of 1,000 to 1,002. The naive version returns `nan` for every entry, and
+the stable one returns a proper distribution. Say: "Subtracting the row max can't change the answer and stops
+the overflow."
+
+**Why divide by √d.** If the entries of q and k are independent with mean 0 and variance 1, their dot product
+has variance d. At d = 128, raw scores have a standard deviation of about 11. Softmax over values that far
+apart puts nearly all the weight on one key, and the gradients (the signals training learns from) go close to
+zero. Dividing by √d brings the variance back to 1.
+
+**Why mask before softmax.** Setting a score to minus infinity gives it exactly zero weight, and the row still
+sums to 1. If you zero the weights after softmax instead, the rows no longer sum to 1, and the result is
+silently wrong. One of the planted-bug tests below checks exactly this.
+
+Edge case: a row where every key is masked (a padding query) gives `nan`. Skip it or zero its output.
+
+### Stage 2: multi-head attention
+
+One attention pattern per token is limiting. A token may need to look at the previous word for grammar and at
+a name ten tokens back for meaning. **Multi-head attention** runs several attention steps side by side, each
+on its own slice of the vector. Each slice is a **head**. With `d_model` = 64 and 4 heads, each head gets 16
+numbers. The heads run as one batched matrix multiply because the head axis sits next to the batch axis. At
+the end, their outputs are joined back into one 64-number row and mixed by one more matrix.
+
+Now in PyTorch:
+
+```python
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def causal_mask(t_q, t_k, device=None):
+    # Bottom-right aligned, True = may attend (same rule as the NumPy version).
+    i = torch.arange(t_q, device=device)[:, None]
+    j = torch.arange(t_k, device=device)[None, :]
+    return j <= i + (t_k - t_q)                                   # (t_q, t_k)
+
+def attention(q, k, v, mask=None):
+    # q: (B, h, t_q, d)  k, v: (B, h, t_k, d)  ->  (B, h, t_q, d)
+    scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])    # (B, h, t_q, t_k)
+    if mask is not None:
+        scores = scores.masked_fill(~mask, float("-inf"))
+    return torch.softmax(scores, dim=-1) @ v                      # softmax subtracts the max
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.h, self.d = n_heads, d_model // n_heads
+        self.wq = nn.Linear(d_model, d_model, bias=False)
+        self.wk = nn.Linear(d_model, d_model, bias=False)
+        self.wv = nn.Linear(d_model, d_model, bias=False)
+        self.wo = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x):                                          # x: (B, T, d_model)
+        B, T, _ = x.shape
+        split = lambda t: t.view(B, T, self.h, self.d).transpose(1, 2)   # (B, h, T, d)
+        q, k, v = split(self.wq(x)), split(self.wk(x)), split(self.wv(x))
+        out = attention(q, k, v, causal_mask(T, T, x.device))     # (B, h, T, d)
+        out = out.transpose(1, 2).contiguous().view(B, T, self.h * self.d)  # undo the split
+        return self.wo(out)
+```
+
+The one line people get wrong is the merge. The split is `view(B, T, h, d)` and then `transpose(1, 2)`, so
+the merge must transpose back before `view`. Calling `out.reshape(B, T, h * d)` straight from `(B, h, T, d)`
+runs without an error and mixes tokens across heads. In the running example, the prefill output is
+`(1, 4, 4, 16)`, and the bad reshape would quietly put parts of token 2 into token 1's row. The
+`.contiguous()` is needed because `view` won't accept the strided tensor that `transpose` returns.
+
+### Stage 3: KV cache
+
+Look at decode step 1 in the running example. The model must produce a fifth token. Without a cache, it runs
+all five positions through every layer again, even though the keys and values of the first four can't have
+changed. They can't change because each position only ever looks backward: adding a token at the end never
+changes what earlier tokens saw.
+
+So you compute each token's K and V once, store them per layer, and on each later step run the model on the
+single new token. The store is the **KV cache**. Decode step 1 computes K and V for one token and appends them,
+so the cache goes from 4 rows to 5. Decode step 2 makes it 6.
+
+These are the answers to the OpenAI question of what has to change:
+
+1. The attention layer takes a cache, appends the new K and V to it, and attends over everything stored.
+2. The mask has `T` rows and `S` columns, aligned bottom-right. With one query, that means no mask at all.
+3. Positions continue from the cache length instead of restarting at 0. In decode step 1, the new token is
+   position 4, not position 0. In a RoPE model the new keys are rotated at their absolute positions before
+   they are cached.
+4. The generation loop splits into a **prefill** (the whole prompt in one forward pass) and **decode** steps
+   (one token in, one token out).
+
+```python
+class KVCache:
+    """One layer's cache, preallocated. Stores n_kv_heads, not n_heads: that is GQA's saving."""
+
+    def __init__(self, batch, n_kv_heads, max_len, head_dim, dtype=torch.float32):
+        self.k = torch.zeros(batch, n_kv_heads, max_len, head_dim, dtype=dtype)
+        self.v = torch.zeros_like(self.k)
+        self.len = 0
+
+    def append(self, k, v):                                        # k, v: (b, h_kv, T_new, d), b <= batch
+        b, t = k.shape[0], k.shape[2]
+        if self.len + t > self.k.shape[2]:
+            raise ValueError("KV cache full")
+        self.k[:b, :, self.len:self.len + t] = k                  # write in place, no torch.cat
+        self.v[:b, :, self.len:self.len + t] = v
+        self.len += t
+        return self.k[:b, :, :self.len], self.v[:b, :, :self.len] # (b, h_kv, S, d)
+
+    def reorder(self, idx):                                        # beam search: row i <- row idx[i]
+        self.k[: len(idx)] = self.k.index_select(0, idx)
+        self.v[: len(idx)] = self.v.index_select(0, idx)
+
+    def nbytes(self, rows=1):
+        return 2 * rows * self.k[0, :, :self.len].numel() * self.k.element_size()
+```
+
+Then come the optimizations the follow-up asks for, roughly in the order they pay off:
+
+- **Preallocate instead of `torch.cat`.** Concatenating copies the whole cache on every step, so total copy
+  traffic grows with the square of the length. Writing into a preallocated buffer copies only the new token.
+  The `llm-inference` lab uses `torch.cat`, which makes it a good thing to point at.
+- **Cache only the KV heads** (next stage). This is where most of the memory goes.
+- **Lower precision for the cache.** Store each number in 2 bytes (bf16, a 16-bit float format) or 1 byte
+  (fp8) instead of 4. That shrinks the cache again, at some risk to accuracy.
+- **Batching and paging.** A serving engine allocates the cache in fixed-size pages, so many requests share
+  GPU memory without each reserving its maximum length up front. PagedAttention describes the cost of not
+  doing this as memory "significantly wasted by fragmentation and redundant duplication"
+  ([Kwon et al., 2023](https://arxiv.org/abs/2309.06180), read 2026-10-12).
+
+Say: "The cache trades memory for compute: each token's keys and values are computed once and read many times."
+
+### Stage 4: grouped-query attention
+
+The cache stores one K and one V vector per head, per layer, per token. That adds up fast, and a decode step
+must read all of it from memory. The fix is to let several query heads share one set of keys and values.
+
+Three names describe the options. **Multi-head attention (MHA)** gives every query head its own K and V.
+**Multi-query attention (MQA)** keeps a single K and V head that all query heads share. Shazeer's motivation
+was decoding speed: incremental inference is slow "due to the memory-bandwidth cost of repeatedly loading the
+large "keys" and "values" tensors" ([Shazeer, 2019](https://arxiv.org/abs/1911.02150), read 2026-10-12).
+**Grouped-query attention (GQA)** sits in between, with `h_kv` KV heads, each shared by `h ÷ h_kv` query heads.
+The GQA paper reports quality close to multi-head attention at a speed close to MQA
+([Ainslie et al., 2023](https://arxiv.org/abs/2305.13245), read 2026-10-12). Llama-3.1-8B uses 32 query
+heads and 8 KV heads, and Llama-3.1-70B uses 64 and 8 (<Cite id="s-20bffa9709" />, <Cite id="s-6fdd575dc5" />).
+
+In the running example there are 4 query heads and 2 KV heads, so query heads 0 and 1 share KV head 0, and
+query heads 2 and 3 share KV head 1. The cache is half the size MHA would need.
+
+The final attention class does MHA, GQA and MQA with one parameter:
+
+```python
+class Attention(nn.Module):
+    """Causal self-attention. n_kv_heads == n_heads is MHA, 1 is MQA, anything between is GQA."""
+
+    def __init__(self, d_model, n_heads, n_kv_heads=None):
+        super().__init__()
+        n_kv_heads = n_kv_heads or n_heads
+        assert d_model % n_heads == 0 and n_heads % n_kv_heads == 0
+        self.h, self.h_kv, self.d = n_heads, n_kv_heads, d_model // n_heads
+        self.wq = nn.Linear(d_model, n_heads * self.d, bias=False)
+        self.wk = nn.Linear(d_model, n_kv_heads * self.d, bias=False)   # smaller under GQA
+        self.wv = nn.Linear(d_model, n_kv_heads * self.d, bias=False)
+        self.wo = nn.Linear(n_heads * self.d, d_model, bias=False)
+
+    def forward(self, x, cache=None):                              # x: (B, T, d_model)
+        B, T, _ = x.shape
+        q = self.wq(x).view(B, T, self.h, self.d).transpose(1, 2)      # (B, h,    T, d)
+        k = self.wk(x).view(B, T, self.h_kv, self.d).transpose(1, 2)   # (B, h_kv, T, d)
+        v = self.wv(x).view(B, T, self.h_kv, self.d).transpose(1, 2)
+        if cache is not None:
+            k, v = cache.append(k, v)                              # (B, h_kv, S, d), S >= T
+        S = k.shape[2]
+        rep = self.h // self.h_kv                                  # query heads per KV head
+        if rep > 1:                                                # expand AFTER caching
+            k = k.repeat_interleave(rep, dim=1)                    # (B, h, S, d)
+            v = v.repeat_interleave(rep, dim=1)
+        out = attention(q, k, v, causal_mask(T, S, x.device))     # (B, h, T, d)
+        out = out.transpose(1, 2).contiguous().view(B, T, self.h * self.d)
+        return self.wo(out)
+```
+
+There are two details to say out loud. First, `repeat_interleave` maps query head `j` to KV head
+`j // rep`, which is the same grouping PyTorch's own reference uses for `enable_gqa=True`
+([PyTorch 2.14 docs](https://docs.pytorch.org/docs/2.14/generated/torch.nn.functional.scaled_dot_product_attention.html),
+read 2026-10-12). The tests compare against that call for 1, 2, 4 and 8 KV heads. Second, the expansion
+happens **after** the cache append. If you expand first and cache the expanded tensors, the code is still
+correct, but you have thrown away the memory saving that is the point of GQA.
+
+The expansion also copies K and V on every step. If the interviewer asks how to avoid that copy, group the
+queries instead (this version is tested too):
+
+```python
+rep = h // h_kv
+qg = q.view(B, h_kv, rep, t, d)                                  # group the query heads
+scores = qg @ k.unsqueeze(2).transpose(-2, -1) / math.sqrt(d)   # (B, h_kv, rep, t, S), K broadcast
+scores = scores.masked_fill(~causal_mask(t, S), float("-inf"))
+out = (torch.softmax(scores, -1) @ v.unsqueeze(2)).view(B, h, t, d)
+```
+
+### Stage 5: a modern block
+
+A **block** wraps attention and the feed-forward layer in two habits that make deep stacks trainable:
+
+- A **residual connection** adds each sub-layer's output back onto its input (`x = x + f(x)`), so information
+  can flow straight through the stack.
+- A **normalization** layer rescales each token's vector to a steady size before the sub-layer sees it.
+  **Pre-norm** means the norm sits inside the residual branch, so the straight path from input to output is
+  never normalized.
+
+The Google title asks for a SwiGLU block. Modern decoders use pre-norm residuals, **RMSNorm** (a simpler
+normalization than the original LayerNorm, with no mean subtraction and no bias) and a gated feed-forward
+layer. **SwiGLU** is that gated layer: one matrix produces a "gate" passed through the SiLU function
+(`z × sigmoid(z)`), a second produces values, the two are multiplied element by element, and a third matrix
+projects back down. Llama-3.1-8B's config lists `silu` as the activation and an intermediate size of 14,336
+against a hidden size of 4,096 (<Cite id="s-20bffa9709" />). SwiGLU comes from Shazeer's GLU-variants paper
+([Shazeer, 2020](https://arxiv.org/abs/2002.05202), read 2026-10-12).
+
+```python
+class RMSNorm(nn.Module):
+    def __init__(self, d, eps=1e-5):
+        super().__init__()
+        self.eps, self.weight = eps, nn.Parameter(torch.ones(d))
+
+    def forward(self, x):                                          # no mean subtraction, no bias
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.w_gate = nn.Linear(d_model, d_ff, bias=False)
+        self.w_up = nn.Linear(d_model, d_ff, bias=False)
+        self.w_down = nn.Linear(d_ff, d_model, bias=False)
+
+    def forward(self, x):                                          # (B, T, d_model)
+        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))  # silu(z) = z * sigmoid(z)
+
+class Block(nn.Module):
+    def __init__(self, d_model, n_heads, n_kv_heads=None, d_ff=None):
+        super().__init__()
+        d_ff = d_ff or int(8 * d_model / 3)    # 3 matrices x 8/3 d^2 = the 8 d^2 of a 4x GELU MLP
+        self.norm1, self.attn = RMSNorm(d_model), Attention(d_model, n_heads, n_kv_heads)
+        self.norm2, self.mlp = RMSNorm(d_model), SwiGLU(d_model, d_ff)
+
+    def forward(self, x, cache=None):
+        x = x + self.attn(self.norm1(x), cache)                    # residual around attention
+        return x + self.mlp(self.norm2(x))                         # residual around the MLP
+
+class TinyGPT(nn.Module):
+    def __init__(self, vocab, d_model=64, n_heads=4, n_kv_heads=2, n_layers=2, max_len=256):
+        super().__init__()
+        self.cfg = dict(n_kv_heads=n_kv_heads, head_dim=d_model // n_heads, max_len=max_len)
+        self.tok, self.pos = nn.Embedding(vocab, d_model), nn.Embedding(max_len, d_model)
+        self.blocks = nn.ModuleList(Block(d_model, n_heads, n_kv_heads) for _ in range(n_layers))
+        self.norm, self.head = RMSNorm(d_model), nn.Linear(d_model, vocab, bias=False)
+
+    def new_caches(self, batch):
+        c = self.cfg
+        return [KVCache(batch, c["n_kv_heads"], c["max_len"], c["head_dim"]) for _ in self.blocks]
+
+    def forward(self, ids, caches=None):                           # ids: (B, T) -> (B, T, vocab)
+        start = caches[0].len if caches else 0                     # positions continue after the cache
+        pos = torch.arange(start, start + ids.shape[1], device=ids.device)
+        x = self.tok(ids) + self.pos(pos)
+        for i, block in enumerate(self.blocks):
+            x = block(x, caches[i] if caches else None)
+        return self.head(self.norm(x))
+```
+
+The `d_ff` default (the feed-forward layer's inner width) is arithmetic, and you should be able to show it.
+The aim is to keep the same number of parameters as the older design: two matrices with a GELU
+activation (a smooth function that passes positive numbers and squashes negative ones) in between. The result is **`d_ff = 8d/3`**, and
+real models don't always use it: Llama-3.1-8B's ratio is 14,336 ÷ 4,096 = 3.5.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- A GELU feed-forward layer with a 4× expansion has two matrices of `d × 4d`, which is 8d² parameters.
+- SwiGLU has three matrices of `d × d_ff`, so it matches at `3 × d × d_ff = 8d²`, which gives `d_ff = 8d/3`.
+- Running example: `d_model` = 64 gives `d_ff` = int(170.67) = 170.
+
+</details>
+
+In the running example, the prompt's `(1, 4, 64)` tensor goes into block 1 and comes out the same shape, then
+the same through block 2. The output head turns it into `(1, 4, V)` logits, and only the last row (the scores
+for "what follows é") is used to pick the next token.
+
+### Stage 6: decoding
+
+The model has produced logits for the next token. Decoding decides which token to emit. A few terms first:
+
+- **log-probability (log-prob):** the natural log of a probability. Probabilities multiply along a sequence;
+  log-probs add. `log_softmax` turns logits into log-probs directly.
+- **Greedy decoding:** always take the single most likely token.
+- **Sampling:** draw a token at random, weighted by its probability. **Temperature** divides the logits first;
+  below 1 it sharpens the choice, above 1 it flattens it. **Top-k** keeps only the k most likely tokens.
+  **Top-p** (also called nucleus sampling) keeps the smallest set of tokens whose probabilities add up to at
+  least `p`.
+- **Beam search:** keep the several best partial sequences at each step, not just one, and return the best
+  complete one.
+
+The Microsoft title wants greedy decoding and beam search, each returning the probability of the sentence it
+produces. Work in log-probabilities and add them. Multiplying probabilities underflows (rounds to 0.0) after a
+few hundred tokens, while the sum of logs stays finite. Say: "I'll sum log-probs and exponentiate once at the
+end."
+
+```python
+@torch.no_grad()
+def greedy(model, prompt, max_new, eos=None):
+    """Greedy decoding with a KV cache. Returns (new tokens, probability of that sequence)."""
+    caches = model.new_caches(batch=1)
+    logits = model(torch.tensor([prompt]), caches)[:, -1]         # prefill: the whole prompt at once
+    out, logp = [], 0.0
+    for _ in range(max_new):
+        lp = torch.log_softmax(logits, dim=-1)[0]                  # (vocab,) log-probs
+        tok = int(lp.argmax())
+        out.append(tok)
+        logp += float(lp[tok])                                     # add logs; multiplying probs underflows
+        if tok == eos:
+            break
+        logits = model(torch.tensor([[tok]]), caches)[:, -1]       # decode: one new token in
+    return out, math.exp(logp)
+
+def filter_logits(logits, top_k=None, top_p=None, temperature=1.0):
+    """Temperature, then top-k, then top-p (nucleus) on one row of logits (vocab,)."""
+    logits = logits / temperature
+    if top_k is not None:
+        kth = torch.topk(logits, top_k).values[-1]
+        logits = logits.masked_fill(logits < kth, float("-inf"))
+    if top_p is not None:
+        sorted_logits, order = torch.sort(logits, descending=True)
+        p = torch.softmax(sorted_logits, dim=-1)
+        drop = (p.cumsum(-1) - p) >= top_p                         # mass before this token already >= p
+        logits = logits.masked_fill(torch.zeros_like(drop).scatter(0, order, drop), float("-inf"))
+    return logits
+
+def beam_search(step, prompt, beam, max_len, eos=None, alpha=0.0):
+    """step(list of equal-length token lists) -> (n, vocab) next-token log-probs.
+    Returns (best continuation, its probability). alpha > 0 divides the score by length**alpha."""
+    alive, done = [(list(prompt), 0.0)], []
+    for _ in range(max_len):
+        logp = step([seq for seq, _ in alive])                     # (n_alive, vocab)
+        vocab = logp.shape[-1]
+        total = torch.tensor([s for _, s in alive])[:, None] + logp  # every beam x every token
+        top = torch.topk(total.flatten(), min(beam, total.numel()))
+        nxt = []
+        for score, flat in zip(top.values.tolist(), top.indices.tolist()):
+            parent, tok = divmod(flat, vocab)
+            seq = alive[parent][0] + [tok]
+            (done if tok == eos else nxt).append((seq, score))
+        alive = nxt
+        if not alive:
+            break
+    done += alive                                                  # unfinished at max_len still count
+    n0 = len(prompt)
+    seq, score = max(done, key=lambda c: c[1] / (len(c[0]) - n0) ** alpha)
+    return seq[n0:], math.exp(score)
+```
+
+Beam search keeps the `beam` best partial sequences by total log-probability. On each step it scores every
+beam extended by every token, which is a `(beam, V)` table, and keeps the top `beam` entries of the flattened
+table. `divmod` recovers the parent beam and the token from each flat index. In this simple version a beam
+that emits EOS leaves the alive set, so the beam narrows as hypotheses finish. Production versions take the
+top `2 × beam` candidates so they can refill it. With `alpha = 0`, beam search prefers short outputs, because
+each extra token adds a negative log-prob. Google's neural machine translation (NMT) system added "a length-normalization procedure" for
+that reason ([Wu et al., 2016](https://arxiv.org/abs/1609.08144), read 2026-10-12).
+
+To use the cache with beams, keep one cache row per live beam. After each step, a surviving candidate may
+come from any parent beam, so reorder the rows to follow their parents:
+
+```python
+class CachedBeamStep:
+    """A step() for beam_search that keeps one KV-cache row per live beam."""
+
+    def __init__(self, model, beam):
+        self.model, self.caches, self.row = model, model.new_caches(batch=beam), None
+
+    @torch.no_grad()
+    def __call__(self, seqs):
+        if self.row is None:                                       # first call: prefill the prompt
+            logits = self.model(torch.tensor(seqs), self.caches)[:, -1]
+        else:
+            parents = torch.tensor([self.row[tuple(s[:-1])] for s in seqs])
+            for c in self.caches:
+                c.reorder(parents)                                 # row i now holds its parent's K/V
+            logits = self.model(torch.tensor([[s[-1]] for s in seqs]), self.caches)[:, -1]
+        self.row = {tuple(s): i for i, s in enumerate(seqs)}
+        return torch.log_softmax(logits, dim=-1)                   # (n, vocab)
+```
+
+Top-k and top-p are filters on the logits, applied before sampling. The paper that introduced top-p argues
+that likelihood-maximizing decoding produces text that is "bland and strangely repetitive"
+([Holtzman et al., 2019](https://arxiv.org/abs/1904.09751), read 2026-10-12). That is why open-ended chat
+uses sampling, and why beam search mostly shows up where there is one right answer, such as translation.
+
+### Stage 7: tokenizers
+
+Back to the first box of the diagram. The Perplexity titles ask for a byte tokenizer, and the Glean title for
+BPE. Start with bytes, because BPE is built on top of them. A **byte tokenizer** maps each UTF-8 byte to an id
+from 0 to 255 and gives special tokens the ids after that. That is how "Olé" became `[79, 108, 195, 169]`.
+
+```python
+import codecs, re
+from collections import Counter
+
+class ByteTokenizer:
+    """ids 0..255 are raw UTF-8 bytes; special tokens get ids from 256 up."""
+
+    def __init__(self, specials=("<|bos|>", "<|eos|>")):
+        self.special = {s: 256 + i for i, s in enumerate(specials)}
+        self.inv = {i: s for s, i in self.special.items()}
+        self.split = re.compile("(" + "|".join(map(re.escape, specials)) + ")")
+
+    def encode(self, text, allow_special=False):
+        if not allow_special:                         # untrusted text: "<|eos|>" is just 7 characters
+            return list(text.encode("utf-8"))
+        out = []
+        for part in self.split.split(text):
+            out += [self.special[part]] if part in self.special else list(part.encode("utf-8"))
+        return out
+
+    def decode(self, ids):
+        buf, out = bytearray(), []
+        for i in ids:
+            if i in self.inv:
+                out.append(buf.decode("utf-8", errors="replace"))
+                out.append(self.inv[i])
+                buf = bytearray()
+            else:
+                buf.append(i)
+        out.append(buf.decode("utf-8", errors="replace"))
+        return "".join(out)
+
+def stream_decode(token_bytes):
+    """Streaming detokenization: a character can be split across tokens, so buffer partial UTF-8."""
+    dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    for b in token_bytes:
+        piece = dec.decode(b)
+        if piece:
+            yield piece
+    tail = dec.decode(b"", final=True)
+    if tail:
+        yield tail
+```
+
+Two lessons hide here. Special tokens must be opt-in, or user text containing `<|eos|>` becomes a real EOS;
+Karpathy's minbpe uses an `allowed_special` argument for this
+([minbpe](https://github.com/karpathy/minbpe), read 2026-10-12). And a token is bytes, not characters. Suppose
+the model in the running example writes "é" back as two tokens, 195 and then 169. When you stream the reply,
+byte 195 alone is not a valid character, so an incremental decoder must hold it until 169 arrives. Printing it
+early shows the user a replacement character.
+
+**Byte-pair encoding (BPE)** ([Sennrich et al., 2015](https://arxiv.org/abs/1508.07909), read 2026-10-12)
+makes tokens longer than one byte, so common text takes fewer tokens. It starts from the 256 byte values. It
+repeatedly finds the most frequent adjacent pair and merges it into a new token. In the classic example
+`aaabdaaabac`, the pair `aa` is most common, so it becomes token 256 first:
+
+```python
+def pair_counts(ids):
+    return Counter(zip(ids, ids[1:]))
+
+def merge(ids, pair, new_id):
+    """Replace every non-overlapping occurrence of pair, scanning left to right."""
+    out, i = [], 0
+    while i < len(ids):
+        if i + 1 < len(ids) and (ids[i], ids[i + 1]) == pair:
+            out.append(new_id)
+            i += 2
+        else:
+            out.append(ids[i])
+            i += 1
+    return out
+
+def train_bpe(text, vocab_size):
+    """Returns (merges: {pair: new_id} in learned order, vocab: {id: bytes}, final training ids)."""
+    ids = list(text.encode("utf-8"))
+    merges, vocab = {}, {i: bytes([i]) for i in range(256)}
+    for new_id in range(256, vocab_size):
+        counts = pair_counts(ids)
+        if not counts:
+            break
+        pair, n = max(counts.items(), key=lambda kv: (kv[1], -kv[0][0], -kv[0][1]))  # ties: smallest pair
+        if n < 2:
+            break
+        ids = merge(ids, pair, new_id)
+        merges[pair] = new_id
+        vocab[new_id] = vocab[pair[0]] + vocab[pair[1]]
+    return merges, vocab, ids
+
+def encode(text, merges):
+    """Apply merges by rank (earliest learned first), not by frequency in this text."""
+    ids = list(text.encode("utf-8"))
+    while len(ids) >= 2:
+        pair = min(pair_counts(ids), key=lambda p: merges.get(p, float("inf")))
+        if pair not in merges:
+            break
+        ids = merge(ids, pair, merges[pair])
+    return ids
+
+def decode(ids, vocab):
+    return b"".join(vocab[i] for i in ids).decode("utf-8", errors="replace")
+```
+
+The bug to avoid is in `encode`. It must apply merges in the order they were learned (by **rank**), not by how
+often a pair occurs in the new text. A test checks the property that makes rank order correct: encoding the
+training text reproduces the exact ids the training loop ended with. That holds because a merge only creates
+pairs that involve the new token, and those pairs were all learned later, so no lower-ranked pair can
+reappear. Because the base alphabet is bytes, there is never an unknown token, and any string round-trips,
+emoji and Chinese, Japanese or Korean text included.
+
+### The debugging variant
+
+The OpenAI round started with bugs in four annotated regions. Nobody has published what those bugs were, so
+don't memorize a list. Learn the symptoms and the check that catches each one. Every row below is a
+**mutation test** in the suite: the bug is planted on purpose, and the test asserts that the check fails.
+
+| Planted bug | Symptom | Check that catches it |
+|---|---|---|
+| No `1/√d` scale | Runs fine; outputs differ from the reference | Reference comparison |
+| Softmax over the query axis (`dim=-2`) | Columns sum to 1 instead of rows | Reference comparison |
+| Mask excludes the diagonal | Position 0 attends to nothing, so `nan` | Reference comparison (finite check) |
+| Upper-triangle mask | Tokens see the future | Reference, and the causality test |
+| Mask applied after softmax | Rows sum to less than 1 | Reference comparison |
+| Heads merged without transposing back | Shapes fine, tokens mixed across heads | Compare with the correct module on the same weights |
+| Top-left-aligned mask in decode | Full forward is correct; cached decode is wrong | Cache equivalence |
+| Positions restart at 0 in decode | Full forward is correct; cached decode is wrong | Cache equivalence |
+
+The last two rows matter most. Both bugs pass every test that runs the full sequence, and both appear only
+once the cache is in use. In the running example, the prefill logits would be right and the first decoded
+token would already be wrong. That is why the cache-equivalence test is not optional.
+
+## Verification
+
+The suite has 39 tests. It ran on 2026-10-12 on an Apple M1 Ultra (Python 3.13.7, PyTorch 2.14.1, NumPy
+2.5.4), and every test passed under ten random seeds. These are the oracles behind most of them. The last
+function is worth reading closely: PyTorch's own `is_causal=True` gives the wrong answer for a decode step,
+which is the right-hand side of the mask figure.
+
+```python
+def reference(q, k, v):
+    return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+def matches_reference(attn_fn, B=2, h=3, t=7, d=8):
+    q, k, v = (torch.randn(B, h, t, d) for _ in range(3))
+    out = attn_fn(q, k, v, causal_mask(t, t))
+    return bool(torch.isfinite(out).all()) and torch.allclose(out, reference(q, k, v), atol=1e-5)
+
+def cache_matches_full(net, ids):
+    """Logits from prefill + one-token decode steps must equal one full forward pass."""
+    with torch.no_grad():
+        full = net(ids)
+        caches = net.new_caches(batch=ids.shape[0])
+        p = 3
+        parts = [net(ids[:, :p], caches)]
+        for i in range(p, ids.shape[1]):
+            parts.append(net(ids[:, i:i + 1], caches))
+        return torch.allclose(full, torch.cat(parts, dim=1), atol=1e-5)
+
+def test_sdpa_is_causal_is_top_left_when_lengths_differ():
+    # The trap: is_causal=True with 1 query and 6 keys lets the query see only key 0.
+    q, k, v = torch.randn(1, 1, 1, 8), torch.randn(1, 1, 6, 8), torch.randn(1, 1, 6, 8)
+    wrong = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    assert torch.allclose(wrong, v[:, :, :1])
+    right = attention(q, k, v, causal_mask(1, 6))
+    assert torch.allclose(right, F.scaled_dot_product_attention(q, k, v))  # no mask needed
+```
+
+This is what the suite covers, stage by stage:
+
+- **Attention:** NumPy against PyTorch's built-in call; the stable softmax at scores of 1,000; the mask's
+  alignment; the `is_causal` trap above. PyTorch documents that for a non-square mask `is_causal` takes "the
+  form of the upper left causal bias"
+  ([docs](https://docs.pytorch.org/docs/2.14/generated/torch.nn.functional.scaled_dot_product_attention.html),
+  read 2026-10-12). The same page notes that a boolean `True` means "take part in attention" there, the
+  opposite of `nn.MultiheadAttention`'s convention.
+- **Multi-head and GQA:** multi-head attention matches the reference projection by projection; `Attention`
+  with `h_kv = h` matches `MultiHeadAttention` on the same weights; GQA with 1, 2, 4 and 8 KV heads matches
+  `enable_gqa=True`; the no-copy grouping matches the `repeat_interleave` version.
+- **Cache:** cached decoding equals the full forward pass with 1, 2 and 4 KV heads; the model is causal; the
+  cache's bytes equal `2 × layers × h_kv × d × tokens × 4`, which is half of what MHA would need here; an
+  overflowing append raises an error.
+- **Block:** RMSNorm matches `torch.nn.RMSNorm`; SwiGLU's parameter count is within 1% of a 4× GELU MLP.
+- **Decoding:** greedy with a cache equals greedy without one (same tokens and probability); beam width 1
+  equals greedy; a beam wide enough to be exhaustive (4⁴ over a 4-token vocabulary) equals brute-force
+  search over all 256 sequences; the returned probability equals the product recomputed step by step; cached
+  beam search equals uncached; top-k and top-p keep exactly the expected tokens and sampling never leaves
+  that set.
+- **Tokenizers:** special tokens only when allowed; streaming decode of a split "é"; the classic
+  `aaabdaaabac` example's first merge is `aa`; round trips on Unicode, including 200 random strings;
+  compression; encoding the training text reproduces the training ids.
+- **Bug hunt:** the eight mutation tests from the table above.
+
+<AINative title="Where an agent helps and what you still check">
+In the rounds above you write this without an assistant: Anthropic's guidance bars AI unless told otherwise,
+and the Colab candidate describes the rule being enforced. At work, a coding agent will produce a plausible
+multi-head attention or BPE in seconds. The two most damaging bugs on this page (a top-left mask during
+decode and positions that restart at zero) still pass every full-sequence test an agent is likely to write.
+What you contribute is the oracle: the reference comparison, the causality perturbation and the cache
+equivalence test, plus brute force for search and round trips for tokenizers. Ask the agent for those tests
+first and read them closely, then let it write the implementation. Mutation-test the tests, as this page
+does, so you know they can fail.
+</AINative>
+
+## Complexity and performance
+
+Two resources matter for a model on a GPU. **Compute** is how many arithmetic operations per second the chip
+can do. **Memory bandwidth** is how many bytes per second it can read from its own memory (**HBM**, the
+high-bandwidth memory on the GPU board). Prefill does a lot of maths on every byte it reads, so it is usually
+limited by compute. A decode step does little maths per byte, because it reads every weight and the whole
+cache to produce one token, so it is usually limited by bandwidth. Keep that split in mind for the rest of this
+section.
+
+| Piece | Time | Memory |
+|---|---|---|
+| Attention, full sequence | O(T² · d) per head for QKᵀ and AV | O(T²) per head for the score matrix |
+| One decode step with a cache | O(S · d) per head | KV cache O(S · h_kv · d) per layer |
+| Generating n tokens with no cache | Re-runs Σ(p + i) tokens | No cache; scores recomputed |
+| `torch.cat` cache growth | O(S) copy per step, O(n²) total | Temporary copies |
+| Beam search, width k | k × the decode work | k cache rows (no prefix sharing) |
+| BPE training, naive | O(N) per merge × M merges (1 MB × 30,000 merges = 3 × 10¹⁰ pair visits) | O(N) |
+
+**What the cache saves.** With a 1,000-token prompt and 500 generated tokens, a cache pushes about **417×
+fewer** token positions through the model's matrix layers (arithmetic, not a measurement; the box below shows
+it). Say: "Without a cache, generation is quadratic in length. With one, each step does one token's work."
+
+**How much memory the cache takes.** Each token keeps one K and one V vector per KV head, per layer. Use the
+KV-heads formula, never the hidden-size one:
+
+<Formula
+  title="KV cache per token"
+  expr="bytes per token = 2 × layers × n_kv_heads × head_dim × bytes_per_value"
+  vars={[
+    { sym: '2', meaning: 'one K and one V tensor per layer' },
+    { sym: 'layers', meaning: 'transformer layers' },
+    { sym: 'n_kv_heads', meaning: 'KV heads (fewer than query heads under GQA)' },
+    { sym: 'head_dim', meaning: 'dimension of each head' },
+    { sym: 'bytes_per_value', meaning: '2 for bf16/fp16, 4 for fp32' },
+  ]}
+  example={[
+    "Llama-3.1-8B, bf16: 2 × 32 × 8 × 128 × 2 = 131,072 B (128 KiB) per token; with 32 KV heads it would be 524,288 B, 4× more",
+    "Llama-3.1-70B, bf16: 2 × 80 × 8 × 128 × 2 = 327,680 B per token; the hidden-size form gives 2,621,440 B, 8× too high",
+    "GPT-2 (12 KV heads, fp32): 2 × 12 × 12 × 64 × 4 = 73,728 B per token",
+  ]}
+/>
+
+So one Llama-3.1-8B token costs **128 KiB** of cache, and one Llama-3.1-70B token costs **320 KiB** (about 0.33 MB). At
+128K tokens, one Llama-3.1-70B request holds **42.95 GB** of cache, and one Llama-3.1-8B request holds
+**17.18 GB** (16 GiB). The llm-inference lab computes GPT-2's cache at 1,024 tokens as
+<LabNumber lab="llm-inference" metric="KV cache size (GPT-2, seq_len=1024)" />. Some prep material uses the
+hidden-size form, which overcounts for GQA models (<Cite id="s-d97e9a72e2" />, <Cite id="s-f440daaea4" />).
+The serving guide uses the KV-heads form (<Cite id="s-75e82f8882" />).
+
+**Why GQA is about bandwidth, not only capacity.** A decode step reads every weight once. With one sequence,
+that alone takes about **7.85 ms per token** for an 8B model stored in bf16 on an A100 GPU
+(<Cite id="s-4525fcd815" />, <Cite id="s-8e443a8b66" />). The step also reads the whole cache for every
+sequence in the batch. Take 32 sequences at 8,192 tokens each on Llama-3.1-8B. With GQA, reading their cache
+adds about **16.9 ms** per step. With full multi-head K and V it would add **67.4 ms**, against 7.85 ms for the
+weights (derived; it ignores every other byte of traffic). Batching shares the weight read across sequences
+but not the cache read, so cutting KV heads is what keeps long-context batches fast.
+
+**Beam search multiplies the cache.** Four beams at 8,192 tokens on the 8B model take **4.29 GB** of cache
+unless the shared prompt is stored once. PagedAttention's "flexible sharing of KV cache within and across
+requests" is what avoids that duplication ([Kwon et al., 2023](https://arxiv.org/abs/2309.06180)).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Cache savings:** decoding 500 tokens after a 1,000-token prompt without a cache pushes
+  500 × 1,000 + 500 × 499 ÷ 2 = 624,750 token positions through the model. With a cache it pushes
+  1,000 + 499 = 1,499. 624,750 ÷ 1,499 ≈ 417, before counting attention.
+- **Long-context cache:** Llama-3.1-70B, 327,680 B × 131,072 tokens = 42.95 GB. Llama-3.1-8B,
+  131,072 B × 131,072 tokens = 17.18 GB (16 GiB).
+- **Running example:** TinyGPT keeps fp32 values (4 bytes), so after decode step 2 its cache is
+  2 × 2 layers × 2 KV heads × 16 × 6 tokens × 4 B = 1,536 B, half the 3,072 B that 4 KV heads would need.
+- **Weight read at batch 1:** weight bytes ÷ HBM bandwidth = 16 GB ÷ 2,039 GB/s ≈ 7.85 ms per token
+  (8B model, bf16, A100).
+- **Cache read for 32 × 8,192 tokens:** 8,192 × 131,072 B = 1.07 GB per sequence; 32 × 1.07 GB = 34.4 GB;
+  34.4 GB ÷ 2,039 GB/s ≈ 16.9 ms. With 32 KV heads instead of 8 it is 4× that, 67.4 ms.
+- **Beams:** 4 × 1.07 GB = 4.29 GB.
+
+</details>
+
+**Attention's T² memory.** The toy builds the full `(T, S)` score matrix. FlashAttention computes the same
+exact result in small tiles, cutting "reads and writes between levels of GPU memory"
+([Dao et al., 2022](https://arxiv.org/abs/2205.14135), read 2026-10-12). In an interview, name it and say
+it doesn't change the math. You won't be asked to write it in this round.
+
+## Small-team version
+
+At a 50–500 person company, the person who owns AI rarely writes attention code. Most small teams call
+managed APIs, and self-hosting pays off only under specific conditions (see "Revisit when" below). Even so, these internals explain most of the cost, latency and context
+surprises an API user runs into, and they are what you debug once you do host a model.
+
+### Why the internals pay off when you only call an API
+
+**Tokens are the unit of cost and context.** Price per million tokens can't be compared across tokenizers.
+Anthropic's pricing page says its newer tokenizer (Claude 4.7 and later) "produces approximately 30% more
+tokens for the same text"
+([Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing), read 2026-10-12). Compare
+models on dollars per task over your own prompts, counted with each provider's token counter.
+
+**Prompt caching is the KV cache, sold back to you.** Because attention is causal, the K and V at position
+`i` depend only on tokens up to `i`. A provider can therefore reuse a prefix's cache, but only if the prefix
+is byte-for-byte identical, and a change at position `j` invalidates everything after `j`. Put the stable
+parts first (system prompt, tool definitions, reference documents) and the per-request parts last. One
+timestamp at the top of the system prompt defeats the cache.
+
+Here is what that is worth, at Claude Sonnet 5 list prices ($2 per 1M input tokens, $0.20 per 1M cache reads,
+$10 per 1M output tokens, same page). The workload is assumed: 50,000 requests a day, 3,000 input tokens each
+(2,000 of them a stable prefix), and 400 output tokens. Without cache hits a request costs **1.00 cent**, about
+**$15,000 per 30 days**. With the prefix cached it costs **0.64 cents**, about **$9,600**. That is about **$5,400 a
+month** for knowing why the timestamp has to move. The figures ignore cache-write charges, which add 1.25× on
+the write for 5-minute caches according to the same page.
+
+**Latency lives in output tokens.** Prefill is one parallel pass; decode is one pass per output token. For
+Llama-3.1-70B on four A100 GPUs, a 2,000-token prompt has a compute floor of about **226 ms**, while each output
+token has a bandwidth floor of about **17.3 ms**. So 300 output tokens take at least **5.2 s**. Say: "Capping
+`max_tokens` and asking for shorter answers buys more latency than trimming the prompt."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **No cache hits:** 3,000 × $2/M + 400 × $10/M = $0.0100 per request; × 50,000 × 30 = $15,000.
+- **Prefix cached:** 1,000 × $2/M + 2,000 × $0.20/M + 400 × $10/M = $0.0064; × 50,000 × 30 = $9,600.
+- **Latency floors** (Llama-3.1-70B on 4×A100, exact 141.1 GB weight basis): prefill ≈ 226 ms of compute for
+  2,000 tokens; decode ≈ 17.3 ms per token of bandwidth; 300 × 17.3 ms ≈ 5.2 s.
+
+</details>
+
+**Sampling and log-probs.** `temperature` and `top_p` in an API call are `filter_logits` above. Where an API
+exposes token log-probs, a sequence's probability is their sum, exponentiated. That gives a usable
+confidence signal for classification-style prompts. Check whether your provider offers log-probs before you
+design around them.
+
+**Untrusted text and special tokens.** If you ever tokenize user input yourself (with a self-hosted model,
+or for counting), make sure special tokens are not parsed from it.
+
+### Build, buy, skip
+
+- **Build:** a token budget check in CI using the provider's counting endpoint; a prompt layout with a
+  stable prefix, plus a test asserting the prefix bytes don't change between requests; dollars per task in
+  your eval reports; a log of `max_tokens`, output length and latency per feature.
+- **Buy or reuse:** the provider API. If you self-host, a serving engine that already does paged KV memory,
+  continuous batching (adding and removing requests from the running batch between steps) and GQA kernels,
+  and the model's own tokenizer and chat template (the exact text format that wraps each message). Never retrain or
+  reimplement a tokenizer for a model trained with a different one.
+- **Skip:** custom attention or kernels in production, your own inference engine, and beam search for
+  chat-style generation.
+
+### What you still own
+
+You own the context budget (prompt tokens plus `max_tokens` against the model's limit), the stop sequences
+and EOS behavior, the sampling settings per feature, and the evals that tell you when a provider-side
+tokenizer or model change moved your cost or your quality.
+
+### Revisit when
+
+Self-hosting changes the picture. A sensible default is to start with a managed API and move to
+self-hosting only with measured, steady volume in the hundreds of millions of tokens a month, a residency or
+regulatory requirement, freemium economics where the API bill is existential, or a narrow task where a
+fine-tuned small model wins on your eval. Once you host a model, everything on
+this page becomes an on-call problem: a chat-template mismatch, a missing EOS that makes the model talk
+forever, a cache sized with the wrong formula that runs out of memory at the first long prompt.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Writing the code"
+  senior={[
+    "Writes correct attention, multi-head, cache and GQA with shapes on every line, and a stable softmax without being prompted.",
+    "Proves the cache with an equivalence test and the mask with a causality test, and handles EOS and probabilities in decoding.",
+  ]}
+  staff={[
+    "Writes the oracles first and mutation-tests them, so the test that would catch a top-left mask in decode exists before the cache does.",
+    "Explains each optimization as bytes moved per step: preallocated cache, KV heads only, bf16 or fp8 cache, paging, prefix sharing for beams.",
+  ]}
+/>
+
+<LevelContrast title="Talking about it">
+  <Fragment slot="senior">Answers "what changes for KV caching" with the list: cache, mask alignment, position offset, prefill and decode.</Fragment>
+  <Fragment slot="staff">Connects the same list to money and latency: GQA's 4× to 8× smaller cache sets the batch size, output tokens set latency, and the provider's prompt cache rewards a stable prefix. Says which of these a small team should never build.</Fragment>
+</LevelContrast>
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="What parts of the transformer need to change for KV caching, and what optimizations would you make? (Reported, OpenAI)">
+    The attention layer appends and reads the cache; the mask becomes `T × S` aligned bottom-right; positions
+    continue from the cache length; generation splits into prefill and decode. Optimizations: preallocate
+    instead of `torch.cat`, store only the KV heads, a lower-precision cache, batch rows with paged memory,
+    and reorder rows (or share prefixes) for beam search. See [Stage 3](#stage-3-kv-cache).
+  </FollowUp>
+  <FollowUp q="Now add GQA in the same hour. (Reported by a Blind poster as Anthropic's ask; low confidence)">
+    Shrink `wk` and `wv` to `h_kv × d` outputs, cache the small K and V, then `repeat_interleave` by `h ÷ h_kv`
+    on the head axis (or group the queries to avoid the copy). MHA and MQA are the two ends of the same
+    parameter. State the memory win with the KV formula.
+  </FollowUp>
+  <FollowUp q="Make it masked or causal. (Reported title, Apple)">
+    Add a boolean mask before softmax, filling minus infinity. Explain why it is lower-triangular for
+    prefill and why it must stay bottom-right aligned when `T` differs from `S`. Mention padding masks and the
+    `nan` from fully masked rows.
+  </FollowUp>
+  <FollowUp q="Return the probability of the sentence. (Reported title, Microsoft)">
+    Sum per-token log-probs and exponentiate at the end. Say whether the prompt's tokens are included
+    (usually not) and whether EOS counts (usually yes). Add length normalization if you compare beams of
+    different lengths.
+  </FollowUp>
+  <FollowUp q="How does RoPE change your cache? (Not reported; a natural next push)">
+    RoPE rotates q and k by their absolute positions inside attention. You cache keys after rotation, and
+    each new token is rotated at `cache.len + i`. The position-offset bug from the table becomes a rotation
+    bug with the same symptom: full forward right, cached decode wrong.
+  </FollowUp>
+  <FollowUp q="Why does a bigger vocabulary help and hurt? (Not reported; a natural next push)">
+    Fewer tokens per text means shorter sequences and a smaller KV cache per document. The cost is embedding
+    and output-head parameters: Llama-3.1-8B's 128,256-token vocabulary at a hidden size of 4,096, untied,
+    is 2 × 128,256 × 4,096 ≈ 1.05B parameters, about 13% of its 8.03B, plus a wider softmax at every step.
+  </FollowUp>
+  <FollowUp q="Implement attention with appropriate batching considerations. (Together AI prep guide example)">
+    Ragged batches need a padding mask combined with the causal mask (AND them), and padded query rows must
+    not produce `nan`. Left-padding for generation keeps every row's next position at the same index.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Skipping the max subtraction in softmax.** Large scores overflow to `nan`; the Together prep guide calls
+  it "the step people skip under pressure" (<Cite id="s-0457784328" />), and the test is scores of 1,000.
+- **Using `is_causal=True` during cached decode.** For a non-square mask PyTorch aligns it top-left, so the
+  new token sees only the first key; pass an explicit bottom-right mask, or no mask when `T = 1`.
+- **Mixing mask conventions.** `F.scaled_dot_product_attention` treats `True` as "attend" while
+  `nn.MultiheadAttention` treats `True` as "masked out" (PyTorch docs, read 2026-10-12), so a mask that works
+  in one silently inverts in the other.
+- **Merging heads with `reshape` and no transpose.** It runs and has the right shape, but each token's row
+  now holds pieces of other tokens.
+- **Restarting positions at zero in decode.** The new token gets the wrong position, and only a
+  cache-equivalence test catches it.
+- **Caching after `repeat_interleave`.** The output is correct, but the cache is as large as without GQA.
+- **The hidden-size KV formula.** It counts query heads instead of KV heads, so it is 8× too high for
+  Llama-3.1-70B (64 ÷ 8 heads) (<Cite id="s-d97e9a72e2" />, <Cite id="s-c12521aa7d" />).
+- **Multiplying probabilities in beam search.** The product underflows to zero; sum log-probs, and without
+  length normalization beams favor short outputs (Wu et al., 2016).
+- **Encoding BPE by frequency instead of merge rank.** It produces different ids from the ones the model was
+  trained on.
+- **Parsing special tokens out of untrusted text.** A user who types `<|eos|>` can end the model's turn.
+
+## Prove it with a lab
+
+<LabRef lab="transformer" role="proof" note="Build attention, multi-head attention, a pre-norm block and a small GPT, then add what this page adds on top: GQA, SwiGLU and a KV cache. Its generate() re-runs the full context, which makes it a good place to practise Stage 3." />
+
+<LabRef lab="llm-inference" role="partial" note="A real KV cache on GPT-2 and a KV-size formula with n_kv_heads. Swap its torch.cat growth for a preallocated cache and write the cache-equivalence test against its naive v0." />
+
+<LabRef lab="tokenizer" role="partial" note="Byte-level BPE (v1) and the v2 GPT-2-style tokenizer pass their tests. v2 used to lose spaces because its split pattern matched no whitespace (fixed 2026-10-13); reading that pattern is a good exercise." />
+
+The llm-inference lab's GPT-2 cache size at 1,024 tokens is
+<LabNumber lab="llm-inference" metric="KV cache size (GPT-2, seq_len=1024)" showMetric />. The transformer lab's
+throughput and loss rows are estimates, so don't quote them as measurements.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-7fa103b073" />
+- <Cite id="s-8f304f761b" />
+- <Cite id="s-a129aa6451" />
+- <Cite id="s-b4d190c38f" />
+- <Cite id="s-be19e40ea6" />
+- <Cite id="s-0630fd2aff" />
+- <Cite id="s-4e3fbcaea8" />
+- <Cite id="s-d302bba651" />
+- <Cite id="s-bebe1e8956" />
+- <Cite id="s-5a478c45c5" />
+- <Cite id="s-0457784328" />
+- <Cite id="s-20bffa9709" />
+- <Cite id="s-6fdd575dc5" />
+- <Cite id="s-75e82f8882" />
+- <Cite id="s-d97e9a72e2" />
+- <Cite id="s-f440daaea4" />
+- <Cite id="s-c12521aa7d" />
+- <Cite id="s-4525fcd815" />
+- <Cite id="s-8e443a8b66" />
+- Vaswani et al., "Attention Is All You Need" (2017): https://arxiv.org/abs/1706.03762 (read 2026-10-12)
+- Shazeer, "Fast Transformer Decoding: One Write-Head is All You Need" (2019): https://arxiv.org/abs/1911.02150 (read 2026-10-12)
+- Ainslie et al., "GQA" (2023): https://arxiv.org/abs/2305.13245 (read 2026-10-12)
+- Shazeer, "GLU Variants Improve Transformer" (2020): https://arxiv.org/abs/2002.05202 (read 2026-10-12)
+- Sennrich et al., "Neural Machine Translation of Rare Words with Subword Units" (2015): https://arxiv.org/abs/1508.07909 (read 2026-10-12)
+- Holtzman et al., "The Curious Case of Neural Text Degeneration" (2019): https://arxiv.org/abs/1904.09751 (read 2026-10-12)
+- Wu et al., "Google's Neural Machine Translation System" (2016): https://arxiv.org/abs/1609.08144 (read 2026-10-12)
+- Kwon et al., "Efficient Memory Management for LLM Serving with PagedAttention" (2023): https://arxiv.org/abs/2309.06180 (read 2026-10-12)
+- Dao et al., "FlashAttention" (2022): https://arxiv.org/abs/2205.14135 (read 2026-10-12)
+- PyTorch 2.14, `torch.nn.functional.scaled_dot_product_attention`: https://docs.pytorch.org/docs/2.14/generated/torch.nn.functional.scaled_dot_product_attention.html (read 2026-10-12)
+- Karpathy, minbpe: https://github.com/karpathy/minbpe (read 2026-10-12)
+- Anthropic, Pricing: https://platform.claude.com/docs/en/about-claude/pricing (read 2026-10-12)
+- Small-team defaults: `docs/ai-interviews/research/11-small-team-lens.md` §6 (2026-10-12)

@@ -1,0 +1,198 @@
+---
+question: infra-031
+family: kv-store-durable-log
+status: published
+labs: [wal, kafka-lite]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Every change, including a whole multi-key transaction, becomes one record in an append-only log. I write the
+> record, force it to disk with fsync, apply it in memory, and only then return success. Each record carries its
+> length and a checksum. On start-up I load the last snapshot, read the log until the first incomplete or damaged
+> record, cut the file there, and replay what is newer than the snapshot. And I prove it with a test that kills
+> the process at random moments."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+You have relied on databases that survive crashes. This question asks you to be one. Two requirements hide in
+the title, and each maps to one mechanism:
+
+1. **"No acknowledged write is lost."** Once your `set` returns, the caller will tell a user the write happened.
+   So you may only return after the write is safe on the drive. Forcing bytes onto the drive is a system call
+   named **fsync**, and it takes milliseconds. This is about **when you return**.
+2. **"Never half-applied."** If a transfer changes two keys, a crash must not leave one changed and the other
+   not. This is about **how you frame records**: one transaction must be one record that is either complete or
+   ignored.
+
+Most answers get the first part roughly right. They break on **recovery**: what start-up does with a record the
+crash cut in half. The question is a title on PracHub (a site that collects reported questions), "Build a Crash-Consistent Single-Server Key-Value Store",
+tagged Baseten; only the title is candidate-reported (<Cite id="s-fa7d3ae628" />).
+
+## Clarify first
+
+Spend a minute here. The first question decides the design:
+
+- **Which crash?** "Process crash only, or power loss too? If only the process dies, the operating system still
+  has my data and a plain `write` is enough. I'll assume power loss, so I need `fsync`."
+- **Transactions.** "Are multi-key writes in scope? I'll assume yes, and they must be all-or-nothing."
+- **Latency.** "Is one forced disk write per call acceptable at first? I'll assume yes and batch later if
+  needed."
+- **Ownership.** "One process owns the files? I'll assume yes."
+
+## Answer
+
+### Words you need first
+
+- When you call `write()`, the bytes land in the **page cache**: memory the operating system keeps for file data.
+  It survives your process dying, but not the machine losing power.
+- **fsync** forces a file's bytes from the page cache onto the drive, and waits. It takes milliseconds, which is
+  why it is the expensive line in this design.
+- To **acknowledge** a write is to return success to the caller.
+- A **write-ahead log** (WAL) is a file you only append to. Each change goes there, forced to disk, *before* it
+  is applied or acknowledged.
+- A **torn write** is a record the crash cut off partway through.
+- A **checksum** (here **CRC32**, a 4-byte number computed from the record's bytes) lets recovery tell a complete
+  record from damaged bytes.
+- The **LSN** (log sequence number) is a counter that numbers each record: 1, 2, 3 and so on.
+
+### The picture
+
+```
+ set / commit
+      │ 1. encode the change as ONE record:  length | crc32(length + payload) | payload
+      ▼
+┌─────────────────┐
+│ wal file        │  2. append the record, then fsync
+└─────────────────┘
+      │ 3. apply the change to the in-memory store
+      ▼
+ return success     4. only now is the write acknowledged
+
+ Start-up:  load snapshot ─► read wal until the first bad record ─► cut the file there ─► replay LSN > snapshot
+ Checkpoint: save snapshot atomically ─► then empty the wal
+```
+
+**The record** carries its own length and checksum, so a reader can tell where it ends and whether it is whole.
+**The wal file** is only ever appended to. **The in-memory store** is updated after the log, never before, so
+memory never holds a write the disk lacks. **The snapshot** is the whole store saved now and then (temp file,
+fsync, rename, fsync the directory), tagged with the last LSN it includes, so the log can be emptied.
+
+### The code that matters
+
+```python
+def recover_log(path):
+    records, good = read_frames(path)          # stops at the first torn or corrupt record
+    if os.path.exists(path) and os.path.getsize(path) != good:
+        with open(path, "r+b") as f:
+            f.truncate(good)                   # cut BEFORE appending again
+            os.fsync(f.fileno())
+    return records
+
+def set(self, key, value):
+    self.lsn += 1
+    self.log.append(encode_ops(self.lsn, {key: value}))   # write + fsync
+    self.kv.set(key, value)                                # only now
+```
+
+`read_frames` walks the file record by record: read the 8-byte header, check that the whole payload is there,
+check the checksum. The first record that fails either check marks the end of the good part of the file.
+
+### Follow one transfer through a crash
+
+Picture a credit-tracking service. Alice and Bob have 100 credits each, and Alice sends Bob 30 inside a
+transaction. The numbers below are an illustration: say the log holds 41 records ending at byte 2,000, and the
+transfer's record is 48 bytes (an 8-byte header and a 40-byte payload).
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| 1 | `commit` encodes `alice → 70, bob → 130` as **one** record, LSN 42. | "Two keys, one record, so the disk sees all of the transfer or none of it." |
+| 2 | The record is appended at byte 2,000 and `fsync` starts. | "I don't return until fsync does." |
+| 3 | Power fails. Only 30 of the 48 bytes reached the disk. | "The caller never got an answer, so losing this write is allowed." |
+| 4 | On restart, the reader finds a header saying 40 bytes of payload but only 22 are there. It stops at byte 2,000. | "A torn record can only be the last one." |
+| 5 | `recover_log` cuts the file back to 2,000 bytes and forces that to disk. | "Cut before appending, or the next write lands behind garbage." |
+| 6 | Replay applies records newer than the snapshot's LSN. Alice and Bob are at 100 and 100. | "Consistent: the transfer happened completely or not at all." |
+
+If the transfer had been two records, one per key, the crash could fall between them. Alice would be at 70 and
+Bob still at 100: thirty credits gone. That is the half-applied state the title forbids.
+
+### The line most answers miss
+
+Step 5 is the truncate. Without it, the file is reopened for appending with 30 garbage bytes at the end. The next
+write lands *after* the garbage. The next recovery stops at the garbage again and never reaches the new record,
+so a write the caller saw succeed disappears. The wal lab's v1 `open()` has this shape: it recovers to the first
+bad record and reopens in append mode without truncating (read on 2026-10-12).
+
+Say: "Recovery has to cut the torn tail before the log accepts new writes."
+
+### Checkpoints, briefly
+
+The log cannot grow forever. A **checkpoint** saves a snapshot tagged with the current LSN, makes it durable,
+and only then empties the log. If the crash lands between the two, the old records are still in the log, and
+replay skips every record at or below the snapshot's LSN. Replay is then **idempotent**: running it twice gives
+the same result as running it once.
+
+### Prove it
+
+Three tests, all run in the family walkthrough on 2026-10-12:
+
+- **Every truncation point.** Write records, cut the log at every byte offset, and check that recovery returns
+  exactly the complete records. This is step 3 of the example, tried at every possible byte.
+- **Append after a torn tail.** Recover, append, recover again; the new record must survive.
+- **`kill -9`.** A child process writes from 32 threads, prints each sequence number after its write returns,
+  and is killed with SIGKILL (a signal it cannot catch) at a random moment, 15 times. Every printed number was
+  recovered.
+
+Then say the limit. A process kill leaves the page cache intact, so this test does not prove power-loss safety.
+On macOS, plain `fsync` does not even flush the drive's own cache; Apple's man page points to a separate call,
+`F_FULLFSYNC`, for that
+([Apple fsync(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html)).
+
+### When fsync fails
+
+If `fsync` returns an error, stop: fail the write, refuse new writes, restart and recover. Do not retry it.
+Retrying can report success for data that never reached disk, which is why PostgreSQL now panics on fsync
+failure ([PostgreSQL wiki](https://wiki.postgresql.org/wiki/Fsync_Errors)).
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Crash consistency"
+  senior={["Log-then-apply, framed records with checksums, one record per transaction, truncating recovery, and a kill -9 test."]}
+  staff={["Separates process crash from power loss and says what each test proves, treats fsync errors as fail-stop, covers the directory fsync and checkpoint ordering, and distinguishes a torn tail from mid-log corruption."]}
+/>
+
+In plain words: a Senior candidate builds a log that recovers correctly and tests it. A Staff candidate also
+says exactly which crash each test covers, refuses to retry a failed fsync, and treats a bad record in the
+*middle* of the log (with good records after it) as corruption to stop on, not a torn tail to cut.
+
+## Small-team version
+
+Put state that must survive a crash in Postgres or SQLite, and choose their durability settings deliberately.
+PostgreSQL's asynchronous commit risks "data loss, not data corruption", bounded by three times
+`wal_writer_delay` ([PostgreSQL 18 docs](https://www.postgresql.org/docs/current/wal-async-commit.html)). SQLite
+in WAL mode with `synchronous=NORMAL` stays consistent but can roll back recent commits after power loss
+([sqlite.org/pragma](https://www.sqlite.org/pragma.html)). Both are the process-crash versus power-loss choice
+from Clarify, made with a setting.
+
+Buy, don't build: the database you already run is free to configure. Hand-roll a log only for a local spool,
+such as a GPU worker buffering results while the database is unreachable, and keep the truncation and kill tests
+above as its gate.
+
+## Pitfalls
+
+- **Acknowledging before `fsync`, then claiming nothing can be lost.** That design is valid only if you state
+  the loss window.
+- **One record per key in a transaction.** A crash between records leaves half a transfer.
+- **Recovery that stops at a bad record but does not truncate.** The next acknowledged write is lost behind the
+  garbage.
+- **Retrying a failed `fsync`.** It can report success for data that never reached disk.
+- **Testing with `kill -9` and calling it power-loss safe.** The page cache survives a kill, not a power cut.
+
+## Go deeper
+
+- Family walkthrough: [Key-value store to durable log](/system-design-labs/interviews/walkthroughs/kv-store-durable-log/), stage 4 and Verification.
+- Under load: [group commit for many writers](/system-design-labs/interviews/questions/r2b-020/).
+- Labs: <LabRef lab="wal" inline /> (add the truncation it is missing) and <LabRef lab="kafka-lite" inline /> (acknowledges before its batched fsync).

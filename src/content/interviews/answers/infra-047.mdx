@@ -1,0 +1,186 @@
+---
+question: infra-047
+family: gpu-cluster-control-plane
+status: published
+labs: [container-orchestrator]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "GPUs inside one machine talk about nine times faster than GPUs in different machines, and between machines,
+> crossing switches costs more. So I treat placement as packing at two levels. An 8-GPU pod needs one whole node.
+> A 64-GPU job needs eight whole nodes under one leaf switch. At both levels I use best-fit: the tightest node that
+> fits, the smallest leaf that fits. Each job says whether one leaf is required or only preferred, with a wait
+> limit, and inside each node I hand out GPUs together with the network card next to them."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you understand why network position matters for GPU jobs, and whether you
+can turn that into a placement rule you can defend with numbers.
+
+### What makes this different from placing web services
+
+When you place web services, network position barely matters. Every server can reach every other server fast
+enough, and a request touches a handful of them for a few milliseconds.
+
+A big training job is different. It runs the same step thousands of times on many GPUs, and at the end of every
+step all the GPUs exchange gigabytes of data. That exchange happens in lockstep: the step isn't done until the
+slowest link finishes. So the slowest link the job crosses sets its speed for the whole run, and placement decides
+which links it crosses.
+
+A prep site says recent CoreWeave candidates were asked to design "a multi-tenant GPU cluster scheduler aware of
+InfiniBand topology", and that interviewers are "less interested in textbook answers"; it names no candidate
+(<Cite id="s-1c022c73a6" />). Expect to defend numbers, not vocabulary.
+
+### Words you need first
+
+- **Node**: one server with 8 GPUs (assume NVIDIA H100s).
+- **NVLink**: NVIDIA's direct GPU-to-GPU link inside a node. It is the fastest path a GPU has.
+- **InfiniBand**: the low-latency network between nodes. Each node reaches it through network cards (**NICs**).
+- **Leaf and spine switches**: the network is a tree. A **leaf** switch connects a group of nodes; **spine**
+  switches connect the leaves. Traffic between two nodes on the same leaf goes through one switch; traffic between
+  leaves goes up to a spine and back down.
+- **Oversubscribed uplink**: the links from a leaf up to the spine carry less than the nodes below it can send. So
+  traffic that crosses leaves gets less bandwidth.
+- **All-reduce**: the step where every GPU sends its piece of an array and ends up with the average of everyone's.
+  Training jobs do this with their **gradients** (the array of adjustments each GPU computed) on every step.
+- **Tensor parallelism**: splitting one model's layers across several GPUs. It talks constantly, so it needs the
+  fastest link.
+
+## Clarify first
+
+- **Fabric shape.** "How many nodes per leaf switch, how many leaves per spine, and how oversubscribed are the
+  uplinks?"
+- **Job mix.** "Multi-node training, single-node inference, or both?"
+- **Tenancy.** "May two tenants share a leaf? A node?"
+- **Waiting.** "Is it acceptable to wait for a perfect placement, and for how long?"
+
+## Answer
+
+### Why topology matters, in numbers
+
+Inside an H100 node, NVLink gives **450 GB/s each way** per GPU
+([Hopper blog](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/)). Across nodes the network
+card is the limit; assume **50 GB/s per GPU**. That is a 9× gap.
+
+Now one training job. It trains an 8-billion-parameter model on **64 GPUs**, and its gradients are **16 GB** (2
+bytes per number, a format called bf16). In a ring all-reduce, each GPU sends about **31.5 GB per step**:
+
+- under one leaf, at 50 GB/s: about **0.63 s per step**;
+- through an oversubscribed uplink at half that bandwidth: about **1.26 s per step**.
+
+That extra 0.63 s is paid on every step, for the whole run.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Ring all-reduce bytes per GPU"
+  expr="bytes sent per GPU = 2 × (N − 1) ÷ N × S"
+  vars={[
+    { sym: 'N', meaning: 'GPUs in the ring' },
+    { sym: 'S', meaning: 'bytes being reduced; 8B parameters × 2 bytes (bf16) = 16 GB' },
+  ]}
+  example={[
+    "2 × 63 ÷ 64 × 16 = 31.5 GB per GPU per step",
+    "31.5 ÷ 50 GB/s (assumed) = 0.63 s; at half the bandwidth through an oversubscribed uplink, 1.26 s",
+  ]}
+/>
+
+NVLink: 18 links at 25 GB/s each way = 450 GB/s each way per GPU; NVIDIA's "900 GB/s" is both directions together.
+450 ÷ 50 = 9×.
+
+</details>
+
+Say it like this: "Tensor parallelism stays inside a node, and a multi-node job wants one leaf. Crossing an
+oversubscribed uplink can double the time of every gradient exchange."
+
+### Placement as packing at two levels
+
+- **Level 1, GPUs inside a node.** An 8-GPU pod needs a whole node. Keep free GPUs per node, and pick the node with
+  the fewest free GPUs that fits (best-fit).
+- **Level 2, nodes inside a leaf.** A 64-GPU job needs eight whole nodes under one leaf. Keep a count of free whole
+  nodes per leaf, and pick the leaf with the fewest free nodes that fits.
+
+Measure fragmentation per leaf the way you would per node: a cluster with 40 free nodes spread five per leaf has no
+room for an 8-node job.
+
+### Follow one job
+
+The leaf names and counts below are illustrative.
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| 1. Submit | A tenant submits a 64-GPU training job: 8 whole nodes. | "This is a gang: all eight nodes start together or none do." |
+| 2. Candidates | Leaf L3 has 12 free whole nodes. Leaf L7 has 9. Leaf L9 has 5. | "L9 can't hold it. L3 and L7 can." |
+| 3. Best-fit | Pick **L7**, the smallest leaf that fits. | "L3's 12 free nodes stay together for a bigger job." |
+| 4. Inside each node | Hand out all 8 GPUs with the network card paired to each. | "A GPU far from its network card is slow even on a good leaf." |
+| 5. Nothing fits | If no leaf had 8 free nodes and the job says **preferred**, wait up to its bound, then place across two leaves. If it says **required**, keep waiting. | "A job that waits an hour for one leaf may finish sooner on two." |
+
+### Required versus preferred
+
+Let each job choose. Kueue, a Kubernetes job-queueing add-on, does this in its Topology Aware Scheduling with
+"required" and "preferred" annotations; a preferred placement that doesn't fit falls back to the next level up
+([Kueue TAS](https://kueue.sigs.k8s.io/docs/concepts/topology_aware_scheduling/), beta since v0.14).
+
+Add a wait bound. Topology as a hard rule with no bound means a big job can wait forever while the cluster has
+plenty of free nodes in the wrong places.
+
+### Inside the node: pair GPUs with their network cards
+
+**GPUDirect RDMA** lets a network card read GPU memory directly, without a copy through the CPU. It needs the GPU
+and the card under the same **PCIe root complex**, the part of the server's internal bus that a group of devices
+hangs off ([GPUDirect RDMA docs](https://docs.nvidia.com/cuda/gpudirect-rdma/index.html)). So "8 free GPUs and 8
+free NICs" is not enough. Allocate each GPU with its paired card.
+
+### Multi-tenancy
+
+Give each tenant quotas in GPUs **and** in leaves. Keep small single-GPU work off the nodes in leaves that large jobs
+need, or let it borrow them only preemptibly (it can be evicted when a big job arrives).
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Topology-aware scheduling"
+  senior={["Explains the bandwidth gap with arithmetic and places jobs with nested best-fit."]}
+  staff={["Makes required versus preferred a per-job choice with a wait bound, and measures job step time against placement to prove the rule pays."]}
+/>
+
+In plain words: a Senior answer explains why topology matters and packs at both levels. A Staff answer also lets
+jobs trade waiting against speed, and proves the rule pays by comparing step times against placements.
+
+## Small-team version
+
+You won't see an InfiniBand fabric unless you rent a multi-node training cluster. If you do, ask the provider how
+jobs are placed and use its scheduler. For single-node inference, topology means only one rule: keep tensor
+parallelism inside one node.
+
+The money is why placement matters when you do rent one. 64 reserved H100s at $3.19 an hour (Together, fetched
+2026-10-11) cost about **$149,000 a month**. A placement that makes each training step 0.63 s slower, as in the
+half-bandwidth example above, wastes a share of that bill equal to the share of step time it adds.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+64 × $3.19 × 730 hours ≈ $149,000 a month.
+
+</details>
+
+Default: the provider's scheduler, with a required-topology flag for multi-node jobs.
+
+Say it like this: "If we rent a training cluster, I'd ask how it places multi-node jobs and set them to require
+one network domain."
+
+## Pitfalls
+
+- **Placing a multi-node job on any free nodes.** The slowest link it crosses slows every step.
+- **Topology as a hard rule with no wait bound.** Big jobs can starve while free nodes sit in the wrong leaves.
+- **Ignoring GPU-to-NIC pairing inside a node.** The direct GPU-to-network path needs both on the same root complex.
+
+## Go deeper
+
+- Family walkthrough: [topology deep dive](/system-design-labs/interviews/walkthroughs/gpu-cluster-control-plane/#deep-dives).
+- Training-side view: [distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/).
+- Lab: <LabRef lab="container-orchestrator" inline />.

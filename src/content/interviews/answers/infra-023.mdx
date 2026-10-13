@@ -1,0 +1,195 @@
+---
+question: infra-023
+family: cache-coding
+status: published
+labs: [kv-cache, cdn-edge]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll build the LRU as a hash map plus a doubly linked list, with two helpers that every operation goes through,
+> so each new requirement is a small change. To save it, I write the entries from oldest to newest, so replaying
+> them rebuilds the order. Each expiry is stored as a wall-clock time, because the in-process clock means nothing
+> after a restart. The format is versioned JSON, never pickle. And I write to a temporary file, force it to disk
+> and rename it into place, so a crash leaves the old snapshot or the new one, never half of one."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know one thing: can you keep a small, correct core while requirements keep arriving?
+
+A normal least-recently-used (LRU) cache question ends when `get` and `put` work. This one doesn't. The interviewer adds a requirement, waits
+for you to handle it, then adds another. The candidate's own description is an LRU cache where "they added
+complexity in multiple waves", which made it "a time-management test as much as a coding test"
+(<Cite id="s-42f1c7f6dd" />). The waves this Anthropic Senior candidate reports are handling files and the
+trade-offs of serialization.
+
+So the round is decided by two things. First, how little of your first version you have to rewrite when the third
+requirement lands. Second, whether you can talk clearly about what a saved copy of the cache must preserve.
+
+### Words you need first
+
+- **LRU** (least recently used): when the cache is full, evict the entry that has gone longest without a read or a
+  write.
+- **TTL** (time to live): how long an entry stays valid after it is written. Interviewers usually add it as an
+  early wave.
+- To **serialize** is to turn the cache into bytes you can write to a file; to **restore** (or deserialize) is to
+  build the cache back from those bytes. The saved file is a **snapshot**: the state at one moment.
+- A **monotonic clock** only moves forward and ignores changes to the system time (`time.monotonic` in Python).
+  It is the right clock for TTLs inside a running process, and the wrong one to write to disk, as you'll see.
+
+## Clarify first
+
+Spend a minute pinning down the setup. Say your assumptions out loud:
+
+- **Capacity in entries?** "I'll assume capacity counts entries, and that `put` on an existing key counts as a
+  use."
+- **Will TTLs come later?** "I'll assume yes, so I'll pass the cache a clock from the start instead of reading
+  the system clock inside it."
+- **Who reads the snapshot?** "I'll assume a future version of the program may read it, so I'll add a version
+  field."
+- **What must survive?** "I'll assume the restored cache must keep both the recency order and each entry's
+  remaining TTL."
+- **Can the file be tampered with?** "I'll assume the snapshot file isn't trusted, which rules out loading
+  arbitrary objects with `pickle`."
+
+## Answer
+
+### The core that every wave hooks into
+
+**Stage 1** is a dict from key to node and a doubly linked list with **sentinels**: two dummy nodes, `head` and
+`tail`, that sit at the ends and never hold data, so no code needs an "is this the first node?" branch. Two helpers,
+`unlink` and `push_front`, carry every operation. `get` unlinks the node and pushes it to the front. `put` either
+updates an existing node and moves it, or evicts the node just before `tail` and pushes a new one. The node stores
+its own key, so eviction can delete it from the map as well as from the list. Tests: eviction order, update without
+eviction, capacity 1.
+
+**Each later wave touches one helper, not the whole class.** TTL adds an expiry check in `get`. Optionally, it adds
+a **min-heap** (a priority queue that always gives you the smallest item first) of expiry times, so a full cache
+drops expired entries before it evicts a live one. Threads wrap the public methods in a lock. Serialization walks
+the list. Say: "I want each new requirement to be a few lines in one place. If I'm rewriting the class, my first
+version was wrong."
+
+### One example, followed through a save and a restore
+
+Take a cache of capacity 3 holding three entries. From least to most recent: `a` (no TTL), `b` (expires in 5
+seconds), `c` (expires in 60 seconds). The program saves the snapshot, then crashes and restarts 10 seconds later.
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| 1. Walk | The saver starts at `tail.prev` (`a`) and walks towards `head`, writing `a`, `b`, `c` in that order. | "Oldest first, so replaying through `put` rebuilds the order without storing it." |
+| 2. Convert time | `b`'s expiry is written as "now on the wall clock + 5 s", `c`'s as "now + 60 s". `a` has none. | "The monotonic clock restarts from an arbitrary point, so I store absolute wall-clock time." |
+| 3. Write the file | The JSON goes to `snapshot.tmp`, is forced to disk, then renamed over `snapshot`. | "A crash mid-write leaves the old file intact." |
+| 4. Restart, +10 s | The loader reads the version, then replays the entries. `b` expired during the downtime and is skipped. `c` comes back with about 50 seconds left. | "Entries that died while we were down stay dead. The rest keep their remaining life." |
+| 5. Check | The restored cache holds `a`, then `c`, in that order. | "This is the round-trip test I'd write first." |
+
+### The serialization trade-offs, said out loud
+
+The Anthropic report lists the trade-offs as their own question, so give each one a sentence:
+
+- **What to write.** Entries from least to most recent, so replaying them through `put` rebuilds the order without
+  storing it. Skip entries that are already expired.
+- **Time.** A monotonic clock is meaningless after a restart, so write each expiry as absolute wall-clock time and
+  convert it back on load. Entries that expired during the downtime are dropped.
+- **Format.** JSON with a version field is safe and readable. A binary format is smaller and faster but needs a
+  schema, a fixed byte order and length checks. Python's `pickle` round-trips anything, and also runs code from a
+  hostile file when you load it.
+- **Files.** Write to a temp file, call **fsync** (which forces the file's bytes from the operating system's memory
+  onto the disk), then `os.replace` it over the old snapshot. The rename is atomic, so a crash leaves the old file
+  or the new one.
+
+Here are the two methods. `to_json` walks the list from oldest to newest; `from_json` checks the version and
+replays.
+
+```python
+def to_json(self, wall=time.time):
+    now_m, now_w = self.clock(), wall()
+    rows, n = [], self.tail.prev                    # walk LRU -> MRU
+    while n is not self.head:
+        if not self._expired(n, now_m):
+            exp_w = None if n.expires_at is None else now_w + (n.expires_at - now_m)
+            rows.append([n.key, n.val, exp_w])
+        n = n.prev
+    return json.dumps({"version": 1, "capacity": self.cap, "entries": rows})
+
+@classmethod
+def from_json(cls, text, clock=time.monotonic, wall=time.time):
+    doc = json.loads(text)
+    if doc.get("version") != 1:
+        raise ValueError("unknown snapshot version")
+    c, now_w = cls(doc["capacity"], clock), wall()
+    for key, val, exp_w in doc["entries"]:          # replay rebuilds recency order
+        if exp_w is None:
+            c.put(key, val)
+        elif exp_w > now_w:
+            c.put(key, val, ttl=exp_w - now_w)
+    return c
+```
+
+The test that proves it is the example above. Take a snapshot, then restore with a new monotonic origin and the wall
+clock moved forward 10 seconds. Check that the order survives and that an entry with a 5-second TTL is gone. That
+test passed in the family's scratch run on 2026-10-12.
+
+### When a snapshot isn't enough
+
+If the follow-up becomes "no write may be lost between snapshots", say plainly that a snapshot can't give you that.
+Anything written after the last save is lost in a crash. You need an append-only log replayed on start, plus
+periodic compaction (rewriting the log as one fresh snapshot so it doesn't grow forever). Say: "A snapshot bounds
+how much I lose. A log is what makes it zero."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Growing LRU"
+  senior={["Ships a tested O(1) LRU fast, then adds TTL and a versioned snapshot without rewriting the core."]}
+  staff={["Names what each wave threatens (time across restarts, partial writes, untrusted input) before coding it, and says when a snapshot must become a log."]}
+/>
+
+In plain terms: a Senior candidate gets every wave working. A Staff candidate says what could go wrong with each
+wave before writing it, and knows where snapshots stop being the right tool.
+
+## Small-team version
+
+You won't hand-roll this. An in-process cache comes from a library, and a shared one is managed Redis or Valkey.
+Persistence is that product's job: Redis offers snapshots and an append-only file. What you own is deciding whether
+a cache *should* survive a restart at all.
+
+Two cases come up on an AI team. An **embedding** is a list of numbers a model computes for a piece of text, used
+for search; an embedding cache stores those numbers so the same text isn't sent to the model twice. A response
+cache stores a large language model's answers.
+
+- **For embeddings keyed by model version, a warm restart saves money.** The same text and model always give the
+  same numbers, so old entries stay correct.
+- **For LLM responses, a restart is a free way to flush stale entries.** After a prompt change, old answers may be
+  wrong.
+- **Put the prompt or model version in the key either way.** Then a change can never serve an old entry.
+
+How much does a cold restart cost? Re-embedding an assumed 1 million chunks of 500 tokens each through OpenAI's
+text-embedding-3-small costs about **$10** at its list price. (A **token** is the unit providers charge for, roughly
+¾ of a word.) At that price, persisting the cache is about restart latency, not money. With a self-hosted embedding
+model or a much larger corpus, the answer changes.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Tokens:** 1,000,000 chunks × 500 tokens = 500 million tokens (both counts are assumptions).
+- **Price:** text-embedding-3-small at $0.02 per 1 million tokens (list price fetched 2026-10-11).
+- **Cost:** 500 × $0.02 = **$10** for a full re-embed.
+
+</details>
+
+## Pitfalls
+
+- **Storing the monotonic expiry in the snapshot.** The monotonic clock restarts from a new origin, so every TTL is
+  wrong after a restart.
+- **Writing the snapshot in place.** A crash mid-write corrupts the only copy.
+- **No version field.** The next format change can't tell old files from new ones.
+- **Rebuilding from scratch at every wave.** It burns the time you need for the later waves; hook into `unlink` and
+  `push_front` instead.
+
+## Go deeper
+
+- Family walkthrough: [Caches in coding rounds](/system-design-labs/interviews/walkthroughs/cache-coding/), stages 1–4 and the verification list.
+- When a snapshot isn't enough: [key-value store to durable log](/system-design-labs/interviews/walkthroughs/kv-store-durable-log/).
+- Labs: <LabRef lab="kv-cache" inline /> (lazy TTL plus an append-only file), <LabRef lab="cdn-edge" inline /> (a byte-bounded LRU).

@@ -1,0 +1,171 @@
+---
+question: eng-013
+family: rag-in-code
+status: published
+labs: [rag, rate-limiter, embedding-pipeline, vector-index]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Every choice I made, I can back with a measurement: I compared keyword, vector and combined search on a
+> labeled question set, and the README leads with those numbers. At 100× the data, the search code barely
+> changes; ingestion becomes a resumable job keyed by a content hash, so retries never duplicate anything. Under
+> rate limits I batch requests, cap concurrency below my quota, and back off with jitter on a 429 with a cap on
+> attempts. And the rate limit sets a floor on ingest time that more workers can't beat."
+>
+> The rest of this page explains each part of that answer.
+
+The take-home itself proves you can build. The live follow-ups test two other things: whether your choices were
+decisions backed by measurement, and whether you can see the production system behind the prototype.
+
+What makes this different from defending an ordinary take-home is that the system's quality isn't pass/fail. A
+retrieval system always returns something, and a language model writes a fluent answer from it, right or wrong.
+So "why this chunking?" has no answer from first principles. The only convincing answer is "I tried the
+alternatives on a set of questions with known answers, and here are the numbers." The scale questions are more
+familiar ground for a backend engineer: idempotent jobs, retries and rate limits. The twist is that the
+provider's limit is counted in tokens, not requests.
+
+(Reported for an OpenAI forward-deployed engineer take-home: about five hours on OpenAI's APIs plus a recorded
+video. The follow-ups were "why this chunking strategy, why not a different retrieval method", what would change
+"if the dataset was 100x larger", and "API rate limiting, retry patterns" <Cite id="s-812dbc9385" />.)
+
+### Words you need first
+
+- **RAG** (retrieval-augmented generation): find a few relevant pieces of your documents and paste them into a
+  language model's prompt so it answers from them.
+- **Chunk**: one of those pieces. **Chunking** is how you split documents into them.
+- **Embedding**: a vector of numbers computed from text by an embedding model, so similar meanings point in
+  similar directions. **Dense** search ranks chunks by vector closeness; **BM25** is the standard keyword-ranking
+  formula; **hybrid** merges the two.
+- **Token**: the unit providers count, roughly ¾ of a word. A **TPM** limit is tokens per minute. When you exceed
+  a limit, the API replies with HTTP **429** ("Too Many Requests").
+
+## Clarify first
+
+- **What corpus and what users does the brief describe?** Reuse its wording in your README.
+- **What would "working well" mean to the customer in the brief?** Turn it into a labeled set and a metric.
+- **Which OpenAI APIs are in scope?** "I'll assume embeddings plus chat; batch only if the brief mentions bulk
+  work."
+- **What does the video need to cover?** "I'll assume a 5–10 minute walkthrough: demo, design, numbers, limits."
+
+## Answer
+
+### In the take-home
+
+Spend the hours roughly in thirds:
+
+1. **A third on the pipeline.** Chunking, embedding, keyword and vector search, a cited answer.
+2. **A third on measurement.** A 30–50-question labeled set and the eval script.
+3. **A third on the README, the video and the failure cases.**
+
+Lead the README with numbers. Report **hit@5** (the share of questions with at least one right chunk in the top
+5) and **recall@5** (the share of all right chunks that made the top 5) for BM25-only, dense-only and hybrid,
+each with an error bar. Then show two failures you fixed and one you didn't.
+
+### "Why this chunking, why not another retrieval method?"
+
+Answer with the experiment, not the opinion. Say: "I split on headings and paragraphs, sized under the embedding
+model's input limit, with the heading path prepended. Fixed windows cut tables and sentences. I compared dense,
+BM25 and hybrid on the labeled set; hybrid won on identifier-heavy questions."
+
+The rag lab shows why a measurement beats a belief here. On SciFact, a public benchmark of science claims, its
+hybrid added nothing until the keyword side's word-splitting (its tokenizer) was fixed. Its hit@3 (like hit@5, but for the top 3) was
+<LabNumber lab="rag" metric="hit@3 on BEIR SciFact" /> (dense, hybrid, rerank), against
+<LabNumber lab="rag" metric="BM25 tokenizer (SciFact)" /> for hybrid with a `\w+` tokenizer. Someone who
+"knew" hybrid was better would never have looked.
+
+### "What changes at 100×?"
+
+Follow the ingestion job, because that is what changes most:
+
+```
+Documents (5,000 instead of 50)
+   │
+   ▼
+Chunker ── hash = sha256(chunk text + embedding model name)
+   │
+   ▼
+Already embedded? ──yes──▶ skip  (a re-run or retry costs nothing)
+   │ no
+   ▼
+Batcher ── many chunks per embedding request
+   │
+   ▼
+Token bucket ── caps tokens per minute below the account's TPM limit
+   │
+   ▼
+Embedding API ──429 or 5xx──▶ back off with jitter, honour Retry-After, cap attempts
+   │ ok
+   ▼
+Store vector keyed by hash, then checkpoint progress
+```
+
+- **Ingestion becomes a resumable job.** Content-hash each chunk with the model name, skip unchanged hashes, and
+  checkpoint progress.
+- **Search changes less than people expect.** BM25 moves to a real inverted index (the per-word lists of
+  documents a search engine keeps). Vectors move to an approximate index only when flat search (comparing the query with every
+  vector) gets slow; flat NumPy over 50,000 vectors is still a few milliseconds.
+- **Updates, deletes and re-embedding on model change** become operations you own.
+- **The eval set grows.** 30 questions over 100× the documents measure little.
+
+### "Rate limits and retries"
+
+Batch many inputs per embedding request. Cap concurrency on your side, and pace requests with a **token bucket**
+(a counter that refills at a fixed rate and that each request draws from) sized below your account's limit. On a 429 or a 5xx,
+back off exponentially with **jitter** (a random part of the delay, so workers don't retry in lockstep), honour
+`Retry-After`, and cap attempts. Writes keyed by content hash are idempotent, which makes retries safe. Chat
+requests get timeouts and one fallback (a smaller model, or "try again later"), not unbounded retries.
+
+The rate limit also sets a floor on ingest time. With assumed numbers (100× of 50 documents at 2,000 tokens each,
+and a 1M TPM limit), ingestion takes **at least 10 minutes**, however many workers you run. Say: "More workers
+don't beat the TPM limit. I'd show progress and tell the user when it will finish."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Lower bound on ingest time under a rate limit"
+  expr="T ≥ total_tokens ÷ TPM_limit"
+  vars={[
+    { sym: 'total_tokens', meaning: 'documents × tokens per document' },
+    { sym: 'TPM_limit', meaning: 'embedding tokens per minute on your tier (assumed below; check yours)' },
+  ]}
+  example="100× of 50 docs = 5,000 docs × 2,000 tokens (assumed) = 10M tokens; at an assumed 1M TPM, at least 10 minutes"
+/>
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Take-home defense"
+  senior={["Defends chunking and retrieval with measured comparisons, and gives concrete 100x and retry changes."]}
+  staff={["Frames the prototype as a customer deliverable: what the eval means for the customer's decision, what it costs per month, and what they would own after handover."]}
+/>
+
+## Small-team version
+
+This take-home is a small team's normal week: a working feature, a README with a number, and a list of what
+breaks next.
+
+- **The embedding bill doesn't matter.** text-embedding-3-small was listed at $0.02 per million tokens on
+  2026-10-11, so 10M tokens is about **$0.20**.
+- **What matters is safety under failure.** Retries must not duplicate data, and a rate-limit storm must not take
+  the feature down.
+- **Build one shared token bucket in front of the provider.** It does more than any retry tuning, because it
+  stops the 429s before they happen.
+
+## Pitfalls
+
+- **Defending chunking with "it's the standard size".** That is a belief; the interviewer wants a comparison.
+- **Retrying without jitter or a cap.** Synchronized, unlimited retries turn a 429 into a self-inflicted outage.
+- **A video that only demos the happy path.** It never shows a failure or a number, which is what reviewers look
+  for.
+- **Answering "100×" with "use a vector database".** The hard part at 100× is ingestion, not search.
+
+## Go deeper
+
+- Family walkthrough: [Build a small RAG in code](/system-design-labs/interviews/walkthroughs/rag-in-code/), especially "What changes at 100× the data".
+- Labs: <LabRef lab="rate-limiter" inline /> for the token bucket, <LabRef lab="rag" inline />, <LabRef lab="embedding-pipeline" inline />.

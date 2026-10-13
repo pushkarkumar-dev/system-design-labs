@@ -1,0 +1,160 @@
+---
+question: infra-076
+family: gpu-kernel-perf
+status: published
+labs: [llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "When a model writes one token for one user, each step is hundreds of tiny GPU jobs. The CPU has to start each
+> one, and it can be slower at starting them than the GPU is at finishing them, so the GPU waits. A CUDA graph
+> records the whole sequence once and replays it with a single command, which removes that CPU cost. The catch is
+> that a replay repeats exactly what was recorded, so shapes and memory addresses must stay fixed. Servers live
+> with that by recording one graph per batch size and padding each batch up to the nearest one."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The interviewer wants to know two things: can you tell a step that is slow because of the GPU from one that is
+slow because of the CPU, and do you know what the fix costs?
+
+Start with how a GPU gets work. A GPU program is called a **kernel**. Your Python code, running on the CPU, asks
+the GPU to run kernels one at a time; each request is a **kernel launch** and costs the CPU a few microseconds.
+For big kernels that run for milliseconds, the launch cost doesn't matter.
+
+What makes model serving different from a normal backend: a language model writes its reply one **token** (a
+chunk of roughly ¾ of a word) at a time, and each token needs one full pass through the model. This phase is
+called **decode**. With a single user (a **batch size** of 1), each pass is hundreds of small kernels, each
+finishing in microseconds. Now the CPU's launch cost is comparable to the GPU's work, and the GPU spends much of
+each step idle, waiting for the next launch. It is like a fast database stuck behind a chatty client that sends
+one tiny query per round trip.
+
+The fix is a **CUDA graph**: record the sequence of launches once, then replay it with one command.
+
+(The source is a PracHub prep guide that lists CUDA graphs as a Fireworks technical-review topic and says its
+exercises are not "questions represented as having been asked by Fireworks", so the reported evidence is thin
+<Cite id="s-b6632d5df9" />.)
+
+## Clarify first
+
+- **Decode or prefill? Small batch or large?** **Prefill** reads the whole prompt in one big pass, with big
+  kernels; decode is many small ones.
+- **Does a timeline of the step show gaps between kernels, or back-to-back kernels?** Gaps mean the CPU is the
+  bottleneck; back-to-back means the GPU is.
+- **How variable are batch sizes and sequence lengths?** A replay needs fixed shapes.
+- **Is there CPU-side logic inside the step,** such as choosing the next token or checking for a stop word?
+
+## Answer
+
+### What a CUDA graph is
+
+A CUDA graph is a recorded sequence of GPU work, captured once and replayed with one submission. NVIDIA's PyTorch
+guide: you "launch the entire graph as a single unit with a single submission from the CPU", and graphs help most
+"for workloads with many small operations"
+([NVIDIA CUDA Graph guide](https://docs.nvidia.com/dl-cuda-graph/cuda-graph-basics/cuda-graph.html), accessed
+2026-10-12).
+
+### The worked example: one user, one GPU, one token at a time
+
+Fireworks' blog (2023-08-29, vendor) reports Llama-2-7B (a 7-billion-parameter model) going from **30 to 69
+tokens per second** at batch size 1 on one NVIDIA A100-SXM4-80GB GPU when CUDA graphs were turned on
+([Fireworks blog](https://fireworks.ai/blog/speed-python-pick-two-how-cuda-graphs-enable-fast-python-code-for-deep-learning)).
+Follow one token through both setups:
+
+| Setup | Time per token | Where the time goes | What to say in the interview |
+|---|---|---|---|
+| No graphs | **33.3 ms** | GPU work plus about 18.8 ms of CPU launching | "Over half of each token was the CPU, not the GPU." |
+| With graphs | **14.5 ms** | Mostly GPU work | "One submission per step instead of hundreds." |
+| Memory floor | **6.9 ms** | Reading every weight once from GPU memory | "Even with graphs we're at about 47% of the floor, so there's room left." |
+
+The last row needs one idea. During decode, each step must read every one of the model's weights from the GPU's
+main memory (**HBM**). That memory delivers 2,039 GB per second on this A100. So no step can be faster than
+"weight bytes ÷ memory speed". That limit is the **memory floor**.
+
+Say it like this: "Graphs removed the CPU's share. What's left is GPU time, and the next lever there is batching
+more users per step, not more graph work."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Without graphs:** 1 ÷ 30 tokens/s = **33.3 ms** per token.
+- **With graphs:** 1 ÷ 69 = **14.5 ms** per token. The difference, 33.3 − 14.5 ≈ **18.8 ms**, was CPU overhead.
+- **Memory floor:** about 7 × 10⁹ weights × 2 bytes (bf16, name-rounded) = 14 GB. 14 GB ÷ 2,039 GB/s = **6.9 ms**,
+  so at most about **146 tokens/s** at batch 1.
+- **Share of the floor:** 69 ÷ 146 ≈ **47%**.
+
+</details>
+
+### The constraints, and how servers live with them
+
+A replay repeats exactly what was recorded. That is the whole interview, because a real server's traffic changes
+every step.
+
+- **Fixed shapes.** Capture one graph per batch size, and pad each batch up to the nearest captured size. The
+  Fireworks post records a graph per batch size, with the graphs sharing one memory pool.
+- **Stable addresses.** Before each replay, copy the inputs into fixed buffers that the graph already points at.
+  Kernel arguments must "remain the same across runs".
+- **No CPU synchronization or data-dependent control flow inside the capture.** Nothing in the recorded region may
+  wait for the CPU, or choose a path based on the data.
+- **Incompatible operations stay outside.** vLLM's "piecewise" mode keeps attention and other incompatible
+  operations **eager** (launched one by one, as normal) and captures everything else
+  ([vLLM design doc](https://docs.vllm.ai/en/latest/design/cuda_graphs/), dated 2026-10-08).
+- **Memory.** Each captured size costs GPU memory and capture time at startup.
+
+Say it like this: "I'd capture graphs for, say, a handful of batch sizes, pad each batch up to the nearest one,
+and keep attention eager if its shapes vary. Padding wastes a little compute; that's cheap compared with the CPU
+time it saves."
+
+### When graphs don't help
+
+Graphs don't help large-batch steps or long prefills, where kernels already run for milliseconds and launch cost
+is noise. They also don't help steps that are slow because of **memory-bound** kernels (kernels limited by how
+fast they read memory). Those need **fusion** (merging kernels so data stays on the chip) or more batching.
+
+How to tell from a trace: gaps between kernels say graphs; back-to-back kernels that are each slow say fusion or
+batching.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="CUDA graphs"
+  senior={["Explains capture and replay, the static-shape and address constraints, and padding to captured batch sizes."]}
+  staff={["Proves the step is launch-bound from a trace first, and weighs graph memory and capture time against the latency gain at the traffic's real batch sizes."]}
+/>
+
+In plain words: a Senior answer explains how graphs work and how to live with fixed shapes. A Staff answer first
+proves the CPU is the problem, then checks the gain at the batch sizes real traffic actually has.
+
+## Small-team version
+
+Your serving engine does this for you. What you own is two habits. First, don't leave graphs disabled after
+debugging: vLLM describes its graphs-off mode as "Good for debugging". Second, if latency at low traffic is poor,
+take a trace and look for gaps between kernels before blaming the GPU.
+
+What graphs are worth in money, using the Fireworks batch-1 figures and an A100 rented at RunPod's **$1.59 an
+hour** (fetched 2026-10-11): about **$14.70 per million tokens** without graphs against about **$6.40** with them.
+The gain shrinks as batch size grows, and on a managed API it is the provider's concern, not yours.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Tokens per hour:** 30 × 3,600 = 108,000 without graphs; 69 × 3,600 = 248,400 with them.
+- **Cost per million tokens:** $1.59 ÷ 108,000 × 10⁶ ≈ **$14.70**; $1.59 ÷ 248,400 × 10⁶ ≈ **$6.40**.
+- This is batch 1, the worst case. With many users per step, each step's cost is shared, and launch overhead is a
+  smaller share of it.
+
+</details>
+
+## Pitfalls
+
+- **Treating graphs as a kernel speedup.** They remove CPU launch cost only; each kernel runs exactly as fast as
+  before.
+- **Forgetting dynamic shapes.** A graph recorded for batch 8 can't run batch 11 without padding to a captured size.
+- **Quoting a vendor's 2.3× as a constant.** It was batch 1, one model, one GPU, in 2023.
+
+## Go deeper
+
+- Family walkthrough: [GPU kernel performance](/system-design-labs/interviews/walkthroughs/gpu-kernel-perf/), worked example 4.
+- See per-token Python overhead in <LabRef lab="llm-inference" inline />.

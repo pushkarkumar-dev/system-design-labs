@@ -1,0 +1,219 @@
+---
+question: eng-058
+family: llm-platform-gateway
+status: published
+labs: [load-balancer, rate-limiter, feature-flags]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "The client takes a route name, not a model, and turns it into an ordered list of models that can serve the
+> request. Before calling, it reserves tokens against every limit; after the reply, it refunds what wasn't used
+> and writes a cost record. The heart of it is one table that sorts every failure into retry, don't retry, or
+> mark-this-key-empty. And the rule that makes streaming safe: fail over to another provider only before the
+> first word has been sent to the user, because after that a retry would glue two different answers together."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you can build the client every backend team will depend on for model calls,
+and get its failure behaviour right.
+
+You have built HTTP clients with retries and circuit breakers before. A client for large language model (LLM)
+providers looks the same from a distance, but three things are different:
+
+1. **Calls cost wildly different amounts.** Providers bill and limit by **tokens**, small pieces of text of
+   roughly ¾ of a word. One call sends 100 tokens; another sends 100,000. A limiter that counts calls protects
+   nothing.
+2. **Replies stream and take seconds.** The provider sends the reply piece by piece as the model writes it. Once
+   the first piece has reached the user, a quiet retry is no longer possible.
+3. **Providers are not interchangeable.** Another provider's model gives a different answer. Failing over changes
+   what the user gets, not only where the request went.
+
+My reading: the round turns on whether you classify failures correctly and know when failover stops being safe.
+
+PracHub's statement of this Perplexity screen is a long requirements list (capability map, per-key limits, quotas,
+health checks, separate timeouts, circuit breakers, cost-aware balancing, fallbacks, tracing, key rotation,
+thread-safe streaming) with no numbers (<Cite id="s-a90c8401d4" />).
+
+## Clarify first
+
+Spend a minute on these, and say your assumptions out loud:
+
+- **Library or service?** "The prompt says client library, so I'll assume it runs inside each service. Circuit
+  breakers can stay local to each process, but counters must live in a shared store, or every process enforces
+  its own copy of the limit."
+- **Which models are interchangeable?** "I'll assume fallback stays within a quality tier, and only on routes
+  that opt in."
+- **Streaming?** "Most calls stream."
+- **Traffic.** "Assume 2,000 requests a second at peak, with 1,500 input and 300 output tokens each." (Assumed.)
+- **Limits.** "Assume each provider key has a tokens-per-minute limit, say 40 million." (Assumed.)
+
+## Answer
+
+### Words you need first
+
+- **Route.** A name a caller uses, such as `support-answer`. The client maps it to an ordered list of models.
+  Callers never name a model, so the platform can move traffic without code changes.
+- **Capability map.** A table of what each model supports: maximum prompt length, tool calling, a JSON output
+  mode, streaming, regions and the provider's data-retention terms.
+- **Time to first token (TTFT).** How long until the first piece of the reply arrives. It is the delay users feel.
+- **`max_tokens`.** The cap the caller sets on the reply's length. The real reply is usually much shorter.
+
+### The shape of the client
+
+The interface is one call: `call(route, messages, opts{tenant, feature, deadline, stream})`. Behind it sit four
+small parts. A **provider adapter** translates the request into each provider's API. A **circuit breaker** per
+provider, model and region stops traffic to something that keeps failing. A **limiter** per key tracks tokens per
+minute. A **cost record** is written per call. A key the provider has told us is out of quota is marked **exhausted** until
+its reset time, and the client stops using it.
+
+```
+call(route="support-answer", messages, tenant, feature, deadline, stream)
+   │
+   ▼
+Route → candidate models (filtered by the capability map)
+   │
+   ▼
+Drop models with open breakers and keys marked exhausted; score the rest by price and recent latency
+   │
+   ▼
+Reserve tokens (input + max_tokens) in the shared counter store
+   │
+   ▼
+Adapter calls provider A ──► fails before first byte? ──► retry budget allows? ──► provider B
+   │
+   ▼
+Stream tokens back to the caller   (first forwarded byte = commit point)
+   │
+   ▼
+Refund unused tokens from the provider's reported usage; write one cost record per attempt
+```
+
+### Follow one call through it
+
+A support service calls `support-answer` with a 1,500-token prompt and `max_tokens` of 1,000. Provider A is the
+primary; provider B has a model in the same tier. Timings are illustrative.
+
+| Moment | What happens | What to say in the interview |
+|---|---|---|
+| Start | Route resolves to A, then B. Both pass the capability map. | "Callers name a route, never a model." |
+| Admission | Reserve 1,500 + 1,000 = 2,500 tokens on the tenant and the key. | "Limits count tokens: reserve the worst case, refund the rest." |
+| 40 ms | A returns a 503, and no byte has been sent to the user. | "Before the first byte, a retry is invisible to the user." |
+| Retry | The retry budget has room, so the call goes to B. A's failure counts toward A's breaker. | "Retries are capped as a share of traffic, so a failing provider isn't buried." |
+| First token | B's first token is forwarded. The call is now committed to B. | "From here on, no silent failover." |
+| End | B reports 300 output tokens. Refund 700; write two cost records, one per attempt. | "Every attempt is recorded, including the failed one." |
+
+### The failure table
+
+This table is the core of the answer. Write it on the board:
+
+- **Connect error, or no first byte before the TTFT timeout:** try the next candidate within the retry budget;
+  it counts toward that model's breaker.
+- **429 with Retry-After:** mark the key exhausted until the reset time; don't open the breaker. A 429 ("too many
+  requests") from a provider means your key ran out of quota, which is not an outage.
+- **5xx before the first byte:** retry elsewhere within budget.
+- **Validation error or refusal** (the model declining to answer): return it; never retry.
+- **Error after tokens have streamed:** no silent retry; send an error event and let the caller decide.
+
+### The commit point
+
+Say it like this: **"The first forwarded byte is the commit point. Before it, I fail over. After it, a second
+model's text would be spliced onto the first."** Assembled's production fallback uses the same rule, and the team
+found most outages happen before the first token
+([Assembled](https://www.assembled.com/blog/your-llm-provider-will-go-down-but-you-dont-have-to), 2025-06-12).
+
+### Retry budget
+
+If every call may try three times, a provider that starts failing gets **3× its normal load** exactly when it can
+least take it. A **retry budget** caps retries at a fraction of normal requests. With a 20% budget (the
+load-balancer lab's value), the failing provider sees **at most 1.2×**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Retry amplification"
+  expr="load on a failing provider ≤ base × (1 + b) with a retry budget b, versus base × max_attempts without"
+  vars={[{ sym: 'b', meaning: 'retries as a fraction of requests (the load-balancer lab uses 0.2)' }]}
+  example="3 attempts, no budget: 3× load on the failing provider. Budget 0.2: at most 1.2×."
+/>
+
+- **Reservation:** input 1,500 + `max_tokens` 1,000 = 2,500 reserved; actual output 300, so refund 700 and charge
+  1,800.
+- **Keys at peak:** 2,000 requests a second × 1,800 tokens × 60 = 216 million tokens a minute. At an assumed 40
+  million per key, ⌈216 ÷ 40⌉ = 6 keys before failover headroom.
+
+</details>
+
+### Timeouts, breakers and keys
+
+**Timeouts are four numbers:** connect; time to first byte (per model and prompt-size bucket, because a long
+prompt legitimately takes longer to start); the idle gap between tokens; and the caller's total deadline.
+
+**Breakers trip on latency too.** A 20-second time to first token is an outage for a chat user, even with zero
+errors.
+
+**Keys** live in a secret store, scoped per route. Rotate them by adding the new key, shifting traffic to it, then
+revoking the old one. Redact them from every log.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Provider pool"
+  senior={["Covers the list with clean interfaces, the failure table, the first-byte rule, a retry budget and token-based limits."]}
+  staff={["Makes fallback a per-route contract backed by an eval run on each pair, plans fallback capacity in tokens per minute, and decides when the library should become a service."]}
+/>
+
+In plain words: a Senior answer gets the mechanics right. A Staff answer also says what evidence turns a fallback
+on (an **eval run**, a fixed set of real examples graded before a change ships), checks that the fallback provider's
+limits can absorb the primary's traffic, and says when this library should become a shared service.
+
+## Small-team version
+
+This client is the first platform piece a small AI team needs, usually when a second team starts calling models.
+
+- **Split the work.** Have a coding agent write the adapters and the SDK surface. Write the failure tests
+  yourself, against a fake provider that stalls, returns 429 with Retry-After, fails mid-stream and over-reports
+  usage.
+- **One fallback.** Wire one fallback model in the same tier on a second provider. Budget for evaluating prompt
+  changes on both: Assembled reports that adds 20–30% to prompt development time.
+- **Buy before you build more.** When a second team arrives, an off-the-shelf proxy such as LiteLLM adds per-key
+  and per-team budgets ([docs](https://docs.litellm.ai/docs/proxy/users), fetched 2026-10-12).
+
+**Why the fallback is worth it, in money and hours.** Assembled measured 99.58% uptime for the weaker of two
+providers. With only that provider, you would be down about **3 hours a month**. A support feature at an assumed
+50,000 calls a day, using Claude Sonnet 5 with prompt caching (list prices fetched 2026-10-11), spends about
+**$9,600 a month**. The client's own cost is mostly your time: about **$1,620 a month for 10% of one engineer**.
+Revisit the build when spend passes the point where 1% matters more than that, or when a third team needs
+billing-grade metering.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Downtime:** 0.42% × 720 hours ≈ 3.0 hours a month.
+- **Support feature:** assume 3,000 input tokens (2,000 of them a cached prefix) and 400 output tokens a call. At
+  $2 per million input, $0.20 per million cached input and $10 per million output, that is $0.0064 a call;
+  × 50,000 × 30 = $9,600 a month.
+- **Engineer time:** the [BLS](https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm)
+  median developer wage of $135,980 (May 2025) ÷ 0.70 (wages are about 70% of total compensation) ≈ $194K a year;
+  10% of that ÷ 12 ≈ $1,620 a month.
+
+</details>
+
+## Pitfalls
+
+- **Retrying after the first byte.** Users see two different answers glued together.
+- **Opening the breaker on 429s.** It takes a healthy provider out of rotation because one key ran dry.
+- **Retries with no budget.** Three attempts per call triple the load on a provider that is already struggling.
+- **Limiting by request count.** Providers limit and bill by tokens, so a count protects neither your budget nor
+  their limits.
+- **Silent cross-provider fallback with no eval.** A different model is a different product, and nobody checked
+  that it answers well enough.
+
+## Go deeper
+
+- Family walkthrough: [Internal LLM platform](/system-design-labs/interviews/walkthroughs/llm-platform-gateway/#deep-dives), especially the failure table and the back-of-envelope.
+- Fix the known retry bug in <LabRef lab="load-balancer" inline />; make <LabRef lab="rate-limiter" inline /> count tokens; roll out fallbacks with <LabRef lab="feature-flags" inline />.
+- Related: [the concurrent LLM client walkthrough](/system-design-labs/interviews/walkthroughs/concurrent-llm-client/) for the single-process retry and 429 mechanics.

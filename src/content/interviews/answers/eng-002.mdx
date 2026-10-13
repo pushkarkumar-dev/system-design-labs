@@ -1,0 +1,217 @@
+---
+question: eng-002
+family: enterprise-rag-acl
+status: published
+labs: [rag, vector-index, embedding-pipeline, oauth-provider]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll split it into an indexing half and a serving half. Indexing copies each company's documents into its own
+> partition, cut into passages, with the list of people and groups allowed to read each one. Serving looks up the
+> user's groups, searches only the passages they may read, checks the winners once more against the live
+> permission system, and has the model answer with citations. For deletion I'll give a number, not 'quickly':
+> how long until we hear about the change, plus how long to apply it, or the login token's lifetime if groups
+> live in it, plus any cache that ignores permissions. With change events and per-request group lookups that's
+> about 3 minutes, and I'd measure it with a probe."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you see this as a distributed-systems question about copies of data, not
+as a question about language models.
+
+In a normal backend, permissions live next to the data. A query such as `SELECT … WHERE owner_id = :user` applies
+the rule on every read, and a revoked share takes effect on the next query. An AI assistant over company
+documents breaks that in three ways:
+
+1. **It copies the content.** To search by meaning, the system copies text out of Drive, Slack or the wiki into
+   its own indexes. Those copies don't change when the original is deleted or re-shared.
+2. **The model reads before the user does.** The best passages go into the model's input. If a forbidden passage
+   gets there, its facts can appear in the answer even if you hide the citation.
+3. **Many companies share one system.** One leak across customers is the worst outcome the product can have.
+
+So the two things to get right are where the permission check runs, and a number for how stale a permission can
+get.
+
+PracHub lists this as an OpenAI MLE onsite question. Only the title is candidate-reported; the follow-ups,
+including "A document is deleted in the source system. How quickly and how reliably does it disappear from
+answers?", are PracHub's own write-up (<Cite id="s-f8053ff3a7" />).
+
+## Clarify first
+
+Say your assumptions out loud, so your numbers mean something:
+
+- **Tenants and skew.** "A **tenant** is one customer company. I'll assume thousands of tenants, the largest with
+  5M documents and 20,000 users."
+- **Isolation contract.** "Is logical partitioning enough, or does any contract require separate storage or keys
+  per tenant?"
+- **Deletion and revocation target, and its owner.** "I'll assume a deleted or un-shared document must stop
+  appearing within 5 minutes, and that security owns that number."
+- **Connectors.** "A **connector** is the code that pulls documents and permissions from one source. Do the
+  sources push change events, or can we only poll? Are permissions inherited from folders and nested groups?"
+
+## Answer
+
+### Words you need first
+
+- **RAG** (retrieval-augmented generation): search the documents first, then give the best passages to a large
+  language model (LLM) and ask it to answer only from them, with citations.
+- **Chunk**: a passage of a few hundred words cut from a document. Search and citations work on chunks.
+- **Embedding**: a list of numbers a small model computes from text, so that texts with similar meaning get
+  similar vectors. **Vector search** finds chunks whose vectors are closest to the question's. **Keyword search**
+  (scored by a formula called **BM25**) finds exact words and names. Using both is **hybrid retrieval**.
+- **ACL** (access control list): who may read a document. Each entry is a **principal**, a user or a group. A
+  user's **principal set** is their id plus all their groups, flattened.
+
+### The system
+
+```
+INDEXING (background)
+  Connectors ──► Change log (durable, one cursor per connector)
+                    │ content lane              │ ACL + delete lane (fast)
+                    ▼                           │
+              Parse, chunk, embed               │
+                    ▼                           ▼
+        Per-tenant stores: keyword index · vector index · ACL store
+                    ▲
+SERVING (user waits)
+  Question ─► Auth + groups ─► Filtered retrieval ─► Fuse + rerank
+                                                         │
+                         Answer with citations ◄─ ACL re-check (fail closed)
+```
+
+**Indexing.** Connectors write versioned change events (created, updated, deleted, permissions changed) to a
+durable log. Workers parse, chunk, embed and **upsert idempotently** into the tenant's keyword and vector indexes:
+writing the same event twice changes nothing, so replays are safe. ACL changes and deletes take a separate fast
+lane. That lane re-tags chunks, or marks them with a **tombstone** (a "this is deleted" record every query checks),
+without re-embedding anything.
+
+**Serving.** Look up the user's groups on every request, rather than reading them from the login token. Run
+hybrid retrieval inside the tenant's partition with the principal filter applied *during* the search, so
+forbidden chunks are never scored. Merge the two result lists by rank with **reciprocal rank fusion (RRF)**,
+because their scores aren't comparable. A **reranker**, a slower model that reads the question and each
+candidate together, reorders the top few dozen. Then re-check each survivor against the authoritative ACL store (the **post-check**).
+If that check errors, drop the chunk: this is **failing closed**. Finally the model writes the answer with chunk
+ids, and code verifies every cited id was retrieved and permitted.
+
+### Why the filter runs inside the search
+
+Filtering after ranking looks simpler: take the top 20, remove what the user can't see. It fails three ways. A
+user with narrow access may get 2 chunks out of 20. Anything that sees results before the filter (a cache, result
+counts, "related documents") can leak them. And under load someone adds "skip the check on timeout", which leaks
+exactly when the permission service is struggling.
+
+Filtering inside a vector search needs care. Large indexes use a graph called **HNSW** that finds near neighbours
+approximately by walking a few hundred nodes. If you filter only after that walk, too few results survive. So
+pick by how much the user can see: compare against every allowed chunk exactly when the allowed set is small, and
+use a graph search that applies the filter during the walk when it is large.
+
+Say it like this: "Filter inside retrieval so nothing downstream sees forbidden text; re-check the final few
+dozen against the live ACL store and fail closed; alert on how many that re-check drops."
+
+### Deletion, as a bound
+
+Follow one example. Dana, a sales engineer at an invented tenant called Northwind, is in the group `sales-leads`,
+which can read a document called *Kestrel pricing exception*. At 10:00 an admin removes her from the group. How
+long can the assistant still quote the document to her? Four delays decide it:
+
+- **Detect** (t_detect): until the connector hears about the change. Events take about a minute; polling takes up
+  to the polling interval.
+- **Apply** (t_apply): until the new ACL or tombstone is in the indexes.
+- **Claims** (t_claims): if her groups are written inside her login **access token** (a signed credential such as
+  a JWT; not an LLM token), the server believes them until the token expires.
+- **Cache** (t_cache): how long a cached answer whose key ignores permissions can live.
+
+| Design | Detect + apply | Token | Cache | Kestrel still citable until |
+|---|---|---|---|---|
+| Polling every 15 min, groups in a 1-hour token, 10-minute answer cache | 17 min | 60 min | 10 min | about **11:10** |
+| Change events, groups looked up per request, caches keyed by ACL version | 3 min | ~1 min | 0 | about **10:03** |
+
+<Formula
+  title="How long a deleted or revoked document stays citable"
+  expr="t_stale ≈ max(t_detect + t_apply, t_claims) + t_cache"
+  vars={[
+    { sym: 't_detect, t_apply', meaning: 'connector detection delay; time to tombstone in the index' },
+    { sym: 't_claims', meaning: 'lifetime of a token carrying group claims (0 if looked up per request)' },
+    { sym: 't_cache', meaning: 'TTL of any cache not keyed by ACL version' },
+  ]}
+  example="Polling 15 min + 2 min apply, groups in a 1-hour token, 10-minute answer cache: max(17, 60) + 10 = 70 min. Events + per-request groups + ACL-versioned caches: max(3, 1) + 0 = 3 min."
+/>
+
+The first design misses a 5-minute target by 14×, and its biggest term is the token, not the index. The
+oauth-provider lab makes this concrete: its access tokens last an hour and can't be revoked.
+
+"Reliably" means measuring it. A probe per tenant creates a test document (a **canary**), shares it with a test user, revokes
+the share, and times how long queries keep returning it. Also purge derived copies: embedding caches, logs that
+captured retrieved text, and evaluation sets built from real questions.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Design 1:** detect 15 + apply 2 = 17 minutes; token 60 minutes; max(17, 60) = 60; plus a 10-minute cache = 70
+  minutes. 70 ÷ 5 = 14× over target.
+- **Design 2:** detect 1 + apply 2 = 3 minutes; groups cached for 1 minute; max(3, 1) = 3; caches keyed by ACL
+  version add 0. Total 3 minutes.
+- **Index size for the largest tenant (assumed):** 2,000-token documents in 400-token chunks with 60 overlap give
+  ceil(1,940 ÷ 340) = 6 chunks each, so 5M documents → 30M chunks. At 768 float32 values plus 128 bytes of graph
+  links each: 30M × 3,200 B = 96 GB.
+
+</details>
+
+### The two other PracHub follow-ups
+
+**Tuning the embedding model to a customer's domain.** You need "this question should find this passage" pairs.
+Mine them from the corpus: headings paired with their sections, or questions a model generates from passages,
+kept only if a retriever confirms them. Train with a **contrastive loss**, which pulls each question toward its
+passage and away from the other passages in the same batch (**in-batch negatives**). Compare **recall@k** (how
+often the right passage lands in the top k) against the base model on held-out labelled questions. A new model
+means re-embedding everything into a **shadow index** built beside the live one, then switching an alias. Vectors
+from two models can't be mixed: the embedding-pipeline lab measured that about a third of nearest neighbours
+change even between two related small models.
+
+**Frequent questions, cheaper and faster.** A cache keyed only by the question, or by a similar question, gives
+user A's answer to user B. Safe options, cheapest first: cache question embeddings (no document content in them);
+cache answers for content the whole tenant can read; key personalized answers by tenant, a fingerprint of the
+principal set, and the ACL version. Never put a similarity cache in front of the permission filter.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Multi-tenant RAG"
+  senior={["Filters inside retrieval, handles deletes with tombstones, keys caches by principals."]}
+  staff={["Gives the deletion bound with its dominant term, monitors post-check drops as the ACL-lag signal, and makes canaries and revocation probes release-blocking."]}
+/>
+
+In plain words: a Senior answer puts the filter in the right place. A Staff answer also says which delay
+dominates the deletion time, which metric shows the ACL copy falling behind, and which tests block a release.
+
+## Small-team version
+
+At a 50–500 person company there is one tenant, so "don't leak across customers" becomes "don't leak across
+permission groups". The leak still matters: one HR or legal passage shown to the wrong person is an incident.
+
+- **v1:** index only what every employee can already open (handbook, public wiki, public channels). There is no
+  per-user filter to get wrong. Most questions are about this content anyway.
+- **v2:** per-user permissions in Postgres. A `chunks` table with the text, an embedding (stored with pgvector, the Postgres
+  vector extension), and an `acl_principals text[]` column with a GIN index (Postgres's index for array overlap), filtered with `acl_principals && :user_principals`. Groups
+  come from the identity provider per request, cached for a minute. Keep the fail-closed re-check.
+- **The number:** polling every 15 minutes with 2 minutes to apply gives about **17 minutes**. Write it down and
+  get the security owner to accept it, or add change events to get to about 3.
+- **What it costs:** for 300 employees, 150,000 documents and 10 questions a person a day (all assumed), the
+  family walkthrough works out about **$6** to embed everything and **$162** (gpt-5-mini) to **$1,080** (Claude
+  Sonnet 5) per 30 days for answers, at list prices fetched 2026-10-11.
+
+## Pitfalls
+
+- **Filtering after ranking.** Narrow users get near-empty results and every stage before the filter can leak.
+- **Stripping citations after generation.** The model already read the text, so its facts can stay in the answer.
+- **"Deleted documents disappear quickly."** That isn't a bound; name the four terms and the total.
+- **Group claims in hour-long tokens.** The token lifetime then outweighs every other delay.
+- **A similarity cache keyed only by the question.** It serves one user's answer to another.
+
+## Go deeper
+
+- Family walkthrough: [Permission-aware enterprise RAG](/system-design-labs/interviews/walkthroughs/enterprise-rag-acl/#how-fast-a-deleted-or-revoked-document-disappears).
+- Add a principals filter to a real RAG: <LabRef lab="rag" inline />; the t_claims term: <LabRef lab="oauth-provider" inline />.

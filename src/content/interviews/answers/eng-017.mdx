@@ -1,0 +1,172 @@
+---
+question: eng-017
+family: rag-system-design
+status: published
+labs: [vector-index, embedding-pipeline, rag]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "An embedding model turns text into a list of numbers so that similar meanings land close together. We embed
+> every passage once, embed the question at query time, and fetch the nearest passages, which finds paraphrases
+> keyword search misses but blurs exact codes and names, so production search is usually hybrid. A vector store
+> keeps those vectors and finds near neighbours fast; the hard part is filtering and updates, not raw speed, so I
+> pick one by scale and filters, starting with pgvector if we already run Postgres. For documents bigger than the
+> model's input, I choose by question: retrieve passages for questions about parts, summarise section by section
+> for questions about the whole, and send the whole document with caching when it almost fits."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants the mechanism in two minutes, then the choices and failure cases.
+
+You know keyword search: an inverted index maps each word to the documents that contain it. Embedding search works
+differently, and that difference is the point of the question:
+
+1. **It matches meaning, not words.** "How much warning before ending a contract?" can find a passage titled
+   "Notice period", with no shared words.
+2. **It is approximate by design.** Finding the nearest vectors among millions exactly is slow, so vector indexes
+   trade a little accuracy for speed.
+3. **It sits in front of a large language model** (**LLM**, such as Claude or GPT) whose input is limited, so
+   "what fits in the prompt" becomes a design constraint.
+
+PromptLayer's post, written from the interviewer side (July 2025), lists the sample question "Explain how
+embeddings enable semantic search. How would you handle documents that exceed context limits?" next to "Compare
+different vector database options. When would you use each?". It wants "practical applications and trade-offs,
+not just memorized definitions" and lists "Red flags: Boring textbook answers." (<Cite id="s-1205b0cc50" />).
+
+## Clarify first
+
+- **One long document, or a corpus?**
+- **What scale:** thousands, millions or billions of vectors?
+- **Do queries need filters** (customer, date, permissions)? This decides the vector store more than raw speed
+  does.
+
+## Answer
+
+### Words you need first
+
+- **Token**: a piece of a word, about ¾ of a word. Models read and bill text in tokens.
+- **Context window**: the most tokens an LLM can read in one request.
+- **Chunk**: one passage cut from a document; the unit you embed, search and cite.
+- **Embedding**: a vector (for example, 1,536 numbers) computed from a chunk by an embedding model.
+- **RAG** (retrieval-augmented generation): search the documents first, then put only the best chunks in the
+  LLM's prompt.
+
+### How embeddings enable semantic search
+
+An embedding model is trained on pairs of related texts, so that related meanings get vectors pointing in similar
+directions. Closeness is measured by **cosine similarity** (the angle between two vectors) or the dot product.
+
+```
+Ingestion (once per chunk)                Query (per question)
+
+chunk text                                question text
+   │                                         │
+   ▼                                         ▼
+embedding model ── vector ──► vector store ◄── embedding model
+                              (vectors + ids + metadata)
+                                    │
+                                    ▼
+                           nearest k chunk ids ──► LLM prompt
+```
+
+Embed every chunk once. At query time, embed the question with the **same** model and fetch the nearest chunk
+vectors. This finds paraphrases with no shared words, which keyword search misses. It blurs exact identifiers
+(error codes, part numbers, names), which keyword search catches. That is why production search is usually
+**hybrid**: both, merged.
+
+Two limits worth naming:
+
+- **A fixed input window.** The small open model all-MiniLM-L6-v2 reads 256 word pieces (its own tokens); longer
+  text is cut off without an error.
+- **Vectors from different models can't be compared.** Changing the model means re-embedding everything.
+
+### What a vector store does
+
+It stores vectors with ids and metadata, and answers "which stored vectors are nearest to this one?". Exact search
+compares the query with every vector. That is fine up to roughly hundreds of thousands of vectors. Past that,
+**approximate nearest-neighbour** (ANN) indexes trade a little recall for large speedups:
+
+- **HNSW**: a graph where each vector links to a few near neighbours, so search hops toward the query instead of
+  checking everything.
+- **IVF**: cluster the vectors first, then search only the few clusters nearest the query.
+
+The hard parts in practice are filtering, updates and deletes, not raw search. pgvector's README (the Postgres
+extension that adds vector columns and indexes) gives the filter trap: "If a condition matches 10% of rows, with
+HNSW and the default hnsw.ef_search of 40, only 4 rows will match on average" (fetched 2026-10-12). Its iterative
+scans, from version 0.8.0, fix this.
+
+### Follow one query through it
+
+Say a company assistant holds 600,000 chunks from many customers' documents (assumed), and a user from one customer
+asks *"What is the notice period for contractors?"*
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| Embed the question | One call to the embedding model. | "Same model as the chunks, or the distances mean nothing." |
+| ANN search, no filter | HNSW looks at about 40 candidates and returns the nearest. | "Fast, and slightly approximate." |
+| Add the filter "customer = this one" | If this customer owns 10% of the chunks, only about 4 of those 40 candidates survive the filter. | "This is the filter trap; I'd use iterative scans, or partition by customer." |
+| Return k chunks | The contractor section, its neighbours, with ids and page numbers. | "Then the LLM answers and cites the ids." |
+
+### When to use which store
+
+- **pgvector**, when you already run Postgres and have up to low millions of vectors.
+- **A managed store** (Pinecone from $50/month, turbopuffer from $16/month, prices fetched 2026-10-11), when you
+  have millions of vectors with heavy updates and filters.
+- **An in-process library** (FAISS-style), for offline batch work.
+
+Say it like this: "I'd pick the store by filters, update rate and who operates it, not by a benchmark chart."
+
+### Documents bigger than the context window
+
+Three tools, chosen by the question:
+
+- **Questions about parts of the document**: chunk, retrieve, cite.
+- **Questions about the whole document**: **map-reduce**, meaning summarise or extract per section, then combine.
+- **Documents that almost fit**: send the whole thing with **prompt caching** (the provider keeps the processed
+  start of your prompt for a few minutes, so repeats are cheap). A 200-page PDF is about 80,000 tokens, which
+  current models accept. Compare its cost per question with RAG before choosing.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Embeddings and vector stores"
+  senior={["Explains the mechanism, names the limits (input window, model lock-in) and picks a store by scale."]}
+  staff={["Picks the store by filtering, update rate and operations rather than benchmarks, and routes oversized documents by question type."]}
+/>
+
+## Small-team version
+
+Use the database you already run. Postgres with pgvector and full-text search covers a small company's documents.
+
+**What it costs.** For the walkthrough's assumed 600,000 chunks at 1,536 dimensions, that is about **3.7 GB** of
+float32 vectors (1.8 GB as pgvector's `halfvec`), on a database you already pay for, against a **$50/month**
+minimum for Pinecone Standard (fetched 2026-10-11).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- float32: 600,000 × 1,536 × 4 B = 3.69 GB ≈ **3.7 GB**.
+- `halfvec` (2 bytes per value): 600,000 × 1,536 × 2 B = 1.84 GB ≈ **1.8 GB**.
+- Filter trap: 40 candidates (default `hnsw.ef_search`) × 10% matching = **4 rows** on average.
+
+</details>
+
+**When to change.** A dedicated store is a later decision tied to a number: millions of vectors, frequent updates,
+filtered queries, or no one on the team who knows Postgres tuning. For long documents, long context plus caching
+is often the simplest correct v1.
+
+## Pitfalls
+
+- **A textbook definition of embeddings with no trade-off.** PromptLayer calls that a red flag; name what they miss
+  and what you pair them with.
+- **Choosing a vector database from a benchmark chart.** Filters and deletes decide it, and charts rarely test them.
+- **"Just chunk it" for questions that need the whole document.** Top-k returns a few passages; whole-document
+  questions need map-reduce or long context.
+
+## Go deeper
+
+- Family walkthrough: [Design a RAG system end to end](/system-design-labs/interviews/walkthroughs/rag-system-design/).
+- Build flat, HNSW and IVF indexes: <LabRef lab="vector-index" inline />. Embedding model swaps: <LabRef lab="embedding-pipeline" inline />.

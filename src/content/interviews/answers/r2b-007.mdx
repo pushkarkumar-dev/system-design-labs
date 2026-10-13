@@ -1,0 +1,195 @@
+---
+question: r2b-007
+family: coding-assistant
+status: published
+labs: [llm-inference, rag, speculative-decoding]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "A coding assistant is a pipeline around an unreliable model. The editor waits for a typing pause and cancels
+> stale requests. A context engine picks the few thousand lines the model should see. A router sends completions to
+> a small, fast model and edits to a large one. An apply engine checks every edit before the user sees it. Latency
+> comes from reading the prompt and writing the answer, so I keep the prompt's start stable for reuse, keep outputs
+> short, and use speculative decoding for edits. And I measure quality by how much accepted code survives, not by
+> how often users press Tab."
+>
+> The rest of this page explains each part of that answer.
+
+The question asks you to design the whole product, like Copilot or Cursor. Its tags (below) say the interviewer
+expects two halves: the product (what context to send, how edits apply, how to measure quality) and the serving
+(latency, cost, which model). You need numbers on both.
+
+What makes it different from a backend system you've designed:
+
+1. **The model can't see the repository.** A large language model (LLM) reads text in small pieces called
+   **tokens**, and it can only read so many per request (its **context window**). A big repository is many times
+   too large. So a search step decides what the model sees.
+2. **Its output is untrusted.** A suggested edit is usually right and sometimes wrong in small ways. You check it
+   like input from a buggy client.
+3. **Requests fire on almost every typing pause.** Most become stale before they finish. Speed comes from writing
+   fewer tokens, reusing work and cancelling early.
+
+This was reported as a Meta Machine Learning Engineer question, "Design an LLM-Based Coding Assistant", dated Jun 27,
+2026 and tagged ML System Design, LLM Applications, and LLM Inference & Serving; only the title is visible
+(<Cite id="s-be19e40ea6" />).
+
+## Clarify first
+
+Ask, and state an assumption for each:
+
+- **Features?** Completion as you type, chat, multi-file edits, autonomous agents? "I'll take the first three."
+- **Users and scale?** "Tens of thousands of developers."
+- **Latency targets?** "A few hundred milliseconds for a completion after a typing pause, a few seconds for an edit.
+  Those are my assumptions to confirm."
+- **Models?** "At this scale I'd self-host the completion model and call larger models for chat and edits."
+- **Privacy?** "Does code leave the developer's machine, and may the provider keep it?"
+
+### The example we follow
+
+A developer is editing `payments/client.py` (400 lines; names illustrative). First they type inside `charge()` and
+want a **completion**: a line of grey text. Then they ask in chat: *"Add retries with exponential backoff to
+charge()."* That is an **edit** of about 30 lines.
+
+## Answer
+
+### The pipeline
+
+```
+Editor plugin ── waits for a typing pause, cancels stale requests
+   │
+   ▼
+Context engine ── code around the cursor, recent edits, definitions of nearby names,
+   │               word search and meaning search; packed to a per-feature token budget
+   ▼
+Router ── completion → small, fast model
+   │       chat / edit planning → large model; applying edits → fast apply model
+   ▼
+Apply engine ── find the old text, apply, re-parse, quick checks
+   │
+   ▼
+Diff in the editor ──► telemetry everywhere
+```
+
+**Editor plugin.** Waits about 50 ms after the last keystroke (a **debounce**) and cancels any request the user has
+typed past. **Context engine.** Gathers candidates (the cursor's surroundings, recent edits, the definitions of
+names used nearby, and search results), ranks them, and packs them into a fixed token budget. **Router.** Sends
+each request to the right size of model. **Apply engine.** Locates the model's quoted old text, requires a unique
+match, applies the change, re-parses the whole file, and refuses with a reason when anything doesn't fit.
+**Telemetry.** Acceptance, retained code, latency per stage, apply failures.
+
+### Size it
+
+Code comes out at about **8 tokens per line** with modern tokenizers (measured on 2026-10-12 over this site's lab
+code). So a 2-million-line monorepo is about **16 million tokens**. Retrieval is required, not optional.
+
+### Two words for serving
+
+When the model gets a prompt, it first reads all of it in one pass, called **prefill**; that sets the wait for the
+first token. Then it writes the answer one token at a time, called **decode**. While reading, it saves a summary of
+every token, the **KV cache**. If many requests start with the same text, a server can keep that part of the KV
+cache and skip re-reading it: **prefix caching**.
+
+### Serving: completion
+
+Completion latency is the sum of the stages:
+
+**latency ≈ debounce + context gathering + network + prefill + output tokens ÷ decode speed**
+
+For our completion, with assumed values (50 + 20 + 60 + 150 ms, then 30 tokens at 200 tokens per second), that is
+about **430 ms**. Prefill is a large share of a short suggestion's latency. So the levers are:
+
+- **Keep the prompt's start stable** (instructions and slow-changing context first, the cursor's text last), so its
+  KV cache is reused.
+- **Use a small model**, because completions are short and frequent.
+- **Cancel most requests**, because users keep typing.
+
+Say: "With these numbers, halving prefill with a cached prompt start saves 75 ms, the same as doubling the model's
+writing speed, and it is far cheaper."
+
+### Serving: edits
+
+Edits are bound by output, because the model writes one token at a time. Rewriting the 400-line file is about
+**3,200 tokens**; a search/replace block (old plus new text for the 30-line change) is about **480**.
+
+**Speculative decoding** fits edits well. Something cheap guesses the next few tokens, and the big model checks all
+of them in one step, keeping guesses up to the first mismatch. The share of guesses it keeps is the **acceptance
+rate**, α. For an edit, the original file is an excellent guesser, because most of the output copies it. With 8
+guesses at 95% acceptance, each big-model step yields about **7.4 tokens** (illustrative). That is tokens per step,
+not a speedup: guessing and checking cost something. Cursor reported about 1,000 tokens per second for its
+fast-apply model in 2024, using the original file as the guess
+([Cursor, 2024-05-14](https://cursor.com/blog/instant-apply)).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Repository:** 2,000,000 lines × 8 tokens/line = 16,000,000 tokens.
+- **Completion latency (all assumed):** 50 ms debounce + 20 ms context + 60 ms network + 150 ms prefill +
+  30 ÷ 200 s = 150 ms decode = **430 ms**.
+- **Edit sizes:** 400 × 8 = 3,200 tokens; (30 + 30) × 8 = 480 tokens.
+- **Speculative decoding:** expected tokens per big-model step E = (1 − α^(K+1)) ÷ (1 − α), with K guesses and
+  acceptance α, assuming each guess is accepted independently with the same probability. α = 0.95, K = 8:
+  (1 − 0.95⁹) ÷ 0.05 = 7.4.
+
+</details>
+
+### Quality metrics
+
+- **Offline**, before shipping: **context recall** (did the code the user touched next make it into the prompt?) on
+  labelled requests; apply success at each step of the fallback ladder; task success on held-out tasks with tests.
+- **Online**, after shipping: **acceptance rate** and **retained code** (how much accepted code is still there
+  minutes later); latency at p50 and p95 per stage.
+
+Say: "Acceptance alone can be gamed by suggestions people accept and then delete. Retained code can't."
+
+### Privacy
+
+Send only the packed context, never the repository. Scan for secrets. Default to **zero retention** (the provider
+keeps nothing after answering) and no training on customer code.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Coding assistant at scale"
+  senior={["Breaks latency into stages, routes by feature, and uses prefix caching and speculative edits with numbers."]}
+  staff={["Defines the metric that can't be gamed (retained code, not raw acceptance), and decides when self-hosting completion pays versus a vendor API."]}
+/>
+
+In plain words: a Senior answer builds both halves and puts numbers on the latency. A Staff answer also picks the
+metric that would catch a bad change, and makes the buy-versus-host decision with the costs on the table.
+
+## Small-team version
+
+At 50–500 people you buy seats. Cursor Teams listed **$40 per user per month** on 2026-10-12. That breaks even if it
+saves about **26 minutes** of an engineer's time a month, at a loaded cost of roughly $93 an hour. Your work is
+checking the data terms and measuring whether it helps. METR's 2025 study found experienced developers slower with
+AI in its setting ([METR, 2025-07-10](https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/)), so
+don't assume the gain.
+
+Build only internal tools that edit your own code or config, with this page's context and apply rules. The answer
+changes when customers or policy forbid sending code to a third party. Then you need a self-hosted model and an
+index on the client, and someone has to evaluate that model against the hosted default.
+
+<details>
+<summary>The arithmetic behind the break-even</summary>
+
+BLS median software developer wage $135,980 (May 2025) ÷ 0.70 for overhead (assumed) ≈ $194,000 a year ÷ 2,080
+hours ≈ $93 an hour ≈ $1.55 a minute. $40 ÷ $1.55 ≈ 26 minutes a month.
+
+</details>
+
+## Pitfalls
+
+- **Designing only one half.** The tags cover both product and serving, so skipping either leaves half the
+  question unanswered.
+- **One model for everything.** A large model on every keystroke is slow and expensive; route by feature.
+- **Quoting a speedup multiplier.** Tokens per step is not speedup; give the formula and its assumptions.
+- **Ignoring privacy until asked.** It decides which providers and features you can use, so raise it early.
+
+## Go deeper
+
+- Family walkthrough: [Design an AI coding assistant](/system-design-labs/interviews/walkthroughs/coding-assistant/), especially "Back-of-envelope" and "Latency: completion, chat and apply".
+- Related Meta title: [r2b-008](/system-design-labs/interviews/questions/r2b-008/), private code leakage.
+- Labs: <LabRef lab="llm-inference" inline />, <LabRef lab="speculative-decoding" inline />, <LabRef lab="rag" inline />.

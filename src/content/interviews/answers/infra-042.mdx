@@ -1,0 +1,167 @@
+---
+question: infra-042
+family: kv-cache-memory-math
+status: published
+labs: [llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'd decide by arithmetic, not habit. In bf16 the 70B model's weights are 141 GB. Split over two GPUs they
+> leave room for only three 8K conversations, and the per-token delay floor is 35 ms, so I'd run one copy across
+> all four GPUs: 59 conversations at a 17 ms floor. In int8 the weights halve, and the choice becomes a real
+> trade: one 4-GPU copy is faster and holds more, while two 2-GPU copies give two independent failure domains at a
+> 17 ms floor that still meets a 50 ms budget."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The interviewer wants to see you make a deployment decision from memory and bandwidth numbers. Three things
+decide it: how much room each option leaves for users, how fast each can write a token, and how much one GPU
+failure takes down. The answer flips with the weights' precision, and showing that flip is the point.
+
+A backend engineer already makes this kind of choice: one big instance or two smaller ones behind a load
+balancer. What makes the GPU version different:
+
+1. **The program is bigger than one machine's memory slot.** A 70B model in bf16 is 141 GB; one A100 holds
+   80 GB. So the model must be split, and the split itself costs network traffic on every step.
+2. **Every copy of the model pays the full weight cost again.** Two replicas store the weights twice, which eats
+   the memory that would otherwise hold users.
+3. **Speed per user depends on how many GPUs share the reading.** Writing each token means reading every weight;
+   more GPUs per copy means each reads less, so each token comes faster.
+
+(A 2026 prep guide lists both "How would you serve a 70B model on 4 A100 80GB?" and "How do you choose between
+TP=2 and TP=4 for a given model?" without answering them <Cite id="s-f07fcd5321" />.)
+
+## Clarify first
+
+- **Which 70B?** "I'll assume Llama-3.1-70B: 70.55 billion parameters, 64 query heads, 8 KV heads."
+- **Weight precision?** "I'll work bf16 and int8. The A100 has no fp8 Tensor Cores (its fast matrix units), so
+  8-bit means int8 here."
+- **Context and latency?** "I'll assume up to 8K tokens per conversation and a 50 ms budget between tokens."
+- **Overhead and interconnect?** "5 GB per GPU of overhead, assumed, and NVLink between the four GPUs."
+
+## Answer
+
+### Words you need first
+
+- **Token**: the unit the model reads and writes, roughly ¾ of a word. **Decode** is the phase where the model
+  writes the reply one token per pass.
+- **KV cache**: per-token memory every active conversation holds on the GPU so the model doesn't re-read the
+  whole conversation each step. For this model it is **320 KiB per token**, 2.68 GB for an 8K conversation.
+- **Tensor parallelism (TP)**: splitting every layer's matrix multiplications across GPUs. Each GPU computes a
+  slice, then the GPUs combine partial results with an **all-reduce** (each sends its piece and gets the sum),
+  twice per layer. "TP = 4" means one copy of the model across 4 GPUs.
+- **Replica**: one complete copy of the model. **Failure domain**: what one fault takes down.
+- **Decode floor**: the fastest one token can be written, with one user, set by the time to read the weights
+  from GPU memory (2,039 GB/s on an A100 80GB SXM).
+
+### The two options on four GPUs
+
+```
+Option A: one TP = 4 replica             Option B: two TP = 2 replicas
+┌────────────────────────────────┐       ┌───────────────┐ ┌───────────────┐
+│ GPU0   GPU1   GPU2   GPU3      │       │ GPU0   GPU1   │ │ GPU2   GPU3   │
+│ ¼ of every layer on each GPU   │       │ ½ of each     │ │ ½ of each     │
+│ weights stored once            │       │ layer         │ │ layer         │
+│ one shared KV pool             │       │ own KV pool   │ │ own KV pool   │
+└────────────────────────────────┘       └───────────────┘ └───────────────┘
+         one failure domain                 two failure domains, load balancer in front
+```
+
+In **option A**, every token's work is spread over four GPUs, and the weights exist once, leaving the most room
+for the cache. In **option B**, each pair is an independent server; a router spreads conversations across them.
+
+### Follow the numbers
+
+| | One TP = 4 replica | Two TP = 2 replicas | What to say in the interview |
+|---|---|---|---|
+| bf16 conversations at 8K | **59** | **6** in total (3 per pair) | "Two GPUs barely fit the bf16 weights." |
+| bf16 decode floor | **17.3 ms** | **34.6 ms** | "TP = 2 uses most of a 50 ms budget before batching." |
+| int8 conversations at 8K | **85** | **58** in total | "At int8 both have real room." |
+| int8 decode floor | **8.65 ms** | **17.3 ms** | "Both meet 50 ms." |
+| Weights stored | once | twice | "Replicas pay the weight cost twice." |
+| Failure domain | 4 GPUs | 2 GPUs | "Two replicas halve the blast radius." |
+| All-reduce | 4-way, 2 per layer | 2-way, cheaper per step | "Smaller groups, cheaper collectives." |
+
+**In bf16, choose TP = 4.** TP = 2 fits the weights but leaves room for 3 conversations per pair, and its
+34.6 ms floor eats most of a 50 ms budget before batching adds cache reads.
+
+**In int8 it is a trade.** TP = 4 holds more conversations, halves the floor and stores the weights once. Two
+TP = 2 replicas give two independent failure domains and simpler, cheaper all-reduces, at a 17.3 ms floor that
+still fits 50 ms. Pick TP = 4 for tight latency; pick two replicas when losing all four GPUs at once is the
+bigger risk.
+
+Say it like this: "In bf16 it isn't close: TP = 2 leaves room for three users. In int8 I'd pick TP = 4 if
+latency is tight, and two replicas if a single GPU fault taking everything down is the bigger risk."
+
+### Two checks before you commit
+
+**Both options are legal.** TP must divide both the 64 query heads and the 8 KV heads; 2 and 4 both do. TP = 8
+isn't an option on four GPUs.
+
+**The all-reduce at TP = 4 is small.** At a batch of 64, 160 all-reduces of 1 MiB add about **0.84 ms** per step
+at 300 GB/s each way, plus a fixed latency per collective that you should measure.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+conversations = (GPUs × 80 − weights − GPUs × 5) ÷ (327,680 B × 8,192); floor = weights ÷ TP ÷ 2,039 GB/s.
+
+- **KV per token**: 2 × 80 layers × 8 KV heads × 128 × 2 bytes = 327,680 B. Per 8K conversation: 2.68 GB.
+- **TP = 4, bf16**: 320 − 141.1 − 20 = 158.9 GB → **59**. Floor: 141.1 ÷ 4 = 35.28 GB ÷ 2,039 GB/s = **17.3 ms**.
+- **TP = 2, bf16**: 160 − 141.1 − 10 = 8.9 GB → **3** per replica, 6 in total. Floor: 70.55 GB ÷ 2,039 =
+  **34.6 ms**.
+- **TP = 4, int8** (70.55 GB of weights): 320 − 70.55 − 20 = 229.45 GB → **85**. Floor: 17.64 GB ÷ 2,039 =
+  **8.65 ms**.
+- **TP = 2, int8**: 160 − 70.55 − 10 = 79.45 GB → **29** per replica, 58 in total. Floor: 35.28 GB ÷ 2,039 =
+  **17.3 ms**.
+- **All-reduce**: 160 × 1 MiB at 300 GB/s each way ≈ **0.84 ms** per step at batch 64.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="TP = 2 or TP = 4"
+  senior={["Computes headroom and floors for both options and picks TP = 4 for bf16."]}
+  staff={["Shows the answer flips at int8, brings in failure domains and collective latency, and says what measurement would change the choice."]}
+/>
+
+## Small-team version
+
+At a small company the question usually becomes "do we need four GPUs at all?" The same arithmetic answers it:
+
+- **An int4 70B fits one 80 GB H100**, with room for 13 conversations at 8K. int4 stores each weight in about
+  4.5 bits once its scale numbers are counted, 39.69 GB in all.
+- **An fp8 KV cache doubles the conversations** on any option, at the cost of some precision.
+
+At RunPod list prices (fetched 2026-10-11):
+
+| Setup | Conversations at 8K | $/hour | $/month |
+|---|---|---|---|
+| 4× A100, bf16, TP = 4 | 59 | $5.56–$6.36 | $4,059–$4,643 |
+| 1× H100, int4 | 13 | $2.69–$3.49 | $1,964–$2,548 |
+
+Evaluate the quantized build's quality on your own test set before choosing it. Then compare both against a
+serverless endpoint for the same model: Together lists Llama 3.3 70B at $1.04 per 1M tokens (fetched
+2026-10-11), and the family walkthrough finds the 4×A100 box only wins above about 27–30% of peak throughput
+around the clock.
+
+Default: the serverless endpoint until your measured volume clears that bar.
+
+## Pitfalls
+
+- **Listing TP = 8 on four GPUs.** There aren't eight GPUs to split across.
+- **Forgetting that two replicas store the weights twice.** That is where TP = 2's room went in bf16.
+- **Using the hidden-size cache formula.** It counts every query head as having its own keys and values, which
+  makes every option look 8× tighter.
+- **Ignoring cache reads at large batch.** Each step reads every conversation's cache too, so the step grows past
+  the floor as the batch fills.
+
+## Go deeper
+
+- Family walkthrough: [KV cache and GPU memory math](/system-design-labs/interviews/walkthroughs/kv-cache-memory-math/#derivations), section 6.
+- Collective costs and why TP stays inside NVLink: [Roofline and sharded-matmul math](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/#derivations).
+- Check the KV formula in <LabRef lab="llm-inference" inline />.

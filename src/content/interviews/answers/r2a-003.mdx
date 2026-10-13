@@ -1,0 +1,177 @@
+---
+question: r2a-003
+family: rag-system-design
+status: published
+labs: [rag, llm-eval, model-quantizer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'd build a grounded question-answering product on RAG: search the documents, have the model answer only from
+> what was found, require a citation for every claim, check the citations in code, and refuse when the evidence is
+> weak. For model choice, I'd use the smallest model that passes the eval at each step, because a cheap model can
+> cost about a seventh of a strong one. Quantization and distillation apply only to the parts we host ourselves,
+> and every one of them has to pass the same task eval. And the eval comes from what users need: did we find the
+> evidence, did we invent anything, do we refuse when we should, and what does each answer cost."
+>
+> The rest of this page explains each part of that answer.
+
+This is not a recorded question. It is a list of areas a recruiter flagged, so the interviewer will likely ask a
+broad design question and probe each area. The test is whether you can connect them: model choice, grounding,
+efficiency and evals all serve one product and are judged by one eval.
+
+Some background, because the vocabulary is the hard part:
+
+1. **"Grounded" or "factual" means the answer comes from your documents.** A large language model (**LLM**, such
+   as Claude or GPT) left alone will write plausible text from its training. **RAG** (retrieval-augmented
+   generation) searches your documents first and hands the model the passages it should use.
+2. **Efficiency means cost and latency per answer.** LLMs are billed per **token** (a piece of a word, about ¾ of
+   a word), so model size and the number of calls per question set the bill.
+3. **Every efficiency trick risks quality.** A smaller or compressed model is cheaper and may be worse. Only a task
+   eval tells you how much worse.
+
+The source: a DeepMind Applied AI Engineer candidate posted on 2025-09-30, before the interview, the areas the
+recruiter flagged for the ML system design deep dive: model choice and designing for scale, "Retrieval (RAG)
+Factuality, grounding, implementation", "Efficiency Quantization, distillation, optimization", agent frameworks,
+and "Evaluation Aligning evals with problem formulation" (<Cite id="s-5ce95dc021" />). No comment reports the actual
+question. The interpretation answered here: design a grounded generative-AI product end to end and defend model
+choice, efficiency and evals, using RAG as the backbone.
+
+## Clarify first
+
+- **What product and users?** "Assume a grounded question-answering assistant over a large document set."
+- **What does "factual" mean here?** "Every claim supported by a cited source."
+- **Latency and cost targets; hosted models or our own serving?**
+
+## Answer
+
+### Words you need first
+
+- **Chunk**: one passage cut from a document; the unit you search and cite.
+- **Quantization**: storing a model's numbers with fewer bits (for example 8-bit or 4-bit integers instead of
+  16-bit floats), so it needs less memory and runs faster, at some loss of precision.
+- **Distillation**: training a small model to copy a large model's answers on a narrow task.
+- **Faithfulness**: whether each claim in an answer is supported by the passage it cites.
+
+### The system
+
+```
+User question
+   │
+   ▼
+Router / rewriter ── cheap model: make the question standalone, pick the path
+   │
+   ▼
+Hybrid search ── keywords + meaning, merged; reranked
+   │
+   ▼
+Answer model ── stronger model; chunks with ids; a citation per claim
+   │
+   ▼
+Checks in code ── cited ids were in the context; quoted text appears in the chunk
+   │
+   ▼
+Answer with sources, or "not found" when the best evidence scores too low
+```
+
+**Model choice and scale.** Choose the smallest model that passes the eval for each step: a cheap model for query
+rewriting and routing, a stronger one for the final answer. Prices differ by about **7×** per request between the
+two tiers in this example. A 4,000-token-in, 400-token-out request is **$0.012** on Claude Sonnet 5 and **$0.0018** on gpt-5-mini (list
+prices fetched 2026-10-11). So routing each step to the right model is the first cost lever. Scale is mostly
+ingestion and index size, not queries.
+
+**Grounding and factuality.** Retrieve with hybrid search (keyword search plus search by meaning) and reranking (a
+slower model reorders the top candidates). Pass chunks with ids, and require a citation per claim. Verify cited ids
+and quoted spans in code. Refuse when the best evidence scores below a threshold, calibrated on questions the
+documents can't answer. Measure faithfulness separately from **retrieval recall** (did search find the evidence at
+all?).
+
+**Efficiency: quantization and distillation.** These apply to the parts you host yourself.
+
+- **Quantize** the embedding model, the reranker or the answer model to 8-bit or 4-bit integers to cut memory and
+  latency. The error has to be measured. The model-quantizer lab measured the mean 4-bit weight error on GPT-2 as
+  <LabNumber lab="model-quantizer" metric="INT4 weight error, one scale per 32 weights" /> with one scale factor
+  per 32 weights, against <LabNumber lab="model-quantizer" metric="INT4 weight error, one scale per tensor" /> with
+  one scale for a whole matrix. That is weight error, not quality; the gate is your task eval.
+- **Distill** a large model's answers into a smaller one for a narrow, high-volume step (routing, extraction).
+- **Quantize the vectors too.** Storing search vectors as 8-bit integers instead of 4-byte floats cuts index memory
+  4×. Check recall before and after.
+
+**Agent frameworks.** Use a **workflow** (fixed steps in code) for single-hop questions. Add an **agent loop**,
+where the model decides what to search next, only for questions that need several searches, and cap its steps.
+
+**Evals aligned to the problem.** Derive the metrics from what users need:
+
+| User need | Metric |
+|---|---|
+| "It found the evidence" | recall@k: share of test questions whose answer chunk is in the top k |
+| "It didn't invent anything" | faithfulness and citation validity |
+| "It knows its limits" | refusal correctness on questions the documents can't answer |
+| "It's fast and affordable" | latency and cost per question |
+
+Use an **LLM judge** (a second model prompted to grade answers) only after checking it against human labels.
+
+### Follow one decision through it
+
+Say the team wants to cut cost by moving the query-rewrite step from Sonnet 5 to gpt-5-mini. The rewrite turns
+"what about for contractors?" into "notice period for contractors".
+
+1. **Price it.** At an assumed 500 tokens in and 50 out, 5,000 questions a day: about **$225 a month** on Sonnet 5,
+   about **$34** on gpt-5-mini.
+2. **Gate it.** Run the eval set with each rewriter. Compare recall@k on the same questions.
+3. **Decide.** If recall holds within its interval, ship the cheap model. If it drops, keep the strong one for
+   follow-ups only and route first questions, which need no rewriting, around it.
+
+Say it like this: "Every efficiency change, whether a cheaper tier, a quantized reranker or a distilled router,
+goes through the same task eval with a stated quality floor."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Per request, 4,000 in and 400 out: Sonnet 5 ($2 / $10 per 1M) = $0.008 + $0.004 = **$0.012**; gpt-5-mini
+  ($0.25 / $2 per 1M) = $0.001 + $0.0008 = **$0.0018**. Ratio ≈ 6.7.
+- Rewrite step on Sonnet 5: 5,000 × (500 × $2 + 50 × $10) ÷ 1M = **$7.50 a day**, about $225 a month.
+- On gpt-5-mini: 5,000 × (500 × $0.25 + 50 × $2) ÷ 1M ≈ **$1.13 a day**, about $34 a month.
+- Self-hosting: 2 GPUs × $4.19 per GPU-hour × 730 hours ≈ **$6,117 a month**.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Applied generative-AI design"
+  senior={["Covers each flagged area with a concrete mechanism and a measurement."]}
+  staff={["Connects them: routing and quantization decisions gated by the same task eval, with a stated quality floor and cost target."]}
+/>
+
+## Small-team version
+
+At a small company, quantization and distillation usually mean choosing a smaller hosted model or a cheaper tier,
+not running your own. Spend the effort on routing each step to the right model, on prompt caching (the provider
+keeps the processed start of your prompt so repeats are cheap), and on a task eval that every model change has to
+pass.
+
+**What it costs.** The rewrite step above is about **$225 a month** on Claude Sonnet 5 or **$34** on gpt-5-mini
+(prices fetched 2026-10-11).
+
+**When to host.** Only with steady high volume or a data-residency requirement. A rented node with two H100 GPUs at
+Lambda's $4.19 per GPU-hour is about **$6,117 a month** before labour. One published analysis puts that at
+break-even against Sonnet 5 only near 612M output tokens a month
+([Cohorte, 2026-09-20](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even)).
+
+## Pitfalls
+
+- **Listing techniques without saying which part of the system each one changes.** Quantization of what, for which
+  step, measured how?
+- **Treating weight error as a quality measure.** A small weight error can still break a task; only the task eval
+  says.
+- **Generic metrics instead of evals built from the product's failures.** Start from what users need, as in the
+  table above.
+
+## Go deeper
+
+- Family walkthrough: [Design a RAG system end to end](/system-design-labs/interviews/walkthroughs/rag-system-design/).
+- Cost and model routing: [the llm-cost-latency family's question pages](/system-design-labs/interviews/questions/eng-015/). Evals: [eval system design](/system-design-labs/interviews/questions/eng-036/).
+- Measure quantization error: <LabRef lab="model-quantizer" inline />; eval intervals: <LabRef lab="llm-eval" inline />.

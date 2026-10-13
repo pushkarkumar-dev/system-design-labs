@@ -1,0 +1,922 @@
+---
+title: "Distributed training: parallelism plan, collectives, checkpointing and recovery"
+summary: "Plan a large training run across hundreds of GPUs: split the model so it fits, keep heavy traffic on fast links, see why 4× the GPUs is not 4× faster, and checkpoint so one dead machine costs minutes, not hours."
+track: ai-infra
+format: design
+family: distributed-training
+smallTeamFocus: "Skip multi-machine training. Fine-tune on one machine or through a managed API; a small LoRA run costs tens of dollars in GPU time, so spend the effort on data, evals and serving."
+rounds: [ml-system-design, system-design, domain-deep-dive]
+level: both
+timeboxMin: 45
+order: 201
+status: published
+basedOn: [infra-091, infra-012, infra-089, infra-090, infra-092, r2b-015, infra-040, infra-041, infra-035, infra-093]
+askedAt: [meta, nvidia, openai, amazon, google, other]
+labs:
+  - { lab: transformer, role: proof, note: "A from-scratch GPT with a training loop, AdamW and a checkpoint. Count its model-state bytes per parameter, then split them the way ZeRO would. Its benchmark rows are estimates." }
+  - { lab: lora-finetune, role: partial, note: "LoRA math, a training loop and adapter save/load/merge on one device. It is the realistic small-team training job; 2 of its 13 tests fail, and its trainable-parameter figures conflict, so work the LoRA formula by hand." }
+  - { lab: gossip, role: partial, note: "SWIM-style failure detection: the same suspect-then-confirm logic a training controller needs to tell a dead node from a slow one. Its demo does not build and the revived-node test fails." }
+  - { lab: observability, role: background, note: "Metrics and traces with atomic counters and histograms, the shape of per-rank step-time telemetry. The Go package does not compile as of 2026-10-11." }
+gapLabs: [training-parallelism, sharded-checkpointing]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'd plan this from arithmetic, not from a list of acronyms. Training needs about 16 bytes of GPU memory per
+> parameter, so a 46.7-billion-parameter model needs about 747 GB just for its state. No single GPU holds that, so
+> the model has to be split. I'd keep the chattiest traffic inside each 8-GPU machine, where the links are fast,
+> copy the model across machines to share out the data, and spread the optimizer's memory so each GPU holds about
+> 31 GB. On 256 GPUs the run takes about 28 days. On 1,024 it takes about 7, but the gradient exchange between
+> machines no longer hides behind the math, so it costs the same or more GPU-hours. Finally, once a job spans
+> thousands of GPUs, something fails about twice a day. So I checkpoint in the background and keep a spare machine
+> ready: one dead machine should cost minutes, not hours."
+>
+> The rest of this page explains each part of that answer.
+
+The question comes in a few shapes. The fullest one is a design: train a large model on 256 GPUs (32 machines of
+8), then scale it to 1,024 GPUs "while controlling cost" (<Cite id="s-40368f3e05" />). You choose how to split the
+model and the data across GPUs, say what network traffic each choice creates, and checkpoint so a failure costs
+minutes. Another version starts from the failure: a training job runs on 500 machines and one of them dies. What
+happens next?
+
+### What makes this different from the distributed systems you know
+
+You have probably run big batch jobs: a MapReduce or Spark job, or a queue of workers chewing through files. Those
+jobs are made of independent tasks. If one worker dies, the scheduler re-runs its task somewhere else and the other
+workers never notice. A slow worker delays only its own task.
+
+Large-model training is the opposite. It is **one program running on hundreds or thousands of GPUs in lockstep**.
+That changes four things.
+
+1. **Every step waits for the slowest GPU.** Training repeats one step over and over: about 240,000 times
+   in this page's example (a trillion tokens of text at about 4 million tokens per step; a token is roughly ¾ of a
+   word). At the end of each step
+   every GPU must exchange results with the others before anyone can start the next step. One slow GPU slows all
+   of them.
+2. **One failure stops everything.** If one machine dies, the others are stuck halfway through an exchange. The
+   whole job stops and restarts from the last saved copy. A failure costs the time of every GPU, not one.
+3. **The state is enormous.** The model and its training bookkeeping are hundreds of gigabytes, far more than one
+   GPU's memory. Splitting that state is the first design problem.
+4. **The network between machines is the bottleneck.** GPUs inside one machine talk over very fast links. Machines
+   talk to each other over a much slower network. In this page's example, one GPU gets 300 GB/s each way inside
+   its machine, while a whole machine gets 25–50 GB/s to the rest of the cluster. Where each kind of traffic flows
+   decides whether the GPUs compute or wait.
+
+So the round is a capacity-planning exercise. The interviewer wants a plan derived from memory per GPU, bytes per
+link and the failure rate, not a list of technique names.
+
+### Words you need first
+
+- **Parameter**: one number inside the model that training adjusts. A "70B model" has 70 billion of them. In
+  memory, each one takes 2 bytes in the usual 16-bit format, called **bf16**.
+- **Training step**: one round of learning. The GPU runs a batch of text through the model (the **forward
+  pass**), measures how wrong the predictions were, and works backwards to compute, for each parameter, which
+  direction would reduce the error (the **backward pass**). Those directions are the **gradients**. Then the
+  **optimizer** (almost always one called **Adam**) uses the gradients to nudge every parameter.
+- **GPU memory**, called **HBM** (high-bandwidth memory): the GPU's own RAM. The A100 and H100 models used on this page have 80 GB. Everything
+  a GPU works on must fit there.
+- **Node**: one physical machine, here holding 8 GPUs. Inside a node, GPUs talk over **NVLink**, a direct
+  GPU-to-GPU link. Between nodes, traffic goes over the data-center network (InfiniBand or Ethernet), which is much
+  slower.
+- **Token**: a piece of a word, about ¾ of a word on average. Training data is measured in tokens; "1T tokens" is
+  a trillion of them.
+- **Checkpoint**: a saved copy of the whole training state, so the job can resume after a failure. It plays the
+  role a database snapshot plays for a database.
+
+Ten reported questions share this problem. Four are designs, three are explanations, two ask about your own
+experience, and one is a coding and theory puzzle.
+
+<QuestionRow id="infra-091" />
+<QuestionRow id="infra-012" />
+<QuestionRow id="infra-089" />
+<QuestionRow id="infra-090" />
+<QuestionRow id="infra-092" />
+<QuestionRow id="r2b-015" />
+<QuestionRow id="infra-040" />
+<QuestionRow id="infra-041" />
+<QuestionRow id="infra-035" />
+<QuestionRow id="infra-093" />
+
+## What is being tested
+
+The common thread is arithmetic. Interviewers want the plan to fall out of three numbers: memory per GPU, bytes on
+each link, and how often machines fail. The NVIDIA reports add a second test: whether you have actually run and
+profiled jobs on many GPUs, or only read about them.
+
+What the sources say, briefly, separated by who is saying it:
+
+- **An NVIDIA senior ML engineer candidate** describes a design round built around one question: what happens if
+  one node of a 500-node training system dies. The follow-ups they list are "How fast do you detect the failure?",
+  "At what point do you restart versus let the cluster catch up?" and "Do you even need 500 nodes, and are you
+  using them efficiently?" The same loop had a domain round on supported training modes, hardware constraints and
+  NVIDIA products, which the candidate called "trivia-heavy" (<Cite id="s-79598dd069" />).
+- **Another NVIDIA candidate** was asked to design a training environment for a trillion-parameter model. The
+  interviewers then pushed on benchmarking and debugging GPU utilization and on which NVIDIA tools the candidate had
+  used. In hindsight the candidate wrote that the round "really rewards real GPU experience, not just conceptual
+  knowledge" (<Cite id="s-7dd221b925" />).
+- **An OpenAI research-engineer candidate** implemented all_gather (a way for every machine to collect every other
+  machine's data), then had to bound the number of rounds over noisy channels and improve the bound using the fact
+  that the values are floats. They called it "the hardest round for me by far" and were rejected
+  (<Cite id="s-7fa103b073" />).
+- **PracHub write-ups** cover the Meta design used on this page, a Meta reinforcement-learning system, an
+  OpenAI-tagged fine-tuning platform and an Amazon question on parallelism (<Cite id="s-40368f3e05" />,
+  <Cite id="s-096f521464" />, <Cite id="s-a6d1d2135d" />, <Cite id="s-9936fcb114" />). On PracHub only the title
+  is candidate-reported; the requirement lists are the site's own.
+- **One Blind poster** advises that training-infra candidates need Megatron and ZeRO (two techniques explained
+  below) "source-code deep"; commenters suspected the post was an ad (<Cite id="s-a129aa6451" />).
+
+No first-hand report in this research describes a standalone checkpointing round or debugging a collective hang
+by name. Checkpointing shows up as a requirement inside larger designs.
+
+## Clarify and scope
+
+Ask these first, and write the answers down as assumptions. This page follows **one worked example** from here
+to the end: a 256-GPU training run, scaled to 1,024 GPUs, that loses a node partway through.
+
+1. **Model shape.** Is it **dense** (every parameter is used for every token) or a **Mixture of Experts (MoE)**?
+   An MoE model has several parallel copies of part of each layer, called **experts**, and a small **router** that
+   sends each token to only a few of them. That gives a big model whose cost per token is like a small one's. If
+   the interviewer leaves the shape open, propose one. This page uses Mixtral 8x7B's published shape: 8 experts
+   per layer, each token goes to the top 2 (**top-2**), hidden size 4,096, 32 layers, expert width 14,336. It has
+   **46.7B parameters in total, of which 12.9B are active per token** (Mistral's
+   [announcement](https://mistral.ai/news/mixtral-of-experts), 2023-12-11, and its
+   [config.json](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/raw/main/config.json), fetched 2026-10-12).
+2. **Token budget and deadline.** About 1T tokens, per the write-up. When must it finish?
+3. **Network.** Is "200–400 Gbps across nodes" per node or per GPU? That is an 8× difference. This page assumes per
+   node, so at best **50 GB/s per node each way** (400 Gbps ÷ 8 bits), and 25 GB/s at 200 Gbps.
+4. **Global batch.** How many tokens does one step see, across all GPUs? Researchers tune this and it changes how
+   the model learns, so you can't change it freely. Assume about 4M tokens (4,194,304, which is 1,024 sequences of
+   4,096 tokens).
+5. **Storage.** How fast can the cluster write checkpoints? Assume 100 GB/s in total.
+6. **Spares and failure history.** Are spare nodes on standby? How often have nodes failed in this cluster?
+7. **Precision and software.** bf16 on A100. The A100 has no 8-bit floating-point (FP8) units, so FP8 is off the
+   table (<Cite id="s-8e443a8b66" />). Which framework: PyTorch FSDP (fully sharded data parallel), DeepSpeed or
+   Megatron-Core? All three are ways of splitting a model across GPUs.
+
+Say out loud what is out of scope: tokenizer and data curation details (mention deduplication and language
+balance in one line), the content of the evaluation suite, and serving.
+
+Say it like this: "Before I split anything, I want three numbers: how much memory the model needs per GPU, how many
+bytes cross each link per step, and how often a node fails here."
+
+## Back-of-envelope
+
+Do four quick estimates before drawing anything: how long the run takes, how much memory it needs, how much
+gradient traffic crosses the network, and how much traffic the experts create. Each one decides part of the
+design.
+
+### How long the run takes
+
+Training cost is counted in **FLOPs** (floating-point operations). A standard rule of thumb: each token costs about
+6 FLOPs per active parameter, 2 for the forward pass and about 4 for the backward pass (Kaplan et al., 2020).
+
+A GPU never runs at its advertised peak. The share it actually achieves on useful model math is called **MFU**
+(model FLOPs utilization). 40% is a good, realistic figure; this page assumes it.
+
+For the worked example, the run needs about **7.7 × 10²² FLOPs**. On 256 A100s at 40% MFU that is about
+**28 days, or 172,000 GPU-hours**. On 1,024 GPUs it would take about 7 days and the same 172,000 GPU-hours, if MFU
+held at 40%. If MFU drops to 30% on the bigger cluster, it takes 9.3 days and **229,000 GPU-hours**.
+
+At A100 rental prices of $1.39–$2.79 per GPU-hour (RunPod and Lambda, fetched 2026-10-11), 172,000 GPU-hours is
+roughly **$240K–$480K**. More GPUs buy calendar time, not fewer GPU-hours. If utilization falls from 40% to 30%,
+the same run costs about 33% more. That is the "controlling cost" half of the prompt.
+
+Say it like this: "Four times the GPUs gets the run done in a quarter of the time only if utilization holds. If it
+drops from 40% to 30%, I pay a third more for the same model."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Training compute"
+  expr="C ≈ 6 × N_active × D     time ≈ C ÷ (GPUs × peak × MFU)"
+  vars={[
+    { sym: 'N_active', meaning: 'parameters touched per token (all of them for a dense model)' },
+    { sym: 'D', meaning: 'training tokens' },
+    { sym: '6', meaning: '2 FLOPs per parameter forward, about 4 backward (Kaplan et al. 2020)' },
+    { sym: 'peak', meaning: 'dense bf16 peak: 312 TFLOPS on A100' },
+    { sym: 'MFU', meaning: 'model FLOPs utilization; 40% is an assumption here' },
+  ]}
+  example={[
+    "6 × 12.88 × 10⁹ × 10¹² = 7.73 × 10²² FLOPs",
+    "256 × 312 × 10¹² × 0.4 = 3.19 × 10¹⁶ FLOP/s → 2.42 × 10⁶ s ≈ 28 days, 172,000 GPU-hours",
+    "1,024 GPUs at 40% → 7 days, the same 172,000 GPU-hours; at 30% → 9.3 days, 229,000 GPU-hours",
+  ]}
+/>
+
+Cost: 172,000 × $1.39 ≈ $240K and 172,000 × $2.79 ≈ $480K.
+
+</details>
+
+### How much memory it needs
+
+Training holds much more than the model itself. With the usual mixed-precision setup, each parameter needs:
+
+- 2 bytes for the bf16 weight the GPU computes with,
+- 2 bytes for its bf16 gradient,
+- 12 bytes for the optimizer's bookkeeping: a full-precision (fp32, 4-byte) master copy of the weight, plus two
+  running averages that Adam keeps per parameter (4 bytes each).
+
+That is **16 bytes per parameter**. The accounting comes from the ZeRO paper (Rajbhandari et al., 2019), which
+named this state and showed how to split it. For the whole model it is **747 GB**, about nine GPUs' worth of
+memory before any working data for the batch. So the state must be split, and the question is how.
+
+Here is the split this page proposes, worked for one GPU:
+
+| Step | What each GPU holds | Model state per GPU | What to say in the interview |
+|---|---|---|---|
+| No splitting | the whole model | 747 GB | "Nine GPUs' worth. It has to be split." |
+| Put one expert per GPU inside each node | the shared layers plus 1 of 8 experts | **116 GB** | "Each GPU owns one expert per layer, but 116 GB still doesn't fit in 80." |
+| Also split the optimizer's 12 bytes across the GPUs that hold copies of the same thing | as above, but only a slice of the optimizer state | **about 31 GB** | "Now it fits, with about 49 GB left for the batch's working data." |
+
+The first split is **expert parallelism (EP)**: different GPUs hold different experts. The second is **ZeRO stage 1**:
+the GPUs that hold identical copies of some weights each keep only a slice of the optimizer state for them. Both are
+explained in the deep dives. The ZeRO paper's own example shows the same effect: a 7.5B model with 64 copies needs
+120 GB per GPU without the split and 31.4 GB with optimizer-state splitting
+([ZeRO paper](https://arxiv.org/abs/1910.02054)).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Model-state memory, mixed-precision Adam"
+  expr="bytes = 2Ψ (bf16 weights) + 2Ψ (bf16 grads) + 12Ψ (fp32 master, momentum, variance) = 16Ψ"
+  vars={[
+    { sym: 'Ψ', meaning: 'parameters held by this GPU' },
+    { sym: '12', meaning: 'K = 12 for mixed-precision Adam (ZeRO paper)' },
+  ]}
+  example={[
+    "Whole model: 16 × 46.7 × 10⁹ = 747 GB, about 9.3 A100s of HBM before any activation",
+    "Per GPU with 8 experts spread over 8 GPUs (EP = 8): dense part 1.61B params, experts 5.64B params",
+    "No sharding: 16 × 1.61B + 16 × 5.64B = 25.7 + 90.2 = 116 GB → does not fit in 80 GB",
+    "Optimizer sharded (ZeRO-1): 4 × 1.61B + 12 × 1.61B ÷ 256 + 4 × 5.64B + 12 × 5.64B ÷ 32 = 6.4 + 0.08 + 22.5 + 2.1 ≈ 31 GB",
+  ]}
+/>
+
+The shared (non-expert) layers are copied on all 256 GPUs, so their optimizer state is split 256 ways. Each expert
+is copied once per node, on 32 GPUs, so its optimizer state is split 32 ways. Each expert is 3 × 4,096 × 14,336
+parameters per layer, times 32 layers, which is 5.64B.
+
+</details>
+
+### How much gradient traffic crosses the network
+
+Each node holds a full copy of the model and trains on different data. This arrangement is called **data
+parallelism (DP)**. After the backward pass each node has its own gradients. Before anyone
+updates the weights, all nodes must agree on the average gradient. An operation where every participant
+contributes data and every participant ends up with the combined result is called a **collective**. This one is
+**all-reduce**: everyone sends their gradients, everyone gets the sum.
+
+The standard way to do it is a **ring all-reduce**. The nodes form a ring and pass slices of the gradient around it
+twice: once to add them up, once to hand out the totals. Its key property is the one to say out loud: **each node
+sends about twice the size of its gradients, no matter how many nodes are in the ring.** A naive design, where
+everyone sends everything to everyone, grows with the square of the node count; the ring takes 2(N − 1) steps
+instead (<Cite id="s-028bbc6f1c" />).
+
+In the worked example each node holds a full copy of the model, so it holds 93.4 GB of bf16 gradients. Each step it
+sends about **181 GB**. At 50 GB/s that is **3.6 s**, and 7.2 s at 25 GB/s. With 128 nodes it is 185 GB: almost
+the same.
+
+Splitting the optimizer state (ZeRO-1) doesn't add traffic. The all-reduce becomes two half-operations, a
+**reduce-scatter** (everyone ends up with the sum of one slice) and an **all-gather** (everyone collects all the
+slices), which move the same bytes in total. Splitting the weights themselves as well (ZeRO stage 3, or FSDP's
+FULL_SHARD mode) costs 1.5× the traffic, per the ZeRO paper.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Ring all-reduce traffic"
+  expr="bytes sent per participant = 2(N − 1) ÷ N × S"
+  vars={[
+    { sym: 'N', meaning: 'participants in the ring (here: nodes)' },
+    { sym: 'S', meaning: 'bytes being reduced (the full bf16 gradient a node holds)' },
+  ]}
+  example={[
+    "Each node holds a full replica: S = 2 B × 46.7B = 93.4 GB of gradients per step",
+    "32 nodes: 2 × 31 ÷ 32 × 93.4 = 181 GB per node per step → 3.6 s at 50 GB/s, 7.2 s at 25 GB/s",
+    "128 nodes: 185 GB per node per step → 3.7 s / 7.4 s. It barely changes with N.",
+  ]}
+/>
+
+</details>
+
+### How much traffic the experts create
+
+In an MoE layer, each token's data must travel to the GPUs holding its two chosen experts, and the results must
+come back. Every GPU sends a different piece to every other GPU. That collective is called **all-to-all**. It
+happens twice per MoE layer in the forward pass (send out, bring back) and twice again in the backward pass.
+
+In the worked example each GPU handles 16,384 tokens per step, and about **30 GB** of its expert traffic leaves
+the GPU each step. Over NVLink, which carries 300 GB/s in each direction on an A100, that is **0.1 s**. If the
+experts sat on different nodes, the same exchange would push about 241 GB per node through the 50 GB/s network:
+**4.8 s per step**, with nothing to hide behind. That one comparison is why the experts stay inside the node.
+
+(NVIDIA's A100 page lists NVLink at 600 GB/s. That figure counts both directions together. NVIDIA's
+[Hopper architecture post](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/), fetched
+2026-10-11, gives 12 links at 25 GB/s each way, so 300 GB/s per direction.)
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="MoE all-to-all per step"
+  expr="bytes ≈ tokens × MoE layers × 4 × k × hidden × 2 B"
+  vars={[
+    { sym: '4', meaning: 'dispatch and combine, in forward and again in backward' },
+    { sym: 'k', meaning: 'experts per token (top-2)' },
+    { sym: '2 B', meaning: 'bf16 activations' },
+  ]}
+  example={[
+    "Per GPU: 16,384 tokens × 32 × 4 × 2 × 4,096 × 2 B = 34.4 GB; 7/8 leaves the GPU = 30.1 GB",
+    "Over NVLink at 300 GB/s each way: 0.10 s per step",
+    "If experts sat on different nodes: about 8 × 30.1 = 241 GB per node → 4.8 s at 50 GB/s, on the critical path",
+  ]}
+/>
+
+16,384 tokens per GPU is the 4,194,304-token global batch divided by 256 GPUs.
+
+</details>
+
+### Put the step together
+
+Now compare the math time with the network time, per step, at the same 4M-token batch:
+
+| | 256 GPUs | 1,024 GPUs |
+|---|---|---|
+| Math per GPU per step at 40% MFU | **10.1 s** | **2.5 s** |
+| Gradient bytes per node per step | 181 GB | 185 GB |
+| Gradient time at 50 / 25 GB/s | 3.6 / 7.2 s | 3.7 / 7.4 s |
+| Can the backward pass hide it? | Yes, with margin | **No**: the network is now the bottleneck |
+
+The gradient exchange can run while the backward pass is still computing earlier layers, so on 256 GPUs it is
+mostly free. On 1,024 GPUs each GPU gets a quarter of the batch, so its math drops to 2.5 s, but the bytes each node
+sends stay the same. The network time no longer fits behind the math.
+
+Say it like this: "Ring all-reduce sends about twice the gradient per node no matter how many nodes join, while the
+math per GPU falls by four. At a fixed batch, the 1,024-GPU job is waiting on the network."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Math per GPU at 256 GPUs: 6 × 12.88 × 10⁹ × 16,384 tokens = 1.27 × 10¹⁵ FLOPs. At 312 × 10¹² × 0.4 =
+  1.25 × 10¹⁴ FLOP/s that is **10.1 s**.
+- At 1,024 GPUs each GPU sees 4,096 tokens, a quarter of the work: about **2.5 s**.
+
+</details>
+
+## High-level design
+
+Here is the system for the worked example, top to bottom:
+
+```
+ Object storage: pre-tokenized data shards
+        │  data loader reads in a fixed, saved order and prefetches
+        ▼
+ ┌─ 32 nodes, 8 A100 GPUs each ─────────────────────────────────┐
+ │  node 0:  GPU0 … GPU7 hold expert 0 … expert 7 of every layer │
+ │           experts swap tokens over NVLink (all-to-all)        │
+ │  node 1 … node 31: the same layout, different data            │
+ │  ◄── gradients averaged across nodes over the network ──►     │
+ │      (reduce-scatter + all-gather, optimizer state split)     │
+ └───────────────────────────────────────────────────────────────┘
+        │ heartbeats, per-GPU step times      │ checkpoint shards, in the background
+        ▼                                     ▼
+   Controller                            Checkpoint store
+   (detects failures, restarts the job)  (several recent versions)
+        │
+        ▼
+   Telemetry and evals: utilization, step times, expert load, loss
+```
+
+**Data loader.** Training data is already split into tokens and stored as shards in object storage. The loader
+reads them in a fixed order whose position is saved in every checkpoint, balances languages (the write-up's model
+is bilingual), and prefetches so the GPU never waits for input.
+
+**Trainer.** One process per GPU. Each process is called a **rank**, and the ranks call each other to run the
+collectives. The layout for this model: **no tensor parallelism** (splitting each layer across GPUs), **8-way
+expert parallelism inside each node, 32-way data parallelism across nodes, ZeRO-1** for the optimizer state, bf16,
+and **selective activation recomputation**. The forward pass's intermediate results, called **activations**, are kept for the backward pass; recomputation throws
+some of them away and recomputes them later, to save memory. Each of these is explained in the first deep dive.
+
+**Controller.** It gathers the ranks at startup (a step called **rendezvous**, handled by the c10d backend of torchrun, PyTorch's launcher, or
+the scheduler's equivalent). A health agent on each node reports heartbeats and per-rank step times. The controller
+owns the restart policy.
+
+**Checkpoint manager.** It saves the full training state, split into one piece per rank, in the background, and
+keeps several recent versions, not only the latest.
+
+**Telemetry and evals.** Utilization (MFU), per-rank step time, collective bandwidth, expert load and dropped
+tokens, loss and gradient size, plus a held-out loss per language on each checkpoint.
+
+Why this plan, in one sentence each: splitting individual layers across GPUs is too expensive for a model this
+narrow (first deep dive), keeping experts inside the node keeps their traffic on NVLink, and ZeRO-1 is the cheapest
+memory split that fits in 80 GB without adding traffic to a network that is already busy.
+
+## Deep dives
+
+### Choosing how to split the work
+
+There are a handful of ways to spread training across GPUs. Each splits something different, needs a different
+collective, and hurts in a different place. Learn them as a table, then pick by the numbers.
+
+| Strategy | What it splits | Traffic it needs | Where it hurts |
+|---|---|---|---|
+| **Data parallel (DP)** | the batch: every GPU has the whole model and different data | all-reduce of gradients (reduce-scatter + all-gather when sharded) | gradient bytes per step don't shrink as you add copies |
+| **ZeRO / FSDP** | optimizer state, then gradients, then the weights, across the DP copies | reduce-scatter, all-gather | splitting the weights adds 1.5× traffic |
+| **Tensor parallel (TP)** | each layer's matrix multiplications | all-reduce of intermediate results, 2 forward + 2 backward per layer | needs NVLink-class bandwidth |
+| **Sequence parallel (SP)** | some per-token work, along the sequence | reduce-scatter + all-gather instead of all-reduce | same bandwidth as TP, less memory |
+| **Pipeline parallel (PP)** | the layers, into consecutive stages | point-to-point sends between stages | idle time, called the bubble |
+| **Expert parallel (EP)** | the experts, across GPUs | all-to-all, twice per MoE layer each way | uneven routing; slow if it crosses nodes |
+
+**Data parallelism** is the simplest and the default: copy the model, give each copy different data, and average
+the gradients. It works until the model no longer fits on one GPU.
+
+**ZeRO**, and PyTorch's version of it, **FSDP** (fully sharded data parallel), removes the waste of every copy
+holding identical optimizer state. Stage 1 splits the optimizer state (4× less memory in the ZeRO paper's setup),
+stage 2 adds the gradients (8×), and stage 3 adds the weights, with savings that grow with the number of copies. In
+PyTorch terms, FULL_SHARD splits all three (like stage 3), SHARD_GRAD_OP splits gradients and optimizer state, and
+HYBRID_SHARD splits inside a node and keeps full copies across nodes
+([PyTorch FSDP docs](https://docs.pytorch.org/docs/2.14/fsdp.html), fetched 2026-10-12). HYBRID_SHARD is the usual
+answer when the network between nodes is the bottleneck.
+
+**Tensor parallelism** splits each layer's big matrix multiplications across GPUs. The Megatron-LM paper
+([Shoeybi et al., 2019](https://arxiv.org/abs/1909.08053)) showed the trick that makes it cheap. These models are
+stacks of identical **transformer** layers, and each layer's feed-forward block has two matrix multiplications in a
+row with a simple per-number function between them. Split the first one **by columns**: each GPU computes its own
+slice of the output and applies that function locally. Split the second one **by rows**: it takes that slice
+directly as input and produces a partial sum. One all-reduce adds the partial sums. Alternating the two splits is
+what removes a gather between them. A whole transformer layer then needs two all-reduces forward and two backward.
+
+That is a lot of traffic inside every layer, so tensor parallelism only pays when each GPU has a lot of math per
+byte sent, which means wide layers on fast links. A derived ratio puts a number on it: for this model's width of
+4,096 on A100 NVLink, splitting each layer 8 ways would add communication equal to **39%** of the math. For a much
+wider model on H100 it is 13%. The same wide model over a 50 GB/s network would be 1.2: more time talking than
+computing. Narayanan et al. ([2021](https://arxiv.org/abs/2104.04473)) give the rule of thumb: tensor parallelism
+"up to degree g when using g-GPU servers", and pipeline parallelism across servers.
+
+Say it like this: "Tensor parallelism stays inside the NVLink domain, and only for wide models. At a hidden size of
+4,096 it would cost 39% extra, so for this model I use expert parallelism instead."
+
+**Pipeline parallelism** puts different layers on different GPUs: GPU 1 runs layers 1 to 8, GPU 2 runs 9 to 16, and
+so on. The activations flow from stage to stage like an assembly line. The cost is idle time: at the start of each step
+the later stages wait for work, and at the end the earlier ones wait. That idle time is called the **bubble**. To
+shrink it, each step's batch is cut into smaller **micro-batches** that flow through the line one after another,
+usually in a pattern called **1F1B** (one forward, one backward, alternating). The bubble is roughly
+(stages − 1) ÷ micro-batches. Giving each GPU several smaller chunks of layers (an **interleaved** schedule) divides
+it further.
+
+The catch is that pipelines and data parallelism compete for the same batch. Each data-parallel copy gets only its
+share of the batch to cut into micro-batches. For a trillion-parameter dense model with 16 stages and 32 copies at a
+4M-token batch, each copy has only 32 micro-batches: a **47% bubble**, or 12% interleaved. Quadruple the batch and
+it drops to 12% and 3%.
+
+**Sequence parallelism** fixes a waste inside tensor parallelism. Some cheap per-token operations (layer
+normalization and dropout) are repeated on every GPU of the tensor-parallel group. Korthikanti et al.
+([2022](https://arxiv.org/abs/2205.05198)) split those along the sequence instead and replace each all-reduce with
+a reduce-scatter plus an all-gather. They say this adds no communication, and report 5× less activation memory
+together with selective recomputation.
+
+**Expert parallelism** puts different experts on different GPUs, as in the worked example. Its all-to-all is heavy,
+so it belongs inside a node unless you have a very fast network.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="TP communication ÷ compute per layer (derived)"
+  expr="ratio ≈ (2 ÷ 9) × (t − 1) × P ÷ (h × L)"
+  vars={[
+    { sym: 't', meaning: 'tensor-parallel degree' },
+    { sym: 'P', meaning: 'dense peak FLOP/s per GPU' },
+    { sym: 'h', meaning: 'hidden size' },
+    { sym: 'L', meaning: 'link bandwidth per GPU, each way' },
+  ]}
+  example={[
+    "Comm: 4 all-reduces × 2(t−1)/t × 2·s·b·h bytes. Compute: 72·h²·s·b FLOPs ÷ t (12h² params per layer × 6).",
+    "A100, h = 4,096, t = 8, 300 GB/s: 0.39 → communication is 39% of compute",
+    "H100, h = 25,600, t = 8, 450 GB/s: 0.13. Same model over 50 GB/s networking: 1.2",
+  ]}
+/>
+
+The ratio ignores attention-score math, which would only make tensor parallelism look slightly better.
+
+Pipeline bubble (Narayanan et al., 2021): (p − 1) ÷ m for 1F1B and (p − 1) ÷ (v·m) with v interleaved chunks per
+GPU. The number of micro-batches m is the global batch divided by the data-parallel degree and the micro-batch size.
+For p = 16, DP = 32, a 4M-token batch and one 4,096-token sequence per micro-batch: m = 32, so 15 ÷ 32 = 47%, and
+15 ÷ 128 = 12% with v = 4. A 16M batch gives m = 128: 12% and 3%.
+
+</details>
+
+### MoE: routing traffic, expert capacity and load balance
+
+The router decides which experts each token visits. Hardware likes fixed sizes, so each expert gets a fixed number
+of slots per step, called its **capacity**. The Switch Transformer paper
+([Fedus et al.](https://arxiv.org/abs/2101.03961)) defines it as the tokens in a batch divided by the number of
+experts, times a **capacity factor** (CF) that adds headroom. Tokens beyond an expert's capacity are **dropped**:
+they skip that expert and pass to the next layer unchanged. The paper reports better results at low factors (1.0
+and 1.25), adds an extra **load-balancing loss** term (with coefficient α = 10⁻²) that penalizes uneven routing,
+and computes the router in 32-bit floats for stability.
+
+In the worked example, the 8 GPUs of one node exchange **32,768 tokens** per step. With top-2 routing over 8
+experts, each expert's fair share is **8,192 slots**; at CF 1.25 it gets **10,240**. An expert that receives twice
+its share drops 37.5% of its tokens.
+
+Now the failure case. A prep guide's skew example sends 80% of tokens to 3 of 32 experts, so each of those three
+gets 8.5 times its fair share (<Cite id="s-9e6b455b13" />). At CF 1.25 such an expert drops **85%** of its
+tokens. No capacity factor fixes that.
+
+Say it like this: "A capacity factor absorbs noise, not collapse. I'd alarm on per-expert load and the share of
+dropped tokens, and treat a collapsing router as a training incident, not a tuning detail."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Expert capacity, top-k"
+  expr="capacity = CF × tokens_in_group × k ÷ E"
+  vars={[
+    { sym: 'CF', meaning: 'capacity factor' },
+    { sym: 'tokens_in_group', meaning: 'tokens exchanged in one all-to-all group' },
+    { sym: 'E', meaning: 'experts' },
+  ]}
+  example={[
+    "8 GPUs × 4,096 tokens = 32,768 tokens × 2 ÷ 8 = 8,192 slots per expert; CF 1.25 → 10,240",
+    "An expert that gets 2× its share drops 1 − 1.25 ÷ 2 = 37.5% of its tokens",
+  ]}
+/>
+
+Skew: 80% ÷ 3 = 26.7% per hot expert against 1 ÷ 32 = 3.125% uniform, which is 8.5×. Dropped share at CF 1.25:
+1 − 1.25 ÷ 8.5 = 85%.
+
+The Switch auxiliary loss is α·N·Σ fᵢ·Pᵢ, where fᵢ is the share of tokens sent to expert i and Pᵢ the router's
+average probability for it.
+
+</details>
+
+### Checkpointing so a dead node costs minutes
+
+A checkpoint has to hold everything needed to resume training exactly where it stopped. Think of it as a database
+snapshot plus the write-ahead log position.
+
+**What goes in.** The bf16 weights plus the fp32 master weights and Adam's two running averages: 14 bytes per
+parameter, so **654 GB** for the worked example. Gradients are recomputed, so they are left out. Add the data
+loader's position, the random-number generator states, the learning-rate schedule's step and the parallel layout.
+Without the data position, a restart silently re-trains on data the model has already seen.
+
+**How it is written.** Each rank writes only its own piece, so the 654 GB becomes about **2.55 GB per GPU**, written
+in parallel. PyTorch Distributed Checkpoint (DCP) does this: it saves from many ranks at once, writes at least one
+file per rank, and "handles load-time resharding", so you can restart on a different number of GPUs
+([DCP docs](https://docs.pytorch.org/docs/2.14/distributed.checkpoint.html), fetched 2026-10-12; its `async_save`
+is marked experimental there). A **synchronous** write to 100 GB/s of storage pauses training for about **6.5 s**.
+An **asynchronous** one pauses only while each GPU copies its piece to the machine's ordinary RAM, about
+**0.13 s** at an assumed 20 GB/s, then writes to storage in the background.
+
+**How often.** Checkpoint too rarely and every failure throws away hours of work. Checkpoint too often and the
+pauses add up. A classic formula, **Young's approximation**, balances the two: the best interval is about the
+square root of (2 × the pause per checkpoint × the mean time between failures)
+([summary with Daly's refinement](https://blog.acolyer.org/2015/06/10/a-higher-order-estimate-of-the-optimun-checkpoint-interval-for-restart-dumps/),
+2015).
+
+That needs a failure rate. The only large public number in this research is Meta's: **419 unexpected
+interruptions in 54 days** while training Llama 3 405B on up to 16K H100s, with GPU problems the largest category
+at 58.7% ([Llama 3 paper](https://arxiv.org/abs/2407.21783), Section 3.3.4). That works out to about
+**2 × 10⁻⁵ interruptions per GPU-hour**. Treat it as an order of magnitude; your hardware will differ.
+
+Now apply it to the NVIDIA version of the question: 500 nodes, assumed 8 GPUs each, so 4,000 GPUs. At that rate
+the whole job is interrupted about **every 12.7 hours**. Failure is routine. Here is what each design costs. The pause and restart
+times in the table are assumptions for a bigger model than the worked example, not measurements:
+
+| Design | Pause per checkpoint | Restart time | Best interval | Total time lost | Cost of one failure |
+|---|---|---|---|---|---|
+| Synchronous checkpoints | 30 s | 10 min | 28 min | about **4.9%** | 24 min of the whole cluster |
+| Asynchronous checkpoints | 2 s | 10 min | 7 min | about **2.3%** | 14 min |
+| Async + hot spare + restore from memory | 2 s | 2 min | 7 min | about **1.2%** | **5.6 min** |
+
+Once checkpoints are cheap, **restart time dominates**. That is where the remaining minutes are: a spare node that
+has already joined the rendezvous pool, the newest checkpoint held in a peer node's RAM as well as in object
+storage, and a startup path that doesn't re-download containers. For contrast, checkpointing every 3 hours with 30
+minutes of manual diagnosis loses 2 hours of 4,000 GPUs, **8,000 GPU-hours, per failure**.
+
+One more point. The number of failures a run expects depends on its total GPU-hours, not on its size: the 256-GPU,
+28-day run and the 1,024-GPU, 7-day run each expect about 3.4 interruptions. What grows with cluster size is the
+cost of each one, because every GPU waits.
+
+Say it like this: "At 4,000 GPUs a failure every 12 or 13 hours is normal. With background checkpoints and a hot
+spare, each one costs about six minutes of the cluster instead of half an hour."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Checkpoint interval and overhead"
+  expr="τ ≈ √(2 × δ × M)     overhead ≈ δ ÷ τ + (τ ÷ 2 + R) ÷ M"
+  vars={[
+    { sym: 'δ', meaning: 'training stall per checkpoint' },
+    { sym: 'M', meaning: 'mean time between interruptions for the whole job' },
+    { sym: 'R', meaning: 'restart time: detect, replace, rendezvous, reload' },
+  ]}
+  example={[
+    "500 nodes × 8 GPUs (assumed) = 4,000 GPUs → M ≈ 1 ÷ (4,000 × 1.97 × 10⁻⁵) = 12.7 h",
+    "Sync, δ = 30 s, R = 10 min: τ = 28 min; overhead 1.8% + 3.1% ≈ 4.9%; each failure costs 24 min of the cluster",
+    "Async, δ = 2 s, R = 10 min: τ = 7 min; overhead ≈ 2.3%; each failure costs 14 min",
+    "Async plus a hot spare and in-memory restore, R = 2 min: overhead ≈ 1.2%; each failure costs 5.6 min",
+  ]}
+/>
+
+- Failure rate: 419 ÷ (54 days × 24 h × 16,384 GPUs) ≈ 1.97 × 10⁻⁵ per GPU-hour.
+- Checkpoint size: 14 × 46.7 × 10⁹ = 654 GB; ÷ 256 GPUs = 2.55 GB each. Synchronous: 654 GB ÷ 100 GB/s ≈ 6.5 s.
+  Asynchronous: 2.55 GB ÷ 20 GB/s ≈ 0.13 s.
+- The cost of one failure is the average work lost since the last checkpoint (τ ÷ 2) plus the restart time R.
+- Expected interruptions: 172,000 GPU-hours × 1.97 × 10⁻⁵ ≈ 3.4.
+- Checkpoint every 3 h plus 30 min of diagnosis: on average 1.5 h of lost work + 0.5 h = 2 h × 4,000 GPUs = 8,000
+  GPU-hours.
+
+</details>
+
+## Failure modes and overload
+
+### Detect: dead, hung, slow, wrong
+
+Failures in a lockstep job come in four kinds, and each needs a different detector.
+
+- **Dead.** A process exits or a node stops sending heartbeats. The health agent sees it within seconds (for
+  example, 3 missed heartbeats at 5-second intervals, an assumption).
+- **Hung.** A peer died in the middle of a collective, and every other rank blocks forever waiting for it. GPU
+  collectives run on **NCCL** (NVIDIA's collective communication library). PyTorch's default NCCL timeout is
+  **10 minutes**, after which collectives abort and the process crashes
+  ([torch.distributed docs](https://docs.pytorch.org/docs/2.14/distributed.html), fetched 2026-10-12). Ten minutes
+  of 4,000 GPUs is 667 GPU-hours. So add a **step watchdog**: alert when no rank finishes a step within about 3×
+  the median step time. Meta reports using PyTorch's NCCL flight recorder to diagnose hangs.
+- **Slow.** A **straggler** fails nothing and slows everyone. The Llama 3 paper: "Even a single straggler can slow
+  down thousands of other GPUs." Compare each rank's compute time with its time spent waiting in collectives: the
+  slow rank is the one everyone else waits for.
+- **Wrong.** The loss suddenly jumps, becomes NaN (not a number), or a GPU silently computes wrong values. Watch the
+  loss and the size of the gradients, and keep several checkpoints so you can roll back past the point where it
+  started.
+
+### Recover: restart or continue smaller
+
+A common misunderstanding is that "elastic" training keeps running when a node dies. With torchrun, PyTorch's
+launcher, it doesn't. On a worker failure "all workers are stopped and restarted", and on a membership change "ALL
+surviving workers are killed immediately" and re-form with new ranks
+([torchrun docs](https://docs.pytorch.org/docs/2.14/elastic/run.html), fetched 2026-10-12). Every option costs one
+restart. The real question is whether to wait for a replacement or restart smaller now.
+
+When the model is split across GPUs with tensor and pipeline parallelism, the smallest unit you can drop is one
+whole model copy (all the GPUs that together hold one replica), not one node. Say the job has 62 copies and loses
+one. Running with 61 costs **1.6%** throughput until the spare arrives, plus a second restart later to grow back.
+
+The rule, which is derived rather than sourced: **if a spare will be ready sooner than one restart takes, wait for
+it. Otherwise restart smaller now and grow back at a later checkpoint.** If you shrink, keep the global batch the
+same by having each copy process more micro-batches before updating (**gradient accumulation**). Otherwise the
+optimization changes under the researchers.
+
+Say it like this: "Every path pays one restart. I wait for the spare if it's faster than a restart; otherwise I drop
+one replica, keep the batch with accumulation, and grow back at the next checkpoint."
+
+### Load you don't control
+
+The Llama 3 paper also reports a 1–2% daily throughput swing tied to temperature, and synchronized power swings of
+"tens of megawatts" across the data center. At this scale, a checkpoint pause where every GPU idles at once is a
+power event too.
+
+## Evals and observability
+
+**Is the cluster used well?** The headline number is MFU: useful model math per second divided by what the GPUs
+could do at peak. For a 1T dense model on 4,096 H100s, 40% MFU means about **270,000 tokens per second**. Use the
+H100's **dense** peak, 989.5 TFLOPS in bf16. NVIDIA's page prints 1,979, which assumes a special sparse format that
+training doesn't use, so halve it.
+
+Don't read the `nvidia-smi` "utilization" number as MFU. NVIDIA defines it as the percent of time "one or more
+kernels was executing" ([nvidia-smi docs](https://docs.nvidia.com/deploy/nvidia-smi/index.html), fetched
+2026-10-12). A **kernel** is one program running on the GPU; a GPU running one tiny kernel all the time shows 100%.
+
+**Debugging low utilization, as a ladder.** Each rung finds a different cause.
+
+1. Measure tokens per second and MFU.
+2. Per-rank step-time histograms show stragglers.
+3. A timeline profiler (Nsight Systems or the PyTorch profiler) shows gaps between kernels (the data loader or the
+   CPU can't keep up), collectives that don't overlap with the backward pass, and pipeline bubbles.
+4. Compare collective bandwidth with a baseline from NVIDIA's nccl-tests. Its "bus bandwidth" applies the factor
+   2(n − 1)/n for all-reduce, so results compare with the hardware peak at any rank count
+   ([PERFORMANCE.md](https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md), fetched 2026-10-12).
+5. Fleet counters (DCGM, NVIDIA's data-center GPU manager) show which GPUs are slowing down from heat or power
+   limits.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+MFU = 6 × N_active × tokens per second ÷ (GPUs × dense peak). For 40% MFU on a 1T model and 4,096 H100s:
+0.4 × 4,096 × 989.5 × 10¹² ÷ (6 × 10¹²) ≈ 270,000 tokens per second.
+
+</details>
+
+**Is the model learning?** Loss and gradient size, per-expert load and dropped-token share, held-out loss per
+language, and periodic downstream evals on checkpoints.
+
+**Is recovery working?** **Goodput**, the share of wall-clock time spent on useful training rather than on
+restarts and lost work (Meta reports over 90% effective training time for Llama 3), the checkpoint pause, the
+restart time, and the time from failure to detection.
+
+## Trade-offs
+
+| Decision | You gain | You give up | Revisit when |
+|---|---|---|---|
+| ZeRO-1 instead of splitting the weights too | no extra traffic | 31 GB of state per GPU instead of 3 GB | the batch's working data doesn't fit |
+| Experts inside the node | all-to-all on NVLink (0.1 s) | at most 8 experts per group | you want 64+ experts; then pay the network |
+| No tensor parallelism | no per-layer all-reduces | each layer must fit on one GPU | the hidden size grows past about 16K |
+| 4M-token global batch | the researchers' validated setting | network-bound at 1,024 GPUs | they validate 16M; then math per step returns to 10 s |
+| Asynchronous checkpoints | pause drops from seconds to about 0.1 s | host memory, more code | storage is slow or memory is tight |
+| 1,024 GPUs | 7 days instead of 28 | maybe 33% more GPU-hours | the deadline is worth more than the cost |
+
+For the 1,024-GPU step, list the fixes in order of cost: a bigger batch the researchers have validated, gradient
+exchange overlapped with the backward pass in buckets, pipeline stages across pairs of nodes (so each node holds
+half the model and sends half the gradients), and only then a faster network.
+
+<AINative title="Where an agent helps and what you still check">
+An agent is good at the bookkeeping here: generating the parallelism config, a memory spreadsheet per GPU, an
+nccl-tests sweep script, and a parser that turns profiler traces into per-rank tables. It is also good at
+confidently using the sparse H100 figure or the wrong ZeRO stage. What you verify yourself: measured peak memory on
+two nodes against the spreadsheet, measured bus bandwidth against the link's spec, a drill that kills a node and
+times detection and restart, and a restore test that resumes from a checkpoint and matches the loss curve. In the
+interview the same rule applies to tools: name only the ones you have run.
+</AINative>
+
+## Small-team version
+
+You own AI at a 50–500 person company. Be plain about it: training across many machines is frontier-lab work, and
+most companies your size never train a model at all.
+
+- In a sample of 25 small-company AI job postings collected for this guide on 2026-10-11, most roles consume model
+  APIs; one says outright "No model training required"
+  ([Onit](https://jobs.lever.co/onit/983d3c5d-55d7-4802-9865-80bf58c68bd4)), and only a handful ask for fine-tuning
+  or training. Surveys disagree on how common fine-tuning is: 41% of respondents to
+  [Amplify's 2025 report](https://amplifypartners.com/blog-posts/the-2025-ai-engineering-report) fine-tune, while 57% of
+  [LangChain's agent-engineering survey](https://www.langchain.com/state-of-agent-engineering) respondents don't.
+- The practitioner default is "Don't finetune until you've proven it's necessary"
+  ([Applied LLMs](https://applied-llms.org/), 2024-06-08).
+
+### What training you might actually do
+
+**Fine-tuning** means continuing to train an existing open model on your own examples so it gets better at one
+narrow task. The cheap kind is **LoRA** (low-rank adaptation): you freeze the original weights and train a small
+add-on, often well under 1% of the model's size. The realistic job is fine-tuning or LoRA on a 7–8B open model, on
+one machine or through a managed API. A vendor-reported example: Checkr says a fine-tuned Llama-3-8B beat GPT-4 on
+its hardest classification cases
+([Predibase, Oct 2024](https://predibase.com/blog/how-checkr-streamlines-background-checks-with-fine-tuned-small-language)).
+
+### What it costs
+
+Assume 50M tokens of your own examples, trained for 3 passes (**epochs**): 150M training tokens.
+
+- **Managed API.** Together lists LoRA fine-tuning of Llama 3.1 8B at $0.34–$0.38 per 1M training tokens (two tables;
+  fetched 2026-10-12), so **$51–$57**. Llama 3.3 70B is $2.03–$2.24, so $305–$336.
+- **Rented GPU, LoRA.** One H100 for 3.4–6.8 hours, about **$9–$29** at $2.69–$4.29 per H100-hour (RunPod and
+  Lambda list prices, fetched 2026-10-11).
+- **Rented GPU, full fine-tune.** The 8B model's training state is 128 GB, so it must be split across at least two
+  GPUs with FSDP. On one 8-GPU machine it takes about 38 minutes, roughly **$20**.
+- **QLoRA** (LoRA on a copy of the model compressed to 4 bits) shrinks the 8B model to about 4.5 GB, so it fits on
+  a single small GPU. The QLoRA paper fine-tunes a 65B model on one 48 GB GPU
+  ([Dettmers et al., 2023](https://arxiv.org/abs/2305.14314)).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **LoRA.** With the base weights frozen, training costs about 4 × N × D (forward plus the backward pass through the
+  activations; a derived approximation): 4 × 8.03 × 10⁹ × 1.5 × 10⁸ = 4.8 × 10¹⁸ FLOPs. One H100 at 20–40% MFU of
+  989.5 TFLOPS takes 3.4–6.8 hours: 3.4 × $2.69 ≈ $9 to 6.8 × $4.29 ≈ $29.
+- **Full fine-tune.** 16 × 8.03B = 128 GB of model state. 6 × 8.03 × 10⁹ × 1.5 × 10⁸ = 7.2 × 10¹⁸ FLOPs; on 8 H100s
+  at 40% MFU that is about 38 minutes, roughly 5 GPU-hours, or $20 at $3.99.
+
+</details>
+
+The GPU bill is not the real cost. Data preparation, the eval that proves the fine-tune beats a better prompt plus
+retrieval, and serving the result are. Managed platforms are also a vendor risk: OpenAI's pricing page now says it
+"is winding down the fine-tuning platform" and that it is "no longer accessible to new users" (fetched 2026-10-12).
+
+### Build, buy, skip
+
+- **Build:** a reproducible training job (pinned base model, dataset hash, config in git), checkpoints to object
+  storage every few hundred steps with a tested resume, and an eval gate before anything ships.
+- **Buy:** managed fine-tuning, or GPUs by the hour. The job runner is the same queue as in the
+  [GPU job queue family](/system-design-labs/interviews/walkthroughs/gpu-job-queue/).
+- **Skip:** tensor, pipeline and expert parallelism, elastic restarts, custom collectives and multi-machine jobs.
+- **Still own:** the eval set, data rights and personal data in the training set, rollback to the previous model,
+  and the cost cap.
+
+### Revisit when
+
+Training data reaches billions of tokens, a full fine-tune of a 70B model becomes necessary, you start
+reinforcement learning with automatic graders at volume, a managed vendor deprecates your path, or compliance
+requires training on your own hardware.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Distributed training"
+  senior={[
+    "Derives per-GPU memory from 16 bytes per parameter and picks ZeRO, EP and DP so it fits, naming each collective.",
+    "Explains column- then row-parallel layers, pipeline bubbles and expert capacity with the formulas.",
+    "Checkpoints sharded and asynchronously, and detects dead, hung and slow ranks separately.",
+  ]}
+  staff={[
+    "Shows that per-node gradient traffic is flat in N, so 4× GPUs at a fixed batch is network-bound, and prices the 1,024-GPU run in GPU-hours.",
+    "Turns the failure rate into a checkpoint interval and a restart budget, and decides wait-for-spare versus shrink with a stated rule.",
+    "Asks whether 500 nodes, or pretraining at all, is needed, and names the metric (MFU, goodput) that would prove the plan wrong.",
+  ]}
+/>
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="How fast do you detect a dead node? (Reported, NVIDIA)">
+    Seconds for a crash (heartbeats), minutes for a hang unless you add a watchdog, because NCCL's default timeout
+    is 10 minutes. Add a step watchdog at about 3× the median step time and per-rank timing for stragglers.
+  </FollowUp>
+  <FollowUp q="At what point do you restart versus let the cluster catch up? (Reported, NVIDIA)">
+    Every path pays one restart. Wait for a spare if it will be ready sooner than a restart; otherwise drop one
+    model replica, keep the global batch with accumulation, and grow back at a later checkpoint.
+  </FollowUp>
+  <FollowUp q="Do you even need 500 nodes, and are you using them efficiently? (Reported, NVIDIA)">
+    Compute 6ND and the deadline first. Fine-tuning a 70B model on 1B tokens is about 295 H100-hours at 40% MFU:
+    37 hours on one node, under 5 minutes of compute on 4,000 GPUs, where startup would dominate. Then measure MFU.
+  </FollowUp>
+  <FollowUp q="GPU utilization is low during training. How do you debug it, and with which NVIDIA tools? (Reported, NVIDIA)">
+    MFU first, then per-rank step times, a timeline profile for gaps and un-overlapped collectives, nccl-tests for
+    the link baseline, and DCGM for throttling. Name only tools you have used; the candidate who reported this
+    round says that is where it got hard.
+  </FollowUp>
+  <FollowUp q="Scale to 1,024 GPUs while controlling cost. (Listed on the PracHub page, Meta)">
+    Same GPU-hours at best, more if MFU drops. At a fixed 4M batch the gradient sync (3.6–7.4 s) exceeds compute
+    (2.5 s). Raise the validated batch, overlap gradients with backward, or pipeline across node pairs.
+  </FollowUp>
+  <FollowUp q="One expert gets most of the tokens. What do you do? (Listed on the PracHub page, Meta)">
+    Capacity factor only absorbs noise: at 8.5× the share, CF 1.25 drops 85% of that expert's tokens. Check the
+    load-balancing loss coefficient and router precision, alarm on dropped tokens, and roll back if it collapses.
+  </FollowUp>
+  <FollowUp q="How do new weights reach the rollout engines in async RL? (A PracHub commenter, Meta)">
+    Broadcast from the trainer to the generators every few steps, tag each trajectory with its policy version, and
+    bound staleness. 70B in bf16 is 141 GB per sync, so measure that transfer time.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Using sparse peaks.** Every H100 Tensor Core figure on NVIDIA's spec page is "with sparsity", which training
+  doesn't use; halve it.
+- **Reciting ZeRO stages without the memory math.** Say 16 bytes per parameter and divide.
+- **Tensor or expert parallelism across nodes.** The derived cost ratio goes from 0.13 to 1.2 for the same model.
+- **Assuming 4× GPUs means 4× faster.** Per-node gradient traffic doesn't shrink as you add nodes.
+- **Believing "elastic" means no restart.** torchrun stops and restarts all workers on a failure.
+- **Checkpointing by habit.** Work out the interval from the pause and the failure rate, and test the resume path,
+  including the data position.
+- **Reading `nvidia-smi` as utilization.** It measures whether any kernel was running, not how much work was done.
+- **Claiming tools you haven't used.** The NVIDIA candidate felt weakest exactly there (<Cite id="s-7dd221b925" />).
+
+## Prove it with a lab
+
+No lab in this repo trains across GPUs. The planned training-parallelism and sharded-checkpointing labs would fill
+that gap; until then these cover the pieces.
+
+<LabRef lab="transformer" role="proof" note="Its v3 trains with AdamW and saves a checkpoint. Count the bytes per parameter in the saved state, then shard the optimizer state across two simulated ranks and resume." />
+<LabRef lab="lora-finetune" role="partial" note="The small-team training job: LoRA on one device, with adapter save, load and merge. Work the LoRA parameter formula by hand rather than quoting its bench file." />
+<LabRef lab="gossip" role="partial" note="Suspect-then-confirm failure detection, the logic that separates a dead node from a slow one." />
+<LabRef lab="observability" role="background" note="Histogram metrics are the shape of per-rank step-time telemetry, though the package does not compile yet." />
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-40368f3e05" />
+- <Cite id="s-79598dd069" />
+- <Cite id="s-7dd221b925" />
+- <Cite id="s-7fa103b073" />
+- <Cite id="s-096f521464" />
+- <Cite id="s-a6d1d2135d" />
+- <Cite id="s-9936fcb114" />
+- <Cite id="s-a129aa6451" />
+- <Cite id="s-4e3fbcaea8" />
+- <Cite id="s-028bbc6f1c" />
+- <Cite id="s-8e443a8b66" />
+- <Cite id="s-9e6b455b13" />
+- Rajbhandari et al., [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054) (2019, fetched 2026-10-12)
+- Shoeybi et al., [Megatron-LM](https://arxiv.org/abs/1909.08053) (2019, fetched 2026-10-12)
+- Narayanan et al., [Efficient Large-Scale Language Model Training on GPU Clusters](https://arxiv.org/abs/2104.04473) (2021, fetched 2026-10-12)
+- Korthikanti et al., [Reducing Activation Recomputation in Large Transformer Models](https://arxiv.org/abs/2205.05198) (2022, fetched 2026-10-12)
+- Fedus et al., [Switch Transformers](https://arxiv.org/abs/2101.03961) (2021, fetched 2026-10-12)
+- Kaplan et al., [Scaling Laws for Neural Language Models](https://arxiv.org/abs/2001.08361) (2020, fetched 2026-10-12)
+- Llama Team, [The Llama 3 Herd of Models](https://arxiv.org/abs/2407.21783) (2024, fetched 2026-10-12)
+- Shao et al., [DeepSeekMath (GRPO)](https://arxiv.org/abs/2402.03300) (2024, fetched 2026-10-12)
+- Dettmers et al., [QLoRA](https://arxiv.org/abs/2305.14314) (2023) and Hu et al., [LoRA](https://arxiv.org/abs/2106.09685) (2021), fetched 2026-10-12
+- PyTorch 2.14 docs: [torchrun](https://docs.pytorch.org/docs/2.14/elastic/run.html), [torch.distributed](https://docs.pytorch.org/docs/2.14/distributed.html), [DCP](https://docs.pytorch.org/docs/2.14/distributed.checkpoint.html), [FSDP](https://docs.pytorch.org/docs/2.14/fsdp.html) (fetched 2026-10-12)
+- NVIDIA: [Hopper architecture in depth](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/) (fetched 2026-10-11), [nvidia-smi](https://docs.nvidia.com/deploy/nvidia-smi/index.html) and [nccl-tests PERFORMANCE.md](https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md) (fetched 2026-10-12)
+- Mistral AI, [Mixtral of experts](https://mistral.ai/news/mixtral-of-experts) (2023-12-11) and [Mixtral-8x7B config.json](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/raw/main/config.json) (fetched 2026-10-12)
+- [Young/Daly checkpoint interval summary](https://blog.acolyer.org/2015/06/10/a-higher-order-estimate-of-the-optimun-checkpoint-interval-for-restart-dumps/) (2015-06-10)
+- [Together AI pricing](https://www.together.ai/pricing) and [OpenAI API pricing](https://developers.openai.com/api/docs/pricing) (fetched 2026-10-12)
+- GPU rental: [RunPod pricing](https://www.runpod.io/pricing) and [Lambda pricing](https://lambda.ai/pricing) (fetched 2026-10-11)

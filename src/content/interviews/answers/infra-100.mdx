@@ -1,0 +1,184 @@
+---
+question: infra-100
+family: cache-coding
+status: published
+labs: [kv-cache]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll start with LRU, a hash map plus a doubly linked list, because it's done in about 15 minutes with tests.
+> Then LFU in constant time: a map from use count to an ordered set of keys, oldest first, plus the current
+> minimum count. The minimum only goes up by one when its bucket empties, and resets to 1 on every insert, so I
+> never scan for it. With the time left I'd add expiry, a lock and saving to disk. And I'd mention LFU's weakness:
+> a key that was popular last week never leaves."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants clean constant-time code with tests, followed by extensions that don't break it.
+
+Most cache questions you have seen ask for one policy and stop. This one is long: 90 minutes, which is far more
+than one LRU takes. So the real test is pacing and structure. You need a first version done quickly, a second
+policy that is genuinely O(1) rather than "O(1) except for a scan", and enough time left for the stages that
+follow.
+
+The question comes only from a Glassdoor search snippet: LRU or LFU in a 90-minute CoderPad round, listed alongside
+a scheduler class whose requirements keep changing (<Cite id="s-9daac2715f" />). Confidence is low,
+so prepare for both policies.
+
+### Words you need first
+
+- **LRU** (least recently used): when full, evict the entry that has gone longest without a use.
+- **LFU** (least frequently used): when full, evict the entry with the fewest uses so far. Among ties, evict the
+  least recently used of them.
+- **O(1)**, or constant time: the operation's cost doesn't grow with the number of entries.
+- A **bucket** here is the group of keys that share the same use count.
+
+## Clarify first
+
+Spend one minute on the setup. Say your assumptions out loud:
+
+- **LRU or LFU?** "If it's my choice, I'll start with LRU and offer LFU as the next stage."
+- **How are LFU ties broken?** "I'll assume least recently used among the least frequent."
+- **Does `put` on an existing key count as a use?** "I'll assume yes."
+- **What does `get` return on a miss?** "Whatever you prefer. By default I'll take a caller-supplied default, so a
+  stored zero still counts as a hit."
+
+## Answer
+
+### LRU first (about 15 minutes)
+
+A hash map from key to node plus a doubly linked list with **sentinels** (two dummy nodes at the ends that never
+hold data, so no code has to special-case an empty list). `get` unlinks the node and pushes it to the front. `put`
+updates in place, or evicts the node just before the tail sentinel. The node stores its key, so eviction can delete
+it from the map too. Say: "This is the warm-up. I'll test it, then move on."
+
+### LFU in O(1): three maps and one number
+
+- `vals` maps key to value.
+- `freq` maps key to its use count.
+- `buckets` maps a use count to an insertion-ordered set of keys with that count, oldest first.
+- `min_freq` is the smallest count with a non-empty bucket. The victim is always the first key in
+  `buckets[min_freq]`.
+
+### Follow one cache through LFU
+
+A cache of capacity 2.
+
+| Step | `buckets` after the step | `min_freq` | What to say in the interview |
+|---|---|---|---|
+| `put a` | 1: [a] | 1 | "New keys start at count 1." |
+| `put b` | 1: [a, b] | 1 | "Same count, so order of arrival breaks ties." |
+| `get a` | 1: [b], 2: [a] | 1 | "`a` moves up a bucket. Bucket 1 isn't empty, so the minimum stays." |
+| `get b` | 2: [a, b] | 2 | "Bucket 1 emptied, and it was the minimum, so the minimum goes up by exactly one." |
+| `put c` | 1: [c], 2: [b] | 1 | "Full: evict the first key in bucket 2, which is `a`, the older of the tie. Then insert `c` and reset the minimum to 1." |
+
+The last row is the whole idea. Both `a` and `b` were used twice, and `a` is older inside the bucket, so `a` goes.
+That is the tie-break "by recency" working without any extra field.
+
+```python
+def _touch(self, key):
+    f = self.freq[key]
+    bucket = self.buckets[f]
+    del bucket[key]
+    if not bucket:
+        del self.buckets[f]
+        if self.min_freq == f:
+            self.min_freq = f + 1          # only moves when its bucket empties
+    self.freq[key] = f + 1
+    self.buckets.setdefault(f + 1, OrderedDict())[key] = None
+
+def put(self, key, val):
+    if key in self.vals:
+        self.vals[key] = val
+        self._touch(key)
+        return
+    if len(self.vals) >= self.cap:
+        bucket = self.buckets[self.min_freq]
+        victim, _ = bucket.popitem(last=False)   # least frequent, then least recent
+        if not bucket:
+            del self.buckets[self.min_freq]
+        del self.vals[victim], self.freq[victim]
+    self.vals[key] = val
+    self.freq[key] = 1
+    self.buckets.setdefault(1, OrderedDict())[key] = None
+    self.min_freq = 1                       # a new key always has the lowest count
+```
+
+Explain the two `min_freq` rules out loud:
+
+1. **It goes up by exactly one when you empty its bucket during a touch.** The key you touched now sits at `f + 1`,
+   so `f + 1` is guaranteed non-empty.
+2. **It resets to 1 on every insert.** A new key always has the lowest possible count.
+
+Say: "Nothing ever scans for the minimum. That's what makes `put` O(1)."
+
+Tests to write: evict the least frequent; break a tie by recency (the table above); update an existing key without
+evicting.
+
+### Likely stages for the remaining time
+
+- **Per-entry expiry with an injected clock.** The cache takes a clock function, so tests move time without
+  sleeping.
+- **Thread safety.** One lock, because `get` changes both policies' structures: LRU moves a node, LFU moves a key
+  between buckets.
+- **Serialization in an order that rebuilds the state.** For LFU, write `(key, value, count)` bucket by bucket.
+
+### Know LFU's weakness
+
+A key that was hot last week keeps its count and never leaves. New popular keys start at 1 and get evicted first.
+Fixes are periodic count decay (halve every count now and then) or an admission policy that compares the newcomer
+with the victim before letting it in. Caffeine's design is the usual reference. Naming the problem is enough here.
+Say: "LFU remembers too well. I'd decay the counts or use an admission filter."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="LRU or LFU"
+  senior={["Writes either policy in O(1) with tests, explains the min_freq invariant, and adds TTL or a lock without rewriting."]}
+  staff={["Says which workload each policy suits (recency-skewed vs frequency-skewed), names LFU's stale-popularity problem and a fix, and picks the policy from a measured hit rate."]}
+/>
+
+In plain terms: a Senior candidate writes both policies correctly and explains why they're O(1). A Staff candidate
+also says when each policy wins and would choose between them from measured data, not taste.
+
+## Small-team version
+
+Policy choice matters less than people expect until you measure a hit rate on real traffic. On an AI team, the
+caches that matter sit in front of models: an **embedding** cache (stored number lists a model computes for text,
+used for search) or a response cache (stored answers from a large language model).
+
+- **Measure before choosing.** Log the keys for a day, replay them through LRU and LFU at a few sizes, and keep the
+  simpler one unless the other is clearly better.
+- **Use a library implementation in production.** Your code is the replay script, not the cache.
+
+A quick way to size "clearly better": at an assumed 50,000 requests a day and about 1 cent saved per hit, one point
+of hit rate is worth about **$5 a day, or $150 a month**. A two-point gain rarely pays for a custom policy; a
+20-point gain might.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Saving per hit:** $0.010, the family walkthrough's uncached model call (an assumed 3,000 input and 400 output
+  tokens at Claude Sonnet 5's $2 / $10 per million list price, fetched 2026-10-11).
+- **One point of hit rate:** 1% × 50,000 requests = 500 extra hits a day; 500 × $0.010 = **$5 a day**.
+- **Per month:** $5 × 30 = **$150**.
+
+</details>
+
+## Pitfalls
+
+- **Recomputing `min_freq` by scanning the buckets.** That makes `put` O(n), which is the thing the question is
+  checking.
+- **Forgetting to set `min_freq = 1` on insert.** The next eviction then looks in the wrong bucket.
+- **Evicting before checking whether the key already exists.** An update would then throw out a live key for no
+  reason.
+- **Spending 60 of 90 minutes on stage 1.** The later stages are where the signal is.
+
+## Go deeper
+
+- Family walkthrough: [Caches in coding rounds](/system-design-labs/interviews/walkthroughs/cache-coding/), stage 5 and the pacing plan.
+- Multi-stage rounds in general: [multi-part practical coding](/system-design-labs/interviews/walkthroughs/multipart-practical-coding/).
+- Lab: <LabRef lab="kv-cache" inline />.

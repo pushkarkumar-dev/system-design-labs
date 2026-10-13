@@ -1,0 +1,165 @@
+---
+question: r2a-012
+family: ai-assisted-system-design
+status: published
+labs: [websocket-gateway, rate-limiter, pubsub]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll agree the requirements with you first, and write my own numbers before I prompt. Then I'll give the
+> assistant my requirements and numbers and ask for something bounded, like the components and the data each one
+> stores. I'll make it argue against itself, and I'll judge every answer against my requirements and my
+> arithmetic, out loud. For the design itself: a broker on each device that every app goes through, and a cloud
+> path with persistent connections, at-least-once delivery and dedup on the device. The connection tier is sized
+> by heartbeats, not by notifications."
+>
+> The rest of this page explains each part of that answer.
+
+The design is a notification system for Windows: many applications create notifications, and the system displays
+them. What makes the round unusual is that you must use an **AI assistant** while you design. It is a large
+language model (LLM), the same kind of tool as ChatGPT or Claude: you type a request, called a **prompt**, and it
+writes back.
+
+In a normal design round, the interviewer watches how you think. Here, a full design is always one prompt away, so
+producing a design is no longer the test. The test is what you do with the assistant: what you ask it, how you push
+it when the first answer is generic, and how you decide what to keep. The design still has to be good. The grade
+adds your judgment of the assistant's contribution.
+
+An SDE-2 candidate (Microsoft's mid-level engineer title) reports that AI was "allowed in this round, and actually
+required". The interviewer focused on "how you write prompts, how you refine them, and how you evaluate the
+answers the AI gives you", not on taking its output and using it as is (<Cite id="s-0b4f53a555" />). This comes
+from one candidate post, so the format may vary by team.
+
+## Clarify first
+
+Ask the interviewer, not the assistant. The assistant doesn't know what this interviewer wants. Say it like this:
+"Let me agree the requirements with you before I touch the assistant."
+
+- **On-device, cloud push, or both?** "Many applications create and display notifications" fits both readings: the
+  platform on one PC, or the path from an app's server to the device. Assume both, device side first.
+- **Delivery guarantee.** Assume **at-least-once**: a notification is never lost, but may arrive twice. The device
+  then removes duplicates by notification id. Removing duplicates is called **dedup**.
+- **User controls.** Do-not-disturb, per-app on/off, priority.
+- **Offline devices.** Assume a cap per device and app, plus a time limit.
+- **Scale, if not given.** Assume 500M devices, 20 notifications each per day, and a **peak factor** (how much busier
+  the busiest moment is than the average) of 3. That gives about **347,000 notifications a second** at peak, with
+  about 300M devices connected.
+
+## Answer
+
+### The picture
+
+```
+App servers (calendar, chat, ...)
+   │  1. send(device, notification) + idempotency key
+   ▼
+Push API ── checks the app's quota, remembers the key
+   │
+   ├── device online ──► Connection gateway ── one open connection per device,
+   │                           │                 heartbeats, waits for an ack
+   │                           ▼
+   └── offline ──► Offline store (capped, expires) ──► delivered on reconnect
+                               │
+                               ▼
+                 Device broker (on the PC) ◄── local apps post here
+                   settings, do-not-disturb, per-app quota, dedup by id
+                               │
+                               ▼
+                 Toast on screen  +  History
+```
+
+**On the device: the broker.** One service on each PC that every app posts to. It applies the user's settings and
+do-not-disturb, gives each app a **token bucket** (a budget of notifications that refills at a fixed rate), drops
+duplicates by id, shows the toast and writes history. Apps never draw notifications themselves, so one noisy app is
+contained.
+
+**In the cloud: push API, gateway, offline store.** App servers call a push API with a device id and an
+**idempotency key** (a unique id per send, so a retried request isn't sent twice). A **connection gateway** holds a
+persistent connection to each online device and pushes down it, then waits for an **ack** (the device saying "got
+it"). If the ack doesn't come, the notification goes to a capped offline store and is retried. That retry is where
+duplicates come from, and the device's dedup removes them.
+
+### Size it by heartbeats, not notifications
+
+To keep a connection open, each device sends a tiny "I'm here" message every 30 seconds. That is a **heartbeat**.
+Heartbeats arrive whether or not anyone sends a notification. With 300M devices connected, that is **10 million
+heartbeats a second**, against about 347,000 notifications. So the heartbeat interval and the number of connected
+devices set the size of the gateway tier. Say it like this: "The gateway is sized by connections and heartbeats.
+Ten million heartbeats a second is nearly thirty times the notification rate."
+
+### The graded part: prompt, refine, judge
+
+Follow one session. Each step says what you do and what to say.
+
+1. **Prompt with your own requirements and numbers, and bound the request.** "List the components and the data
+   each one stores. Don't choose technologies yet. Mark any assumption I didn't state." A vague prompt ("design a
+   notification system") gets a generic answer and shows nothing about you.
+2. **Refine by asking it to argue against itself.** "List the five most likely failure modes, what detects each,
+   and check my heartbeat arithmetic."
+3. **Judge each answer against a fixed checklist, out loud.**
+   - Does it meet every stated requirement?
+   - Do its numbers match yours?
+   - Does each component's state make sense at this scale? Suppose the reply proposes one message-queue topic per
+     device. At 500M devices that is 500M topics, so say no and use a store keyed by device id.
+   - What did it leave out? Typical gaps are quota enforcement, duplicates from retries, and a **reconnect storm**
+     during a deploy (millions of devices reconnecting at once).
+
+Keep a short, visible list of the assistant's claims you accepted, changed and rejected:
+
+| Claim from the assistant | Decision | Why |
+|---|---|---|
+| Push API, gateway, offline store, device broker | Accepted | Meets the requirements |
+| One queue topic per device | Changed | 500M topics; a store keyed by device id instead |
+| 10M heartbeats a second | Accepted | Matches my arithmetic |
+| "One machine holds a million connections" | Rejected as a fact | No source; keep my own assumption and load-test it |
+
+(The assistant's claims in the table are illustrative.) That list is the evidence this round reportedly graded.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Every input is an assumption.
+
+- Daily volume: 500M devices × 20 = 10B notifications a day.
+- Average: 10B ÷ 86,400 seconds ≈ 115,741 a second. Peak, × 3: **347,222 a second**.
+- Heartbeats: 300M connected ÷ 30 s = **10M a second**. 10M ÷ 347,222 ≈ 29 times the notification rate.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Notification design with required AI"
+  senior={["A sound device-plus-cloud design with dedup and quotas, prompts that carry requirements and numbers, and at least one AI proposal corrected with arithmetic."]}
+  staff={["Sizes by the hidden driver (heartbeats, reconnect storms), keeps an explicit accepted/changed/rejected list, and states which of the AI's claims would need a load test before anyone relied on them."]}
+/>
+
+## Small-team version
+
+Don't build a delivery network. Mobile and desktop platforms route push through their own services, and managed
+notification providers exist, so check what your platforms require. Buy delivery. Build the part that is your
+product: which events notify whom, user preferences, per-user rate limits, and dedup ids so retries don't
+double-notify.
+
+Draft the design doc with an assistant if you like. Write the requirements and numbers first, and have one person
+review it.
+
+The arithmetic that keeps you honest: at an assumed 200,000 users and 5 notifications each a day, that is **1M a
+day**, about 11.6 a second on average and **35 a second** at a peak factor of 3 (1M ÷ 86,400 × 3). That fits one
+worker and a table, not a gateway tier. Revisit when you need delivery receipts or delivery times your provider
+doesn't offer.
+
+## Pitfalls
+
+- **A vague first prompt.** "Design a notification system" gets a generic answer and shows nothing about you.
+- **Pasting the assistant's design as yours.** The round graded your judgment of it, not its output.
+- **Accepting a capacity figure with no source.** It is a guess that sounds like a fact.
+- **Sizing by notification rate.** Heartbeats and reconnects cost far more.
+
+## Go deeper
+
+- Family walkthrough: [System design with an AI assistant in the room](/system-design-labs/interviews/walkthroughs/ai-assisted-system-design/), especially "Deep dive 1" on prompting and judging.
+- Build the pieces: <LabRef lab="websocket-gateway" inline /> (connections and heartbeats), <LabRef lab="rate-limiter" inline /> (per-app quotas), <LabRef lab="pubsub" inline /> (fan-out).

@@ -1,0 +1,798 @@
+---
+title: "Prompting, RAG or fine-tuning: choose from the failure, prove the return"
+summary: "How to choose between a better prompt, retrieval and fine-tuning, how to tell whether a fine-tune pays for itself, and how to explain the model internals a depth round asks about, in plain words."
+track: ai-engineer
+format: deep-dive
+family: adapt-models
+smallTeamFocus: "Start with a better prompt, retrieval and a test set on a managed API. Fine-tune only a narrow, high-volume task where the test set shows a gap prompting can't close and the saving still covers serving and upkeep."
+rounds: [domain-deep-dive, take-home]
+level: both
+timeboxMin: 45
+order: 224
+status: published
+basedOn: [eng-083, eng-084, eng-085, eng-086, eng-087, r2a-011]
+askedAt: [openai, sierra, anthropic, amazon, faang-unnamed]
+labs:
+  - { lab: llm-eval, role: proof, note: "The eval harness every choice in this walkthrough depends on: bootstrap confidence intervals, a paired test and a contamination check." }
+  - { lab: rag, role: proof, note: "Dense, hybrid and reranked retrieval measured on BEIR: the 'add knowledge without training' option, with real numbers." }
+  - { lab: transformer, role: proof, note: "Attention, the FFN and token embeddings in code, for the depth-round half. MHA only, no KV cache in generate()." }
+  - { lab: lora-finetune, role: partial, note: "LoRA math, an instruction-tuning loop with loss masking, and adapter merge. Its trainable-parameter figures conflict, so work the formula by hand." }
+  - { lab: prompt-optimization, role: partial, note: "DSPy-style signatures, bootstrapped few-shot examples and a search over prompts, run against a mock LLM." }
+  - { lab: tokenizer, role: partial, note: "Character, BPE and GPT-2 byte-level tokenizers: why token counts and costs differ across models." }
+  - { lab: llm-inference, role: partial, note: "A real KV cache on GPT-2, for the r2a-011 KV-cache question." }
+gapLabs: [multi-lora-serving, llm-judge-evals]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+"When would you fine-tune a model, use RAG, or just improve the prompt? Walk through how you choose."
+
+> **If you only remember one thing, say this in the first minute:**
+> "I start from the failure, not from a technique. First I collect real bad outputs and turn them into a small
+> test set, so I can measure any change. If the model is missing facts, I give it the facts at request time by
+> looking up the right documents. That's retrieval. If it behaves wrong, in format or tone or labels, I fix the
+> instructions and examples first. I only train the model itself when the test set shows a gap that prompting
+> can't close, on a narrow task with enough volume that the saving pays for the labelling, the serving and the
+> upkeep."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+### What makes this different from a backend decision you already know
+
+You already make this kind of choice in backend work. You just use different words for it.
+
+A large language model (**LLM**) is a program that reads text and writes text. You don't change its code. You
+change its behaviour in one of three ways, and each one has a backend twin:
+
+1. **Change the prompt.** The **prompt** is the text you send the model with every request: instructions,
+   examples and the user's message. Changing it is like changing **configuration**. It is instant, it is
+   versioned in your repo, and you can roll it back in seconds.
+2. **Add retrieval.** Before calling the model, you look up the documents that answer the question and paste
+   them into the prompt. This is like a **database read at request time**. The facts live in a store you
+   control, so you can update them, delete them and check who may see them. The interview name is
+   retrieval-augmented generation, **RAG** for short.
+3. **Fine-tune.** You train the model further on your own examples, which changes its internal numbers. This is
+   like **forking a dependency**. You get exactly the behaviour you want, but now you own a custom build. You
+   must test it, host it and redo the work every time the upstream model changes.
+
+Seen this way, the answer most interviewers want is the one you'd give for software: try configuration first,
+read data from a store when the problem is data, and fork only when you must and can afford to maintain the fork.
+
+Two things make the AI version harder. First, the model's output is not exact. The same prompt can give a good
+answer today and a slightly wrong one tomorrow, so you can't check a change by reading one output. You need a
+test set and a score. Second, the costs are unusual. A training run can cost a few dollars, while the people who
+label the training data and the GPU (the specialised chip that runs the model) that serves it cost thousands. A strong candidate knows where the
+money really goes.
+
+### Where this was asked
+
+The core question was reported first-hand by a candidate in an OpenAI forward-deployed engineer (FDE) loop, a
+customer-facing engineering role <Cite id="s-812dbc9385" />. Five related reports sit around it:
+
+<QuestionRow id="eng-083" />
+<QuestionRow id="eng-086" />
+<QuestionRow id="eng-085" />
+<QuestionRow id="eng-084" />
+<QuestionRow id="eng-087" />
+<QuestionRow id="r2a-011" />
+
+| Report | What was asked | How solid |
+|---|---|---|
+| OpenAI FDE (eng-083) | A 60-minute technical deep dive covering RAG internals and "fine-tuning tradeoffs (when to fine-tune versus RAG versus prompt engineering)", plus guardrails. The interviewer "pushed hard on evaluation" and asked how you know a system is "actually working well" <Cite id="s-812dbc9385" /> | First-hand |
+| Sierra, OpenAI, Anthropic (eng-086) | "What's your approach to prompt engineering?" <Cite id="s-5f98d711e8" /> | Question list, medium |
+| Amazon GenAI L6 (eng-085) | A depth round on "LLM/ViT architectures, fine-tuning, ROI estimation" <Cite id="s-3e400c7e21" /> | Playbook naming no candidate, low |
+| OpenAI take-home (eng-084) | Develop a strategy for OpenAI's fine-tuning capabilities from its public docs <Cite id="s-d7a8e88bf0" /> | Undated question list, low. The docs have changed a lot since |
+| FAANG Staff (eng-087) | "an ML depth round probing transformers, fine-tuning, RLHF, and hallucination mitigation" <Cite id="s-fe60d2bf1f" /> | One Blind commenter (tag Google), year not shown |
+| Amazon GenAI phone screen (r2a-011) | Fine-tuning, token embeddings, the KV cache, evaluating a RAG system, and a hash-table coding task <Cite id="s-760e5688f9" /> | A forum topic summary we could only partly see |
+
+Don't worry about the terms inside those quotes yet; each one is explained further down, except ViT (a vision
+transformer, the same design applied to images), which this page doesn't cover. One page covers all six
+because they test one judgment: start from the failure, pick the cheapest fix that addresses it, and prove it with
+a test set. The depth questions check that you understand the machinery under that judgment.
+
+## What is being tested
+
+### A decision procedure, not a favourite tool
+
+The interviewer wants to hear you name the failure before the fix. There are only three kinds of failure:
+
+- The model **doesn't know something** (your refund policy, yesterday's price, a customer's contract).
+- The model **does the wrong thing** (wrong format, wrong tone, wrong label, skips a step).
+- The model is **too slow or too expensive** for the volume.
+
+Each kind points to a different fix. Then you name the data you'd need and how you'd measure success. The
+first-hand OpenAI account is the clearest signal here: the interviewer "pushed hard on evaluation"
+<Cite id="s-812dbc9385" />.
+
+### Knowing the default and its exceptions
+
+Practitioners agree on the default: improve the prompt first. The authors of "What We've Learned From A Year of
+Building with LLMs" write: "Only if prompt engineering cannot achieve the desired level of performance should you
+consider finetuning". They call fine-tuning "heavy machinery, to be deployed only after you've collected plenty
+of examples that convince you other approaches won't suffice" ([applied-llms.org, 2024-06-08](https://applied-llms.org/)).
+The same piece gives two cases where fine-tuning was essential: a domain-specific query language, and a strict
+output format that a frontend renders. Say both halves. "Prompt first, and here is when I'd fine-tune anyway"
+is a stronger answer than either half alone.
+
+### Honest cost
+
+The Amazon report pairs fine-tuning with ROI estimation (return on investment: does the money saved or earned
+exceed the money spent?). Interviewers at companies that pay the bill want to hear what a fine-tune costs after
+the training run: the labelled examples, the testing, the serving, and redoing it all when the base model
+changes.
+
+### Plain explanations under pressure
+
+Two reports ask about the inside of the model: attention, embeddings, the KV cache and RLHF. The bar is a
+correct one-paragraph explanation plus one number, not a lecture. This page builds up each of those terms
+before it uses them.
+
+## Clarify and scope
+
+Spend a minute on questions before choosing. Each one points at one of the three fixes.
+
+1. **"What is failing? Can I see 20 bad outputs?"** "It's not good enough" is not a failure you can fix.
+   Twenty real examples usually show one or two patterns.
+2. **"Is the missing piece knowledge or behaviour?"** Facts that change (prices, policies, a customer's files)
+   point to retrieval. A format, tone, label set or reasoning pattern points to the prompt, then maybe
+   fine-tuning.
+3. **"How fresh must the facts be, and who may see them?"** Daily updates and per-user permissions point to
+   retrieval. Training bakes facts into the model for everyone.
+4. **"What volume, and what latency budget?"** Fine-tuning a smaller model is mostly a cost and speed play. At
+   low volume it rarely pays.
+5. **"Is there a test set, and who labels it?"** Without one, you can't choose honestly. Say you'd build it first.
+6. **"Which models may we use?"** A managed API only, or open-weight models you can host yourself? Are there
+   data-residency rules?
+
+Out of scope: training a model from scratch, frontier-lab training pipelines, and building a fine-tuning
+platform (that is a distributed-training design question).
+
+## Core concepts
+
+### Words you need first
+
+Five terms come up in every answer. Here they are in plain words.
+
+- **Token.** Models read and write text in small pieces called tokens, roughly ¾ of an English word each.
+  Providers bill per token, usually per million, with separate prices for tokens you send (**input**) and tokens
+  the model writes (**output**).
+- **Eval set.** A list of real inputs with the right answer or a pass/fail rule for each. Running the model over
+  it gives a score. It is the AI version of a test suite, and people call running it "an eval".
+- **Retrieval**, or **RAG** (retrieval-augmented generation). Before calling the model, search your documents
+  for the passages that answer the question and put them in the prompt.
+- **Weights**, or **parameters.** The billions of numbers inside the model that training adjusts. "An 8B model"
+  has about 8 billion of them. A **base model** is the model as its maker released it, before you change it.
+- **Fine-tuning.** Training a base model further on your own examples so its weights change.
+
+### The running example
+
+One company follows us through the page. Northwind is a fictional 200-person software company. Its support
+team uses an LLM in two places:
+
+- A **support assistant** that answers customer questions. It keeps misquoting the refund policy.
+- A **ticket classifier** that sorts 50,000 incoming tickets a day into 40 categories. Its labels are good, but
+  it runs on an expensive **frontier model** (the largest, most capable and most expensive kind) with a long
+  prompt.
+
+The interviewer's question, applied to Northwind, is: what do you change for each one, and how do you know it
+worked?
+
+### The decision, as a picture
+
+Here is the procedure as a flow, top to bottom:
+
+```
+Real bad outputs (20–50 of them)
+   │  1. read them, name the failure, label cases
+   ▼
+Eval set ── a score for "how good is it now?"
+   │  2. what kind of failure is it?
+   ├──────────────────────┬──────────────────────────┐
+   ▼                      ▼                          ▼
+Missing facts          Wrong behaviour            Too slow or expensive
+                       (format, tone, label)
+   │                      │                          │
+   ▼                      ▼                          ▼
+Retrieval:             Better prompt:             Smaller model, caching,
+look up docs,          instructions, examples,    shorter prompt, batch
+cite them              output schema              jobs for offline work
+   │                      │                          │
+   └──────────────────────┴────────────┬─────────────┘
+                                       │  3. re-run the eval
+                                       ▼
+                 Gap still there, on a narrow, high-volume task?
+                       │ yes                         │ no
+                       ▼                             ▼
+          Fine-tune (a small add-on          Ship the cheaper fix
+          called LoRA, explained below),
+          compare on held-out data
+```
+
+**Real bad outputs.** You start by reading, not building. Twenty to fifty bad answers show you what is actually
+going wrong.
+
+**Eval set.** You turn those failures into labelled cases. From now on, every change gets a score, so you
+never argue from one example.
+
+**The three branches.** Each kind of failure has a cheap first fix. Missing facts get retrieval. Wrong behaviour
+gets a better prompt. Cost and speed problems get a smaller model or caching before anything else.
+
+**Re-run the eval.** The same test set decides whether the fix worked.
+
+**Fine-tune.** Only if a gap remains on a narrow, stable task with enough volume do you train. Even then you
+compare the fine-tuned model against the best prompt on data it never trained on.
+
+### The decision table
+
+The same procedure as a table, which is handy to sketch on a whiteboard:
+
+| Failure | First fix | Next fix | Fine-tune when |
+|---|---|---|---|
+| Doesn't know private or recent facts | Retrieval with citations | Better passage splitting, keyword search alongside meaning search, a second scoring pass | Rarely: it doesn't update facts reliably and can't enforce permissions |
+| Wrong format or schema | Clear instructions, examples, an output schema | Validate in code and retry | The format is complex, prompts fail on a measured share, and volume is high |
+| Wrong label set or style | Examples in the prompt, a rubric | Search over prompt variants | Hundreds of labelled examples exist and a smaller model must match the big one |
+| Too slow or expensive | Smaller model, caching, shorter prompts | Batch APIs (cheaper, slower bulk jobs) for offline work | A small fine-tuned model passes the same eval at a fraction of the cost |
+| Makes things up | Retrieval, permission to say "I don't know", quote-then-answer | A checking pass, citations verified | Almost never as the first fix |
+
+A published study and a practical point back the first row. The applied-LLMs authors summarize a study where "RAG consistently
+outperformed finetuning for knowledge encountered during training as well as entirely new knowledge"
+(applied-llms.org, above). And retrieval keeps permissions and deletion manageable: a document removed from the
+index stops appearing in answers. A fact trained into the weights doesn't go away.
+
+Say it like this: "Retrieval is for what the model needs to know. Prompting and fine-tuning are for how it
+should behave."
+
+### Prompting, done like engineering
+
+A prompt is code that runs on a model. Treat it the way you treat code: with tests, small changes and a release
+gate.
+
+- **Write the eval before the edits.** OpenAI's own optimization guide says to start by writing evals,
+  "establishing a baseline", and that "the prompt engineering process may be all you need"
+  ([OpenAI model optimization](https://developers.openai.com/api/docs/guides/model-optimization), fetched
+  2026-10-12).
+- **Do error analysis first.** Read 20–50 real outputs and name the failure modes before writing checks, as Hamel
+  Husain and Shreya Shankar's evals FAQ recommends ([hamel.dev](https://hamel.dev/blog/posts/evals-faq/)).
+- **Give the prompt a structure.** State the role and task, give the context, list explicit rules, show a few
+  worked examples that cover the hard cases, and specify the output format. Showing examples in the prompt is
+  called **few-shot** prompting (the "shots" are the examples). Asking the model to reason step by step before
+  answering is called **chain-of-thought**. The applied-LLMs authors list n-shot examples, chain-of-thought and
+  providing relevant resources as techniques that have "consistently helped".
+- **Change one thing at a time, and version it.** Keep prompts in the repo. Run the eval on every change and
+  block the release if the score drops. If you have a **fallback model** (a second model you switch to when the first is down), run the eval on it too, because a prompt
+  doesn't behave the same on every model.
+
+Say it like this: "Prompt engineering isn't clever phrasing. It's a loop: look at failures, change one thing,
+re-run the eval, keep it only if the score improves."
+
+### Retrieval in one paragraph
+
+Retrieval adds knowledge at request time. You split your documents into short passages called **chunks**. You
+turn each chunk into an **embedding**, a list of a few hundred numbers that places text with similar meaning
+close together. At request time you embed the question, find the nearest chunks, and usually also run a
+keyword search. Optionally a **reranker**, a second model that scores each candidate chunk against the question,
+reorders them. You put the top few chunks in the prompt, with an instruction to cite them or say you don't know.
+Retrieval wins on freshness, permissions and audit. It loses when what's missing is a skill rather than a fact.
+The [RAG family](/system-design-labs/interviews/walkthroughs/rag-system-design/) covers the design in depth.
+
+### Fine-tuning, the variants
+
+All fine-tuning changes the weights. The variants differ in what examples you train on and how many weights you
+change.
+
+**Supervised fine-tuning (SFT).** You train on pairs: an input and the ideal output. The model learns to produce
+outputs like yours. During training, the model is scored only on the output part; the input tokens are hidden
+from the score so the model isn't trained to reproduce your instructions. That hiding is called **loss masking**
+(the **loss** is the training score the model tries to lower). SFT teaches format, style, label sets and narrow
+skills.
+
+**Preference tuning.** You train on pairs of answers to the same input, one marked better than the other. The
+best-known form is **RLHF** (reinforcement learning from human feedback). In OpenAI's InstructGPT paper it had three steps:
+collect demonstrations for SFT, then collect "rankings of model outputs" to train a **reward model** (a second
+model that predicts which answer a human would prefer), then train the main model with reinforcement learning (trial and error against a score) to
+score well on that reward model. The paper reports that outputs from its 1.3B model were preferred to those of the
+175B GPT-3 ([Ouyang et al., 2022](https://arxiv.org/abs/2203.02155)). **DPO** (direct preference optimization)
+reaches the same goal "with only a simple classification loss", removing "the need for sampling from the LM
+during fine-tuning" ([Rafailov et al., 2023](https://arxiv.org/abs/2305.18290)). In plain words: no separate reward
+model and no generating answers during training.
+
+**Full fine-tuning versus LoRA.** Full fine-tuning updates every weight, so you need memory for all of them plus
+their training state. **LoRA** (low-rank adaptation) freezes the original weights and trains a small add-on
+instead. For each weight matrix it adapts, it learns two thin matrices, `B` and `A`, whose product `B·A` is added
+to the original. The **rank** `r` is how thin they are, for example 16. `B` starts at zero, so at the first
+step the add-on changes nothing and training starts from the base model's behaviour. The trained add-on is called
+an **adapter**. The LoRA paper reports that, compared with fine-tuning GPT-3 175B with the Adam optimizer, it "can
+reduce the number of trainable parameters by 10,000 times and the GPU memory requirement by 3 times", with "no
+additional inference latency" once the adapter is merged into the weights
+([Hu et al., 2021](https://arxiv.org/abs/2106.09685)).
+
+**QLoRA** goes one step further. It stores the frozen base model in 4-bit numbers (a compressed format, about a
+quarter of the usual size) and trains LoRA adapters on top. The paper reports fine-tuning a 65B model "on a single
+48GB GPU", using a 4-bit format called NormalFloat, double quantization and paged optimizers, two memory-saving tricks
+([Dettmers et al., 2023](https://arxiv.org/abs/2305.14314)).
+
+How big is an adapter? For Llama-3.1-8B, an open 8-billion-parameter model, a rank-16 LoRA on the four attention
+matrices of every layer (the part of each layer that lets a token look at earlier tokens; see the follow-ups) has about **13.6 million parameters, about 27.3 MB**. That is 0.17% of the model. On
+Llama-3.1-70B the same setup is about **131 MB**.
+
+That size is why one base model can serve many adapters. Each customer or task adds megabytes, not a whole new
+model.
+
+Say it like this: "LoRA doesn't train a small model. It trains a small change to a big one, and you can keep many
+of those changes next to one copy of the base."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Each adapted matrix of shape d_in → d_out adds `r × (d_in + d_out)` parameters (`A` is r × d_in, `B` is d_out × r).
+In Llama-3.1-8B the hidden size is 4,096. It uses **grouped-query attention** (GQA): 32 query heads share 8
+key/value heads, so the k and v matrices are narrower than q and o (q, k, v and o are the query, key, value and output
+matrices, explained in the follow-ups).
+
+<Formula
+  title="LoRA trainable parameters"
+  expr="params = layers × r × Σ (d_in + d_out) over the adapted matrices"
+  vars={[
+    { sym: 'layers', meaning: 'transformer layers adapted' },
+    { sym: 'r', meaning: 'LoRA rank' },
+    { sym: 'd_in, d_out', meaning: 'shape of each adapted projection (with GQA, k and v are narrower)' },
+  ]}
+  example="Llama-3.1-8B, r = 16 on q, k, v, o: q and o are 4,096 → 4,096; k and v are 4,096 → 1,024 (8 KV heads × 128). Σ = 8,192 + 5,120 + 5,120 + 8,192 = 26,624; × 16 = 425,984 per layer; × 32 = 13.6M parameters, about 27.3 MB in bf16, 0.17% of 8.03B. The same setup on 70B is 65.5M, about 131 MB."
+/>
+
+bf16 is a 2-byte number format, so 13.6M parameters × 2 bytes ≈ 27.3 MB.
+
+</details>
+
+### Making things up, plainly
+
+The model predicts likely text. When the context doesn't contain the answer, a fluent guess is still likely text,
+so the model produces one. This is called **hallucination**.
+
+The fixes, cheapest first: give it the facts (retrieval); give it permission to say it doesn't know; make it quote
+the source before answering and withdraw claims it can't support. Anthropic's guide lists these three as basic
+strategies ([Reduce hallucinations](https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/reduce-hallucinations),
+fetched 2026-10-12). Then check the citations in code, and measure how often answers are supported by the sources
+in your eval.
+
+Fine-tuning on facts can make this worse, not better. One study found that once a model learns fine-tuning
+examples containing facts it didn't already know, "they linearly increase the model's tendency to hallucinate"
+([Gekhman et al., 2024](https://arxiv.org/abs/2405.05904)).
+
+Say it like this: "If you train a model on facts it didn't know, you also train it to answer confidently past
+what it knows."
+
+## Worked examples
+
+All three examples are Northwind. The first fixes a knowledge failure. The second and third fix a cost problem,
+first the cheap way and then, only if needed, with a fine-tune.
+
+### Example 1: the assistant misquotes the refund policy
+
+| Step | What Northwind does | What to say in the interview |
+|---|---|---|
+| Name the failure | 20 bad answers all quote an old refund window or the wrong plan's rules. | "This is a knowledge failure. The policy changes monthly and differs by plan." |
+| Build the eval | Support leads label 50 real tickets with the correct policy clause, including some where no clause applies. | "Two checks: did it cite the right clause, and did it decline when none applied?" |
+| First fix | Retrieval over the current policy pages, filtered by the customer's plan. The prompt says: quote the clause, and escalate to a human when none matches. | "The facts live in a store we update, so next month's policy change is a document edit, not a training run." |
+| Why not fine-tune | Training would freeze last month's policy into the weights, for every plan at once. | "Fine-tuning can't be updated daily and can't respect who sees what." |
+
+### Example 2: the classifier is accurate but expensive
+
+The ticket classifier uses a frontier model and a long prompt. The eval says its labels are good enough. The
+problem is the bill. Assume each request sends 1,000 tokens that change per ticket, 2,000 tokens of instructions
+that are the same every time, and gets 400 tokens back.
+
+The repeated 2,000 tokens matter. Providers offer **prompt caching**: if the start of your prompt is identical to
+a recent request, those tokens are billed at a much lower "cached input" price.
+
+At list prices fetched 2026-10-11, the same request shape costs:
+
+| Model | Cost per request | At 50,000 a day |
+|---|---|---|
+| Claude Sonnet 5 (frontier, today's setup) | about 0.64 cents | **$9,600 a month** |
+| gpt-5-mini (smaller) | about 0.11 cents | **$1,650 a month** |
+| Claude Haiku 5.5 (smaller) | about 0.03 cents | **$480 a month** |
+
+Step one is not fine-tuning. It is running the same eval on the two smaller models. If either one passes,
+Northwind saves **$7,950 to $9,120 a month** with a prompt change. Fine-tune only if both fail by a margin the
+eval can see.
+
+Say it like this: "Before I train anything, I try the cheapest model that might pass, using the eval I already
+have. That costs an afternoon."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Monthly cost of one request shape"
+  expr="monthly = requests/day × 30 × (in_uncached × p_in + in_cached × p_cache + out × p_out)"
+  vars={[
+    { sym: 'in_uncached, in_cached, out', meaning: 'tokens per request; assumed 1,000, 2,000 (a cached prefix) and 400' },
+    { sym: 'p_*', meaning: 'list prices per token, from provider pages fetched 2026-10-11' },
+  ]}
+  example={[
+    "Claude Sonnet 5 ($2 in, $0.20 cached, $10 out per 1M): 0.0020 + 0.0004 + 0.0040 = $0.0064 per request; × 50,000 × 30 = $9,600 per month.",
+    "gpt-5-mini ($0.25, $0.025, $2.00): $0.0011 per request, $1,650 per month.",
+    "Claude Haiku 5.5 ($0.10, $0.01, $0.50 for prompts up to 100K): $0.00032 per request, $480 per month.",
+  ]}
+/>
+
+Savings: $9,600 − $1,650 = $7,950; $9,600 − $480 = $9,120.
+
+</details>
+
+### Example 3: the small models fail. Does a fine-tune pay back?
+
+Now assume the eval shows that both small API models miss too many labels, but a fine-tuned Llama-3.1-8B (an open
+model Northwind would host itself) matches the frontier model. Is it worth it?
+
+Before any numbers, notice what you are buying. You pay once to create the fine-tune: someone labels training
+examples, an engineer builds and tests it, and a training job runs. Then you pay every month to keep it: a GPU to
+serve it, and part of an engineer's time to re-test and retrain it when things change. The fine-tune pays back
+only if its monthly cost is well below the $9,600 frontier bill.
+
+Here are the lines. All inputs are assumptions except the list prices, which come from Together AI's pricing page
+(fetched 2026-10-12) and US wage data from the Bureau of Labor Statistics (BLS).
+
+| Line | What it is | Amount |
+|---|---|---|
+| Training run | A LoRA SFT job on 2,000 examples, at $0.34 per million training tokens | **$4** per run (the job minimum) |
+| Labelling | A domain expert writes the right label for 2,000 examples, 2 minutes each | about **$6,700** once |
+| Engineering | Two weeks of one engineer to build, test and ship it | about **$7,460** once |
+| Serving | One dedicated H100 (NVIDIA's data-centre GPU, the chip that runs the model), rented by the hour, all month | about **$4,010 a month** |
+| Upkeep | 15% of an engineer: evals, retraining when quality drifts, base-model upgrades | about **$2,430 a month** |
+
+The fine-tune costs about **$6,440 a month** to run, against $9,600. That saves about **$3,160 a month**. The
+one-time cost is about **$14,160**, so it pays back in about **4.5 months**, as long as traffic stays flat and the
+labels don't need redoing.
+
+Three things this table teaches:
+
+1. **The training run is the smallest line.** It costs $4. The people and the GPU are the real cost.
+2. **The comparison decides.** Against the frontier model it pays back. Against Haiku 5.5 at $480 a month it
+   never does. Always compare against the cheapest model that passes the eval.
+3. **How busy the GPU is decides the serving cost.** A dedicated GPU costs the same at 3% load as at 100%. If
+   your host can serve adapters on shared capacity, the serving line shrinks. Check before you price it.
+
+Published cases point both ways. A vendor-reported case (Predibase with Checkr, Oct 2024) describes a fine-tuned
+Llama-3-8B beating GPT-4 on the hardest background-check classifications at lower cost. The applied-LLMs authors
+say of early fine-tuners that "few have found product-market fit and most regret their decision".
+
+Say it like this: "The training run is a few dollars. The fine-tune is a product: labels, a GPU and an owner. I'd
+price those against the cheapest model that passes, not against the one we started with."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Training:** 2,000 examples × 1,000 tokens (assumed) × 3 passes over the data (epochs) = 6M tokens × $0.34 per 1M =
+  $2.04, below Together's $4.00 job minimum, so **$4 per run**.
+- **Labelling:** 2,000 × 2 min = 4,000 min ≈ 67 hours × an assumed $100/hour ≈ **$6,700**.
+- **Loaded engineer cost:** BLS median software developer wage $135,980 ÷ 0.70 (salary as an assumed 70% of total
+  employment cost) ≈ $194K a year. Two weeks ≈ **$7,460**. 15% of a year ÷ 12 ≈ **$2,430 a month**.
+- **Serving:** $5.49 per hour × 730 hours ≈ **$4,010 a month**.
+- **Monthly:** $4,010 + $2,430 = $6,440. Saving: $9,600 − $6,440 = $3,160.
+- **One-time:** $6,700 + $7,460 + $4 ≈ $14,160. Payback: 14,160 ÷ 3,160 ≈ **4.5 months**.
+
+</details>
+
+## Common follow-ups in depth
+
+The depth questions (eng-087, r2a-011) ask what is inside the model you just decided to fine-tune. Stay with
+Northwind's Llama-3.1-8B.
+
+### "Explain a transformer, token embeddings and the KV cache"
+
+A **transformer** is the design almost every LLM uses. It is a stack of identical layers (32 in Llama-3.1-8B).
+Text flows through it like this:
+
+```
+Text "refund for annual plan"
+   │  1. split into tokens, each with an id
+   ▼
+Embedding table ── looks up one vector per token id
+   │  2. vectors go through the layers
+   ▼
+Layer 1 … Layer 32, each with:
+   ├─ Attention ── each token looks back at earlier tokens
+   └─ Feed-forward ── each token's vector is transformed on its own
+   │  3. last layer's vector for the last token
+   ▼
+Next-token scores ── pick the next token, append it, repeat
+```
+
+**Token embeddings.** The embedding table is a lookup table with one learned vector per token in the vocabulary.
+Llama-3.1-8B's has 128,256 entries of 4,096 numbers each, about **525 million parameters, about 1.05 GB** in bf16,
+before any layer runs. Don't confuse it with a **sentence-embedding model**, the kind retrieval uses, which turns
+a whole passage into one vector for search.
+
+**Attention.** In each layer, every token makes three vectors: a **query** (what am I looking for?), a **key**
+(what do I contain?) and a **value** (what do I pass on?). A token compares its query with the keys of all earlier
+tokens. A function called **softmax** turns those match scores into weights that add up to 1. The token then
+takes the weighted mix of the earlier tokens' values. After attention, a **feed-forward** block transforms each
+token's vector on its own. Repeat for every layer. Attention runs as several parallel copies called **heads**,
+each with its own queries, keys and values.
+
+**The KV cache.** The model writes one token at a time. Each new token needs the keys and values of every earlier
+token, in every layer. Recomputing them for each new token would be wasteful, so the model saves them in GPU
+memory. That saved store is the **KV cache** (K for keys, V for values). For Llama-3.1-8B it costs **128 KiB per
+token**, so one 8,192-token request holds about **1.07 GB** while it runs. That memory, more than the weights,
+limits how many long requests one GPU can serve at once.
+
+Say it like this: "The KV cache trades memory for speed: we keep every earlier token's keys and values so we don't
+recompute them for each new word."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Embeddings:** 128,256 × 4,096 = 525,336,576 parameters × 2 bytes ≈ 1.05 GB.
+- **KV cache:** each layer stores one key and one value per KV head. Llama-3.1-8B has 32 layers, 8 KV heads
+  and 128 numbers per head. It uses grouped-query attention (GQA): its 32 query heads share those 8 KV heads.
+
+<Formula
+  title="KV cache per token"
+  expr="bytes per token = 2 × layers × n_kv_heads × head_dim × bytes_per_value"
+  vars={[
+    { sym: '2', meaning: 'one K and one V per layer' },
+    { sym: 'n_kv_heads', meaning: 'KV heads (8 under GQA for Llama-3.1-8B, fewer than its 32 query heads)' },
+    { sym: 'bytes_per_value', meaning: '2 for bf16' },
+  ]}
+  example="Llama-3.1-8B: 2 × 32 × 8 × 128 × 2 = 131,072 B = 128 KiB per token; an 8,192-token request holds 1.07 GB."
+/>
+
+A common mistake is `2 × layers × hidden size × bytes`. It ignores that KV heads are shared, so for Llama-3.1-70B
+(64 query heads, 8 KV heads) it is 8× too high.
+
+</details>
+
+### "How would you evaluate the RAG system?"
+
+Split it into two questions, because they fail for different reasons.
+
+- **Did retrieval find the right passage?** Measure **hit@k**: the share of questions where a correct passage is in
+  the top k results. **Recall@k** is the share of all correct passages that appear in the top k. Both need a
+  labelled set of questions paired with the passages that answer them.
+- **Did the model use it well?** Is each claim supported by the retrieved text? Are the citations right? Does it
+  decline when no passage was relevant?
+
+Report a range, not a single number, because small test sets are noisy. In the rag lab, going from meaning search to hybrid search to reranking gave
+hit@3 on SciFact (a public science fact-checking benchmark) of <LabNumber lab="rag" metric="hit@3 on BEIR SciFact, dense v0 / hybrid v1 / rerank v2" showMetric />.
+At about 300 questions, gaps of a few points are within noise.
+
+Say it like this: "I score retrieval and generation separately. One number for 'RAG quality' can't tell me which
+half to fix."
+
+### "Explain RLHF and its risks"
+
+Give the three steps from above: SFT on demonstrations, a reward model trained on human rankings, then
+reinforcement learning against that reward. Then the risk: the model learns to please the reward, not the intent
+behind it.
+
+The April 2025 GPT-4o update is the warning case. A Georgetown Law brief quotes OpenAI's postmortem: an
+"additional reward signal based on user feedback—thumbs-up and thumbs-down data" weakened the primary reward signal
+"which had been holding sycophancy in check", and OpenAI "didn't have specific deployment evaluations tracking
+sycophancy". (**Sycophancy** means telling users what they want to hear.) The update was rolled back four days
+later ([Georgetown Law Tech Institute](https://www.law.georgetown.edu/tech-institute/insights/tech-brief-ai-sycophancy-openai/)).
+
+The lesson for an application team: any preference tuning needs an eval for the behaviour you don't want.
+
+### "How do you know the fine-tune helped?"
+
+Four things, in this order:
+
+1. **A held-out set**: examples the training never touched. Check for overlap, because near-copies leak in easily.
+   The llm-eval lab checks for any shared run of 13 words (a "13-gram contamination check").
+2. **Strong baselines**: the base model and the best prompt, not a weak first prompt.
+3. **A paired test**: score both models on the same items and look at the items where they disagree. That is far
+   more sensitive than comparing two overall scores.
+4. **Enough items, decided before you start.** With 500 paired items where the two models disagree on 20% of them,
+   the smallest gap the lab's test detects with 80% **power** (an 80% chance of noticing a real gap of that size) is
+   <LabNumber lab="llm-eval" metric="Smallest true gap with 80% power, paired test, n=500" showMetric />.
+
+A 2-point improvement claimed on 100 examples is noise.
+
+## Small-team version
+
+You own AI at a 50–500 person company with a few engineers plus coding agents. Fine-tuning is the most
+over-proposed fix you will hear, often as a way to look like more than "a wrapper" around someone else's model.
+Your job is to say no cheaply, or yes with numbers.
+
+### Default stack
+
+A managed API model with a versioned prompt, retrieval in the database you already run, and an eval set of 50 to
+200 labelled real cases that runs in CI. This matches the field. In LangChain's survey (a vendor survey,
+run late 2025) 57% of respondents don't fine-tune. Amplify's 2025 report (a venture-capital survey) puts
+fine-tuning at 41% against 70% using RAG. Both lean toward early adopters, so treat them as direction, not proof.
+
+### Build, buy, skip
+
+- **Build:** the eval set and the habit of reading failures; prompt versioning with a regression gate; retrieval.
+- **Buy:** model access. If you fine-tune, buy a managed LoRA service on an open model rather than running your own
+  training cluster. Together lists LoRA SFT for Llama 3.1 8B at $0.34 per 1M training tokens (fetched 2026-10-12),
+  so a run on Northwind's 2,000 examples costs the $4 minimum.
+- **Skip:** RLHF or DPO pipelines, full fine-tuning, and fine-tuning for knowledge.
+
+### Platform risk is part of the cost
+
+A fine-tune is tied to its base model. If the provider retires the base model, the fine-tune goes with it.
+OpenAI's deprecations page (fetched 2026-10-12) says:
+
+- from May 7, 2026, organizations that haven't fine-tuned before can't create fine-tuning jobs;
+- active existing customers lose the ability to create new jobs on Jan 6, 2027;
+- inference (answering requests) on fine-tuned models continues only until the base model is deprecated;
+- fine-tuned GPT-3.5, GPT-4, GPT-4.1-nano and o4-mini models are listed for shutdown on Oct 23, 2026
+  ([OpenAI deprecations](https://developers.openai.com/api/docs/deprecations)).
+
+An adapter on an open-weight model you can host anywhere carries less of this risk. In exchange, you own serving.
+
+### Fine-tune when all of these hold
+
+1. The eval shows a gap that prompting, examples and retrieval didn't close, on a narrow and stable task.
+2. You have, or can afford to label, hundreds to a few thousand good examples, and someone owns them.
+3. The volume makes the saving real against the cheapest model that passes, after serving and upkeep.
+4. Or there is a reason other than cost: data that may not leave your network, or a latency target only a small
+   model meets.
+
+### Delivery plan
+
+- **Week 1:** collect 50 failures, label them, build the eval, try prompt fixes and two cheaper models.
+- **Week 2:** if a gap remains, label 500 examples and run one LoRA job on a managed service. Compare it against the
+  best prompt on the held-out set with a paired test.
+- **Week 3:** if it wins, ship behind a feature flag with the eval in CI and a retraining trigger when quality
+  drifts. If not, stop and write down why.
+
+### What to check yourself
+
+The held-out split and its overlap check, the baseline you compare against, the serving cost at real load, and who
+relabels when the product changes. Agents can generate synthetic training examples. Check a sample by hand,
+because the model will learn their mistakes.
+
+### What small-company interviewers probe
+
+Whether you reach for fine-tuning first, whether you can price it including people and serving, and whether you
+have shipped an eval. Revisit the decision when volume grows 10× or more, when a regulated customer forbids sending
+data to a vendor, or when a provider changes its fine-tuning terms.
+
+<AINative title="Agents make the cheap options cheaper still">
+Agents shift this decision further toward prompting and retrieval: an agent can run a prompt variant against
+the eval set, propose few-shot examples from failures, and draft synthetic training data in minutes. That
+makes it tempting to fine-tune on agent-written data and trust agent-written evals. Keep two things human:
+the labels on the held-out set and the decision about what counts as a failure. If the agent writes both the
+training data and the test, a passing score proves only that it agrees with itself.
+</AINative>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Choosing how to adapt a model"
+  senior={[
+    "Maps each failure to prompting, retrieval or fine-tuning, and names the data and the eval for each.",
+    "Explains LoRA, QLoRA, SFT and preference tuning correctly, with one number each.",
+    "Explains embeddings, attention and the KV cache in plain words and computes the KV size.",
+  ]}
+  staff={[
+    "Prices the fine-tune end to end (labels, serving at real utilization, upkeep, platform risk) against the cheapest model that passes.",
+    "Sets the evaluation plan first: held-out data, overlap checks, baselines, sample size for the gap that matters.",
+    "Says what would reverse the decision and who owns re-training when the base model or the product changes.",
+  ]}
+/>
+
+In plain words: a Senior answer picks the right fix and explains the machinery correctly. A Staff answer also puts
+a price and a test plan on the choice, and says what would make them change their mind.
+
+## Follow-ups
+
+<FollowUps>
+<FollowUp q="Reported (OpenAI FDE, first-hand): how do you know the system is actually working well?">
+
+Name the eval. It is a labelled set drawn from real traffic, with a score per failure mode: did retrieval find the
+passage (hit@k), are answers supported by sources, is the format valid, does it decline when it should. Give ranges,
+not single numbers. Gate every prompt or model change on it. Feed production signals (escalations, thumbs-down,
+user edits) into the next round of labelled cases. The candidate reports the interviewer used this question as a
+differentiator <Cite id="s-812dbc9385" />.
+
+</FollowUp>
+<FollowUp q="Reported (OpenAI take-home, aggregator): develop a strategy for OpenAI's fine-tuning capabilities from the public docs.">
+
+Read the current docs first, because they changed. As fetched on 2026-10-12, the optimization guide lists
+supervised, vision, DPO and reinforcement fine-tuning, and also says OpenAI "is winding down the fine-tuning
+platform" and that it is "no longer accessible to new users". A strategy today covers: evals and prompting as the
+default path, which existing fine-tunes to migrate before their base models shut down, and where to move
+fine-tuning that still pays (LoRA on an open-weight model). The family's answer card works this through.
+
+</FollowUp>
+<FollowUp q="Reported (Amazon, secondary): estimate the ROI of a GenAI project.">
+
+Value = volume × value per successful outcome × measured success rate, minus run cost, minus the cost of wrong
+answers, with the one-time cost spread over a payback period. Get the success rate from a pilot or the eval, not a
+guess. Example 3 above is the fine-tune version; the answer card does a support-deflection version.
+
+</FollowUp>
+<FollowUp q="Reported (FAANG Staff, Blind): how do you mitigate hallucinations?">
+
+Ground answers with retrieval, allow "I don't know", quote before answering, check citations in code, and measure
+how often answers are supported and how often the model declines in the eval. Explain why fine-tuning on facts can
+make it worse. Mention the sycophancy incident as the RLHF-side version of the same problem: the model optimizes
+what you reward.
+
+</FollowUp>
+<FollowUp q="Not reported; a natural next push: why does LoRA initialize B to zero?">
+
+So `ΔW = B·A` is zero at step 0 and training starts from the base model's behaviour. A side effect: on the first
+backward pass, A's gradient (the direction training would move it) is zero too, because it is multiplied by B. Only
+B moves first. One of the lora-finetune lab's two failing tests expects a non-zero gradient on A at the first step,
+which this initialization rules out.
+
+</FollowUp>
+<FollowUp q="Not reported; a natural next push: you serve 50 customers, each with their own fine-tune.">
+
+Use LoRA adapters on one shared base model. Each adapter is megabytes (27.3 MB for the 8B example), so many fit
+beside the base weights, and multi-adapter serving engines batch requests for different adapters together. You own
+adapter versioning, per-customer evals, and the base-model upgrade: every adapter must be retrained and re-tested.
+
+</FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Fine-tuning for knowledge.** Facts change and permissions matter, so use retrieval. The applied-LLMs authors'
+  heading is "Prefer RAG over finetuning for new knowledge".
+- **No real baseline.** Comparing a fine-tune against a weak prompt, instead of the best prompt and the cheapest
+  model that passes, flatters the fine-tune.
+- **Pricing only the training run.** It is the smallest line; labels, serving and upkeep dominate.
+- **Ignoring platform risk.** A fine-tune dies with its base model, so check the provider's deprecation terms.
+- **Testing on data close to the training data.** Without a held-out split and an overlap check, the "gain" is
+  leakage.
+- **Hand-waving the depth questions.** Use the KV-heads formula; the hidden-size version is 8× too high for
+  Llama-3.1-70B.
+- **Treating prompt engineering as clever phrasing.** The question wants a process: error analysis, evals,
+  versioning and a regression gate.
+
+## Prove it with a lab
+
+<LabRef lab="llm-eval" role="proof" note="Bootstrap intervals, a paired test, power by simulation and a 13-gram contamination check: the evidence every adaptation choice needs." />
+
+<LabRef lab="rag" role="proof" note="Measured dense, hybrid and reranked retrieval on BEIR SciFact and NFCorpus: the knowledge option without training." />
+
+<LabRef lab="transformer" role="proof" note="Embeddings, attention and the FFN in code for the depth half. Its benchmark rows are estimates, and generate() has no KV cache." />
+
+<LabRef lab="lora-finetune" role="partial" note="LoRA layers, an instruction-tuning loop with loss masking, and adapter merge. On 2026-10-12, 2 of 13 tests failed: the gradient-flow test (A's gradient is zero at step 0 by construction) and the loss-decreases test. Its parameter counts conflict; use the formula above." />
+
+<LabRef lab="prompt-optimization" role="partial" note="Signatures, bootstrapped few-shot examples and prompt search, against a mock LLM with no held-out test set: useful for the mechanics, not the numbers." />
+
+<LabRef lab="tokenizer" role="partial" note="Character, BPE and byte-level tokenizers: why the same text costs a different number of tokens per model." />
+
+<LabRef lab="llm-inference" role="partial" note="A real KV cache on GPT-2, for the KV-cache question in r2a-011." />
+
+There is no lab yet for serving many LoRA adapters on one base (`multi-lora-serving`) or for checking LLM judges
+against human labels (`llm-judge-evals`).
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-812dbc9385" />
+- <Cite id="s-5f98d711e8" />
+- <Cite id="s-3e400c7e21" />
+- <Cite id="s-d7a8e88bf0" />
+- <Cite id="s-fe60d2bf1f" />
+- <Cite id="s-760e5688f9" />
+- Yan, Bischof, Frye, Husain, Liu, Shankar, "What We've Learned From A Year of Building with LLMs", 2024-06-08: https://applied-llms.org/
+- Hu et al., "LoRA: Low-Rank Adaptation of Large Language Models", 2021: https://arxiv.org/abs/2106.09685
+- Dettmers et al., "QLoRA: Efficient Finetuning of Quantized LLMs", 2023: https://arxiv.org/abs/2305.14314
+- Ouyang et al., "Training language models to follow instructions with human feedback", 2022: https://arxiv.org/abs/2203.02155
+- Rafailov et al., "Direct Preference Optimization", 2023: https://arxiv.org/abs/2305.18290
+- OpenAI, "Model optimization" guide, fetched 2026-10-12: https://developers.openai.com/api/docs/guides/model-optimization
+- OpenAI, "Deprecations" (self-serve fine-tuning timeline), fetched 2026-10-12: https://developers.openai.com/api/docs/deprecations
+- Together AI pricing (LoRA fine-tuning, dedicated H100), fetched 2026-10-12: https://www.together.ai/pricing
+- Anthropic and OpenAI pricing pages, fetched 2026-10-11: https://platform.claude.com/docs/en/about-claude/pricing · https://developers.openai.com/api/docs/pricing
+- Anthropic, "Reduce hallucinations", fetched 2026-10-12: https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/reduce-hallucinations
+- Georgetown Law Tech Institute, tech brief on OpenAI's sycophancy postmortem: https://www.law.georgetown.edu/tech-institute/insights/tech-brief-ai-sycophancy-openai/
+- Hamel Husain and Shreya Shankar, evals FAQ: https://hamel.dev/blog/posts/evals-faq/
+- Gekhman et al., "Does Fine-Tuning LLMs on New Knowledge Encourage Hallucinations?", 2024: https://arxiv.org/abs/2405.05904
+- Predibase, Checkr case study (vendor), Oct 2024: https://predibase.com/blog/how-checkr-streamlines-background-checks-with-fine-tuned-small-language
+- LangChain, State of Agent Engineering (vendor survey), 2026-06-12: https://www.langchain.com/state-of-agent-engineering · Amplify Partners, 2025 AI Engineering Report, 2025-06-24: https://amplifypartners.com/blog-posts/the-2025-ai-engineering-report
+- BLS, software developers (median wage, May 2025): https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm

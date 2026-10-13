@@ -1,0 +1,167 @@
+---
+question: r2b-019
+family: gpu-cluster-control-plane
+status: published
+labs: [dist-lock, gossip, raft, observability]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll split the state in two. What hosts report, their heartbeats and metrics, goes into a sharded in-memory
+> table keyed by host: 20,000 hosts every 5 seconds is 4,000 writes a second, which is too much churn for
+> consensus. What the control plane decides, jobs and assignments, goes into a small replicated store with a
+> leader. Each job attempt is handed out under a lease with a fencing token, so a host that lost contact can't
+> commit stale output. A host that misses heartbeats is suspect, not dead, until others confirm it. And if the
+> coordinator dies, hosts keep running their jobs while a new leader takes over."
+>
+> The rest of this page explains each part of that answer.
+
+This is a classic distributed-systems design dressed as a compute cluster. Your backend experience covers most of
+it. The interviewer is checking that you size the write load, separate fast-changing facts from decisions, hand out
+work safely, and keep running when the central coordinator goes down.
+
+### What makes this different from a service registry
+
+You may have built something like it: services register with Consul or etcd, send a heartbeat every few seconds,
+and drop out of the registry when they go quiet. A few hundred services, a few writes a second.
+
+A compute fleet changes the scale and the stakes.
+
+1. **The write load is heavy and constant.** Tens of thousands of hosts each report every few seconds, with GPU
+   readings attached. That is thousands of writes a second, all day, and almost none of them change any decision.
+2. **Jobs have side effects.** A job writes results to storage. If you move a job away from a host that looks dead
+   but isn't, both copies may try to write. You need a rule that lets exactly one of them win.
+3. **A wrong "dead" is expensive.** Declaring a healthy host dead throws away hours of GPU work. Declaring a whole
+   site dead because one monitoring shard went quiet is worse.
+
+PracHub lists this as an NVIDIA tech screen dated 2026-06-20; the visible summary says it tests tracking live host
+state across a large fleet "under high write concurrency", storage schema, scaling with fleet size, and failure
+detection and availability when a central coordinator goes down (<Cite id="s-1f1d1ddaac" />). The full text is
+locked, so state your assumptions.
+
+### Words you need first
+
+- **Observed state**: what hosts report about themselves (alive, GPU readings, running jobs). Changes constantly.
+- **Desired state**: what the control plane has decided (this job runs on that host; this host is cordoned).
+  Changes rarely, and must never be lost.
+- **Lease**: permission to run a job attempt that expires unless the host keeps renewing it.
+- **Fencing token**: a number that goes up with every new attempt of a job. Storage remembers the highest token it
+  has seen and rejects writes carrying a lower one.
+- **Static stability**: the system keeps doing what it was doing when its control plane is unreachable. Running work
+  continues; only new decisions pause.
+
+## Clarify first
+
+- **Fleet size and heartbeat interval.** "I'll assume 20,000 hosts, each heartbeating every 5 seconds."
+- **Job semantics.** "May a job run twice? I'll assume it may execute more than once, but its result must be
+  committed exactly once."
+- **Detection target.** "How fast must we notice a dead host? I'll aim for under 30 seconds."
+- **Sites.** "One site or several?"
+
+## Answer
+
+### Size the load first
+
+20,000 hosts every 5 seconds is **4,000 heartbeats a second**, about **8 MB/s** at an assumed 2 KB each. If a host
+becomes suspect after 3 missed heartbeats, detection takes **15 seconds**, inside the 30-second target.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Writes: 20,000 ÷ 5 s = 4,000 per second; × 2 KB (assumed) = 8 MB/s.
+- Detection: 3 missed × 5 s = 15 s. Halving the interval halves detection time and doubles the writes.
+
+</details>
+
+Say it like this: "4,000 small writes a second is easy for a sharded in-memory table and far too much churn for a
+consensus log."
+
+### Split the state
+
+- **Observed state** goes into a sharded in-memory table keyed by host. Each record keeps the host's latest
+  **sequence number**, so a late heartbeat can't overwrite a newer one (last-writer-wins by sequence). History goes
+  to a time-series store. Losing a shard costs one heartbeat interval, because hosts simply send again.
+- **Desired state** goes into a small replicated store with leader election: Raft, or etcd, which runs Raft. Only
+  decisions go through consensus, so the store stays small and fast.
+
+### The schema
+
+| Table | Columns | Where it lives |
+|---|---|---|
+| hosts | id, site, gpus, labels, last_seq, last_seen, condition | Observed state (condition is written by the control plane) |
+| jobs | id, spec, state, attempt, fencing_token | Desired state |
+| assignments | job, attempt, host, lease_expiry | Desired state |
+
+### Follow one job attempt
+
+Job **J-9** runs on host **h-1201**. The token numbers and times are illustrative.
+
+| Clock | What happens | What to say in the interview |
+|---|---|---|
+| 10:00:00 | The dispatcher writes attempt 1 of J-9 to h-1201 with **fencing token 7** and a lease, renewed by each heartbeat. | "The assignment is in the replicated store before the host starts." |
+| 10:20:00 | h-1201's network link to the control plane fails. The host is alive and still running J-9. | "This is the hard case: alive but unreachable." |
+| 10:20:15 | Three heartbeats missed. h-1201 becomes **suspect**, not dead. Other hosts are asked to probe it (the SWIM approach). | "One silent path isn't proof. I confirm through others first." |
+| 10:20:30 | Nobody can reach it, and the lease expires. h-1201 is marked dead. J-9 gets attempt 2 on h-0877 with **token 8**. | "A new attempt always gets a higher token." |
+| 10:45:00 | h-0877 finishes and writes its result with token 8. Storage accepts it and remembers 8. | "That's the one commit." |
+| 10:50:00 | h-1201's link comes back. It finishes attempt 1 and tries to write with token 7. Storage rejects it. | "Fencing makes a partitioned host harmless." |
+
+### Failure detection
+
+Missed heartbeats make a host **suspect**, not dead. Confirm through indirect probes, where other hosts try to reach
+it (SWIM-style), before declaring it dead. That way one monitoring shard's silence can't kill a whole site.
+
+### Dispatch
+
+Hand out each attempt under a lease with a fencing token that only grows. If the lease expires, reassign with a
+higher token; storage rejects writes with an older token, so a partitioned host can't commit stale output. Cap
+retries per job: a job that fails on many different hosts is the job's fault, not the hosts'.
+
+### When the coordinator goes down
+
+Agents keep running their jobs and buffer their reports. That is static stability. A new leader is elected, rebuilds
+its view from the store and the agents' next heartbeats, and resumes. Nothing in flight is lost, because the store
+holds every assignment.
+
+Say it like this: "Losing the coordinator pauses new decisions. It doesn't stop running work."
+
+### Scale
+
+Shard heartbeat ingestion by host id. Batch scheduling decisions. The replicated store stays small, because
+heartbeats never touch it.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Control plane"
+  senior={["Sizes heartbeat load, splits observed and desired state, uses leases with fencing tokens."]}
+  staff={["Designs for the coordinator being down (static stability), separates suspect from dead, and bounds automated reactions to mass silence."]}
+/>
+
+In plain words: a Senior answer gets the load, the split and the fencing right. A Staff answer also plans for its
+own control plane failing, and refuses to react to mass silence as if it were mass failure.
+
+## Small-team version
+
+Use a managed orchestrator (Kubernetes, or a queue plus serverless GPUs) and don't build a control plane. The parts
+that transfer to a small team's GPU job queue are leases, fencing tokens and capped retries.
+
+A queue table in the Postgres you already run handles the load: **20 GPU machines heartbeating every 5 seconds is 4 writes
+a second**. The family walkthrough puts the point where a custom scheduler pays for an engineer at about **70
+reserved GPUs**.
+
+Say it like this: "At our size this is a Postgres table with leases and a fencing column, not a control plane."
+
+## Pitfalls
+
+- **Every heartbeat through consensus.** Thousands of writes a second of churn swamp the store that holds decisions.
+- **Declaring hosts dead on a single missed heartbeat.** Networks drop packets; you throw away running work.
+- **Reassigning work without fencing.** Two hosts both commit, and results are duplicated or corrupted.
+- **No plan for the coordinator being down.** Then the coordinator is a single point of failure for running work.
+
+## Go deeper
+
+- Family walkthrough: [GPU cluster control plane](/system-design-labs/interviews/walkthroughs/gpu-cluster-control-plane/#high-level-design).
+- Health signals on the same fleet: [question infra-013](/system-design-labs/interviews/questions/infra-013/).
+- Labs: <LabRef lab="dist-lock" inline />, <LabRef lab="gossip" inline />, <LabRef lab="raft" inline />.

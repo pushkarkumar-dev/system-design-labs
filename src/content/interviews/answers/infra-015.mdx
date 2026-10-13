@@ -1,0 +1,212 @@
+---
+question: infra-015
+family: gpu-job-queue
+status: published
+labs: [kafka-lite, wal, load-balancer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Holding 5,000 open connections is easy. The hard part is writing about 2,500 new requests a second to disk
+> before I say 'accepted'. I define 'lost' as: I gave you an ID and you never saw a result or a clear failure. So I
+> acknowledge only after a durable write, saved in groups so the disk keeps up. Retries carry an idempotency key so
+> they can't create duplicates, and a background check counts anything stuck. When I'm overloaded, I say no at the
+> door instead of accepting work and dropping it."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The interviewer wants to know whether you understand what "without losing any" actually has to mean, and where
+loss really happens. Most candidates talk about scaling servers. The loss happens somewhere else.
+
+In a normal web service, "handle 5,000 concurrent requests" is a capacity question: enough servers, a load balancer,
+done. A request that fails just returns an error, and the client tries again. Nothing is promised until the reply
+arrives.
+
+"Without losing any" changes the question. It is about **promises**. Requests get lost in three gaps:
+
+1. **Between accepting a request and saving it.** If the server says "OK" and then crashes before writing the
+   request anywhere permanent, the request is gone, and the client believes it is safe.
+2. **Between a crash and a retry.** If a worker dies halfway through a request, someone has to notice and run it
+   again, without running it twice.
+3. **Under overload.** When too much arrives, systems quietly drop work from full memory queues or time it out.
+
+If this is GPU work, every lost or repeated request is also expensive, because each one may hold a GPU for seconds
+or minutes. A good answer closes each gap in order.
+
+(This was reported for NVIDIA, but only as a Glassdoor snippet whose author was unsure which review it came from,
+so the interviewer's framing is unknown <Cite id="s-28f1d2740e" />. Expect to define the guarantee yourself and
+defend it with numbers.)
+
+## Clarify first
+
+Ask these in the first two minutes, and say your assumption for each:
+
+- **Does the caller wait for the result, or get an ID?** A **synchronous** caller keeps the connection open until
+  the work is done. An **asynchronous** caller gets a job ID back at once and checks later. "I'll design for async,
+  and note what changes for sync."
+- **How long does each request take?** "Assume 2 seconds end to end."
+- **What counts as lost?** Propose it: "Accepted, then never completed or visibly failed. Turning a request away
+  with a 429 or 503 before accepting it is allowed; the client knows to retry."
+- **Are requests safe to retry?** Do clients send an **idempotency key**: a unique string the client makes up for
+  each request and repeats on every retry, so the server can recognize a retry?
+- **Is this GPU work (long, expensive) or short CPU work?** It changes how costly a duplicate is.
+
+## Answer
+
+### Words you need first
+
+- **Durable**: written to disk (or to several machines) so it survives a crash. Memory is not durable.
+- **fsync**: the call that forces data from memory onto the disk. It is the slow, unavoidable step in every durable
+  write.
+- **Little's law**: the number of requests inside a system equals the rate they arrive times how long each one
+  stays. It turns "5,000 concurrent" into a rate.
+
+### Step 1: turn "5,000 concurrent" into a rate
+
+If each request stays in the system for 2 seconds (assumed), 5,000 concurrent requests means **2,500 new requests
+arriving every second**. Each one must be saved durably before you acknowledge it.
+
+5,000 open connections is not the hard part. An asynchronous server handles that easily. **2,500 durable writes a
+second** is the hard part, because a naive design does one fsync per request.
+
+The fix is **group commit**: the database or log collects every write that arrives in a short window (say 5 ms,
+assumed) and flushes them all with one fsync. Each request waits at most one window. The disk sees about **200
+flushes a second**, each carrying about 12 requests, which one well-provisioned database can usually absorb.
+
+"The connections are easy. The real load is 2,500 durable writes a second, and group commit turns that into about
+200 disk flushes a second."
+
+### Step 2: the path of one request
+
+Follow one request, from a client app with idempotency key `k-91a`, through the system:
+
+```
+Client  (sends request with idempotency key k-91a)
+   │
+   ▼
+Load balancer ── spreads requests over API servers
+   │
+   ▼
+API server (stateless) ── validates, checks the key, appends to the durable store
+   │                       waits for the group commit (≤ 5 ms)
+   │                       THEN returns job ID J-77
+   ▼
+Durable store ── replicated log, or a database with synchronous commit
+   │
+   ▼
+Workers ── take the job under a lease, run it, commit "only if my lease is current"
+   │
+   ▼
+Reconciler ── every few minutes: "any job past its deadline and not finished?"
+```
+
+**Load balancer and API servers.** The API servers keep no state of their own, so any of them can take any request.
+They use asynchronous I/O and cap how many requests each one holds at once.
+
+**Durable store.** The API appends the request to a replicated log (an append-only file copied to several
+machines), or inserts it into a database with
+**synchronous commit** (the commit returns only once the data is safely on disk). Only after the write succeeds
+does it return an ID (async) or start processing (sync). The idempotency key has a unique index, so a retry finds
+the existing row and gets the same ID back.
+
+**Workers.** They process each job **at least once** (after a crash, a job may run twice) and finish
+**idempotently** (running twice has the same effect as once). To make that true, each worker holds a **lease**: a
+time-limited claim on the job, renewed by "still here" messages called heartbeats. Each lease grant comes with a
+number that goes up every time, called a **fencing token**. A worker's completion carries its token and is rejected
+if a newer attempt now owns the job.
+
+**Reconciler.** A background job finds requests past their deadline that are still not finished, and retries them
+or fails them visibly. Its count is your **lost-request metric**, and you alarm whenever it is not zero.
+
+### Step 3: walk through the crashes
+
+The interviewer will ask "what if X dies here?" Have one answer per point on the path. This table follows request
+`k-91a`:
+
+| Where the crash happens | What the client saw | What happens next | What to say in the interview |
+|---|---|---|---|
+| API server dies **before** the durable write | no ID, a timeout | The client retries with the same key `k-91a` | "Nothing was promised, so nothing is lost. The retry is a fresh accept." |
+| API server dies **after** the write, before replying | a timeout | The retry with `k-91a` hits the unique key and gets J-77 back | "The idempotency key makes the retry return the same job, not a second one." |
+| Worker dies mid-task | nothing yet | Its lease expires; the job is re-run by another worker with a higher fencing token | "The old worker's late completion is rejected because its token is stale." |
+| Worker freezes, then wakes up late | nothing yet | Same as above; its commit matches no row | "Fencing is what turns at-least-once into exactly one result." |
+| Database is down | a 503 | API refuses new work until it is back | "I never accept into memory during an outage. That's how requests get lost." |
+
+### Step 4: overload is where most systems lose requests
+
+**Bound every queue.** An unbounded in-memory queue looks fine until the process restarts and everything in it
+vanishes.
+
+**Reject at the edge with a retry hint.** When the estimated wait is longer than the client's timeout, reply 429
+(too many requests) or 503 (unavailable) with a `Retry-After` header, instead of accepting the request and timing
+out later. A rejected client knows to come back. A timed-out client doesn't know whether its request was accepted.
+
+**Make clients retry politely.** Retries use **exponential backoff** (wait longer after each failure) with
+**jitter** (a random spread so retries don't arrive in waves), under a **retry budget** (for example, retries may
+add at most a small share of normal traffic). Without that, a short slowdown can multiply the load (three attempts each means up to three times the traffic) as every client
+retries at once.
+
+"Most lost requests happen under overload. So I bound every queue, reject early with a retry hint, and cap how much
+retrying clients can add."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Little's law"
+  expr="concurrent requests = arrival rate × time in system"
+  vars={[
+    { sym: 'arrival rate', meaning: 'requests per second' },
+    { sym: 'time in system', meaning: 'mean seconds per request' },
+  ]}
+  example="5,000 concurrent at 2 s each → 2,500 requests/s to accept durably"
+/>
+
+- **Group commit:** one flush every 5 ms (assumed) is 1,000 ÷ 5 = 200 fsyncs a second. 2,500 ÷ 200 = 12.5
+  requests share each fsync.
+- **Added latency:** each request waits at most one window, so group commit adds at most about 5 ms to the accept.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="No lost requests"
+  senior={["Acknowledges after a durable write, uses idempotency keys, at-least-once workers and bounded queues."]}
+  staff={["Defines 'lost' precisely, sizes durable writes with Little's law and group commit, and makes lost work a measured metric."]}
+/>
+
+In plain words: a Senior answer builds the right mechanisms. A Staff answer starts by defining the promise, proves
+with numbers that the disk can keep it, and adds a metric that shows the promise was kept.
+
+## Small-team version
+
+At a small company this is a Postgres table on the database you already pay for:
+
+- **The table:** one row per request, with synchronous commit on, and a unique index on the idempotency key.
+- **The workers:** claim rows with `SELECT … FOR UPDATE SKIP LOCKED` (which lets several workers take different rows
+  without waiting on each other's locks), under a lease with a fencing column.
+- **The reconciler:** a query run every hour, or even nightly, that lists rows stuck in a non-final state past their
+  deadline.
+
+With group commit, 2,500 accepts a second is about 200 fsyncs a second, which one primary database can usually
+absorb. Load-test it before promising the number. Add the reconciler query before you add Kafka.
+
+"I'd start with Postgres and a reconciler query. I'd add a separate log like Kafka only when the jobs table shows up
+in database CPU or lock waits, or when many consumers need to replay the same stream."
+
+## Pitfalls
+
+- **Acknowledging before the durable write.** A crash between "OK" and the write loses a request the client
+  believes is safe.
+- **Unbounded in-memory queues.** They grow under load and lose everything on restart.
+- **Retries without idempotency.** They turn "no loss" into duplicates, which for GPU work means paying twice.
+- **Treating 5,000 open connections as the hard part.** The hard part is 2,500 durable writes a second.
+- **No measurement of loss.** Without a reconciler count, you can't show that nothing was lost.
+
+## Go deeper
+
+- Family walkthrough: [Async GPU job system](/system-design-labs/interviews/walkthroughs/gpu-job-queue/), the durable-acceptance deep dive.
+- Fsync and group commit in depth: [Key-value store to durable log](/system-design-labs/interviews/walkthroughs/kv-store-durable-log/).
+- <LabRef lab="kafka-lite" inline /> and <LabRef lab="wal" inline /> for durable acceptance, <LabRef lab="load-balancer" inline /> for retry budgets.

@@ -1,0 +1,177 @@
+---
+question: eng-060
+family: llm-from-scratch
+status: published
+labs: [tokenizer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "A tokenizer turns text into a list of integers the model can read, and back. The simplest one uses UTF-8
+> bytes, so every string works and there is never an unknown token. BPE starts from those 256 bytes and learns
+> merges: it repeatedly finds the most common adjacent pair and gives it a new id. When encoding new text, I
+> apply merges in the order they were learned, not by how often pairs appear in that text. I'll also make
+> special tokens opt-in, so user text can't inject them, and decode streams with a buffer, because one
+> character can be split across tokens."
+>
+> The rest of this page explains each part of that answer.
+
+Both questions behind this card test the same idea. Text is bytes. A token is a run of bytes. Encoding and
+decoding must round-trip any string, emoji and non-Latin scripts included. BPE adds a training loop and one
+subtle rule for encoding.
+
+A backend engineer already knows half of this: it is a serialization format with a learned dictionary,
+something like a compression scheme. What is new is that the dictionary's order matters, and that a model was
+trained on one exact dictionary. Two tokenizers that both round-trip text perfectly can still produce different
+ids for the same string. To the model, those are different inputs.
+
+(Glean has "Implement BPE Tokenizer" in a tech phone screen (2026/6/23) <Cite id="s-5a478c45c5" />; Perplexity
+has "Byte Tokenizer" as an online assessment (2026/1/17) and a "ByteTokenizer" onsite challenge (2025/12/20)
+<Cite id="s-bebe1e8956" />. Neither has a question body.)
+
+## Clarify first
+
+- **Base alphabet.** "Bytes or characters? I'll use UTF-8 bytes, so there is never an unknown token."
+- **Special tokens.** "Do we need reserved tokens such as begin, end or padding? May user text produce them?
+  I'll assume no."
+- **BPE details.** "What target vocabulary size? Is there a pre-splitting regex, like GPT-2's, that keeps
+  merges inside words? I'll assume no regex."
+- **Streaming.** "Will output be decoded as it streams? It changes how `decode` works."
+
+## Answer
+
+### Words you need first
+
+- **Token**: one integer id the model reads or writes. The set of ids is the **vocabulary**.
+- **UTF-8**: the standard way to store text as bytes. ASCII letters take 1 byte; "é" takes 2; most emoji take 4.
+- **Byte tokenizer**: every byte is a token, ids 0 to 255. Special tokens get ids from 256 up.
+- **Special token**: a reserved id with a control meaning, such as `<|eos|>` for "end of sequence".
+- **BPE (byte-pair encoding)**: a learned list of **merges**. Each merge replaces a pair of adjacent ids with a
+  new id. The order in which merges were learned is their **rank**.
+- **Round trip**: `decode(encode(s)) == s` for every string `s`.
+
+### The byte tokenizer
+
+`encode` is `list(text.encode("utf-8"))`, plus special ids from 256 up. `decode` joins the bytes and decodes
+UTF-8. The word "café" becomes five ids: `[99, 97, 102, 195, 169]`. The last two are the two bytes of "é".
+
+Two details make it production-grade:
+
+- **Special tokens are opt-in.** They are parsed only when the caller allows it, so user text containing
+  `<|eos|>` stays seven plain characters. Karpathy's minbpe uses an `allowed_special` argument for the same
+  reason ([minbpe](https://github.com/karpathy/minbpe), read 2026-10-12). Say: "Otherwise a user can type the
+  end-of-turn marker and end the model's turn."
+- **Streaming needs a buffer.** If the model writes "é" as two tokens, 195 then 169, byte 195 alone is not a
+  valid character. An incremental UTF-8 decoder holds it until 169 arrives. Printing early shows the user a
+  replacement character.
+
+### BPE, by hand
+
+BPE ([Sennrich et al.](https://arxiv.org/abs/1508.07909)) starts from the 256 bytes and repeatedly merges the
+most frequent adjacent pair into a new id. Follow the classic example, `aaabdaaabac`:
+
+| Merge | Most common pair | New id | Text after the merge | What to say in the interview |
+|---|---|---|---|---|
+| start | | | `a a a b d a a a b a c` (11 ids) | "Bytes first; nothing is unknown." |
+| 1 | `a a` (4 times, counting overlaps) | 256 = "aa" | `aa a b d aa a b a c` (9 ids) | "Replace left to right, without overlaps." |
+| 2 | `a b` (2 times, tied) | 257 = "ab" | `aa ab d aa ab a c` (7 ids) | "Ties go to the smallest pair, so training is deterministic." |
+| 3 | `aa ab` (2 times) | 258 = "aaab" | `aaab d aaab a c` (5 ids) | "A new token can merge again. Eleven bytes are now five tokens." |
+
+You can reproduce this table by running the training loop below on `aaabdaaabac`.
+
+```python
+def train_bpe(text, vocab_size):
+    ids = list(text.encode("utf-8"))
+    merges, vocab = {}, {i: bytes([i]) for i in range(256)}
+    for new_id in range(256, vocab_size):
+        counts = Counter(zip(ids, ids[1:]))
+        if not counts:
+            break
+        pair, n = max(counts.items(), key=lambda kv: (kv[1], -kv[0][0], -kv[0][1]))
+        if n < 2:
+            break
+        ids = merge(ids, pair, new_id)                 # left to right, non-overlapping
+        merges[pair] = new_id
+        vocab[new_id] = vocab[pair[0]] + vocab[pair[1]]
+    return merges, vocab
+
+def encode(text, merges):                              # apply merges by RANK, not frequency
+    ids = list(text.encode("utf-8"))
+    while len(ids) >= 2:
+        pair = min(set(zip(ids, ids[1:])), key=lambda p: merges.get(p, float("inf")))
+        if pair not in merges:
+            break
+        ids = merge(ids, pair, merges[pair])
+    return ids
+
+def decode(ids, vocab):
+    return b"".join(vocab[i] for i in ids).decode("utf-8", errors="replace")
+```
+
+### The rule to state
+
+Encoding applies the earliest-learned merge present, again and again. That reproduces training exactly. Here is
+why: a merge only creates pairs that involve the new token, and every such pair was learned later. So no
+earlier-ranked pair can reappear after a later merge.
+
+Encoding by frequency in the new text breaks this. Take the word "aaab" in some other text. Rank order merges
+`a a` into 256, then `a b` into 257, then `aa ab` into 258: one token, the same as in training. A frequency rule might pick a different pair
+first and land on different ids, which the model never saw.
+
+### Tests and cost
+
+- **First merge:** `aaabdaaabac` merges `aa` first.
+- **Round trip:** random Unicode strings survive `decode(encode(s))`.
+- **Training ids:** encoding the training text reproduces the ids the training loop ended with.
+- **Complexity:** naive training rescans the corpus once per merge, **O(N × M)** for N bytes and M merges.
+  Production trainers update pair counts incrementally instead.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Tokenizers"
+  senior={["Byte tokenizer and BPE that round-trip Unicode, with rank-ordered encoding and tests."]}
+  staff={["Covers special-token injection, streaming decode, training cost, and why vocabulary size trades sequence length against embedding parameters."]}
+/>
+
+## Small-team version
+
+Never ship your own tokenizer for a model; use the one the model was trained with. The payoff from this
+knowledge is in cost and context work. Prices are per token, and different tokenizers turn the same text into
+different numbers of tokens. Anthropic's pricing page says its newer tokenizer "produces approximately 30% more
+tokens for the same text"
+([pricing](https://platform.claude.com/docs/en/about-claude/pricing), read 2026-10-12). So compare models on
+dollars per task over your own prompts, counted with each provider's counter.
+
+Worked example, on the family walkthrough's assumed workload: 50,000 requests a day, 3,000 input and 400 output
+tokens each, Claude Sonnet 5 at $2 in and $10 out per 1M, no caching. That is about **1 cent per request and
+$15,000 per 30 days**. If the same text became 30% more tokens at the same per-token price, the bill would be
+about **$19,500, so $4,500 a month more**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Per request: 3,000 × $2/M + 400 × $10/M = $0.0100; × 50,000 × 30 = $15,000.
+- 30% more tokens: $15,000 × 1.3 = $19,500; difference $4,500.
+
+</details>
+
+Default: the provider's tokenizer and counting endpoint, and no tokenizer code of your own. Revisit only if you
+host a model yourself, and then check that user text can't produce special tokens.
+
+## Pitfalls
+
+- **Encoding by pair frequency in the new text.** It produces ids the model was never trained on; apply merges
+  by rank.
+- **Character-level vocabularies that need an unknown token.** Any character missing from the vocabulary is
+  lost; bytes cover everything.
+- **Decoding token by token in a stream.** Split multi-byte characters show up as replacement characters.
+- **Treating special-token strings in user input as control tokens.** A user can then end the turn or inject
+  structure.
+
+## Go deeper
+
+- Family walkthrough: [Stage 7: tokenizers](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#stage-7-tokenizers) and [Small-team version](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#small-team-version).
+- Lab: <LabRef lab="tokenizer" inline /> (v1 BPE and the v2 GPT-2-style tokenizer both pass their tests).

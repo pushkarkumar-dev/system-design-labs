@@ -1,0 +1,168 @@
+---
+question: infra-041
+family: distributed-training
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Source-code depth means I can point to where each technique communicates and what it saves. Megatron's tensor
+> parallelism hides its traffic in two small functions, f and g, at the start and end of each block: two all-reduces
+> forward and two backward per layer. Sequence parallelism swaps each all-reduce for a reduce-scatter plus an
+> all-gather, which moves the same bytes and saves activation memory. Pipeline parallelism is a schedule of
+> point-to-point sends, and interleaving shrinks its idle time. ZeRO splits the 16 bytes per parameter of training
+> state: the first two stages add no traffic, the third adds 1.5×."
+>
+> The rest of this page explains each part of that answer.
+
+This isn't a recorded interview question. It is advice about how deep training-infrastructure interviews go. Treat it
+as a hint about depth, not a format. "Source-code depth" most plausibly means three things: you know where the
+communication calls sit, what each one moves, and which memory each technique removes.
+
+### What makes this different from knowing the names
+
+Most candidates can say "tensor parallelism, pipeline parallelism, ZeRO". That is like a backend engineer saying
+"sharding, replication, caching" without knowing where the network calls happen or what each one costs. The depth
+being asked for is the second kind: given a profiler trace from a training job, you can predict which exchange is
+which and why it's there.
+
+### Words you need first
+
+- **Parameter**: one learned number in the model. Training also stores a **gradient** for each (which way to move
+  it) and the optimizer's bookkeeping.
+- **Activations**: the intermediate results each layer produces in the forward pass, kept for the backward pass.
+  They are often the biggest memory cost.
+- **Collective**: an exchange where every GPU in a group contributes and gets a combined result. The ones here are
+  **all-reduce** (everyone gets the sum), **reduce-scatter** (everyone gets the sum of one slice) and **all-gather**
+  (everyone collects all slices). An all-reduce is a reduce-scatter followed by an all-gather.
+- **Tensor parallelism (TP)**: splitting each layer's matrix math across the GPUs of one machine.
+
+The source is one Blind poster's advice that training- and inference-infra candidates need "Megatron-LM (TP/PP/SP),
+ZeRO, FlashAttention" and that "if you can't go source-code deep, don't bother applying"; commenters suspected the
+post was an ad (<Cite id="s-a129aa6451" />).
+
+## Clarify first
+
+If an interviewer opens this way, ask:
+
+- **Which framework?** "Does the team use Megatron-Core, DeepSpeed or PyTorch FSDP?"
+- **Which goal?** "Is the focus training throughput, memory, or long inputs?"
+- **Which format?** "Are we reading code, or discussing a design?"
+
+## Answer
+
+Walk the four techniques in the order data flows through one transformer layer (the building block a language
+model repeats dozens of times), then the optimizer.
+
+### Tensor parallelism, at the level of the calls
+
+In [Megatron-LM](https://arxiv.org/abs/1909.08053), two small functions plug into automatic differentiation and
+carry all the communication:
+
+- **f**: does nothing in the forward pass; all-reduces in the backward pass.
+- **g**: all-reduces in the forward pass; does nothing in the backward pass.
+
+Each block (the attention, and the feed-forward part called the MLP) starts with a **column-parallel** linear layer, with f at its input, and ends
+with a **row-parallel** linear layer, with g at its output. The column split leaves each GPU with a slice of the
+output that the row split can use directly, so nothing is exchanged in the middle. The paper counts **two
+all-reduces forward and two backward per layer**.
+
+Say it like this: "If I know where f and g sit, I can look at a trace and say which all-reduce belongs to which
+block."
+
+### Sequence parallelism
+
+Between those blocks, a few cheap operations (layer normalization and dropout) run on the full data on every GPU of
+the tensor-parallel group. That repeats work and wastes activation memory.
+
+Korthikanti et al. ([2022](https://arxiv.org/abs/2205.05198)) split those regions along the sequence instead: each
+GPU handles a different part of the input text. They replace each all-reduce with a **reduce-scatter** on the way
+into the sequence-split region and an **all-gather** on the way out. Because an all-reduce already is a
+reduce-scatter plus an all-gather, they report **no extra communication**. Together with **selective
+recomputation** (discarding some activations and recomputing them in the backward pass), they report **5× less
+activation memory**.
+
+Say it like this: "Sequence parallelism doesn't add traffic. It splits the same all-reduce into its two halves and
+does useful work in between."
+
+### Pipeline parallelism
+
+Pipeline parallelism puts different layers on different GPUs, called **stages**. Stages exchange activations
+point-to-point. The batch is cut into **micro-batches** so several stages can work at once. The schedule is the code
+you'd be asked about:
+
+- **1F1B** alternates one forward and one backward micro-batch, which caps how many micro-batches' activations are
+  held at once.
+- The **interleaved** schedule gives each GPU v smaller chunks of layers. It cuts the idle share (the **bubble**)
+  from (p − 1) ÷ m to (p − 1) ÷ (v·m), for p stages and m micro-batches, at the cost of v times the communication
+  ([Narayanan et al., 2021](https://arxiv.org/abs/2104.04473)).
+
+### ZeRO
+
+Mixed-precision training with the Adam optimizer costs **16 bytes per parameter**: 2 for the 16-bit weight, 2 for
+its gradient, and 12 for a 32-bit master copy and Adam's two running averages. In plain data parallelism every GPU
+holds all of it. ZeRO ([Rajbhandari et al., 2019](https://arxiv.org/abs/1910.02054)) splits it across the GPUs that
+hold copies of the model:
+
+| Stage | What is split | Memory saving (paper) | Extra traffic |
+|---|---|---|---|
+| 1 | optimizer state | 4× | none |
+| 2 | + gradients | 8× | none |
+| 3 | + the weights themselves | grows with the number of copies | **1.5×**, because weights are all-gathered before each layer's forward and backward pass |
+
+Follow the paper's own example: a **7.5B model with 64-way data parallelism** needs **120 GB per GPU** unsplit and
+**31.4 GB** with stage 1.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Per-GPU model state under ZeRO-1"
+  expr="bytes ≈ 4Ψ + 12Ψ ÷ N_d"
+  vars={[
+    { sym: 'Ψ', meaning: 'parameters on this GPU' },
+    { sym: 'N_d', meaning: 'data-parallel degree' },
+  ]}
+  example="ZeRO paper: a 7.5B model at 64-way DP needs 120 GB per GPU unsharded and 31.4 GB with optimizer sharding"
+/>
+
+16 × 7.5B = 120 GB. With stage 1: 4 × 7.5B + 12 × 7.5B ÷ 64 = 30 + 1.4 = 31.4 GB.
+
+</details>
+
+### FlashAttention, in one line
+
+Attention compares every token with every other token, which normally builds a full table of scores (s × s for a
+sequence of s tokens). FlashAttention computes attention in tiles without ever storing that table. In the
+activation-memory formula Korthikanti et al. give, that table is the 5as/h term (a is the number of attention
+heads, s the sequence length, h the hidden size).
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Source-code depth"
+  senior={["Places f, g, reduce-scatter and all-gather in the layer and states what each saves or costs."]}
+  staff={["Uses that to predict a trace, and says which technique to drop when the link or the batch is the constraint."]}
+/>
+
+## Small-team version
+
+A small team doesn't need Megatron internals. It needs to recognize the FSDP and tensor-parallel options in a
+fine-tuning or serving config, and to estimate memory (16 bytes per trained parameter) before renting GPUs. Spend
+source-code depth on whatever framework you actually run.
+
+## Pitfalls
+
+- **Treating a suspected ad as a known interview format.** It is one poster's advice, not a reported question.
+- **Saying sequence parallelism adds communication.** It moves the same bytes, split into two halves.
+- **Confusing ZeRO-3's 1.5× traffic with stages 1 and 2.** Only splitting the weights adds traffic.
+- **Reciting names with no bytes attached.** Depth means knowing what each call moves.
+
+## Go deeper
+
+- Family walkthrough: [Distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/), its parallelism deep dive.
+- Kernel side of FlashAttention: [GPU kernel performance](/system-design-labs/interviews/walkthroughs/gpu-kernel-perf/).
+- The layers being split: <LabRef lab="transformer" inline />.

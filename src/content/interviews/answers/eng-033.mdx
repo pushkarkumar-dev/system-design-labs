@@ -1,0 +1,203 @@
+---
+question: eng-033
+family: agent-memory-context
+status: published
+labs: [vector-index, rag, agent-framework]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "There are five main strategies: a rolling summary per user, extracted facts with retrieval, summaries of past
+> sessions, memory tools the agent calls itself, and reusable skills. My default is extracted facts: after each
+> session a small model pulls out short claims, and I store each one in a table with where it came from, whether
+> the user said it or the model guessed it, and when it expires. Each turn I fetch the few that matter for this
+> user. Memories are hints, never the truth for an action, and nothing from untrusted web content may write one."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants you to name several strategies, say when each fits, then go concrete on one: what is
+stored, how it is written, read and expired, and how a wrong memory gets corrected.
+
+### Why this is not just "a user profile table"
+
+In a normal app, what you know about a user comes from forms and events. The user typed their email address into
+a field. It is structured, and it is true until they change it.
+
+An LLM-based assistant learns about the user from free-text conversation, and the model itself remembers nothing
+between sessions. So your code has to do three things a profile table never does:
+
+1. **Decide what in a conversation is worth remembering.** That needs a model to read the transcript.
+2. **Track how sure you are.** "I prefer email" (said by the user) is stronger than "seems to prefer email"
+   (guessed by the model).
+3. **Defend the store.** Whatever you remember gets put back in front of the model in every future session, so a
+   wrong or planted memory keeps doing damage.
+
+PromptLayer lists this under context engineering as "What different strategies could you use for long-term
+memory?", and its post gives no model answer (<Cite id="s-1205b0cc50" />).
+
+### Words you need first
+
+- **Token:** the unit an LLM reads and writes, roughly ¾ of an English word.
+- **Context:** everything sent to the model in one call. Memories are only useful once your code puts them there.
+- **Embedding:** a list of numbers a model produces for a piece of text, so that texts with similar meaning get
+  nearby numbers. Finding the stored texts nearest to a query is **vector search**.
+- **Extraction:** a model reading a transcript and pulling out short, structured claims to store.
+
+## Clarify first
+
+- **What kind of agent and user?** A personal assistant, a support bot, a coding agent? "I'll assume an assistant
+  with returning users."
+- **What should it remember?** Preferences, facts about the user, past interactions, how to do tasks?
+- **Privacy:** can users see and delete memories? "I'll assume yes."
+- **Scope:** per user, or shared across a workspace? "I'll assume per user."
+
+## Answer
+
+### The example to keep in mind
+
+Maya contacts a shop's support assistant about a late order, A-17. The assistant replaces it. Along the way she
+says, "Email is better for me than SMS." She is a little annoyed about the delay. A week later she comes back and
+asks, "Did my replacement ship?"
+
+A good memory system lets the assistant answer the way a good human agent would: knowing what happened last
+time, sending the update by email, and checking the real shipping status rather than guessing.
+
+### Strategies, cheapest first
+
+1. **Rolling summary per user,** put into each new session. Simple and lossy; fine for a few sessions. For Maya:
+   one paragraph about everything she has ever said, which gets vaguer over time.
+2. **Extracted facts and preferences with retrieval.** After each session a small model extracts claims; code
+   removes duplicates and stores them with their source; each turn fetches a few by relevance, recency and
+   importance. **This is the default.** For Maya: "prefers email for updates".
+3. **Episodic memory:** summaries of past sessions, fetched by similarity, for "last time we discussed this". For
+   Maya: "3 Oct: replaced order A-17 after a delay; customer unhappy".
+4. **Agent-managed memory:** the agent calls `save_memory` and `search_memory` tools itself, the approach the MemGPT research
+   system framed as managing "different memory tiers" ([arXiv 2310.08560](https://arxiv.org/abs/2310.08560)).
+   Flexible, but it costs extra steps and the model can skip it.
+5. **Procedural memory:** reusable skills or instructions learned from successful runs, such as "how to replace a
+   delayed order".
+
+Say it like this: "I pick by how long the memory needs to live and by what I can evaluate. Extracted facts are
+the easiest to test, so they're my default."
+
+### The system, write path and read path
+
+```
+End of session
+     │
+     ▼
+Extractor (small model) ── proposes claims with source + confidence
+     │
+     ▼
+Your code ── dedupe, resolve conflicts, set expiry
+     │
+     ▼
+Memory table (Postgres + pgvector), keyed by tenant + user
+     ▲
+     │  filter by user, rank by relevance / recency / importance
+     │
+Next session, each turn ── top few memories, labelled as data ──► model context
+```
+
+**The extractor** reads the finished transcript and proposes candidate memories. It runs once per session, so a
+small, cheap model is enough. **Your code** decides what is kept: it removes duplicates, and when a new memory
+conflicts with an old one, a newer statement from the user replaces an older guess. The old row is marked
+**superseded** (replaced but kept), so you can audit what changed. **The memory table** is ordinary Postgres;
+**pgvector** is a Postgres extension that adds embedding columns and nearest-neighbour search. **The read path**
+runs each turn. It filters to this user first, ranks, and injects a few memories under a fixed token budget,
+clearly labelled as data.
+
+### Going concrete on option 2: the table
+
+The columns are: `user_id`, `kind`, `content`, `embedding`, `source_msg`, `origin` (user-stated, inferred, tool),
+`confidence`, `created_at`, `confirmed_at`, `expires_at`, `superseded_by`.
+
+Each column answers a follow-up question:
+
+- `source_msg` and `origin` are the **provenance**: where the memory came from and whether the user said it or
+  the model guessed it. "Prefers email" for Maya has `origin = user_stated`.
+- `confidence` and `origin` decide ranking: inferred memories rank below stated ones.
+- `expires_at` handles staleness. Preferences decay slowly; situational facts ("traveling this week") expire
+  fast.
+- `superseded_by` handles correction without losing history.
+
+When Maya returns and asks "Did my replacement ship?", the read path fetches the A-17 episode and the email
+preference. The assistant then calls the order system to check the shipping status. It does not answer from
+memory, because a memory is a hint and the backend is the truth.
+
+### Stopping errors from compounding
+
+A wrong memory is worse than a missing one: it is injected into every future session, and the model treats it as
+true. The defences:
+
+- Inferred memories rank below stated ones.
+- High-stakes actions confirm with the user instead of trusting memory.
+- Users can see and edit what is remembered.
+- Memories are injected as labelled data, never as instructions.
+- Untrusted content must not write memories.
+
+That last point is a real attack. **Prompt injection** is when text the model reads (a web page, a document)
+contains instructions, and the model follows them. A 2024 proof of concept showed web content using prompt
+injection to plant instructions in ChatGPT's memory that persisted into later chats
+([Embrace The Red, 2024-09-20](https://embracethered.com/blog/posts/2024/chatgpt-macos-app-persistent-data-exfiltration/)).
+
+### Evaluating it
+
+Build probe questions whose answers depend on a stored memory ("How does Maya want updates?"). Check two things.
+First, retrieval: **hit@k**, how often the right memory is in the top k results. Second, end to end: does the
+final answer use it correctly?
+
+### What it costs
+
+With assumed usage of 20 sessions a month and 10 turns each, memory costs about **$0.47 per user per month**,
+almost all of it from putting the memories into each turn. For 1,000 active users that is about **$470 a
+month**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+cost = sessions × (extraction call + injected tokens × turns × input price). All usage figures are assumed; list
+prices fetched 2026-10-11.
+
+- Extraction with Claude Haiku 4.5 (6,000 tokens in at $1 per 1M, 300 out at $5 per 1M) = **$0.0075** per
+  session.
+- Injecting 800 tokens of memories into 10 turns at $2 per 1M (Sonnet 5, uncached) = **$0.016** per session.
+- 20 sessions × $0.0235 ≈ **$0.47 per user-month**; × 1,000 users ≈ $470.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Long-term memory"
+  senior={["Picks extracted facts with retrieval, designs the table with provenance and expiry, and evaluates with probes."]}
+  staff={["Treats memory as a privacy and security surface (write sources, deletion, poisoning) and decides which strategy the product can actually evaluate."]}
+/>
+
+## Small-team version
+
+In money and actions:
+
+- **Build the memory table in the Postgres you already run, with pgvector.** Each user has only a small number of
+  memories, so a query filtered by user is enough; you don't need a separate vector database.
+- **Use a small model for extraction after each session.** It costs under a cent per session.
+- **Skip memory frameworks and graph memory** (memories stored as a graph of linked people and things) until this plain version fails an eval.
+- **Ship a "what I remember" view with delete in the same release.** You will be asked.
+- **Test that deletion is complete:** the row, its embedding, and any summary built from it.
+
+Budget about half a dollar per active user per month, and check it on a dashboard.
+
+## Pitfalls
+
+- **Stuffing all past transcripts into context.** It overflows the window and costs more per turn than memory
+  costs per month.
+- **No provenance or expiry.** A stale guess then outranks a fresh statement from the user.
+- **Writing memories from retrieved web or document text.** That is how memory poisoning gets in.
+- **Memories injected as instructions.** The model obeys them; they must be labelled as data.
+
+## Go deeper
+
+- Family walkthrough: [Agent memory and context management](/system-design-labs/interviews/walkthroughs/agent-memory-context/), sections "Long-term memory: a write path and a read path" and "How do you stop a wrong memory from compounding?".
+- Retrieval: <LabRef lab="vector-index" inline /> and <LabRef lab="rag" inline />. A simple memory class to critique: <LabRef lab="agent-framework" inline />.

@@ -1,0 +1,180 @@
+---
+question: infra-097
+family: cache-coding
+status: published
+labs: [kv-cache]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "In C I'll build the hash map myself with separate chaining, and make each node intrusive: one allocation that
+> sits in both its bucket chain and the recency list. The table is a power of two at least twice the capacity, so
+> it never resizes and the bucket index is a bit mask. Eviction reuses the oldest node instead of freeing and
+> allocating. The file format starts with a magic number, uses fixed-width integers, and the loader checks every
+> length field before trusting it, because a file on disk is untrusted input."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you can build the data structures yourself and handle memory and bytes
+without a library to lean on.
+
+In Java, Go or Python, an LRU cache is a few lines on top of a built-in hash map and a linked list, and the runtime
+frees memory for you. In C there is no built-in hash map, no list, and no garbage collector. Every pointer you
+forget to update is a crash or a silent corruption, and every byte you read from a file can lie. The question is
+less about the eviction rule and more about **pointer discipline** (every link updated in every structure), **ownership**
+(who frees what), and **defensive parsing** of a file you wrote yourself.
+
+The report comes from an NVIDIA candidate. It lists an LRU cache "with serialization and evolving constraints" and
+a hash map "without any STL", next to `memcpy` versus `memmove` and an alignment macro (<Cite id="s-21ef4a7dbc" />).
+
+### Words you need first
+
+- **LRU** (least recently used): when the cache is full, evict the entry unused for longest. It is built from a
+  hash map (for lookup) and a doubly linked list ordered by use (for eviction).
+- The **STL** is C++'s standard template library: `std::list`, `std::unordered_map` and the rest. "Without the
+  STL" means writing those yourself.
+- **Separate chaining** is a hash table design where each bucket holds a linked chain of the entries whose keys
+  hash to it.
+- An **intrusive** node carries the link pointers for every structure it belongs to inside itself, instead of
+  being wrapped by each structure. One node, one allocation, two memberships.
+- The **load factor** is entries divided by buckets. Low means short chains and fast lookups.
+
+## Clarify first
+
+Spend one minute on the setup. Say your assumptions out loud:
+
+- **C or C++ without the STL?** "I'll assume C11, which also rules out `std::list` and `std::unordered_map`."
+- **Key and value types?** "I'll assume `int` keys and values. With strings I'd own copying and freeing them, and
+  I'd say so."
+- **Can the hash table resize?** "An LRU never holds more than `cap` keys, so I'll use a fixed table sized when the
+  cache is created."
+- **Where is the file read?** "I'll assume the same machine reads it back. Across architectures I'd also fix the
+  byte order."
+
+## Answer
+
+### The layout, as a picture
+
+Here is a cache with capacity 3 holding keys 7, 12 and 3, with 8 buckets (a power of two, at least 2 × 3):
+
+```
+buckets[0..7]                    recency list
+  [3] → node(3)                  head ⇄ node(12) ⇄ node(7) ⇄ node(3) ⇄ tail
+  [4] → node(12) → node(7)              most recent        least recent
+  others → NULL
+```
+
+Each node appears once in memory but is reachable two ways: through its bucket's `chain` pointer and through
+`prev`/`next` in the recency list. (The bucket numbers are illustrative.) The two **sentinel** nodes, `head` and
+`tail`, are dummy nodes embedded in the cache struct. They never hold data, so there is no "empty list" special
+case. Because the table has 8 buckets, the index is `hash & 7`, a bit mask instead of a division.
+
+At most 3 entries in 8 buckets keeps the load factor at or below 0.5 without ever resizing.
+
+```c
+typedef struct Node {
+    int key, val;
+    struct Node *prev, *next;   /* recency list */
+    struct Node *chain;         /* next node in the same bucket */
+} Node;
+
+static Node *find(LRU *c, int key) {
+    for (Node *n = c->buckets[bucket_of(c, key)]; n; n = n->chain)
+        if (n->key == key) return n;
+    return NULL;
+}
+
+static void map_remove(LRU *c, Node *n) {
+    Node **pp = &c->buckets[bucket_of(c, n->key)];
+    while (*pp != n) pp = &(*pp)->chain;   /* pointer-to-pointer: no special case for the head */
+    *pp = n->chain;
+}
+```
+
+`map_remove` uses a **pointer to a pointer**: `pp` points at whichever pointer currently leads to the node, either
+the bucket slot or the previous node's `chain`. Removing the node is then one assignment, with no special case for
+the first node in the chain. Say: "Pointer-to-pointer removal means the head of the chain isn't special."
+
+### Follow one eviction
+
+The cache above is full. `lru_put(9, 90)` arrives.
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| 1 | `find(9)` walks the chain of key 9's bucket and returns NULL. | "Miss, and the cache is full, so I evict." |
+| 2 | The victim is `tail.prev`, node(3). Unlink it from the recency list. | "Oldest node, found in O(1)." |
+| 3 | `map_remove` unlinks node(3) from its bucket's chain. | "Forget this and the bucket keeps a pointer to a node I'm about to reuse." |
+| 4 | Overwrite the node's key and value with 9 and 90. Push it onto the chain of key 9's bucket and at the front of the list. | "Reusing the node saves a `free` and a `malloc` on every miss." |
+
+### Saving and loading
+
+Write a magic number (fixed bytes at the start of the file that say what kind of file it is), the capacity and the
+count, then `(key, value)` pairs from least to most recent. Writing oldest first means replaying them through
+`lru_put` rebuilds the recency order. On load, check every field before trusting it.
+
+```c
+LRU *lru_load(FILE *f) {
+    char magic[4]; uint64_t cap, size;
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "LRU1", 4) != 0) return NULL;
+    if (fread(&cap, 8, 1, f) != 1 || fread(&size, 8, 1, f) != 1) return NULL;
+    if (cap == 0 || size > cap || cap > (1u << 30)) return NULL;   /* never trust a length field */
+    LRU *c = lru_new((size_t)cap);
+    if (!c) return NULL;
+    for (uint64_t i = 0; i < size; i++) {
+        int32_t kv[2];
+        if (fread(kv, 4, 2, f) != 2 || !lru_put(c, kv[0], kv[1])) { lru_free(c); return NULL; }
+    }
+    return c;
+}
+```
+
+Fixed-width types (`int32_t`, `uint64_t`) make the sizes explicit, so the file means the same thing on every
+compiler. Across machines, also fix the byte order: write little-endian explicitly, byte by byte. The bound check
+on `cap` matters most. A corrupted or hostile file that says "capacity: 4 billion" must not become a giant
+allocation. Say: "The file is input. I check the magic, the bounds and every read's return value."
+
+The family's C version passed 2,000 randomized trials against an array-based oracle (a slow, simple version you
+trust), each with a save-and-load round trip, plus a corrupted-header test. It ran under AddressSanitizer and
+UndefinedBehaviorSanitizer (compiler options that stop the program on out-of-bounds access, use after free, and
+undefined behaviour) on 2026-10-12.
+
+If they ask about `memmove` here: shifting entries inside an array-based structure means the source and
+destination overlap. That needs `memmove`; `memcpy` is undefined on overlap.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="LRU in C"
+  senior={["Writes a correct chained hash map and intrusive list with sentinels, frees everything, and serializes with fixed-width types."]}
+  staff={["Treats the file as untrusted input (magic, bounds, partial reads), states the portability limits, and tests with sanitizers and a randomized oracle."]}
+/>
+
+In plain terms: a Senior candidate writes C that is correct and leak-free. A Staff candidate also treats the file
+as hostile, says where the format stops being portable, and proves the code with sanitizers and random tests.
+
+## Small-team version
+
+Outside systems roles this is interview-only: a small AI team uses a library cache and never writes this in C.
+
+The habit that carries over is parsing defensively. An AI team loads many files it didn't write: model files,
+tokenizer files (the vocabulary a language model uses to split text), and caches saved to disk. Any of them can be
+truncated by a failed download or crafted by an attacker. A length field you didn't check becomes a huge
+allocation, and an unchecked read becomes garbage data. Prefer loaders that validate sizes, and formats that don't
+run code on load. Say: "Treat every file you load like a request from the internet."
+
+## Pitfalls
+
+- **Forgetting to unlink the evicted node from its bucket chain.** The bucket then holds a dangling pointer to a
+  node that has been reused.
+- **Hashing negative keys with `%`.** In C, `-7 % 8` is negative, so the index is out of range; cast to unsigned
+  first.
+- **Writing `int` and `size_t` to disk.** Their sizes vary by platform, so the file can't be read elsewhere.
+- **Trusting the count field on load.** A corrupted count becomes an enormous allocation or a read past the end.
+
+## Go deeper
+
+- Family walkthrough: [Caches in coding rounds](/system-design-labs/interviews/walkthroughs/cache-coding/), the C variant and the verification section.
+- More C/C++ systems questions: [systems concurrency primitives](/system-design-labs/interviews/walkthroughs/systems-concurrency-primitives/).
+- Lab: <LabRef lab="kv-cache" inline /> (Rust, with an O(n) eviction scan you can replace).

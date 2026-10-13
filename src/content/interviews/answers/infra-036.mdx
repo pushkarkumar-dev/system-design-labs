@@ -1,0 +1,177 @@
+---
+question: infra-036
+family: roofline-sharded-matmul
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Both GPUs already hold A and B, so the inputs never move; only the result does. I split C by rows: each GPU
+> computes half of C completely, with no adding up and no extra rounding. If both need all of C, they swap
+> halves. On NVLink the swap is much shorter than the math, so I hide it: I cut each half into chunks, compute
+> on one stream, send on another, and use events so a chunk is sent only after it is computed. On PCIe the swap
+> takes longer than the math, so there two GPUs barely help."
+>
+> The rest of this page explains each part of that answer.
+
+This looks like an algorithm question, but most of it is a concurrency question you already know. Think of two
+worker threads that each compute half of a result and must hand their half to the other. You'd want each worker
+to start sending finished pieces while it computes the next ones, and you'd need a signal so nobody reads or
+overwrites a buffer too early. The GPU version is the same: two queues of work per GPU, and markers that say
+"this piece is done".
+
+What is different is the cost balance. On a GPU the math is extremely fast, so moving data between GPUs can
+easily cost more than computing it. The whole design follows from noticing what has to move.
+
+(A PracHub listing for a Google machine-learning engineer technical screen, 2025: compute C = A × B on two GPUs
+when A and B "must be resident on both devices", choosing a partition, collectives or point-to-point
+operations, overlap of compute and communication, and streams and events for correctness
+<Cite id="s-86daab52b4" />. PracHub is a site that collects reported questions.) The key observation is in the
+setup: the inputs are already everywhere, so only C has to move. The rest tests whether you can schedule GPU
+work asynchronously without races.
+
+### Words you need first
+
+- A **matmul** is `C = A × B` with A of size M × K and B of size K × N. It costs **2MKN FLOPs** (floating-point
+  operations, counting a multiply-add as 2). The kernel that does it is called a **GEMM**.
+- A **CUDA stream** is a queue of GPU work that runs in order (**CUDA** is NVIDIA's GPU programming platform).
+  Work on two different streams can run at the same time.
+- An **event** is a marker recorded in one stream that another stream can wait on, much like a future or a latch.
+- **NCCL** is NVIDIA's library for moving data between GPUs. An **all-gather** gives every GPU all the slices;
+  **send/recv** is a plain point-to-point transfer.
+- **NVLink** is NVIDIA's fast direct link between GPUs in one machine. **PCIe** is the ordinary expansion bus,
+  much slower.
+
+## Clarify first
+
+- **Where does C go?** "Does each GPU need all of C, or can each keep half? I'll assume both need all of C, the
+  harder case."
+- **Sizes and precision?** "M = K = N = 8,192, bf16 inputs (2 bytes per number), sums kept in fp32 (4 bytes)
+  inside the multiply, bf16 output."
+- **Link?** "NVLink, 450 GB/s each way on an H100, or PCIe Gen5, 64 GB/s each way?"
+- **Libraries?** "I'll assume CUDA, cuBLAS (NVIDIA's matmul library) and NCCL are available."
+
+## Answer
+
+### The worked example: an 8,192-cubed multiply on two H100s
+
+Each H100 does about 989.5 trillion dense bf16 FLOPs per second. We follow one multiply from choosing the split
+to reading the final C.
+
+| Step | Decision | Number | What to say in the interview |
+|---|---|---|---|
+| 1 | Split C by rows (M) | 556 µs of math per GPU | "Each half is complete; no reduction." |
+| 2 | Size the swap | Each half of C is 67.1 MB | "Only C moves." |
+| 3 | Swap over NVLink | 149 µs | "Shorter than the math, so it can hide." |
+| 4 | Swap over PCIe Gen5 | 1,049 µs | "Longer than the math: the link sets the time." |
+| 5 | Overlap in 8 chunks | about 19 µs exposed on NVLink | "Only the last chunk's send is visible." |
+
+### Step 1: partition on M (or N)
+
+GPU 0 computes the top half of C's rows, GPU 1 the bottom half. Each half is complete, so there is no reduction
+and no extra rounding.
+
+**Don't split K**, the inner dimension. Each GPU would produce a full-size partial C (134 MB in bf16, 268 MB if
+kept in fp32) and need an all-reduce to add them. That moves more bytes and buys nothing when the inputs are
+already on both GPUs.
+
+Say it like this: "The inputs are replicated, so splitting K only adds a full-size reduction. I split M."
+
+### Steps 2–4: compute and exchange time
+
+The math is **556 µs** per GPU. Each half of C is **67.1 MB**. Over NVLink, sending it takes **149 µs**, which
+can hide under the math. Over PCIe Gen5 it takes **1,049 µs**, longer than the math. Both directions run at once,
+so each GPU's send and receive happen in parallel.
+
+**Collective.** An all-gather of the two halves (or a send/recv pair) gives both GPUs all of C.
+
+### Step 5: overlap with streams and events
+
+Split each GPU's half into, say, 8 row chunks:
+
+1. Compute stream: run the GEMM for chunk i into its slot of C, then record event e_i.
+2. Communication stream: wait on e_i, then send chunk i to the peer and receive the peer's chunk i into the
+   other half of C (NCCL send/recv or a peer copy).
+3. The compute stream moves on to chunk i + 1 while chunk i is in flight. The exposed communication is about one
+   chunk: 149 µs ÷ 8 ≈ **19 µs** on NVLink.
+4. Record a final event on the communication stream. Anything that reads C waits on it.
+
+Choosing the chunk count is a trade-off: more chunks hide more communication, but small GEMMs run less
+efficiently.
+
+### Correctness
+
+- **Use non-default streams.** The legacy default stream waits for every other blocking stream, so it would
+  silently serialize the overlap.
+- **Don't overwrite a buffer a pending send still reads.** With reused buffers, double buffer and wait on the event
+  after the send.
+- **Accumulate in fp32 inside the GEMM.**
+
+### Scaling and failure
+
+With D GPUs, the same row split gives each GPU 1 ÷ D of the math, while the all-gather volume per GPU approaches
+all of C. So communication grows relative to compute; keep it inside NVLink. NCCL collectives block if a peer
+dies, so set timeouts and fail the whole operation rather than return half a C.
+
+Say it like this: "If a GPU dies mid-gather, I time out and fail the call. Half a matrix is worse than an error."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Compute and exchange time"
+  expr="compute = 2MKN ÷ (2 × P);  exchange = (M ÷ 2) × N × s ÷ L"
+  vars={[
+    { sym: 'P', meaning: '989.5 × 10¹² dense bf16 FLOP/s (H100)' },
+    { sym: 'L', meaning: 'per-direction link bandwidth; both directions run at once' },
+  ]}
+  example={[
+    'Compute: 2 × 8,192³ ÷ (2 × 989.5 × 10¹²) = 556 µs per GPU. Each half of C: 8,192 × 4,096 × 2 B = 67.1 MB',
+    'NVLink: 67.1 MB ÷ 450 GB/s = 149 µs, hideable. PCIe Gen5: 1,049 µs, longer than the math',
+  ]}
+/>
+
+- **K-split partial C:** 8,192 × 8,192 × 2 B = 134 MB in bf16; × 2 = 268 MB in fp32.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Two-GPU matmul"
+  senior={["Splits on M, rejects K, sizes compute and exchange, and writes the stream/event schedule."]}
+  staff={["Shows the PCIe case flips to communication-bound, chooses chunk count from exposed time vs kernel efficiency, and covers buffer lifetimes and timeouts."]}
+/>
+
+In plain words: Senior gets the split and the schedule right. Staff also notices when the link, not the math,
+sets the time, and covers what happens when buffers are reused or a GPU fails.
+
+## Small-team version
+
+This is framework territory for a small team: PyTorch, NCCL and the serving engine do it for you. The lesson
+that transfers is the arithmetic: on PCIe-only GPUs, moving results can cost more than computing them. So
+prefer one GPU (**quantize**, storing weights in fewer bits, if needed) over splitting work across PCIe cards.
+
+The single card also tends to be cheaper. At RunPod's list prices (fetched 2026-10-11):
+
+- Two always-on **L40S** cards (PCIe only) cost 2 × 730 × $0.79–$1.09 ≈ **$1,150–$1,590 a month**.
+- One **A100 80GB** costs 730 × $1.39–$1.59 ≈ **$1,010–$1,160 a month**, with more memory and no PCIe exchange.
+
+Rent an NVLink machine only when the model doesn't fit one 80 GB card even quantized, or when one card can't
+meet your latency at your batch.
+
+## Pitfalls
+
+- **Splitting K although the inputs are replicated.** It adds a full-size reduction and extra rounding for nothing.
+- **Using total NVLink bandwidth as per-direction.** 900 GB/s is both directions; one direction gets 450.
+- **Launching everything on the default stream.** The legacy default stream serializes the work, so nothing overlaps.
+- **Reusing a send buffer early.** Overwriting it before its transfer completes sends corrupted data.
+
+## Go deeper
+
+- Family walkthrough: [Roofline and sharded-matmul math](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/#derivations), sections 5 and 7.
+- Kernels and streams: [GPU kernel performance](/system-design-labs/interviews/walkthroughs/gpu-kernel-perf/).
+- Count FLOPs in <LabRef lab="transformer" inline />.

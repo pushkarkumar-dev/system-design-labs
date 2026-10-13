@@ -1,0 +1,879 @@
+---
+title: "Systems-level concurrency primitives and race hunting"
+summary: "Four short systems questions: memmove and an alignment macro, a bounded queue many threads share, a thread-safe reference-counted pointer, and a race that only shows up under load. C++ and Go code, run under sanitizers."
+track: ai-infra
+format: coding
+family: systems-concurrency-primitives
+smallTeamFocus: "Use library primitives (std::shared_ptr, channels, queue.Queue, database row locks). Keep the race-hunting method: write the invariant, add load and delay, read the log, and fence anything protected by a lease."
+rounds: [practical-coding, coding-dsa, debugging]
+level: both
+timeboxMin: 45
+order: 346
+status: published
+basedOn: [infra-028, infra-098, r2b-017, r2b-018]
+askedAt: [nvidia, openai]
+labs:
+  - { lab: rate-limiter, role: proof, note: "A real load-dependent race: its sliding-window limiter is check-then-act, every access is atomic, and go test -race reports nothing while the concurrency test still fails intermittently." }
+  - { lab: dist-lock, role: proof, note: "Lease-based locks and fencing tokens in Go: the fix for the stale-lock-holder race built in this walkthrough." }
+  - { lab: logical-clocks, role: background, note: "Lamport and vector clocks, for ordering events from a distributed mockup when wall-clock timestamps lie." }
+gapLabs: []
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "Each of these is small, so I'll state the rule first and then write the code. `memmove` is `memcpy` that
+> survives overlapping ranges: it copies backwards when the destination sits after the source. A shared
+> bounded queue is a mutex plus two condition variables, with a close operation so nobody waits forever. A
+> shared pointer's count can be bumped up with no ordering, but the decrement that reaches zero must be ordered,
+> because every thread's use of the object has to finish before the delete. And a race that only shows up under
+> load is usually a protocol bug, not a memory bug: I'd write the invariant, add load and delay until it breaks,
+> read the log, and fix it with something like a fencing token."
+>
+> The rest of this page explains each part of that answer, and builds it in code, one stage at a time.
+
+### What makes this different from the concurrency you already write
+
+As a backend engineer you handle concurrency every day, but almost always through something someone else built.
+The database gives you transactions and row locks. Go gives you channels. Java gives you `ConcurrentHashMap`.
+Redis gives you `SET NX` with an expiry. You pick the right tool and trust it.
+
+These four questions take that away. You are asked to **build** the tool, and two things you normally never see
+become the whole point.
+
+1. **The processor does not run your memory writes in the order you wrote them.** Inside one thread everything
+   looks in order. But another thread, on another core, can see your writes arrive in a different order, because
+   both the compiler and the CPU reorder work to go faster. A mutex hides this from you: everything one thread did
+   before it unlocked is visible to the next thread that locks. Once you write code without a mutex, you have to
+   say yourself which writes must be visible before which. That is what the smart-pointer question really tests.
+2. **A program can be "fully locked" and still be wrong.** Every single read and write can be protected, and the
+   sequence of steps can still go wrong when one step is slow. That is what the race-hunting question tests, and
+   it is the part of this page you will use at work.
+
+The other two questions (the copy function and the queue) are warm-ups for the same habit: state what your code
+assumes, then show it holds.
+
+### The four questions as given
+
+- In C or C++, define the difference between `memcpy` and `memmove`, implement both, and write a macro that
+  rounds a size up to the next multiple of an alignment.
+- Implement a thread-safe reference-counted smart pointer in C++.
+- Implement (or design) a multi-producer, multi-consumer circular buffer.
+- Find a race condition that only shows up under high load in a mockup of a distributed system.
+
+<QuestionRow id="infra-098" />
+<QuestionRow id="r2b-017" />
+<QuestionRow id="r2b-018" />
+<QuestionRow id="infra-028" />
+
+The first three were reported for NVIDIA (<Cite id="s-21ef4a7dbc" />, <Cite id="s-1f1d1ddaac" />) and the
+fourth for OpenAI (<Cite id="s-3b9dae2c4c" />). The evidence is thin; the end of "What is being tested" says
+exactly what each report contains.
+
+### Words you need first
+
+- A **thread** is one line of execution inside a process. Threads share the same memory, which is why they can
+  step on each other.
+- A **data race** is two threads touching the same memory at the same time, at least one of them writing, with
+  nothing (no lock, no atomic) coordinating them. In C++ that is undefined behaviour: the program is allowed to do
+  anything.
+- An **atomic** operation is one the hardware does as a single indivisible step, such as "add 1 to this counter
+  and give me the old value". Two threads can do it at once without a lock and the count stays right.
+- A **sanitizer** is a compiler mode that adds checks to your program while it runs. **ThreadSanitizer** (TSan)
+  reports data races. **AddressSanitizer** (ASan) reports bad memory use, such as reading freed memory.
+  **UndefinedBehaviorSanitizer** (UBSan) reports things like signed overflow. Go has the same idea built in as
+  `go test -race`.
+
+### One imagined worker that ties the four together
+
+The interview asks each question on its own. To keep them connected on this page, picture one small worker
+process inside an AI service. Requests come in, get queued, and are handled by a pool of worker threads that
+share one loaded model and write results to a storage service.
+
+```text
+HTTP handlers (many producer threads)
+   │  push a job
+   ▼
+Bounded ring buffer ─────────────── stage 2: a queue many threads share
+   │  pop a job
+   ▼
+Worker threads (many consumers) ─── stage 3: all share one model handle
+   │  copy the input into an aligned buffer ── stage 1: memmove + ALIGN_UP
+   │  take a lease, read, compute, write
+   ▼
+Lock service + storage ──────────── stage 4: the race that appears under load
+```
+
+**The ring buffer** holds jobs between the handlers that accept them and the workers that run them. It has a
+fixed size, so a flood of requests makes handlers wait instead of using up all memory.
+
+**The worker threads** all use the same loaded model. A reference-counted pointer keeps the model alive while any
+worker still uses it, and frees it exactly once when the last one lets go.
+
+**The copy step** moves request bytes into a buffer whose size is rounded up to an alignment the hardware likes.
+That is `memmove` plus the alignment macro.
+
+**The lock service and storage** decide which worker owns a job and hold the result. When a worker stalls at the
+wrong moment, two workers can both think they own the job. That is the race in stage 4.
+
+All code on this page was compiled and run on 2026-10-12 on an Apple M1 Ultra. The C++ was built with Apple
+clang 21 under ThreadSanitizer and, separately, under AddressSanitizer plus UndefinedBehaviorSanitizer. The Go
+mockup was run with Go 1.26.9 and `-race`.
+
+## What is being tested
+
+No source states a rubric for these rounds, so this section is a reading of the questions, not a report.
+
+**Definitions you can defend.** `memcpy` versus `memmove` is one sentence (overlap). Then you write code that
+copies in the right direction. The alignment macro tests whether you can work with bits, and whether you say out
+loud what it assumes (the alignment is a power of two) and where it breaks (very large sizes wrap around to 0).
+
+**Memory ordering with reasons.** For the smart pointer, every candidate makes the count atomic. The real question
+is which **ordering** each operation needs and why. Ordering is the promise about which *other* memory writes
+become visible together with the atomic one. The short answer is: the increment needs none, the final decrement
+does. You will see why in stage 3.
+
+**Blocking behaviour.** For the ring buffer: what happens when it is full or empty, how producers and consumers
+wake each other, and how the queue shuts down. A version with no lock at all is a stretch goal, not the
+baseline.
+
+**Debugging method when results are random.** For the race: turn "sometimes wrong under load" into three
+things. A rule you can check (the **invariant**), a load or delay you can turn up until it breaks, and a fix you
+can show holds at that same load.
+
+Say this when you start: "I'll state the precondition of everything I write in a comment. Then each follow-up
+is a small change, not a rewrite."
+
+These questions sit closer to systems-software interviews than to AI work. The other questions on the same
+NVIDIA account (an LRU cache with serialization, a hashmap without the STL, C++'s standard library of containers) point the same way
+(<Cite id="s-21ef4a7dbc" />). Expect follow-ups that change one constraint at a time: an alignment that is not a
+power of two, an element type that can only be moved and not copied, weak references, a second consumer.
+
+### Where these were reported
+
+The NVIDIA memory
+questions come from one first-hand account, a Software Engineer in India who interviewed about five months
+before 2026-10-11. It lists "Implement memcpy and memmove from scratch, first defining the difference between
+them", and, in the phone interview, "a macro which takes size, alignment as input and returns the next size
+which is aligned to alignment" (<Cite id="s-21ef4a7dbc" />). The same loop had an LRU cache with serialization
+and a hashmap without the STL.
+The smart pointer and the ring buffer are PracHub titles on NVIDIA's Software Engineer page, both tagged Senior+: "Implement a Thread-Safe Reference-Counted Smart Pointer in C++" (dated
+2026-09-15) and "Design a Multi-Producer Multi-Consumer Circular Buffer" (2026-07-16), read on 2026-10-12
+(<Cite id="s-1f1d1ddaac" />). Only the titles are candidate-reported. The OpenAI race hunt comes from a
+Glassdoor snippet for a Senior Software Engineer loop that we could not re-open (the page returned 403 on
+2026-10-11), so treat its wording as approximate (<Cite id="s-3b9dae2c4c" />).
+
+## Clarify and scope
+
+Spend a minute writing down your assumptions. Each one removes a trap.
+
+- **Language and standard.** C or C++? Which standard? Assume C++20 with `std::atomic`, and write the C-style
+  functions so they would compile as C too.
+- **memmove.** May your `memmove` call the library's `memmove`? Assume no.
+- **Alignment.** Always a power of two? Assume yes, and offer a general version as well.
+- **Smart pointer.** Like `std::shared_ptr`, with a separate small object that holds the count (a **control
+  block**), or **intrusive**, with the count stored inside the object itself? Weak references? A custom deleter?
+  Assume a control block, no weak pointer, and plain `delete`.
+- **Ring buffer.** Should a full queue make the caller wait (**blocking**) or return failure straight away
+  (**try-only**)? Can elements be copied, or only moved? Fixed capacity? Assume blocking with a close
+  operation, works with move-only types, fixed capacity.
+- **Race hunt.** May you change the code, add logging, run it many times and inject delays? Assume yes to all.
+
+Out of scope: weak pointers, custom allocators, `std::atomic<shared_ptr>`, a queue with a guaranteed bound on
+every operation (**wait-free**), and redesigning the whole mockup.
+
+Say it like this: "I'll do the simple correct version of each first, test it under a sanitizer, and then talk
+about the faster version if we have time."
+
+## Plan before code
+
+Here is the plan, one stage per question. The last column is how each stage is checked, so you know before you
+write a line what "done" looks like.
+
+| Stage | Question | Core idea | How it is checked |
+|---|---|---|---|
+| 1 | infra-098 | copy forwards or backwards by pointer order; `(n + a − 1) & ~(a − 1)` | 20,000 random overlapping copies against the library `memmove`; `static_assert`s |
+| 2 | r2b-018 | mutex plus two condition variables; then per-slot sequence numbers | 8 producers × 8 consumers, 160,000 items, sum and count; TSan |
+| 3 | r2b-017 | relaxed increment, acquire-release final decrement | 8 threads × 1,000 copy, move and assign loops, 200 objects destroyed exactly once; TSan, ASan |
+| 4 | infra-028 | lease expires during a pause; fencing tokens | lost updates under load without fencing, none with it; `-race` |
+
+Don't worry if some words in the table are new (condition variable, relaxed, acquire-release, lease, fencing
+token). Each one is explained in its stage below, before it is used in code.
+
+A `static_assert` is a check the compiler runs at build time; if it fails, the code does not compile. It is a
+cheap way to prove the macro on known inputs.
+
+## Solution in stages
+
+### Stage 1: memcpy, memmove and the alignment macro
+
+**The rule.** Both functions copy `n` bytes from a source address to a destination address. `memcpy` may assume
+the two ranges do not overlap. If they do, cppreference says "the behavior is undefined"
+([cppreference, memcpy](https://en.cppreference.com/w/c/string/byte/memcpy), read 2026-10-12). `memmove` must
+work as if the bytes were "copied to a temporary character array" first
+([cppreference, memmove](https://en.cppreference.com/w/c/string/byte/memmove)). Real libraries get the same
+result without a temporary: they copy forwards when the destination starts before the source, and backwards
+otherwise.
+
+**Why direction matters, on eight bytes.** Take a buffer holding `ABCDEFGH`. Move 5 bytes from position 0 to
+position 2. The right answer is `ABABCDEH`: the first five letters, shifted right by two.
+
+| Copy order | What happens | Result |
+|---|---|---|
+| Forwards | The first copy writes `A` into position 2, over the `C` you still need. Two steps later you copy that `A` again instead of `C`. | `ABABABAH` (wrong) |
+| Backwards | You copy position 4 to 6 first, then 3 to 5, and so on. Every byte is read before anything overwrites it. | `ABABCDEH` (right) |
+
+Say it like this: "If the destination is after the source and they overlap, a forward copy reads bytes it has
+already overwritten. So I copy backwards in that case."
+
+```cpp
+// Round n up to a multiple of a. a must be a power of two.
+#define ALIGN_UP(n, a)     (((n) + ((a) - 1)) & ~((a) - 1))
+#define IS_POW2(a)         ((a) != 0 && (((a) & ((a) - 1)) == 0))
+#define ALIGN_UP_ANY(n, a) ((((n) + (a) - 1) / (a)) * (a))   // any a > 0, costs a divide
+
+void* my_memcpy(void* dst, const void* src, size_t n) {
+  auto* d = static_cast<unsigned char*>(dst);
+  auto* s = static_cast<const unsigned char*>(src);
+  for (size_t i = 0; i < n; i++) d[i] = s[i];
+  return dst;
+}
+
+void* my_memmove(void* dst, const void* src, size_t n) {
+  auto* d = static_cast<unsigned char*>(dst);
+  auto* s = static_cast<const unsigned char*>(src);
+  if (d == s || n == 0) return dst;
+  // Compare addresses as integers: < on pointers into different objects is unspecified.
+  if (reinterpret_cast<uintptr_t>(d) < reinterpret_cast<uintptr_t>(s)) {
+    for (size_t i = 0; i < n; i++) d[i] = s[i];          // forwards
+  } else {
+    for (size_t i = n; i > 0; i--) d[i - 1] = s[i - 1];  // backwards
+  }
+  return dst;
+}
+```
+
+**Why the address comparison goes through `uintptr_t`.** `uintptr_t` is an unsigned integer type wide enough to
+hold an address. The C and C++ standards do not say what "less than" means for two pointers into different
+objects, and `memmove` can be called with exactly that. Comparing the addresses as plain integers sidesteps the
+question.
+
+**What alignment means.** Hardware reads memory fastest, and some instructions only work, when an address or a
+size is a multiple of some number such as 8, 16 or 64. That number is the **alignment**. "Round 9 up to an
+alignment of 16" means "give me the smallest multiple of 16 that is at least 9", which is **16**. Rounding 16 up
+gives **16**, because it is already aligned.
+
+**Why the macro works.** When the alignment `a` is a power of two, `a − 1` is a block of 1-bits at the bottom of
+the number (15 is binary `1111`). Adding `a − 1` pushes any value that is not already a multiple over the next
+multiple. Then `& ~(a − 1)` clears the bottom bits, which rounds down to that multiple. The bit-by-bit version is
+in the box below.
+
+Three more things to say without being asked:
+
+- **Double evaluation.** A macro pastes its arguments in as text. `ALIGN_UP` uses `a` twice, so
+  `ALIGN_UP(n, a++)` adds 1 to `a` twice. A `static inline` function avoids this.
+- **Overflow.** Near the largest `size_t` value (`SIZE_MAX`) the addition wraps around. `ALIGN_UP(SIZE_MAX − 3, 8)`
+  gives **0**, and the test on this page checks that it does. A caller that then allocates 0 bytes and writes a
+  large amount has a buffer overflow. Check before allocating.
+- **Speed.** A production `memcpy` first aligns the pointers, then copies whole machine words or vector registers,
+  then the leftover bytes. Mention it; do not write it unless asked.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- `ALIGN_UP(9, 16)`: 9 + 15 = 24, which is binary `11000`. `~15` is a mask with the low four bits cleared.
+  `11000 & ...10000` = `10000` = **16**.
+- `ALIGN_UP(16, 16)`: 16 + 15 = 31 = binary `11111`. Clearing the low four bits leaves `10000` = **16**.
+- `ALIGN_UP(SIZE_MAX − 3, 8)`: (SIZE_MAX − 3) + 7 = SIZE_MAX + 4, which wraps around to 3. Then 3 `&` `~7` =
+  **0**.
+- `IS_POW2(a)`: a power of two has exactly one 1-bit, so `a & (a − 1)` clears it and gives 0. For 12 (`1100`),
+  12 `&` 11 (`1011`) = 8 (`1000`), not 0, so 12 is rejected.
+- `ALIGN_UP_ANY(9, 12)`: (9 + 11) ÷ 12 = 1 in integer division, × 12 = **12**. It works for any positive `a` but
+  needs a divide, which is much slower than a mask.
+
+</details>
+
+### Stage 2: the ring buffer
+
+**What it is.** A **ring buffer** (or circular buffer) is a fixed-size array used as a queue. A `head` index says
+where the next item will be taken from. When an index reaches the end of the array it wraps back to 0, so the
+same slots are reused forever. **Multi-producer, multi-consumer** (MPMC) means many threads push and many threads
+pop at the same time.
+
+**Two words you need for the code.** A **mutex** lets one thread at a time into a section of code. A **condition
+variable** lets a thread sleep, with the mutex released, until another thread signals that something changed.
+`wait(lock, predicate)` sleeps until the predicate (a small true-or-false check) is true. It re-checks the
+predicate every time it wakes, which matters because a thread can wake with no signal at all (a **spurious
+wake-up**), or wake to find another thread already took the item.
+
+Write the blocking version first. It is short, clearly correct, and what most real systems use:
+
+```cpp
+template <class T>
+class BlockingRing {
+ public:
+  explicit BlockingRing(size_t cap) : buf_(cap), cap_(cap) {}
+
+  void push(T v) {
+    std::unique_lock<std::mutex> lk(mu_);
+    not_full_.wait(lk, [&] { return count_ < cap_ || closed_; });
+    if (closed_) return;
+    buf_[(head_ + count_) % cap_] = std::move(v);
+    ++count_;
+    not_empty_.notify_one();
+  }
+
+  std::optional<T> pop() {                  // nullopt = closed and drained
+    std::unique_lock<std::mutex> lk(mu_);
+    not_empty_.wait(lk, [&] { return count_ > 0 || closed_; });
+    if (count_ == 0) return std::nullopt;
+    T v = std::move(buf_[head_]);
+    head_ = (head_ + 1) % cap_;
+    --count_;
+    not_full_.notify_one();
+    return v;
+  }
+
+  void close() {
+    std::lock_guard<std::mutex> lk(mu_);
+    closed_ = true;
+    not_full_.notify_all();
+    not_empty_.notify_all();
+  }
+
+ private:
+  std::vector<T> buf_;
+  size_t cap_, head_ = 0, count_ = 0;
+  bool closed_ = false;
+  std::mutex mu_;
+  std::condition_variable not_full_, not_empty_;
+};
+```
+
+**Follow it with a capacity of 4.** Start with `head = 0` and `count = 0`. Our imagined HTTP handlers push jobs
+A, B, C and D into slots 0, 1, 2 and 3, and `count` becomes 4. A fifth handler calls `push(E)`. The predicate
+`count < cap` is false, so it sleeps on `not_full_`. A worker pops: it takes A from slot 0, moves `head` to 1,
+drops `count` to 3, and calls `not_full_.notify_one()`. The sleeping handler wakes, re-checks the predicate
+(now true), and writes E into slot `(1 + 3) % 4 = 0`, the slot A just left. That reuse is the "ring".
+
+Points an interviewer checks, and what to say about each:
+
+- **Predicate waits.** "The wait re-checks the condition, so a spurious wake-up or a stolen item can't make me
+  read an empty slot."
+- **Two condition variables.** "A push wakes a consumer, not another producer. With one shared condition variable
+  and `notify_one`, the wrong kind of thread can get the signal and everyone stalls."
+- **A count.** "If I only kept head and tail, head equal to tail could mean empty or full. The count tells them
+  apart."
+- **Close.** "`close` wakes everyone. Producers stop, and consumers drain what is left and then get `nullopt`.
+  Without it, worker threads block forever at shutdown."
+
+**The stretch: no mutex at all.** Under heavy contention, threads spend their time queueing for the one mutex.
+The well-known alternative puts a **sequence number** in every slot and uses atomic operations instead of a lock.
+It needs two more terms.
+
+- **Compare-and-swap** (CAS) is an atomic "if this value is still X, set it to Y, and tell me whether it worked".
+  Two threads can race to CAS the same counter and exactly one wins.
+- A **release store** is a write that publishes every write the thread made before it. An **acquire load** is a
+  read that, if it sees a released value, also sees everything written before that release. Used as a pair, they
+  hand data safely from one thread to another without a lock.
+
+The protocol is this. A producer wants position `pos`. It may claim the slot when the slot's sequence equals
+`pos`. It claims by CAS on the shared tail counter, writes the value, then publishes with a release store of
+`pos + 1`. A consumer at position `pos` claims when the sequence equals `pos + 1`, reads the value, then frees the
+slot for the next trip round the ring by storing `pos + capacity`. This is the design usually credited to Dmitry
+Vyukov; the code below was written and tested for this page.
+
+```cpp
+template <class T>
+class SeqRing {                                  // capacity must be a power of two
+  struct alignas(64) Cell { std::atomic<size_t> seq; T val; };
+ public:
+  explicit SeqRing(size_t cap) : cells_(cap), mask_(cap - 1) {
+    for (size_t i = 0; i < cap; i++) cells_[i].seq.store(i, std::memory_order_relaxed);
+  }
+  bool try_push(T v) {
+    size_t pos = tail_.load(std::memory_order_relaxed);
+    for (;;) {
+      Cell& c = cells_[pos & mask_];
+      size_t seq = c.seq.load(std::memory_order_acquire);
+      intptr_t diff = (intptr_t)seq - (intptr_t)pos;
+      if (diff == 0) {
+        if (tail_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
+          c.val = std::move(v);
+          c.seq.store(pos + 1, std::memory_order_release);   // publish
+          return true;
+        }
+      } else if (diff < 0) {
+        return false;                                      // full
+      } else {
+        pos = tail_.load(std::memory_order_relaxed);       // another producer won
+      }
+    }
+  }
+  bool try_pop(T& out) {
+    size_t pos = head_.load(std::memory_order_relaxed);
+    for (;;) {
+      Cell& c = cells_[pos & mask_];
+      size_t seq = c.seq.load(std::memory_order_acquire);
+      intptr_t diff = (intptr_t)seq - (intptr_t)(pos + 1);
+      if (diff == 0) {
+        if (head_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
+          out = std::move(c.val);
+          c.seq.store(pos + mask_ + 1, std::memory_order_release);  // free for next lap
+          return true;
+        }
+      } else if (diff < 0) {
+        return false;                                      // empty
+      } else {
+        pos = head_.load(std::memory_order_relaxed);
+      }
+    }
+  }
+ private:
+  std::vector<Cell> cells_;
+  size_t mask_;
+  alignas(64) std::atomic<size_t> tail_{0};
+  alignas(64) std::atomic<size_t> head_{0};
+};
+```
+
+**Follow one slot with a capacity of 4.** At the start the four slots hold sequence numbers 0, 1, 2 and 3. A
+producer at position 0 sees slot 0's sequence is 0, equal to its position, so it wins the CAS, writes job A, and
+stores 1. A consumer at position 0 looks for sequence 0 + 1 = 1, finds it, takes A, and stores 0 + 4 = 4. When a
+producer later reaches position 4, it lands on slot 0 again (4 mod 4 is 0) and finds sequence 4, so it may write.
+If it arrived before the consumer had taken A, it would have found sequence 1, which is less than 4: the ring is
+full, and `try_push` returns false.
+
+Because the capacity is a power of two, `pos & mask_` gives the slot without a divide (the same bit trick as
+stage 1).
+
+Be honest about its limits. These are what a strong candidate says next:
+
+- **It is not strictly lock-free.** "Lock-free" in the textbook sense means some thread always makes progress,
+  however the others are paused. Here, a producer that claims a slot and is then paused by the operating system
+  (**descheduled**) before it publishes blocks every consumer at that slot until it runs again.
+- **It only offers `try_` operations.** Making callers wait needs a strategy on top: spin, yield, or a futex (a Linux call that lets a thread sleep until a
+  memory word changes) or a condition variable.
+- **It pads against false sharing.** CPUs move memory between cores in fixed chunks called **cache lines**. If
+  two hot counters share one line, every write by one core invalidates the other core's copy, even though they
+  touch different variables. That is **false sharing**. `alignas(64)` puts each cell and each counter on its own
+  64-byte line. The 64 is an assumption about the target's cache-line size.
+
+### Stage 3: the reference-counted pointer
+
+**What it is.** A **reference-counted pointer** (C++'s `std::shared_ptr` is the standard one) keeps a count of
+how many pointers refer to an object. Copying the pointer adds 1. Destroying a copy subtracts 1. Whoever brings
+the count to zero deletes the object. In our imagined worker, every worker thread holds a copy pointing at the
+loaded model, and the model is freed only when the last worker lets go.
+
+```cpp
+template <class T>
+class RcPtr {
+  struct Ctrl { std::atomic<long> refs; T* obj; };
+ public:
+  RcPtr() = default;
+  explicit RcPtr(T* p) : c_(p ? new Ctrl{{1}, p} : nullptr) {}
+  RcPtr(const RcPtr& o) : c_(o.c_) {
+    if (c_) c_->refs.fetch_add(1, std::memory_order_relaxed);
+  }
+  RcPtr(RcPtr&& o) noexcept : c_(std::exchange(o.c_, nullptr)) {}
+  RcPtr& operator=(RcPtr o) noexcept { std::swap(c_, o.c_); return *this; }  // copy-and-swap
+  ~RcPtr() { release(); }
+  T* get() const { return c_ ? c_->obj : nullptr; }
+  T& operator*() const { return *c_->obj; }
+  T* operator->() const { return c_->obj; }
+ private:
+  void release() {
+    if (c_ && c_->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete c_->obj;
+      delete c_;
+    }
+  }
+  Ctrl* c_ = nullptr;
+};
+```
+
+**The three orderings in this code.** C++ lets you choose, per atomic operation, how much ordering to pay for.
+
+- `memory_order_relaxed`: the operation itself is atomic, and that is all. No promise about other memory.
+- `memory_order_release` and `memory_order_acquire`: the publish-and-see pair from stage 2.
+- `memory_order_acq_rel`: both at once, for a read-and-write operation such as `fetch_sub`.
+
+The formal name for "this write is guaranteed visible before that read" is **happens-before**. Interviewers
+like the phrase, and you should be able to say what it means in plain words.
+
+**Follow one model through its life.** The main thread creates the pointer: count 1. Worker A copies it: a
+relaxed `fetch_add`, count 2. The main thread writes some state into the model, then drops its copy. Its
+`fetch_sub` returns 2, so the count is now 1 and nothing is deleted. Worker A finishes and drops its copy. Its
+`fetch_sub` returns 1, so worker A deletes the model.
+
+**Why the increment can be relaxed.** Worker A could only copy the pointer because it already had one, handed to
+it by some other thread. That handover (a queue, a lock, thread start) already synchronized the two threads.
+Boost's atomic documentation says it this way: "New references to an object can only be formed from an existing
+reference, and passing an existing reference from one thread to another must already provide any required
+synchronization"
+([Boost.Atomic usage examples](https://www.boost.org/doc/libs/1_86_0/libs/atomic/doc/html/atomic/usage_examples.html),
+read 2026-10-12). cppreference says the same of typical `shared_ptr` implementations: increments use the
+equivalent of `fetch_add` with `memory_order_relaxed`, while "decrementing requires stronger ordering to safely
+destroy the control block" ([cppreference, shared_ptr](https://en.cppreference.com/w/cpp/memory/shared_ptr)).
+
+**Why the decrement cannot be relaxed.** In the story above, the main thread wrote into the model and then
+dropped its copy. Worker A deletes the model. The main thread's writes must be finished, and visible, before the
+delete runs on another core. Otherwise the destructor can read half-written state, or the memory can be freed
+while a write to it is still landing. The release half of the main thread's decrement publishes its writes. The
+acquire half of worker A's decrement, the one that reaches zero, sees them. Boost does this with a release
+decrement plus an acquire **fence** (a standalone ordering instruction) only on the thread that reaches zero. The
+code above uses `acq_rel` on every decrement, which is simpler to explain and costs a little more on processors
+that reorder memory more freely. Either is correct.
+
+Say it like this: "The increment is relaxed because you can only copy a pointer you already safely have. The
+decrement is acquire-release because every thread's use of the object must happen before the delete, and the
+thread that deletes has to see all of it."
+
+**What "thread-safe" covers.** Different copies of the pointer used in different threads are safe. Two threads
+writing the *same* `RcPtr` object are not. cppreference says that for `shared_ptr`, unsynchronized access to the
+same instance with a non-const member "then a data race will occur", and points to `std::atomic<shared_ptr>`.
+State this boundary before the interviewer asks.
+
+**Copy-and-swap assignment.** `operator=` takes its argument by value (which makes a copy, adding 1), swaps it
+in, and lets the old value be destroyed (subtracting 1). Assigning a pointer to itself is safe because the copy
+keeps the count above zero, and if the copy fails, nothing has changed yet (the **strong exception
+guarantee**). Moving steals the pointer and never touches the count.
+
+### Stage 4: the race that only appears under load
+
+**The words first.** A **lease** is a lock with an expiry time (its **time-to-live**, or TTL). If the holder
+crashes, the lock frees itself when the TTL runs out, so the system does not wait forever. Redis `SET key value
+NX PX 2000` is a lease you have probably used. A **read-modify-write** is "read the value, compute a new one,
+write it back". It is only safe if nobody else writes in between.
+
+**The mockup.** A lock service grants leases. A storage service holds a counter. Workers take a lease, read the
+counter, do some work, write the counter plus one, and release the lease. In our imagined worker this is "claim
+the job, run it, record the result". Every shared field is behind a mutex.
+
+```go
+func (l *LockService) Acquire(id int) (int64, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	if l.holder != 0 && now.Before(l.expires) {
+		return 0, false
+	}
+	l.holder, l.expires = id, now.Add(l.ttl)
+	l.token++ // increases on every grant
+	return l.token, true
+}
+
+// worker loop
+tok, ok := ls.Acquire(id)
+if !ok { time.Sleep(50 * time.Microsecond); continue }
+v := st.Read(tok)
+time.Sleep(pause()) // the work; under load it sometimes outlasts the lease
+err := st.Write(v+1, tok)
+ls.Release(id)
+```
+
+**What happens at light load.** With 4 workers and work that always finishes inside the 20 ms lease, the final
+count is always correct. Nothing is wrong that you can see.
+
+**What happens under load.** Now use 16 workers and a 2 ms lease, and make one critical section in 20 stall for
+3 ms. The stall stands in for a garbage-collection (GC) pause or a saturated CPU. Here is one stall, step by step
+(the log is reconstructed from the mockup's logic, not copied from a run; the times are illustrative):
+
+| Clock | Event | What to say in the interview |
+|---|---|---|
+| 0.0 ms | `w3` acquires the lease, token 41. Reads the counter: 17. | "w3 thinks it owns the record until 2 ms." |
+| 0.1 ms | `w3` stalls in its work. | "This is the GC pause or the overloaded CPU." |
+| 2.0 ms | The lease expires. `w3` does not know. | "Nothing tells a paused process its lease is gone." |
+| 2.1 ms | `w9` acquires, token 42. Reads 17, writes 18. | "The lock service did its job correctly." |
+| 3.1 ms | `w3` wakes and writes 18 with token 41. | "Two increments, final value 18. One is lost." |
+
+Across eight runs on 2026-10-12, the unfenced version lost between **65 and 187 of 800** increments.
+**`go test -race` reported nothing in any run.** Every individual access was synchronized, so there was no data
+race to find. The bug is in the protocol: the order of steps across services. The Go documentation is explicit
+that the race detector "only finds races that happen at runtime"
+([go.dev race detector](https://go.dev/doc/articles/race_detector), read 2026-10-12), and it only finds data
+races, not logic races like this one.
+
+Say it like this: "The race detector finds unsynchronized memory access. This bug has none. Each step is locked;
+the sequence of steps is wrong."
+
+**The fix: a fencing token.** The lock service already hands out a number that goes up on every grant. Make the
+storage service remember the highest token it has seen and refuse anything older. Then a paused holder's late
+write fails instead of overwriting newer work. Martin Kleppmann's 2016 post describes exactly this pause ("the
+client that acquired the lock is paused for an extended period of time while holding the lock") and calls the
+fencing token "simply a number that increases"
+([Kleppmann, 2016-02-08](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)).
+
+For a read-modify-write, record the token on reads too. Otherwise a stale holder can still write between the
+new holder's read and its first write: `w9` reads 17, `w3` slips in a write of 18 with token 41 (still allowed,
+because storage has not seen 42 yet), and then `w9` writes 18 too.
+
+```go
+func (s *Storage) Read(token int64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if token > s.maxToken {
+		s.maxToken = token // a newer holder is working: older writes must fail
+	}
+	return s.val
+}
+
+func (s *Storage) Write(v int, token int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if token < s.maxToken {
+		return ErrStale // caller lost its lease: redo the whole read-modify-write
+	}
+	s.maxToken, s.val = token, v
+	return nil
+}
+```
+
+Replay the table with this storage. At 2.1 ms, `w9`'s read with token 42 raises the stored maximum to 42. At
+3.1 ms, `w3`'s write with token 41 is refused with `ErrStale`. `w3` starts over, takes a fresh lease, and reads
+18. With fencing, all five runs that day reached **800 of 800**, rejecting 43 to 56 stale writes each, which the
+workers retried.
+
+### Reading the interleaving
+
+An **interleaving** is the actual order in which the steps of different threads ran. Once the invariant fails,
+the log of that order is what turns "sometimes wrong" into a cause. Log each operation with the worker, the token
+it holds and the value it read or wrote. Failing runs show a pattern like this one (reconstructed from the
+mockup's logic, not copied from a run):
+
+```text
+w3 acquire token=41
+w3 read    token=41 value=17
+            ... w3 stalls past its 2 ms lease ...
+w9 acquire token=42
+w9 read    token=42 value=17
+w9 write   token=42 value=18
+w3 write   token=41 value=18      <- stale holder overwrites; one increment lost
+```
+
+Two workers read the same value under different tokens, and the older token wrote last. That is the whole
+diagnosis, and it points straight at the fix: storage must refuse token 41 once token 42 has touched the record.
+
+Why log by token and not by timestamp? Clocks on different machines disagree by milliseconds, which is longer
+than this whole race. A token, or a **Lamport clock** (a counter each process increments and passes along with
+every message, so causes always get smaller numbers than their effects), gives an order you can trust. The
+logical-clocks lab builds one.
+
+In the interview, say what you would look for before you run anything: "a read-modify-write that spans a
+blocking call, a lease or timeout that can expire in the middle of it, and a write that does not check whether
+the caller still holds what it thinks it holds." Most load-only races in a distributed mockup have that shape,
+or the shape of **check-then-act** on a shared counter: read "there is room", then act on it, while another
+thread fills the room in between.
+
+**The method, in the order to say it:**
+
+1. Write the invariant the system must keep. Here: the final count equals the increments performed.
+2. Make it checkable at the end of every run.
+3. Raise load and inject delay at the suspicious point until it fails often.
+4. Log every operation with the token or a logical clock, so you can read the interleaving.
+5. Form the hypothesis from the log.
+6. Fix, then rerun at the same load many times.
+
+Running the race detector is step zero, not the answer.
+
+## Verification
+
+Each stage was checked by a **stress test**: many threads doing the operation many times, with a check at the
+end that would catch a lost or duplicated item.
+
+- **Stage 1:** 20,000 random copies within a 64-byte buffer (lengths 0–32, random source and destination, so most
+  overlap) matched the library `memmove` byte for byte. `static_assert`s cover the macros, and a runtime check
+  shows the overflow wrap.
+- **Stage 2:** both rings moved 160,000 items from 8 producers to 8 consumers. Count and sum matched exactly, so
+  no item was lost or delivered twice.
+- **Stage 3:** 200 rounds of 8 threads each doing 1,000 copy, move and assign cycles while the main thread dropped
+  its reference: 200 objects destroyed, each exactly once.
+- All three passed with no reports under ThreadSanitizer, and again under AddressSanitizer with
+  UndefinedBehaviorSanitizer.
+
+**One result is a warning, not a pass.** Changing the final decrement to `memory_order_relaxed` (a real bug)
+still passed the same TSan test in three runs. A clean sanitizer run means no bug was observed on this hardware
+with this schedule. It does not prove the ordering is right on every compiler and processor you might ship to.
+Argue the ordering from the happens-before rules, and use the sanitizer to catch what you missed.
+
+Say it like this: "TSan passing tells me it didn't catch a race in these runs. The ordering argument is what
+tells me it's correct."
+
+- **Stage 4:** `go vet` clean; `go test -race` passed with no race reports; numbers as above. The lab counterpart
+  is the rate-limiter's concurrency test. Run on 2026-10-11 on the same machine (Go 1.26.9), it failed 24 to 184
+  times in 500 plain runs depending on load and 55 to 97 times in 100 with `-race`, and `-race` reported no data
+  race: every access is atomic, and the bug is check-then-act.
+
+## Complexity and performance
+
+- **`memmove`:** O(n) time, O(1) extra space. Byte loops are slow. Libraries copy whole words and use vector
+  instructions.
+- **Blocking ring:** O(1) per operation. Throughput is limited by the one mutex, which is usually fine until many
+  cores fight over it. `notify_one` per operation is cheaper than `notify_all`, because it wakes one thread
+  instead of all of them.
+- **Sequence ring:** O(1) per operation with one CAS on the shared head or tail. Contention moves to those two
+  counters, which is why they sit on separate cache lines.
+- **`RcPtr`:** every copy is one atomic read-modify-write on a shared cache line, so a pointer copied across many
+  cores becomes a hot spot. Pass it by reference, or move it, when ownership is not changing.
+- **Lease plus fencing:** one extra comparison per storage call, plus retries that grow with how often work
+  outlasts the lease. Lease length is a trade-off. A short lease means a crashed holder is replaced quickly. A
+  long lease means fewer false expiries under load, but slower recovery.
+
+<AINative title="What an agent drafts and what you still prove">
+These rounds are reported without any AI-tool policy (NVIDIA's is unknown as of 2026-10-11), so practise them on
+paper or in a plain editor first. With an agent, the useful division of labour is the reverse of what most people
+try. Let it write the stress harnesses: the random-overlap `memmove` test, the producer-consumer checker, the
+delay-injection loop for the mockup. Do not let it pick memory orderings. Ask it to justify each one in
+happens-before terms, and check the justification against Boost's and cppreference's explanations. As stage 3
+showed, its code passing TSan is not evidence that the ordering is right.
+</AINative>
+
+## Small-team version
+
+This family has little direct use at a company of 50 to 500 people. You will not hand-write a smart pointer or a
+lock-free ring in an AI product. Use `std::shared_ptr`, Go channels, Python's `queue.Queue`, Tokio or asyncio
+queues, and the database's own locking. If you write C++ glue around a model server, the library types are
+faster to review and are maintained by people who test them on every platform.
+
+What does transfer is the stage 4 method, because small AI systems are full of lease-based patterns:
+
+- **A GPU job queue with a visibility timeout.** A worker claims a job, and the job becomes invisible to other
+  workers for a set time. A worker that stalls past that time (a long model load, a GC pause) lets a second worker
+  run the same job. Make the result write conditional on the claim, using a version or token column, so the
+  stale worker's write fails.
+- **A cron job or agent run guarded by a Redis lock with an expiry.** The same stale-holder race.
+- **A "check the budget, then call the API" guard under concurrent requests.** The rate-limiter lab's
+  check-then-act.
+
+**What the race costs.** Put a number on it before deciding how much to invest. Assume 1,000 GPU jobs a day of 10
+minutes each, on an NVIDIA A100 80GB GPU rented at RunPod's $1.39 per hour
+([RunPod pricing](https://www.runpod.io/pricing), fetched 2026-10-11), and assume 2% of jobs outlast the
+visibility timeout and run twice. The duplicate runs waste about **$4.60 a day, or $140 a month** (the
+arithmetic is below). The GPU waste is small. The real cost is the duplicate side effect: two emails sent, two
+rows written, a customer billed twice. That is why the conditional write comes before any tuning of the timeout.
+
+Say it like this: "The wasted GPU time is about $140 a month. I'd fix it anyway, because the duplicate side
+effect is what hurts."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Duplicate runs: 1,000 jobs × 2% (assumed) = 20 jobs a day.
+- GPU time wasted: 20 × 10 minutes = 200 GPU-minutes ≈ 3.33 GPU-hours a day.
+- Cost: 3.33 × $1.39 ≈ **$4.63 a day**, so about $4.60.
+- Monthly: $4.63 × 30 ≈ **$139**, so about $140.
+
+</details>
+
+### Build, buy, skip
+
+- **Skip** hand-written primitives in product code.
+- **Use** conditional writes in the database you already run for anything a lease protects.
+- **Build** the invariant check and the load test yourself; no library writes those for your system.
+
+Revisit if you take on a C++ serving component or a custom CUDA extension (GPU code you compile yourself), or interview for an NVIDIA-style
+systems role.
+
+**How to practise.** Do each primitive once without tools under a 30-minute timer. Then compile it with
+`-fsanitize=thread`, and again with `-fsanitize=address,undefined`, and run a stress test. Afterwards, ask an
+agent to attack your ordering choices, and check its argument yourself.
+
+## Senior vs Staff
+
+The difference is not more code. It is whether you can say why the code is right, and what the tools can and
+cannot prove.
+
+<LevelContrast
+  title="Primitives and races"
+  senior={[
+    "Correct memmove direction, a macro with its precondition stated, a blocking ring with predicate waits and close, and a smart pointer with relaxed increment and ordered final decrement.",
+    "Finds the load-dependent race by checking an invariant under stress, and fixes it.",
+  ]}
+  staff={[
+    "Explains each memory ordering in happens-before terms, separates data races from logic races, and knows a clean sanitizer run is not a proof.",
+    "Names the lock-free ring's real progress guarantee, and turns the race hunt into a reusable method: invariant, load, injected delay, logs with tokens or logical clocks, fencing.",
+  ]}
+/>
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="Implement memcpy and memmove, defining the difference first. (Reported, NVIDIA)">
+    The account lists exactly this order (<Cite id="s-21ef4a7dbc" />). Define it in one sentence: `memmove` must
+    handle overlapping ranges and `memcpy` need not. Then show the direction choice. Mention that `memcpy` may
+    copy in any order and any width, which is why it is allowed to be faster.
+  </FollowUp>
+  <FollowUp q="Write the alignment macro. What if the alignment is not a power of two? (Reported in part, NVIDIA phone interview)">
+    The macro itself is reported (<Cite id="s-21ef4a7dbc" />); the non-power-of-two follow-up is a natural next
+    push. Use `((n + a − 1) / a) * a`, or assert `IS_POW2(a)`. Also mention that the macro evaluates its
+    arguments twice and overflows near `SIZE_MAX`.
+  </FollowUp>
+  <FollowUp q="Add weak pointers to your smart pointer.">
+    (Not reported; a natural next push.) A **weak pointer** can see the object but does not keep it alive. Add a
+    weak count to the control block. The object is destroyed when the strong count hits zero; the control block
+    is freed only when the weak count also hits zero. cppreference describes the same split for `shared_ptr`.
+    `lock()` must increment the strong count only if it is not already zero, so it needs a CAS loop, not
+    `fetch_add`.
+  </FollowUp>
+  <FollowUp q="Your lock-free ring: is it really lock-free?">
+    (Not reported; a natural next push.) Not strictly. A producer descheduled between claiming a slot and
+    publishing it stops consumers at that slot. It never takes a lock and is much cheaper than a mutex under
+    contention, but it is not lock-free by the textbook definition.
+  </FollowUp>
+  <FollowUp q="The race detector is clean. Why does the test still fail under load?">
+    (Not reported; a natural next push.) The race detector finds data races (unsynchronized accesses), not logic
+    races, where each access is synchronized but the sequence is wrong. Both the rate-limiter lab's
+    check-then-act and the stale lease above are logic races.
+  </FollowUp>
+  <FollowUp q="How do you make the load-only race reproducible on demand?">
+    (Not reported; a natural next push.) Inject a delay at the suspected point (after the read, before the write)
+    behind a test flag, shrink the lease, and run with more workers than cores. Once it fails reliably, the fix
+    has to hold under the same setting, run many times.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Comparing unrelated pointers with `<` in `memmove`.** The result is unspecified by the standard; compare the
+  addresses as `uintptr_t` instead.
+- **Using the power-of-two macro for any alignment.** For 12 it silently returns wrong sizes; assert `IS_POW2`
+  or use the divide version.
+- **Passing a macro argument with side effects.** `ALIGN_UP(n, a++)` increments `a` twice.
+- **A relaxed final decrement.** Another thread's writes to the object may not be visible when it is deleted.
+- **`seq_cst` everywhere with no reason.** It is safe, but it shows you cannot say which ordering each operation
+  needs, which is the question.
+- **Calling the pointer thread-safe and then writing one instance from two threads.** That is a data race, as
+  cppreference says of `shared_ptr` ([cppreference](https://en.cppreference.com/w/cpp/memory/shared_ptr)).
+- **Waits without predicates, one condition variable for both directions, or no shutdown.** Each one causes
+  reading an empty slot, a stall, or threads blocked forever.
+- **Treating a clean `-race` or TSan run as proof.** Stage 3 and stage 4 both show bugs that the tools passed.
+- **Fixing a lease race with a longer lease.** The next pause just has to be longer; a fencing token closes the
+  race for any pause.
+
+## Prove it with a lab
+
+<LabRef lab="rate-limiter" role="proof" note="Run its concurrency test 500 times, then with -race. Find the check-then-act in the sliding-window Allow and fix it; the failure rate is your before-and-after metric." />
+
+<LabRef lab="dist-lock" role="proof" note="Its v1 stage adds fencing tokens to a lease lock: the fix from stage 4, with tests that a stale token's write is rejected." />
+
+<LabRef lab="logical-clocks" role="background" note="Lamport and vector clocks for ordering the events you log while hunting a race across components." />
+
+No lab in this repository covers C or C++ memory primitives; the C++ code on this page is the practice material.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-21ef4a7dbc" />
+- <Cite id="s-1f1d1ddaac" />
+- <Cite id="s-3b9dae2c4c" />
+- cppreference, [memcpy](https://en.cppreference.com/w/c/string/byte/memcpy), [memmove](https://en.cppreference.com/w/c/string/byte/memmove) and [std::shared_ptr](https://en.cppreference.com/w/cpp/memory/shared_ptr), read 2026-10-12.
+- Boost.Atomic, [usage examples: reference counting](https://www.boost.org/doc/libs/1_86_0/libs/atomic/doc/html/atomic/usage_examples.html), Boost 1.86, read 2026-10-12.
+- Go, [Data Race Detector](https://go.dev/doc/articles/race_detector), read 2026-10-12.
+- Martin Kleppmann, [How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html), 2016-02-08.
+- RunPod, [GPU pricing](https://www.runpod.io/pricing), fetched 2026-10-11.

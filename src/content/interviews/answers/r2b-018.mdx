@@ -1,0 +1,201 @@
+---
+question: r2b-018
+family: systems-concurrency-primitives
+status: published
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll start with a fixed array, one mutex and two condition variables: producers wait while it's full, consumers
+> wait while it's empty, and each side wakes the other. Every wait re-checks its condition, I keep a count so full
+> and empty can't be confused, and a close operation wakes everyone so shutdown works. If we have time, the faster
+> version drops the mutex and puts a sequence number in every slot, but I'd be clear that it isn't strictly
+> lock-free."
+>
+> The rest of this page explains each part of that answer.
+
+### What makes this different from the queues you already use
+
+You use bounded queues all the time: a Go buffered channel, a Java `ArrayBlockingQueue`, Kafka partitions, an SQS
+queue. Someone else made them safe. Here you build one, and the parts you never think about become the question:
+what a thread does when the queue is full, how it learns there is room again, and how everybody stops cleanly when
+the program shuts down.
+
+The interviewer wants to see a bounded queue that many threads push to and pop from, with correct blocking,
+wake-ups and shutdown, and then hear you reason about a version without a lock.
+
+The question appears as a PracHub title, "Design a Multi-Producer Multi-Consumer Circular Buffer", tagged NVIDIA
+Senior+ and dated 2026-07-16 on the page (read 2026-10-12) (<Cite id="s-1f1d1ddaac" />). Only the title is
+candidate-reported. "Design" suggests a discussion of trade-offs as well as code.
+
+### Words you need first
+
+- A **ring buffer** (or circular buffer) is a fixed-size array used as a queue. A `head` index marks the next item to
+  take. When an index reaches the end of the array it wraps back to 0, so the same slots are reused.
+- **Multi-producer, multi-consumer** (MPMC) means many threads push and many threads pop at the same time.
+- A **mutex** lets one thread at a time into a section of code.
+- A **condition variable** lets a thread sleep, with the mutex released, until another thread signals that
+  something changed. `wait(lock, predicate)` sleeps until the predicate, a small true-or-false check, is true.
+- A **spurious wake-up** is a thread waking from a wait with no signal at all. The standard allows it, so code must
+  re-check its condition after every wake.
+
+## Clarify first
+
+- **Block when full or empty, or return failure?** Assume block, with a `close` that wakes everyone.
+- **Can elements be copied, or only moved?** Assume the queue must work with move-only types (like a
+  `unique_ptr` to a job).
+- **Fixed capacity?** Assume yes, set at construction.
+- **Is a lock acceptable, or is lock-free required?** Assume a lock first, and offer lock-free as the second step.
+
+Say it like this: "I'll build the blocking version with a mutex first, because it is short and clearly correct.
+Then I'll talk about removing the lock."
+
+## Answer
+
+### The baseline: one mutex and two condition variables
+
+```cpp
+template <class T>
+class BlockingRing {
+ public:
+  explicit BlockingRing(size_t cap) : buf_(cap), cap_(cap) {}
+  void push(T v) {
+    std::unique_lock<std::mutex> lk(mu_);
+    not_full_.wait(lk, [&] { return count_ < cap_ || closed_; });
+    if (closed_) return;
+    buf_[(head_ + count_) % cap_] = std::move(v);
+    ++count_;
+    not_empty_.notify_one();
+  }
+  std::optional<T> pop() {                       // nullopt = closed and drained
+    std::unique_lock<std::mutex> lk(mu_);
+    not_empty_.wait(lk, [&] { return count_ > 0 || closed_; });
+    if (count_ == 0) return std::nullopt;
+    T v = std::move(buf_[head_]);
+    head_ = (head_ + 1) % cap_;
+    --count_;
+    not_full_.notify_one();
+    return v;
+  }
+  void close() {
+    std::lock_guard<std::mutex> lk(mu_);
+    closed_ = true;
+    not_full_.notify_all();
+    not_empty_.notify_all();
+  }
+ private:
+  std::vector<T> buf_;
+  size_t cap_, head_ = 0, count_ = 0;
+  bool closed_ = false;
+  std::mutex mu_;
+  std::condition_variable not_full_, not_empty_;
+};
+```
+
+### A worked example: capacity 4
+
+Picture HTTP handler threads pushing jobs and worker threads popping them. Start with `head = 0`, `count = 0`.
+
+| Step | What happens | State after | What to say in the interview |
+|---|---|---|---|
+| 1 | Handlers push A, B, C, D into slots 0–3. | head 0, count 4 | "The write slot is `(head + count) % cap`." |
+| 2 | A fifth handler calls `push(E)`. The predicate "count is below capacity" is false, so it sleeps on `not_full_`. | unchanged | "Full means wait, not fail, in this version." |
+| 3 | A worker pops A from slot 0 and calls `not_full_.notify_one()`. | head 1, count 3 | "Popping signals the producers' condition variable, not its own." |
+| 4 | The handler wakes, re-checks the predicate (true now), and writes E into slot `(1 + 3) % 4 = 0`. | head 1, count 4 | "E reuses the slot A left. That's the ring." |
+| 5 | Shutdown: `close()` sets `closed_` and wakes all threads. Workers pop B, C, D, E, then get `nullopt`. | count 0 | "Consumers drain what's left, then stop." |
+
+### Why each piece is there
+
+- **Predicate waits.** The wait re-checks its condition every time it wakes. That handles spurious wake-ups, and it
+  handles the case where another consumer took the item first. Using `if` instead would let a thread read an empty
+  slot.
+- **Two condition variables.** A push wakes a consumer, not another producer. With one shared condition variable
+  and `notify_one`, the signal can go to a thread of the wrong kind, which goes back to sleep, and the thread that
+  could make progress never wakes.
+- **A count.** If you keep only head and tail indexes, "head equals tail" could mean empty or full. The count tells
+  them apart.
+- **Close.** `close` wakes everyone. Producers stop pushing; consumers drain the rest and then return `nullopt`.
+  Without it, worker threads block forever when the program shuts down.
+- **`notify_one` per operation.** One item added means one consumer can make progress, so wake one. `notify_all`
+  would wake every waiting thread to fight over a single item.
+
+### The stretch: per-slot sequence numbers
+
+Under heavy contention, threads spend their time queueing for the one mutex. The well-known alternative uses
+**atomic** operations instead of a lock: operations the hardware does as one indivisible step, so two threads
+can run them at once without a lock. It needs three more terms.
+
+- **Compare-and-swap** (CAS) is an atomic "if this value is still X, set it to Y, and tell me whether it worked".
+  Two threads can race to CAS the same counter, and exactly one wins.
+- A **release store** is a write that publishes every write the thread made before it. An **acquire load** is a
+  read that, if it sees a released value, also sees everything written before that release. Together they hand data
+  from one thread to another safely without a lock.
+- A **cache line** is the fixed-size chunk (commonly 64 bytes) in which CPUs move memory between cores. Two hot
+  variables on one line slow each other down even though they are different variables. That is **false sharing**.
+
+**How it works.** Each slot holds a sequence number. A producer at position `pos` may claim the slot when its
+sequence equals `pos`: it does a CAS on the shared tail counter, writes the value, then release-stores `pos + 1`. A
+consumer claims when the sequence equals `pos + 1`, reads, then release-stores `pos + capacity` to free the slot for
+the next trip round the ring. Capacity is a power of two, so the slot is `pos & mask` without a divide. Head and tail
+sit on separate cache lines. The full code is in the family walkthrough.
+
+**Follow slot 0 with capacity 4.** The slots start with sequences 0, 1, 2, 3. A producer at position 0 sees
+sequence 0, wins the CAS, writes job A, and stores 1. A consumer at position 0 looks for 0 + 1 = 1, finds it, takes
+A, and stores 0 + 4 = 4. A producer at position 4 lands on slot 0 again and finds 4, so it may write. Had it arrived
+before the consumer, it would have seen 1, less than 4, meaning the ring is full.
+
+**Two caveats to volunteer.**
+
+- **It is not strictly lock-free.** Lock-free in the textbook sense means some thread always makes progress, however
+  others are paused. Here, a producer that is paused by the operating system between claiming a slot and publishing
+  it stalls every consumer at that slot.
+- **It offers only `try_push` and `try_pop`.** Making callers wait needs a spin, yield or condition-variable layer on
+  top.
+
+Say it like this: "It never takes a lock, and it's much faster under contention, but a producer paused mid-write
+blocks consumers at that slot, so I wouldn't call it lock-free in the strict sense."
+
+### How it was checked
+
+Both versions moved 160,000 items from 8 producers to 8 consumers with matching count and sum, under
+ThreadSanitizer (a compiler mode that reports data races: two threads touching the same memory at once, with
+nothing coordinating them), in the family walkthrough's run on 2026-10-12. Matching
+count and sum means no item was lost and none was delivered twice. Say you would write that test before claiming the
+queue works.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Bounded MPMC queue"
+  senior={["Correct blocking ring with predicate waits, two condition variables, a count and a close path, plus a producer-consumer stress test."]}
+  staff={["Explains the sequence-number design, its real progress guarantee and its memory orderings, false sharing, and when the mutex version is the better engineering choice."]}
+/>
+
+## Small-team version
+
+Use the language's queue: Go's buffered channel, Python's `queue.Queue`, a Tokio or asyncio bounded channel, or a
+well-tested C++ library. Do not build one.
+
+The design point that transfers is the **bound**. An AI pipeline that pulls documents faster than it can embed them
+(turn each into a list of numbers for search) needs a bounded queue between the stages. Then a slow stage pushes
+back on the fast one, instead of the queue filling memory until the process dies. Picking that bound, and deciding
+what happens when it is reached (wait, drop, or reject the request), is the real decision.
+
+Low direct relevance otherwise.
+
+## Pitfalls
+
+- **`if` instead of a `while` or predicate around `wait`.** A spurious wake-up or a stolen item lets the thread read
+  an empty slot.
+- **One condition variable for both directions with `notify_one`.** The signal can wake the wrong kind of thread,
+  and the queue stalls.
+- **No shutdown path.** Consumers block forever when the program stops.
+- **Head and tail on one cache line in the lock-free version.** Producers and consumers slow each other down through
+  false sharing.
+
+## Go deeper
+
+- Family walkthrough: [Systems-level concurrency primitives and race hunting](/system-design-labs/interviews/walkthroughs/systems-concurrency-primitives/), stage 2.
+- Sibling: [reference-counted smart pointer](/system-design-labs/interviews/questions/r2b-017/).

@@ -1,0 +1,155 @@
+---
+question: infra-079
+family: diagnose-infra-performance
+status: published
+labs: [container-orchestrator, observability]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll start from what users see, latency and errors per service, and what changed. Then I'll look for the
+> feedback loops that turn load into an outage: CPU limits throttling pods while the autoscaler flips up and
+> down, readiness checks pulling pods out so the rest get more load, and retries multiplying traffic. First
+> I stop the bleeding: raise the autoscaler's minimum, shed load at the edge, turn off inner retries. Then I
+> fix the cause: requests set from real usage, and autoscaling on a signal closer to users than CPU."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see whether you can run an incident on a Kubernetes service. That means three
+things: find which layer is overloaded, stop the user pain, and fix the cause.
+
+What makes this different from a single slow server is that Kubernetes reacts to load on its own. It adds
+pods, removes pods, and takes pods out of rotation. Those reactions are meant to help. Under the wrong
+settings they make things worse, and they feed each other. So the core of a good answer is naming those
+loops and breaking them, not just finding "the slow thing".
+
+(The PracHub title is "Diagnose overloaded Kubernetes cluster" from a Perplexity technical screen
+<Cite id="s-161b75eab8" />. Listed on the PracHub page (Perplexity): high p95/p99 latency, timeouts and
+autoscaling thrash on a typical stack (the HPA autoscaler, Prometheus and Grafana, central logs and tracing), with five
+parts to cover: what to inspect, commands, hypotheses, immediate mitigations and longer-term fixes.
+Confidence is low.)
+
+## Clarify first
+
+- **Is the whole cluster overloaded, or one service on it?**
+- **What does the autoscaler scale on** (CPU, a custom metric), with what minimum, maximum and target?
+- **Requests and limits on the hot pods.** Is a cluster autoscaler installed?
+- **What changed?** A deploy, a traffic spike, a new tenant, a dependency slowing down?
+- **Retries:** which layers retry, and how many times?
+
+## Answer
+
+### Words you need first
+
+- A **pod** is one or more containers that run together on a machine, called a **node**.
+- A pod declares a CPU **request** (what the scheduler reserves for it) and a CPU **limit** (the most it
+  may use). When it hits the limit, the kernel **throttles** it: it stops running until the next short
+  time slice.
+- The **HPA** (Horizontal Pod Autoscaler) adds or removes copies of a pod to keep a metric, often average
+  CPU, near a target. **Thrash** means it keeps flipping up and down.
+- A **readiness probe** is the check that decides whether a pod receives traffic. A pod that fails it is
+  taken out of the **Service**, the stable address that spreads traffic over ready pods.
+- **RED** means rate, errors and duration per service: what users feel.
+
+### Follow one incident through
+
+Take one service whose p99 latency jumped and whose replica count keeps going up and down. Here is the
+order to work in:
+
+| Step | What you do | What it tells you | What to say in the interview |
+|---|---|---|---|
+| 1 | RED per service, then what changed | Which service users feel, and the likely trigger | "Most incidents follow a change, so I ask that first." |
+| 2 | `kubectl describe hpa` next to p99 and throttling | Whether scaling and latency move together | "If replicas and latency swing in step, the autoscaler is part of the problem." |
+| 3 | `kubectl get events`, pods not Running | Readiness failures, evictions, restarts | "Pods failing readiness under load push their traffic onto the rest." |
+| 4 | Traces | Which hop holds the latency | "If the time is in the database, more pods won't help." |
+| 5 | Mitigate | Stops the loop | "I stop the feedback loop first, then find which loop it was." |
+| 6 | Fix | Removes the cause | "Then I change the defaults so it doesn't come back." |
+
+### The commands
+
+```bash
+kubectl top nodes; kubectl top pods -A --sort-by=cpu
+kubectl describe node <node>       # Conditions and Allocated resources
+kubectl get events -A --sort-by=.lastTimestamp | tail -50
+kubectl describe hpa <name>        # metric vs target, scaling history
+```
+
+Traces tell you which hop holds the latency. Put the HPA replica count, p99 and CPU throttling on one
+timeline; the loops below show up as lines that move together.
+
+### Guesses, one at a time
+
+- **Throttle-scale loop.** Pods hit their CPU limits and latency rises. The HPA scales up. New pods take
+  time to warm up. Load falls, the HPA scales down, and it starts again. Kubernetes' stabilization window
+  exists "to restrict the flapping of replica count", with a 300 s default for scale-down
+  ([HPA](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/), read
+  2026-10-12).
+- **Readiness cascade.** Overloaded pods fail readiness and leave the Service. The remaining pods get more
+  load, and they fail too.
+- **Retry amplification.** Up to three attempts at each of two layers can send the bottom layer up to
+  **nine times** the traffic (3 × 3). Say it like this: "Retries at every layer turn a slowdown into an
+  outage."
+- **Overcommitted nodes.** Requests set far below real usage let the scheduler pack nodes that then fight
+  over CPU and memory.
+- **A slow dependency** (a database, a provider API) holding threads and connections.
+
+### Mitigate now
+
+- Raise the HPA minimum, so it stops removing pods and the oscillation ends.
+- Shed or rate-limit load at the edge.
+- Turn off retries in the inner layers.
+- Cap how many requests each pod handles at once.
+
+### Fix later
+
+- Set requests from measured usage, so the scheduler stops overpacking nodes.
+- Scale on a signal closer to users, such as requests in flight or queue depth, not CPU alone. A throttled
+  or I/O-bound service has misleading CPU numbers.
+- Keep liveness probes cheap, and make readiness probes independent of dependencies.
+- Add a **retry budget**: a cap on retries as a share of total traffic.
+- Run load tests that reproduce the thrash, so you can see the fix work.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Overloaded cluster"
+  senior={["Works from RED to the cluster with the right kubectl commands, tests concrete hypotheses, and mitigates before fixing."]}
+  staff={["Explains the feedback loops (throttle-scale, readiness cascade, retries) that turn load into an outage, and changes the defaults and the autoscaling signal so it doesn't recur."]}
+/>
+
+In plain words: a Senior answer finds the overloaded layer and stops the pain before fixing it. A Staff
+answer also explains how Kubernetes' own reactions made it worse, and changes the settings that let them.
+
+## Small-team version
+
+If you run an LLM-backed service on managed Kubernetes, the same loops apply, plus one more: the model
+provider's **rate limit**, the cap on how many requests or tokens you may send per minute. Adding pods
+doesn't raise your provider quota. So more pods can mean more rejected calls (HTTP 429), not more
+throughput.
+
+Three defaults cover it:
+
+- Scale on requests in flight, not CPU. An LLM call spends most of its time waiting, so CPU stays low.
+- Cap concurrency to the provider quota.
+- Alert on the 429 rate.
+
+If you have one or two services, ask whether a managed platform would remove the HPA problem entirely.
+Running and tuning autoscaling is real work for a small team, and it only pays when you have many services
+or steady, heavy load.
+
+## Pitfalls
+
+- **Adding nodes before knowing the bottleneck.** If requests, limits or a dependency are the problem, more
+  nodes change nothing.
+- **Autoscaling on CPU for a throttled or I/O-bound service.** CPU doesn't reflect the load such a service
+  is under.
+- **Readiness probes that call the database.** A slow database then takes every pod out of rotation at
+  once.
+- **Retrying at every layer.** The multiplication lands on the layer that is already slowest.
+
+## Go deeper
+
+- Family walkthrough: [Diagnose slow or stuck infrastructure](/system-design-labs/interviews/walkthroughs/diagnose-infra-performance/), worked example 5.
+- How a scheduler and reconcile loop work: <LabRef lab="container-orchestrator" inline />. Metrics and traces in one middleware: <LabRef lab="observability" inline />.

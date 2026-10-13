@@ -1,0 +1,166 @@
+---
+question: r2a-002
+family: chat-serving-streaming
+status: published
+labs: [load-balancer, llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "LLM serving breaks the stateless-service playbook in three ways. Requests differ in cost by thousands of
+> times, so I route on free GPU memory and queue depth, not connection count. Replicas hold per-request memory,
+> so I keep a conversation on the same replica to reuse its cache. And a new replica takes over a minute to load
+> the model, so I autoscale early on queue wait, not GPU utilization. I size the fleet with Little's law and a
+> measured per-replica limit."
+>
+> The rest of this page explains each part of that answer.
+
+### What makes this different from scaling a normal service
+
+You know how to scale a stateless API. Requests are similar, any replica can take any request, a load balancer
+uses round robin or least-connections, and new replicas start in seconds. A large language model (**LLM**)
+serving system breaks each of those:
+
+1. **Requests are not similar.** The model reads text in pieces of about ¾ of a word, called **tokens**. A
+   100-token question and a 100,000-token pasted document are both "one request", but the second needs about
+   **2,000×** more work just to read.
+2. **Replicas are not stateless.** While a reply is written, the GPU keeps a saved summary of every token so far,
+   called the **KV cache**. That memory is scarce, and it is what limits how many users one replica serves.
+3. **Replicas start slowly.** One large model fills a machine of 8 GPUs, and loading its 141 GB of weights takes
+   over a minute before the replica can serve anyone.
+
+A user-submitted report tagged Google, Senior, early March 2026, describes a round on how LLM serving works and
+how to scale it: load balancing, model optimization and horizontal scaling. The question text is the site's own
+(<Cite id="s-db8c0e3034" />).
+
+## Clarify first
+
+- **Interactive, batch, or both?** "Interactive chat, with some batch work."
+- **One model or many?** "One large model, plus a smaller fallback."
+- **Latency targets?** "Separate budgets for the wait before the first word and the gap between words."
+- **Hardware fixed?** "8-GPU machines; the model is split across all 8 so they act as one GPU, which is called
+  tensor parallelism."
+
+## Answer
+
+### Two words you need first
+
+- **Prefill**: the model reads the whole prompt in one pass before writing. It sets the wait for the first word,
+  the **time to first token (TTFT)**.
+- **Decode**: the model writes one token per pass, and each pass serves every user on the replica together. It
+  sets the gap between words, the **inter-token latency (ITL)**.
+
+### Follow two requests to the load balancer
+
+Two requests arrive at the same moment. Request A is a 100-token question. Request B is a 100,000-token
+document with a question at the end.
+
+| Step | Least-connections would… | An LLM-aware router does… | What to say in the interview |
+|---|---|---|---|
+| Pick a replica | Send B to the replica with the fewest open connections | Send B to a replica with enough **free KV memory** and few **tokens waiting** in its queue | "Route on what is scarce: memory and pending tokens." |
+| Same user, next turn | Pick any replica | Prefer the replica that served the last turn, because its cache may still hold the conversation | "Affinity, with bounded load so one popular replica spills over." |
+| Replica is busy | Keep sending | Hold the request in a queue until memory frees up | "Admission is by memory, not connection count." |
+
+### Load balancing
+
+Round robin and least-connections assume requests cost about the same. Here A and B differ by about 2,000× in
+the work to read them. So route on what is actually scarce: **free KV memory** and **queue depth, or pending
+tokens,** on each replica. Add **conversation affinity** so repeated prompt prefixes hit the replica that cached
+them. Use **bounded load** (a cap on how far above average one replica may get) so one popular replica spills
+over to the next.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Request A:** 2 × 70.55 × 10⁹ parameters × 100 tokens = 1.4 × 10¹³ FLOPs (Llama-3.1-70B as the example).
+- **Request B:** weights 1.411 × 10¹⁶ plus attention (each token looking back at every earlier one)
+  2 × 80 layers × 8,192 hidden × 100,000² = 1.31 × 10¹⁶, so about 2.7 × 10¹⁶ FLOPs.
+- **Ratio:** about 2,000×.
+
+</details>
+
+### Model optimization
+
+Name the levers and what each buys, without memorized speed-up multipliers:
+
+- **Batching.** Decoding many users in the same pass shares the cost of reading the weights. Users joining and
+  leaving between passes is **continuous batching**. Derive the gain from your own request-length mix rather
+  than quoting a number.
+- **Prefix caching.** Store the shared system prompt's KV cache once. In the family walkthrough's example, a
+  2,000-token system prompt halves the memory per user, from 350 to 699 users per machine.
+- **Quantization.** Storing the weights in 8 bits (int8 or fp8) instead of 16 halves their size. That frees GPU
+  memory for KV caches and shortens the weight read in each pass. Check quality on your evaluation set.
+- **Chunked prefill.** Reading long prompts in slices between decode passes protects the word gap for everyone
+  else.
+- **Speculative decoding.** A small model guesses several tokens and the large model checks them in one pass. It
+  helps when few users share a pass; with many users it can leave throughput flat or worse.
+
+Say it like this: "Each lever buys a specific thing: batching buys throughput, prefix caching buys memory,
+quantization buys memory and bandwidth, chunking buys a steady word gap."
+
+### Horizontal scaling
+
+Size the fleet in two steps. First, how many replies are open at once: arrival rate × seconds per reply
+(Little's law). At 2,000 new messages a second and 20 seconds per reply, that is **40,000**. Second, how many fit
+on one replica: the smaller of the memory limit and the word-speed limit. In the family walkthrough's example the
+memory limit is **699**, and the word-speed limit is higher only if the GPU code gets close to peak memory speed
+(at 60% of peak it is 532). So you need about **58 eight-GPU machines**, or about 76 if the word gap binds at 532.
+
+Scale on queue wait, pending tokens or TTFT, not GPU utilization, which a prep guide warns is a poor signal
+(<Cite id="s-f440daaea4" />). And scale early: loading 141 GB of weights at an assumed 2 GB/s takes **about 71
+seconds** before a new replica can serve.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Streams in flight:** 2,000 turns/s (assumed) × 20 s (400 tokens × 50 ms, assumed) = 40,000.
+- **Streams per replica:** min(KV memory limit, word-gap limit) = min(699, 532 to 963) in the example.
+- **Replicas:** 40,000 ÷ 699 = 57.2, so 58 eight-GPU machines; 40,000 ÷ 532 = 75.2, so 76.
+- **Cold start:** 141 GB ÷ 2 GB/s ≈ 71 s, before cache warm-up.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Scaling LLM inference"
+  senior={["Routes on KV and queue depth, lists optimization levers with what each buys, and autoscales on queue wait."]}
+  staff={["Sizes the fleet from Little's law and a per-replica cap, says which cap binds is a measurement, and plans for cold-start time in the autoscaling policy."]}
+/>
+
+## Small-team version
+
+Most small teams don't scale GPUs. They scale calls to a provider's API, and the equivalent levers are prompt
+caching, a smaller model for easy traffic, and batch APIs for offline work. Anthropic's Batch API gives "a 50% discount
+on both input and output tokens" ([Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing),
+fetched 2026-10-12).
+
+For example, re-running 1 million requests of 3,000 input tokens (2,000 of them cached) and 400 output tokens
+costs **about $6,400** at Claude Sonnet 5 list prices, or **about $3,200** through the batch API (assuming the
+cache discount still applies). Self-host only with steady volume in the hundreds of millions of tokens a month,
+or for a compliance reason.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Per request: 1,000 × $2/M + 2,000 × $0.20/M + 400 × $10/M = $0.0064 (Sonnet 5 list prices, fetched
+  2026-10-11).
+- 1,000,000 × $0.0064 = $6,400; at 50% off, $3,200.
+
+</details>
+
+## Pitfalls
+
+- **Least-connections routing.** Request costs differ by three orders of magnitude, so connection count says
+  little about load.
+- **Quoting "continuous batching gives N×".** The gain depends on your length mix; derive it.
+- **Autoscaling on GPU utilization.** A busy GPU and a drowning one look the same.
+- **Forgetting cold-start time.** A replica that needs over a minute to load arrives after the spike has hurt.
+
+## Go deeper
+
+- Family walkthrough: [Serve a ChatGPT-style assistant with streaming](/system-design-labs/interviews/walkthroughs/chat-serving-streaming/), especially failure modes and trade-offs.
+- Fleet-level scheduling: [multi-tenant GPU serving](/system-design-labs/interviews/walkthroughs/multi-tenant-gpu-serving/).
+- Labs: <LabRef lab="load-balancer" inline />, <LabRef lab="llm-inference" inline />.

@@ -1,0 +1,167 @@
+---
+question: infra-093
+family: distributed-training
+status: published
+labs: [lora-finetune]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Let me describe the stack I've actually run, and be clear about its limits. Here's what it supports, here's what
+> it doesn't, and why we didn't need more. The hardware limits, in the order they bite: GPU memory decides how the
+> model is split, the fast in-machine links decide how far we can split each layer, the network between machines
+> decides how far data parallelism scales, then compute, then storage for checkpoints. For each NVIDIA product, I'll
+> say where I touched it and where I've only read about it."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you have actually operated a training stack, and whether you can describe its
+limits honestly. No formula wins this round. A precise, first-hand inventory does, including what your stack cannot
+do.
+
+### What makes this different from a design round
+
+A design round rewards reasoning. This round rewards experience, and it is easy to tell the difference. Someone who
+ran FSDP knows which mode they used and why. Someone who read about it lists every mode. For a backend engineer the
+analogy is being asked "which consistency levels does your database setup support, and which did you turn off?"
+The honest, specific answer beats the complete one.
+
+### Words you need first
+
+- **Data parallelism (DP)**: every GPU holds the whole model and trains on different data; gradients (the update
+  directions) are averaged each step. PyTorch's version is **DDP**.
+- **Sharded data parallelism**: the same, but the training state is split across GPUs to save memory. DeepSpeed calls
+  it **ZeRO** (stages 1–3); PyTorch calls it **FSDP**.
+- **Tensor parallelism (TP)**: each layer's math split across the GPUs of one machine. **Pipeline parallelism (PP)**:
+  the layers split into stages across GPUs. **Expert parallelism (EP)**: in a Mixture-of-Experts model, different
+  "expert" sub-networks on different GPUs.
+- **NCCL**: NVIDIA's library that moves data between GPUs during training.
+
+The questions were reported by an NVIDIA senior ML engineer candidate as "What distributed training modes are
+supported and not supported here?", "What hardware constraints matter the most?" and how NVIDIA products pair with
+open-source training and serving. The candidate called the round "trivia-heavy" (<Cite id="s-79598dd069" />).
+
+## Clarify first
+
+- **Which stack?** "Do you mean the stack at my current job, or a named open-source one? I'll say which I'm
+  describing."
+- **Scope?** "Training only, or serving too?"
+- **Scale?** "Hardware constraints for one machine, or for a cluster?"
+
+## Answer
+
+### The inventory
+
+Prepare a table for the stack you have used. Here is a template. Fill it only with what you know:
+
+| Mode | Supported? | Notes to give |
+|---|---|---|
+| Data parallel (DDP) | | gradient all-reduce, overlapped with the backward pass in buckets |
+| Sharded DP (ZeRO-1/2/3, FSDP FULL_SHARD / SHARD_GRAD_OP / HYBRID_SHARD) | | memory saved, traffic cost (ZeRO-3 is 1.5×) |
+| Tensor + sequence parallel | | inside NVLink only |
+| Pipeline parallel | | schedule (1F1B, interleaved), idle "bubble" |
+| Expert parallel | | where the all-to-all traffic runs |
+| Precision | | bf16; FP8 needs Hopper or later (the A100 has no FP8 Tensor Cores) |
+| Fault tolerance | | checkpoint format, resharding on load, restart time |
+
+Then say what is **not** supported and why. For example: "no pipeline parallelism, because our models fit with FSDP
+on one node", or "no elastic resizing: a failure restarts the whole job".
+
+Say it like this: "We didn't support pipeline parallelism. Our largest model fit with FSDP on one machine, so it
+would have added idle time and complexity for nothing."
+
+### Hardware constraints, ranked, with reasons
+
+1. **GPU memory (HBM) capacity** decides how the model is split. Mixed-precision training with Adam needs about
+   16 bytes per parameter.
+2. **NVLink domain size and bandwidth** decide how far tensor and expert parallelism can go. **NVLink** is the
+   direct GPU-to-GPU link inside one machine. On the A100 it is 600 GB/s counting both directions, which is
+   300 GB/s each way ([NVIDIA Hopper post](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/)).
+3. **Bandwidth between machines** decides how far data parallelism scales. A ring all-reduce, the usual way to
+   average gradients, sends about twice the gradient size per machine per step, regardless of how many machines
+   take part.
+4. **Dense compute.** The A100's 312 TFLOPS in bf16 is the dense figure (<Cite id="s-8e443a8b66" />). The H100
+   page's figures assume a sparse format that training doesn't use, so halve them.
+5. **Storage bandwidth** sets the checkpoint pause and how fast data loads.
+
+### A quick check you can do out loud
+
+Does data parallelism still keep up? Compare the time to send the gradients with the time to compute a step.
+
+Follow one example: an **8B-parameter model**. Its bf16 gradients are 16 GB. A ring all-reduce sends about twice
+that, **32 GB per step**. At an assumed 50 GB/s between machines, that is **0.64 s**. If a measured step takes
+several seconds, the exchange can hide behind the backward pass. If a step takes well under a second, the network is
+the bottleneck.
+
+Say it like this: "For an 8B model, the gradient exchange is about 0.64 seconds a step at 50 GB/s. I'd compare that
+with our measured step time before adding machines."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Does data parallelism still overlap?"
+  expr="2 × gradient bytes per node ÷ node bandwidth  vs  compute time per step"
+  vars={[
+    { sym: 'gradient bytes', meaning: 'params × 2 for bf16' },
+  ]}
+  example="8B model: 2 × 16 GB = 32 GB per step at an assumed 50 GB/s = 0.64 s; compare with the measured step time"
+/>
+
+</details>
+
+### NVIDIA products with open-source stacks
+
+Describe the layering you know, top to bottom:
+
+```
+PyTorch (or JAX) ── the training code
+   │
+DeepSpeed / Megatron-Core / PyTorch FSDP ── how the model is split
+   │
+NCCL ── moves data between GPUs over NVLink and InfiniBand
+   │
+CUDA libraries and kernels ── the math on each GPU
+   │
+Nsight, DCGM, nccl-tests ── profiling, fleet health, network baselines
+```
+
+**InfiniBand** is the fast network between machines in most training clusters. **Nsight** is NVIDIA's profiler,
+**DCGM** its data-center GPU manager (health and throttling counters), and **nccl-tests** its benchmark for
+collective bandwidth.
+
+For each layer, say where you touched it and where you only read about it.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Know your stack"
+  senior={["Gives an accurate supported / not-supported list with the reason for each gap."]}
+  staff={["Ties each gap to a decision (why the team didn't need it, what would make it necessary) and ranks hardware limits by which one binds first."]}
+/>
+
+## Small-team version
+
+At a small company, "your stack" is likely a fine-tuning library on one rented machine plus a serving engine. That
+is a fine answer if you can say:
+
+- what it supports (LoRA, a small trainable add-on to a frozen model; QLoRA, the same on a compressed model; FSDP on
+  one machine),
+- what it doesn't (jobs across several machines),
+- and why you didn't need more.
+
+Honesty about scope reads better than borrowed frontier-lab vocabulary.
+
+## Pitfalls
+
+- **Listing modes you have never run as "supported".** A follow-up question exposes it quickly.
+- **Quoting sparse TFLOPS, or two-way link totals as one-way.** Both double the real number.
+- **No "not supported" column.** The gaps and their reasons are the strongest part of the answer.
+- **Product names with no role attached.** Say what each one does in the stack.
+
+## Go deeper
+
+- Family walkthrough: [Distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/), especially its trade-offs table.
+- A small, honest stack to describe: <LabRef lab="lora-finetune" inline />.

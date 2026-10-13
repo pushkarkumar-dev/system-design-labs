@@ -1,0 +1,179 @@
+---
+question: eng-068
+family: llm-platform-gateway
+status: published
+labs: [crdt, feature-flags]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'd separate three things: a draft that people edit, a version that never changes, and a run that records
+> exactly which version it executed. Drafts save with compare-and-swap so two editors can't silently overwrite each
+> other. Publishing freezes the draft into a version whose id is a hash of its content. A run points at a version,
+> never the draft, so editing the draft mid-run changes nothing about the output. Runs are created with an
+> idempotency key, retries are new attempts under the same run, and a call that timed out after the provider may
+> have answered is marked 'unknown', not 'failed'."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you can design a collaborative editor and a job system that agree on one
+thing: exactly which prompt an output ran.
+
+A **prompt** is the text sent to a large language model (LLM): instructions, examples, template variables filled in
+from the input, and settings such as which model to use. A **prompt playground** is a web app where people write a
+prompt, run it against a model and look at the output.
+
+You have built editors and job queues before. This problem joins them, and that is where it gets hard:
+
+1. **The thing being edited is also the thing being executed.** A model call takes seconds to minutes. While it
+   runs, a colleague may change the prompt. If the output points at "the prompt", nobody can say which text
+   produced it.
+2. **The same input does not give the same output.** Running a prompt twice can give two different answers. So
+   "reproducible" can only mean "we know exactly what went in", never "we get the same text out".
+3. **Every run costs money, and a lost response is ambiguous.** If the call times out, the provider may still have
+   produced the output and billed you. Retrying blindly pays twice.
+
+My reading: the decisive parts are immutability, provenance (the record of what produced an output) and retry behaviour, not
+the editor.
+
+Only the title is the candidate-reported part; PracHub's write-up (posted 2026-10-05) splits it into collaboration
+and versioning, then execution and inspection, and hints that "Two collaborators can change the draft while a
+model request is running" (<Cite id="s-f40d0eed6e" />).
+
+## Clarify first
+
+Say your assumptions out loud:
+
+- **Real-time co-editing, or conflict-aware saving?** "I'll start with saves that detect conflicts, and add live
+  co-editing later."
+- **What does a version contain?** "Text, template variables, tool definitions and model settings."
+- **Who can edit, run, share results or use credentials?** "Project roles. The browser never sees provider keys."
+- **Can runs be cancelled or looked up after a lost response?** "Yes, by run id."
+- **Scale.** None is given. "Assume hundreds of editors and a few runs per minute each."
+
+## Answer
+
+### The four records
+
+- **Draft** (changeable): saved with **compare-and-swap** on a revision number. Each save says "I am editing
+  revision 41". If someone else already saved revision 42, the save fails with a conflict instead of silently
+  overwriting. Presence and cursors are short-lived and never stored with the content.
+- **Version** (fixed): created on publish. Its id is a **content hash** of everything that affects the output, so
+  nothing can edit it, and identical content gets the same id.
+- **Run**: `{run_id, version_id, inputs, model, sampling params, operation_id, state}`, with states queued →
+  running → succeeded | failed | unknown.
+- **Attempt**: one row per provider call under a run, each with its own cost record.
+
+### The picture
+
+```
+Browser (editors)
+   │  websocket edits                  │  "run v7 with these inputs" + idempotency key
+   ▼                                   ▼
+Collaboration service              Run API ── creates or returns the run
+   │  save draft (compare-and-swap)    │
+   │  publish → new version            ▼
+   ▼                               Run queue
+Version store  ◄──── reads ────    Worker ── calls the model through the gateway
+ (immutable,                           │      with the project's budget
+  content-hashed)                      ▼
+                                   Results + attempts + cost records
+                                       │
+                                       ▼
+                                   Streamed back to subscribers
+```
+
+**Collaboration service** handles low-latency edits over websockets. **Version store** holds fixed versions.
+**Run API** creates runs and makes repeat requests safe. **Run queue and worker** execute runs and hold the
+provider credentials, through the platform gateway with the project's budget. **Results** stream back to anyone
+watching. The two sides share only the version store. Say it like this: "Collaboration is fast and chatty;
+execution is slow and holds credentials. They share nothing but the versions."
+
+### Follow one run through it
+
+Priya and Sam are editing a summarisation prompt. Priya publishes it as version `v7` and presses Run.
+
+| Moment | What happens | What to say in the interview |
+|---|---|---|
+| Publish | The draft at revision 41 is hashed and stored as `v7`. | "Versions are content-hashed, so nobody can change v7." |
+| Run | Browser posts "run v7" with idempotency key `k-123`. The API creates `run-88`, state queued. | "The idempotency key makes a retried click return the same run." |
+| Mid-run | Sam edits the draft and saves revision 42. | "The run points at v7, not the draft. Sam's edit changes nothing about this output." |
+| Lost response | Priya's network drops; her browser resends with `k-123`. | "Same key, same run. We don't pay twice." |
+| Provider timeout | The worker's call times out after the provider may have answered. | "That's unknown, not failed: the output may exist and we may have been billed." |
+| Retry | The worker retries as attempt 2 under `run-88`. | "A retry is a new attempt, never a new run. Each attempt has a cost record." |
+| Done | `run-88` succeeds; its output says "produced by v7". | "Outputs claim the version they ran." |
+
+### Execution rules, in plain words
+
+The client posts a run with an **idempotency key**, a unique value it chooses, so a retried post after a lost
+response returns the same run. A worker pulls queued runs, calls the model through the gateway, and streams results
+to subscribers. A provider timeout, when the provider may already have produced output, becomes **unknown**, because
+the user may have been billed and the output may exist. Retries create a new attempt under the same run.
+
+**Provenance.** Outputs always claim the version they ran, never the draft. That answers PracHub's hint: editing the
+draft mid-run changes nothing about the running output.
+
+**Comparison** (a PracHub follow-up). Show two runs side by side with a diff of their versions and settings, so a
+reader sees what changed between them. Be clear that reproducible inputs do not mean reproducible outputs: served
+outputs vary even at temperature 0, the setting meant to remove randomness
+([Thinking Machines](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/), 2025-09-10).
+
+**Live co-editing later.** If they push on it, move the draft to a **CRDT** (a data type whose copies merge without
+conflicts) synced over websockets. Publishing still snapshots the merged draft into a fixed version.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Prompt playground"
+  senior={["Immutable content-hashed versions, CAS drafts, idempotent run creation and an explicit unknown state."]}
+  staff={["Makes the same registry serve production with labels such as prod, gates label promotion on an eval run, and defines what happens to access, budgets and logs when a member leaves mid-run."]}
+/>
+
+In plain words: a Senior answer gets the records and states right. A Staff answer makes the same registry serve
+production, where a service asks for the version a label such as `prod` points at, moving that label requires an
+**eval run** (a fixed set of real examples graded before a change ships), and the design says what happens when
+someone loses access in the middle of a run.
+
+## Small-team version
+
+Most small teams keep prompts in git next to the code, with an eval in CI. That is enough until non-engineers need
+to edit prompts without a deploy. Surveyed teams mostly build their own prompt management (61% in the Amplify 2026
+report, [Amplify Partners](https://amplifypartners.com/blog-posts/the-2026-ai-engineering-report)).
+
+When you need one, build the small version:
+
+- **Build:** a versions table keyed by content hash, a `prod` label, and a run log with attempts. With a coding
+  agent, that is a few days of work.
+- **Skip:** live co-editing. Saves with compare-and-swap cover a small team.
+
+**What it costs.** About **$2,240 once** for three days of one engineer (assumed loaded cost). An eval run per
+version is cheap next to that: about **$2** for an assumed 200-item eval. Revisit when product people edit prompts
+weekly, or a regulator asks which prompt produced an output.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Build:** a $194K loaded cost (the
+  [BLS](https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm) median developer wage of
+  $135,980 ÷ 0.70, since wages are about 70% of total compensation) ÷ 260 working days ≈ $746 a day; 3 × $746 ≈ $2,240.
+- **Eval run:** 3,000 input and 400 output tokens on Claude Sonnet 5 at $2 / $10 per million
+  ([Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing), fetched 2026-10-11) = $0.006 + $0.004 =
+  $0.010 a call; 200 calls = $2.
+
+</details>
+
+## Pitfalls
+
+- **Runs that reference the draft.** No one can say which prompt produced an output.
+- **Mutable versions** ("fix a typo in v17"). Every output that claims v17 is now a lie.
+- **Retrying a lost run request without an idempotency key.** You pay for duplicate runs.
+- **Reporting a timed-out provider call as failed.** It may have completed and been billed.
+- **Sending provider keys to the browser.** Anyone with developer tools can take them.
+
+## Go deeper
+
+- Family walkthrough: [Internal LLM platform](/system-design-labs/interviews/walkthroughs/llm-platform-gateway/#deep-dives), the prompt-versions deep dive.
+- Merge semantics for live co-editing: <LabRef lab="crdt" inline />. Label rollout and audit: <LabRef lab="feature-flags" inline />.
+- Sibling question: [Design the OpenAI Playground](/system-design-labs/interviews/questions/eng-069/).

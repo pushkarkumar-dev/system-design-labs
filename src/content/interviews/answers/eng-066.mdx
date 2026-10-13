@@ -1,0 +1,190 @@
+---
+question: eng-066
+family: concurrent-llm-client
+status: published
+labs: [load-balancer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "The network splits the stream wherever it likes, even inside a line or a character, so I'll parse in three
+> layers: bytes to text with an incremental decoder, text to events with a buffer that carries partial lines
+> over, and events to words with a JSON parse that counts bad events instead of crashing. If the stream closes
+> without its end marker, that's an error, not success. And I never retry a stream after the first words have
+> reached the user. The first test I write splits the same stream at every byte position and checks the output
+> never changes."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer is checking whether you can write a byte-level parser that is correct no matter where the
+network splits the data, and whether you can decide what "malformed" should do.
+
+When a chat app shows an answer appearing word by word, the server is **streaming**: it sends the reply in
+small pieces as the model writes it, instead of one response at the end. The model produces text one
+**token** at a time (a token is roughly ¾ of a word), and each piece usually carries a token or a few.
+
+You have parsed HTTP responses before, but usually as one complete body. A stream is different in three ways:
+
+1. **Pieces arrive split anywhere.** The bytes come off the socket in **chunks** whose boundaries have nothing
+   to do with lines or events. A line can arrive in two chunks. So can one character, because some characters
+   take several bytes.
+2. **You show partial output.** The user is reading while you parse. A mistake shows up on screen, and you
+   can't take back words already shown.
+3. **The end is a signal.** A finished stream ends with an explicit marker. A connection that just closes may
+   have been cut off, and the answer may be half-written.
+
+The item comes from a techinterview.org prep guide on Cursor's loop: "Parse and render a stream of tokens from
+an LLM as they arrive, handling partial and malformed chunks" (<Cite id="s-c29d429c3c" />). It's an
+unattributed prep site, so confidence is low, but the problem is real for anyone rendering streamed model
+output.
+
+## Clarify first
+
+Ask these, and say your assumption for each:
+
+- **Format?** "I'll assume server-sent events with JSON in each `data:` line, and a `[DONE]` marker at the
+  end." (Server-sent events are explained below.)
+- **Encoding?** UTF-8, where one character can be split across chunks.
+- **What counts as malformed?** Invalid JSON in one event, or a broken framing line?
+- **Skip, fail, or retry on a malformed event?** Ask whether each piece carries a sequence number, so a gap
+  could be detected.
+- **What ends the stream?** A marker, or just the connection closing?
+
+## Answer
+
+### Words you need first
+
+- **Server-sent events (SSE)** is the usual streaming format: one long HTTP response the server keeps writing
+  to. Each event is one or more lines like `data: {"delta": "Caf"}`, and a blank line ends the event. The
+  **delta** is the next piece of text.
+- **UTF-8** stores most English letters in 1 byte and characters like `é` in 2 or more. So `"Café"` is 5
+  bytes, and a chunk boundary can fall inside the `é`.
+- An **incremental decoder** turns bytes into text across chunks. If a chunk ends halfway through a character,
+  it holds those bytes until the next chunk completes it.
+- **CRLF** is the two-character line ending `\r\n`. SSE also allows a bare `\n` (LF) or a bare `\r` (CR).
+
+### The three layers
+
+```
+socket chunks, split anywhere (an illustration): b'data: {"del'  b'ta": "Caf\xc3'  b'\xa9"}\r\n\r\n'
+   │
+   ▼
+1. bytes → text      incremental UTF-8 decoder (holds half a character until the rest arrives)
+   │
+   ▼
+2. text → events     buffer + SSE rules (line endings, ":" comments, "data:" lines, blank line = event)
+   │
+   ▼
+3. events → deltas   json.loads each event; count bad ones; stop on [DONE]; closed without [DONE] = error
+   │
+   ▼
+the UI appends each delta: "Caf" … "é" … " au lait"
+```
+
+**Layer 1** turns bytes into text. Plain `chunk.decode()` fails on a split character; the incremental
+decoder doesn't. **Layer 2** keeps a buffer of text that hasn't formed a complete line yet, and applies the
+SSE rules to each complete line. **Layer 3** turns each event into a piece of text for the screen, and decides
+what a bad event or an early close means. Each layer can be tested on its own.
+
+### The rules, layer by layer
+
+1. **Bytes to text** with an incremental UTF-8 decoder (`codecs.getincrementaldecoder("utf-8-sig")`). Plain
+   `chunk.decode()` raises on a split character: `"Café"` is 5 bytes, and cutting after byte 4 breaks it. The
+   `-sig` variant also drops a byte-order mark (three invisible bytes some tools put at the start of a text).
+2. **Text to events** following the SSE rules: lines end in CRLF, LF or CR; lines starting with `:` are
+   keep-alive comments; strip one space after `data:`; join multi-line data with `\n`; a blank line
+   dispatches the event. Keep a buffer across chunks. If a chunk ends in `\r`, wait for the next byte, since
+   it may be half of `\r\n`.
+3. **Events to deltas**: `json.loads` each payload. On a decode error, count it and skip it (or fail, per the
+   clarification). Stop on `[DONE]`. If the connection closes without `[DONE]`, raise. A truncated answer
+   that looks complete is the worst outcome.
+
+### Follow one stream through it
+
+The family walkthrough's test fixture is one short reply, "Café au lait", sent in 7-byte chunks with a
+keep-alive comment, an `é` split across two chunks, CRLF line endings, one malformed JSON line and `[DONE]`.
+
+| What arrives | What a naive parser does | What the three layers do | What to say in the interview |
+|---|---|---|---|
+| a `:` keep-alive line | may treat it as data | ignored as a comment | "Colon lines are keep-alives." |
+| `é` split across chunks | `chunk.decode()` raises, or shows two replacement characters | the decoder waits for the second byte | "I decode incrementally, never per chunk." |
+| a chunk ending in `\r`, the next starting with `\n` | sees a line and an empty line, fires an event early | waits one byte, sees one CRLF | "A lone CR at the end of a chunk might be half of CRLF." |
+| one event with broken JSON | crashes the render | counted as malformed, skipped | "Count it and export the count as a metric." |
+| `[DONE]` | | ends the stream normally | "The marker is how I know the answer is complete." |
+| the connection closes early (truncated test) | returns a half answer as if done | raises `IncompleteStream` | "No marker means cut off, not finished." |
+
+### The test to write first
+
+Feed the same raw stream split at every byte position, and then one byte at a time, and assert the events are
+identical each time:
+
+```python
+for i in range(len(raw) + 1):
+    assert events_for([raw[:i], raw[i:]]) == whole, f"split at byte {i}"
+```
+
+In the family walkthrough this test ran on 2026-10-12 against the fixture above. It would have caught both
+the split-character and split-CRLF bugs. Say it like this: "I can't guess where the network will split, so I
+test every split."
+
+### Retries
+
+Never retry after the first token has reached the user, or they see the start twice. Retry only setup
+failures (the request that opens the stream), through the same outcome table as other calls. Say it like
+this: "Before the first token, a stream is a normal request. After it, an error goes to the caller."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Stream parsing"
+  senior={["Builds the three layers, handles split characters and CRLF, treats a missing [DONE] as an error, and proves it with the every-offset test."]}
+  staff={["Decides skip-versus-fail from whether loss is detectable, exports a malformed-chunk metric, and defines what the UI shows on a broken stream."]}
+/>
+
+In plain words: a Senior answer parses correctly and proves it. A Staff answer also decides the product
+behaviour. If pieces carry sequence numbers, a skipped piece can be detected, so failing loudly may be better
+than skipping. And someone has to decide what the user sees when a stream breaks halfway.
+
+## Small-team version
+
+Use your provider SDK's streaming helpers (the provider's own client library already parses its event
+format). You still own what happens around them:
+
+- **A per-read idle timeout.** A healthy stream can run for a minute; one that goes silent for a few seconds
+  is stuck.
+- **A check that the stream finished**, and what the UI shows on a truncated answer.
+- **Cancellation when the user leaves**, so the provider stops generating text nobody will read.
+- **Your own parser only for a format the SDK doesn't cover**, such as a proxy that re-chunks events. Keep the
+  every-offset test in CI.
+
+An agent will happily suggest `chunk.decode()`; the test is how you catch it.
+
+Cancellation is the part with a cost. With assumed traffic of 50,000 chats a day, where 10% are abandoned with
+300 of 400 output tokens still to generate, cancelling upstream saves about **1.5M output tokens a day**, or
+about **$15 a day ($450 a month)**. Small, but free once the disconnect handling exists.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Abandoned chats:** 10% of 50,000 (both assumed) = 5,000 a day.
+- **Tokens saved:** 5,000 × 300 tokens not generated = 1.5M output tokens a day.
+- **Money:** at $10 per 1M output tokens (Claude Sonnet 5, fetched 2026-10-11): 1.5 × $10 = $15 a day, about
+  $450 over 30 days.
+
+</details>
+
+## Pitfalls
+
+- **`chunk.decode()` per chunk.** It fails, or prints garbage, the first time a multi-byte character is
+  split.
+- **Splitting only on `\n`.** It breaks on a bare CR, and on a CRLF split across two chunks.
+- **Treating connection close as success.** A cut-off answer is then shown as if it were complete.
+- **Retrying a stream after tokens were shown.** The user sees the beginning of the answer twice.
+- **Crashing the whole render on one malformed event.** One bad piece then costs the user the entire answer.
+
+## Go deeper
+
+- Family walkthrough: [Concurrent LLM API client](/system-design-labs/interviews/walkthroughs/concurrent-llm-client/), stage 6 and Verification.
+- The "don't retry after the response started" rule in a Go proxy: <LabRef lab="load-balancer" inline />.

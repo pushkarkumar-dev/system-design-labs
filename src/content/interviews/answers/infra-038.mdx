@@ -1,0 +1,162 @@
+---
+question: infra-038
+family: kv-cache-memory-math
+status: published
+labs: [llm-inference, model-quantizer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "First, inference or training? They differ by about 8× per parameter. For inference, memory is weights plus
+> KV cache plus overhead: a 70B model is 141 GB of weights in bf16, and each 8K-token conversation adds 2.7 GB of
+> cache. On four 80 GB GPUs that leaves room for 59 conversations. For training with the Adam optimizer it is
+> 16 bytes per parameter, 1.13 TB for 70B, at least 15 GPUs before activations. Then I pick the split from that
+> budget: tensor parallelism inside one server for inference; sharded optimizer state for training."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The interviewer wants to see that you can build a memory budget from a model's published shape, keep inference
+and training apart, and choose how to split the model from the budget rather than from habit.
+
+A backend engineer sizes memory for a service as heap plus per-request buffers. The GPU version has the same
+shape, fixed cost plus per-request cost, but three things make it different:
+
+1. **The fixed cost is huge.** The model's weights are tens to hundreds of gigabytes, often more than one GPU
+   holds, so the model itself has to be split.
+2. **The per-request cost lives for the whole conversation.** Each active conversation holds a cache on the GPU
+   that grows with every token.
+3. **Training is a different formula.** Training keeps extra numbers for every parameter, so the same model needs
+   about 8× the memory before you count anything else.
+
+(The question appears as a title on a PracHub list of Anthropic questions; the item itself couldn't be opened,
+so this card gives the family's standard answer <Cite id="s-3650fe20d8" />.)
+
+## Clarify first
+
+- **Inference or training?** "They differ by roughly 8× per parameter before activations, so I'll ask first."
+- **Which model?** "I'll assume Llama-3.1-70B: 70.55 billion parameters, 80 layers, 8 KV heads, head size 128."
+- **Precision, context and concurrency?** "bf16, up to 8K tokens per conversation, and as many conversations as
+  fit."
+- **Hardware?** "80 GB GPUs in NVLink servers, with 5 GB per GPU of overhead assumed."
+
+## Answer
+
+### Words you need first
+
+- **Parameters** (or **weights**): the model's numbers. **bf16** stores each in 2 bytes; **fp8** or **int8** in
+  1 byte; **int4** in half a byte, plus a small **scale** number per group of 32 weights that says how to stretch
+  them. Shrinking the numbers this way is called **quantization**.
+- **Token**: the unit the model reads and writes, roughly ¾ of a word.
+- **KV cache**: per-token memory every active conversation holds on the GPU, so the model doesn't re-read the
+  whole conversation for each new token.
+- **Overhead**: temporary working memory (activations), the GPU driver's state, and gaps between allocations.
+
+### Inference: one box, followed through
+
+Memory = weights + KV cache + overhead. Here is Llama-3.1-70B on four A100 80 GB GPUs:
+
+```
+4 × 80 GB = 320 GB
+┌──────────────────────────────────────────────────────┐
+│ Weights (bf16)                 141.1 GB   fixed      │
+│ Overhead (5 GB × 4, assumed)    20 GB                │
+│ KV cache pool                  158.9 GB              │
+│   ÷ 2.68 GB per 8K conversation = 59 conversations   │
+└──────────────────────────────────────────────────────┘
+```
+
+| Step | Number | What to say in the interview |
+|---|---|---|
+| Weights at bf16 / fp8 / int4 | **141.1 / 70.55 / 39.69 GB** | "int4 is 4.5 bits once I count the scales." |
+| Cache per token | **320 KiB** | "Two, for K and V, times layers, KV heads, head size and bytes." |
+| Cache per 8K conversation | **2.68 GB** | "Every user at full length costs that." |
+| 4 GPUs, bf16 | **59** conversations | "Total minus weights minus overhead, divided by per-conversation cache." |
+| 1 GPU, int4 | **13** conversations | "Quantization can shrink the box to one card." |
+
+Say it like this: "For inference I need weights plus cache plus overhead. Weights are fixed; the cache is per
+token per conversation; what's left over decides how many users fit."
+
+### Training, for contrast
+
+Training keeps, for every parameter, the weight, its **gradient** (how much to change it), and the
+**optimizer's** running averages. The ZeRO paper counts mixed-precision Adam at "2Ψ+2Ψ+KΨ=16Ψ bytes" for Ψ
+parameters ([Rajbhandari et al.](https://ar5iv.labs.arxiv.org/html/1910.02054)). That is **16 bytes per
+parameter**: **1.13 TB** of model state for 70B, at least **15 × 80 GB GPUs** before activations.
+
+### Model-parallel options
+
+Each option splits a different thing. Pick by what is too big.
+
+(An **all-reduce** is a step where every GPU sends its partial result and receives the sum. A
+**mixture-of-experts** (MoE) model has many sub-networks, called experts, and uses only a few per token.)
+
+| Option | Splits | Communication | Use when |
+|---|---|---|---|
+| Replicas (data parallel) | Requests | None at inference | The model fits one GPU or one server |
+| Tensor parallel | Each layer's matrix multiplications | Two all-reduces per layer, every step | Inside an NVLink server; degree must divide the 64 query heads and 8 KV heads |
+| Pipeline parallel | Layers | Activations between stages | Across servers; adds idle gaps ("bubbles") at small batch |
+| Sharded optimizer state (ZeRO/FSDP) | Training state | Gathers and reduce-scatters | Training only |
+| Expert parallel | Experts of a mixture-of-experts model | All-to-all | MoE only |
+
+For 70B inference on four A100s: **TP = 4 in bf16**, because TP = 2 leaves room for only 3 conversations per pair.
+In int8, TP = 4 and two TP = 2 replicas become a real trade between latency floor and failure domain. One more
+limit: tensor parallelism shrinks the cache per GPU only up to the 8 KV heads, so past TP = 8 the cache is copied
+rather than split.
+
+Say it like this: "For inference I split with tensor parallelism inside one server. For training I shard the
+16 bytes per parameter with ZeRO or FSDP first, and add tensor or pipeline parallelism when one layer or one
+server isn't enough."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Weights** = parameters × bits ÷ 8. 70.55 × 10⁹ × 2 = **141.1 GB** (bf16); × 1 = **70.55 GB** (fp8);
+  × 4.5 ÷ 8 = **39.69 GB** (int4 with one fp16 scale per 32 weights). Without scales, int4 would be 35.28 GB.
+- **KV per token** = 2 × 80 × 8 × 128 × 2 = **327,680 B**; × 8,192 = **2.68 GB** per conversation.
+- **4 GPUs, bf16**: 320 − 141.1 − 20 = 158.9 GB → 484,910 tokens → **59** at 8K.
+- **1 GPU, int4**: 80 − 39.69 − 5 = 35.31 GB → 107,771 tokens → **13** at 8K.
+- **Training**: 16 × 70.55 × 10⁹ = **1.13 TB**; ÷ 80 GB = 14.1, so at least **15** GPUs.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="VRAM and parallelism"
+  senior={["Builds the weights + KV + overhead budget with the right KV formula, and the 16-bytes-per-parameter training figure."]}
+  staff={["Chooses the split from the budget and the interconnect, and names what changes it: quantization, fp8 cache, context limits, failure domains."]}
+/>
+
+## Small-team version
+
+You will mostly do the inference half, to decide whether to self-host and on what. At the RunPod list prices
+fetched 2026-10-11:
+
+| Setup | Conversations at 8K | Cost per month |
+|---|---|---|
+| 70B int4 on one 80 GB H100 | 13 | $1,964–$2,548 |
+| 70B bf16 on four A100 80 GB | 59 | $4,059–$4,643 |
+
+Default: Together's serverless Llama 3.3 70B at $1.04 per 1M tokens (fetched 2026-10-11). The family walkthrough
+finds the 4×A100 box breaks even only above about 27–30% of peak throughput around the clock, before labor.
+Revisit for steady volume past that, residency, or a narrow task a small model wins.
+
+Full fine-tuning of a 70B model (1.13 TB of model state, 15 or more GPUs) is out of reach for most small teams.
+Adapter fine-tuning of a small model, which trains only a small add-on to the weights, is the realistic case.
+
+## Pitfalls
+
+- **Answering only inference when the title may mean training, or the reverse.** Ask; the formulas differ by 8×.
+- **Putting query heads in the cache formula.** It is 8× too high for this model, which shares 8 KV heads among
+  64 query heads.
+- **int4 without scales.** It gives 35.3 GB instead of 39.7 GB, enough to turn "doesn't fit" into "fits".
+- **Proposing tensor parallelism across servers or over PCIe.** It needs two all-reduces per layer per step,
+  which only NVLink inside a server is fast enough for.
+
+## Go deeper
+
+- Family walkthrough: [KV cache and GPU memory math](/system-design-labs/interviews/walkthroughs/kv-cache-memory-math/#derivations), sections 3, 4 and 9.
+- Training side: [distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/).
+- Check the formula in <LabRef lab="llm-inference" inline />; see group scales in <LabRef lab="model-quantizer" inline />.

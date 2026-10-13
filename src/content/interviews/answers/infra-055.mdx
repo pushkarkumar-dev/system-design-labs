@@ -1,0 +1,179 @@
+---
+question: infra-055
+family: move-big-bytes
+status: published
+labs: [gossip, service-discovery, cdn-edge]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll split the model into chunks of tens of MB: small enough that hosts can forward one while receiving the
+> next, large enough that request overhead doesn't dominate. A chain is fastest on paper but one slow host
+> stalls everyone behind it, so I'd let every host fetch from several peers at once. With a coordinator, a
+> tracker hands out peer lists and can be rebuilt from host reports. Without one, hosts learn who is alive and
+> who has what by gossip. Either way a chunk from any peer is safe, because its hash must match a signed list."
+>
+> The rest of this page explains each part of that answer.
+
+The task: design the pipeline that downloads a big model to many hosts in chunks. The interviewer asks three
+things in turn: how big a chunk is, whether chunks flow down a chain or a tree, and how the system recovers
+when a host dies, first with a coordinator and then without one.
+
+### What makes this different from a normal download
+
+A normal download is one client and one server. If it fails, you retry. Here hundreds of hosts download the
+same file at the same time and also send pieces to each other. So every choice has two sides: what happens to
+one host, and what happens to everyone downstream of it. A host that dies halfway is not just a failed
+download; it may be a source that others were counting on.
+
+The coordinator-free half is where depth shows: who decides which peer to fetch from, and why a chunk from a
+stranger is safe to use.
+
+This question comes from a Senior Staff Anthropic loop on Blind, where the poster calls it "probably my
+stronger design round" (<Cite id="s-e98cbef9cd" />).
+
+## Clarify first
+
+- **Model size.** "I'll assume 150 GB, split into a few dozen files called shards."
+- **Fleet.** "250 hosts per region, each with about 10 GB/s of bandwidth."
+- **Request overhead.** "Each request costs around a millisecond of setup, as an assumption."
+- **Can hosts serve each other?** Is there an origin store or cache to fall back on?
+- **Must a restarted host resume,** or may it start over?
+
+## Answer
+
+### Words you need first
+
+- **Chunk**: a fixed-size piece of the model file, the unit you download, check and forward.
+- **Manifest**: a signed list of every chunk's SHA-256 hash, in order. It is how any host can check any chunk.
+- **Tracker**: a small service that knows which host holds which chunks and hands out lists of peers.
+- **Gossip**: hosts telling each other news directly, with no central service.
+
+### Chunk size
+
+Small chunks keep the pipeline busy and lose little work when a transfer fails. Large chunks mean fewer
+requests and a smaller manifest. Here is the trade for our 150 GB model:
+
+| Chunk size | Chunks | Manifest | Time per chunk | What to say in the interview |
+|---|---|---|---|---|
+| 4 MB | 37,500 | 1.2 MB | 0.4 ms | "A 1 ms request overhead would dominate unless many requests are in flight." |
+| 64 MB | about 2,344 | 75 KB | 6.4 ms | "This is the comfortable middle." |
+| 1 GB | 150 | tiny | 0.1 s | "A 250-host chain needs about 25 s just to fill, and a failure loses up to 1 GB." |
+
+Say: "Tens of MB. And if the origin is an object store, I'll line chunks up with the parts the file was
+uploaded in, so each chunk is one clean read."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+chunks = S ÷ c; manifest = chunks × 32 bytes; time per chunk = c ÷ B, with S = 150 GB and B = 10 GB/s (assumed).
+
+- 64 MB: 150 GB ÷ 64 MB ≈ 2,344 chunks; × 32 B ≈ 75 KB; 64 MB ÷ 10 GB/s = 6.4 ms.
+- 4 MB: 37,500 chunks; 1.2 MB of hashes; 0.4 ms each.
+- 1 GB: a 250-host chain fills in 249 × 0.1 s ≈ 24.9 s.
+
+</details>
+
+### Pipeline versus tree
+
+In a **chain** (pipeline), host 1 forwards each chunk to host 2 as soon as it has it, host 2 to host 3, and so
+on. With 64 MB chunks the whole region finishes in about **16.6 s**: the time one host needs to download the
+file (15 s), plus one chunk's delay per hop.
+
+In a **tree**, each host forwards to k children. Each sender splits its upload k ways, so each child receives
+k times slower. With 2 children that is about **30 s**; with 4, about **60 s**.
+
+The chain is fastest on paper and the most fragile: one slow host in the middle delays everyone after it. A
+**swarm**, where every host uploads every chunk it has checked to any peer that wants it, approaches the
+15-second bound and has no single point of slowness. Say: "I'd start from a swarm, because it has no middle
+host to get stuck behind."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Chain: S ÷ B + (N − 1) × c ÷ B ≈ 15 s + 249 × 6.4 ms ≈ 15 + 1.6 = **16.6 s**.
+- Tree: about k × S ÷ B plus a few chunk-times per level: 30 s at k = 2, 60 s at k = 4.
+
+</details>
+
+### The pieces
+
+```
+Origin / regional cache ── fallback source
+        │
+        ▼
+Host agent ◄──► Host agent ◄──► Host agent      (chunks flow between peers)
+        ▲
+        │  peer lists (with a coordinator)  OR  gossip between hosts (without one)
+Tracker
+```
+
+The **host agent** is a small daemon on each host. It fetches missing chunks, checks each hash, writes the
+chunk, and marks it in a **bitmap** on disk (one bit per chunk). The **tracker** exists only in the
+coordinator version. The **origin or cache** is always the fallback.
+
+### Recovery with a coordinator
+
+A tracker per region and version records which chunks each host holds and hands out peer lists. It drops
+hosts that miss heartbeats. Hosts that were fetching from a dead host time out on those chunks and ask for
+other sources.
+
+The key property: the tracker holds only information that hosts can report again. So a restarted tracker
+rebuilds itself from host reports, and while it is down, hosts keep their current transfers and can fall back
+to the cache. Say: "The tracker is a cache of host state, not the source of truth."
+
+### Recovery without one
+
+Hosts learn who is alive by gossip. A common protocol is **SWIM**: each host pings a random peer, and if it
+gets no answer, it asks a few others to try (an indirect probe) before declaring it dead. That avoids false
+alarms from one bad network path.
+
+Each host's chunk bitmap rides on the gossip messages. For this model it is 2,344 bits, about 293 bytes, so it
+is cheap. A host picks a source at random among peers that advertise the chunk it needs.
+
+Why is a chunk from a stranger safe? **Content addressing**: each chunk is named by its hash. A chunk is valid
+if its hash matches the signed manifest, whoever sent it. No coordinator has to vouch for a peer. Say: "I
+trust hashes, not peers."
+
+A restarted host resumes from its on-disk bitmap. A corrupt chunk fails its hash check, is thrown away,
+fetched from someone else and counted against the sender. Because no host forwards a chunk it hasn't checked,
+corruption can't spread.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Chunked download pipeline"
+  senior={["Sizes chunks from overhead and failure cost, compares chain and tree times, and resumes from a bitmap."]}
+  staff={["Explains why content addressing removes the need for a trusted coordinator, and puts an epoch on control decisions so a recovering host never acts on stale instructions."]}
+/>
+
+An **epoch** here is a number on every control decision that only goes up. A host ignores any instruction
+with a lower epoch than the last one it applied, so a message delayed during a failure can't undo a newer
+decision.
+
+## Small-team version
+
+Use a tested downloader with parallel range requests, a hash check and resume, pulling from a bucket in the
+same region. Chunk size is still a real choice. Line chunks up with the upload's part size, and make them
+large enough that a few dozen requests in flight fill the node. At an assumed 100 MB/s per stream, 20 streams
+fill an assumed 2 GB/s node read path, and a 40 GB model arrives in about **20 s**.
+
+Trackers and gossip are not worth building below dozens of nodes. Your recovery story is "retry the failed
+range, then the whole file, then page someone". What changes the answer is a shared fixed pipe: 20 nodes ×
+40 GB through an assumed 1.25 GB/s link takes **640 s**. If that is longer than your rollout window, mirror
+the weights closer first.
+
+## Pitfalls
+
+- **Picking a chunk size without the trade.** Say what overhead and failure cost it balances.
+- **A chain with no plan for a slow middle host.** Everyone behind it waits.
+- **A tracker nobody can rebuild.** Losing it then stops every transfer.
+- **Trusting peers instead of hashes.** One bad peer can then spread corruption.
+
+## Go deeper
+
+- Family walkthrough: [Move big bytes fast](/system-design-labs/interviews/walkthroughs/move-big-bytes/#chunked-fan-out-with-and-without-a-coordinator).
+- Gossip membership: <LabRef lab="gossip" inline />. A tracker in miniature: <LabRef lab="service-discovery" inline />. Origin coalescing: <LabRef lab="cdn-edge" inline />.
+- The one-file version: [infra-054](/system-design-labs/interviews/questions/infra-054/).

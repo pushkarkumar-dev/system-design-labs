@@ -1,0 +1,186 @@
+---
+question: eng-003
+family: rag-system-design
+status: published
+labs: [embedding-pipeline, rag, vector-index]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "This is a data pipeline with one expensive stage. Documents arrive as change events on a durable queue. Each
+> stage (fetch, parse, chunk, embed, write) is idempotent and keyed by document id and version, and each stamps
+> its own version on what it writes, so a parser or model upgrade reprocesses only what it affects. Embedding is
+> the slow, costly stage, so it runs batched and in parallel and only on chunks whose content changed. Separate
+> queues keep a bulk import from blocking deletions, and quality checks stop a bad parse from reaching the
+> index."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer is testing whether you treat document ingestion for an LLM (large language model, such as Claude or GPT) as the distributed pipeline it is.
+
+You have built pipelines like this: events in, workers, retries, a dead-letter queue. Three things are different
+here:
+
+1. **One stage is far more expensive than the rest.** Turning text into an **embedding** (a list of numbers that
+   captures its meaning, computed by a small model, so search can find passages by meaning) costs real compute
+   per passage. At 10 million documents it is days of work on one machine.
+2. **Bad output is silent.** A parser that reads a two-column PDF in the wrong order produces garbled text, and
+   nothing throws. The search just gets worse.
+3. **Upgrades touch everything.** A better parser or a new embedding model can mean reprocessing the whole corpus,
+   unless every output records which version produced it.
+
+This is the ingestion half of **RAG** (retrieval-augmented generation: search your documents, then let an LLM
+answer from the passages found). Expect it to be judged like any distributed pipeline, with the LLM part as one
+stage. Only the title is known: Aced lists it for Databricks as "Design a document processing pipeline that
+ingests and indexes large volumes of heterogeneous documents for LLM use", with no answer or follow-ups
+(<Cite id="s-d7a8e88bf0" />).
+
+## Clarify first
+
+- **Volume and rate.** "Assume 10M documents to backfill, then 100,000 changed documents a day."
+- **Formats.** PDFs (some scanned), Office files, HTML, spreadsheets. Ask what share is scanned, because scans need
+  **OCR** (software that reads text out of an image), which is slow and error-prone.
+- **Freshness.** "Assume edits must be searchable within an hour, deletions within 15 minutes."
+- **Embeddings by API or self-hosted**, and any rule about where data may live.
+- **Who reads the index?** One RAG app, or many teams with different needs?
+
+## Answer
+
+### Words you need first
+
+- **Token**: a piece of a word, about ¾ of a word. Models read, and bill, text in tokens.
+- **Chunk**: one passage cut from a document, a paragraph to a section long. Chunks are what get embedded,
+  searched and cited.
+- **Vector index**: a structure that finds the stored vectors nearest to a query vector quickly.
+- **Backfill**: processing the whole existing corpus once, as opposed to the daily trickle of changes.
+
+### The pipeline
+
+```
+Sources (change events, or a crawler that lists and diffs)
+   │
+   ▼
+Durable queue ── one per source, fair shares; deletes in a fast lane
+   │
+   ▼
+Fetch ── raw bytes to object storage, keyed by (doc id, version)
+   │
+   ▼
+Detect type → Parse ── structured text; OCR branch for scanned pages
+   │                    (fails 3 times → dead-letter queue)
+   ▼
+Chunk ── split on headings; hash each chunk
+   │
+   ▼
+Embed ── only hashes not seen before; batched
+   │
+   ▼
+Write ── chunks + vectors + keyword entries, one transaction per document;
+         delete the old version's chunks; stamp parser/chunker/model versions
+```
+
+**Queue.** Each source gets its own queue with a fair share of workers, so a 1M-file import doesn't starve the
+daily edits. Deletions and permission changes go in their own fast lane.
+
+**Fetch and parse.** Raw bytes go to object storage first, so a parser fix can re-run without re-fetching. Files
+that fail parsing three times go to a dead-letter queue for a person to look at.
+
+**Chunk and hash.** Each chunk's content hash decides whether it needs embedding. An edit to one page of a long
+document re-embeds one or two chunks, not the whole document.
+
+**Embed.** Batched and parallel, because this is where the time goes.
+
+**Write.** Chunks, vectors and keyword-index entries land in one transaction per document, and the old version's
+chunks are deleted in the same transaction. The keyword index can be written before embedding finishes, so new
+documents are searchable early.
+
+### Follow one document through it
+
+Say a 4,000-token policy PDF is edited: one paragraph on page 3 changes.
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| Event | The source emits "doc 9811, version 7". | "Everything is keyed by document id and version, so retries are safe." |
+| Fetch | Bytes saved to object storage under (9811, v7). | "Raw bytes are kept, so a parser fix can replay without re-fetching." |
+| Parse | 4,000 tokens of text with headings and page numbers. Characters per page look normal. | "A near-empty page means a failed parse; I alert on that per file type." |
+| Chunk | 12 chunks. 11 hashes match version 6; 1 is new. | "Hashing turns an edit into one embedding call, not twelve." |
+| Embed | 1 chunk embedded. | "Embedding is the cost; content hashing is how you avoid paying it twice." |
+| Write | In one transaction: upsert 12 chunk rows for v7, delete v6's chunks. | "No moment where both versions, or neither, are searchable." |
+
+### The size of the backfill
+
+At the assumed 4,000 tokens per document and 400-token chunks, 10M documents become **120M chunks**. Embedding
+them through a hosted API costs about **$960**. On one CPU process, at the rate the embedding-pipeline lab
+measured, it would take about **12 days**. On GPUs, at an assumed rate, about **17 GPU-hours**. The vectors take
+**737 GB** stored as 4-byte numbers (float32), or 184 GB as 1-byte integers (int8).
+
+What that means for the design: batching and parallel workers are the design, not a tuning detail. The lab
+measured how much batching alone buys:
+<LabNumber lab="embedding-pipeline" metric="1 vs 32 chunk-length texts per call (CPU)" /> (one text per call vs
+32 per call). And at this size the index is a vector store split across machines, not one Postgres table. Say it
+like this: "Twelve days on one process means I parallelise embedding from day one and never re-embed a chunk whose
+hash I've seen."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Chunks per document = ceil((T − o) ÷ (c − o)), with T = 4,000 tokens (assumed), c = 400 chunk size, o = 50
+  overlap: ceil(3,950 ÷ 350) = 12. 10M × 12 = **120M chunks**.
+- Tokens: 120M × 400 = 48B tokens × $0.02 per 1M (text-embedding-3-small, fetched 2026-10-11) = **$960**.
+- One CPU process at the lab's batched 112 texts/s: 120M ÷ 112 ≈ 1.07M s ≈ **12.4 days**.
+- At an assumed 2,000 chunks/s per GPU: 120M ÷ 2,000 = 60,000 s ≈ **17 GPU-hours**.
+- Vectors at d = 1,536: 120M × 1,536 × 4 B = **737 GB** float32; × 1 B = **184 GB** int8.
+
+</details>
+
+### Operations and quality gates
+
+- **Backfills run at lower priority** than the daily trickle, ideally through a batch endpoint where the provider
+  discounts it.
+- **Track extracted characters per page**, by file type. A near-zero page means a parse failure.
+- **Count chunks truncated** by the embedder's input limit. Every embedding model reads only so many tokens and
+  silently drops the rest.
+- **Measure search quality after any parser, chunker or model change**: recall@k (the share of test questions
+  whose answer passage is among the top k results) on a labelled set.
+- **An embedding-model change goes to a shadow index**, a second index built alongside the first, and traffic
+  switches by alias once it passes. Never mix vectors from two models in one index.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Ingestion at volume"
+  senior={["Idempotent staged pipeline with content-hash re-embedding, a dead-letter queue and a backfill estimate."]}
+  staff={["Versions every stage's output so parser or model changes reprocess only what they affect, and sets quality gates (parse failure rate, recall@k) that block a bad index from serving."]}
+/>
+
+## Small-team version
+
+At a 50–500 person company the volume is usually thousands to hundreds of thousands of documents. The pipeline is
+then a job queue (Postgres-backed, or your cloud's queue), a worker pool, a hosted embedding API and Postgres.
+
+**What it costs.** A backfill of 150,000 documents (assumed) costs about **$14** to embed: 150,000 × 12 chunks ×
+400 tokens = 720M tokens at $0.02 per 1M (text-embedding-3-small, fetched 2026-10-11). The steady state is cheaper
+still.
+
+**Where the time goes.** Parsing. Read the output of your 20 worst files, and route scanned PDFs to OCR. Buy a
+parsing service only if your formats are hard (scans, complex tables) and your eval shows the open-source parser
+failing.
+
+**When to change.** Move to a vector store split across machines, and parallel GPU embedding, only near the
+10M-document envelope above, or when a data-residency rule forces you to host the embedder yourself.
+
+## Pitfalls
+
+- **No version on outputs.** A parser fix then means re-running everything, because you can't tell which rows it
+  affects.
+- **One queue for everything.** A bulk import then blocks deletions, which are the changes that matter most.
+- **Treating "embedded" as "done".** Garbled text embeds without error; check extraction quality first.
+- **Forgetting deletions in a crawler that only lists current files.** A deleted file is just an absence; reconcile
+  ids on a schedule.
+
+## Go deeper
+
+- Family walkthrough: [Design a RAG system end to end](/system-design-labs/interviews/walkthroughs/rag-system-design/#re-indexing-when-documents-or-the-embedding-model-change).
+- Batching and model versioning: <LabRef lab="embedding-pipeline" inline />. Index trade-offs: <LabRef lab="vector-index" inline />.

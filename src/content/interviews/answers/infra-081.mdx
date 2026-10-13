@@ -1,0 +1,177 @@
+---
+question: infra-081
+family: kv-cache-memory-math
+status: published
+labs: [llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "First I'd ask which memory ran out, because there are two. `OOMKilled` with exit code 137 means the
+> container went over its host-RAM limit, which Kubernetes enforces; GPU memory isn't part of that limit. A CUDA
+> out-of-memory error means the GPU's own 80 GB ran out: weights, plus the KV cache that grows with conversation
+> length and batch size, plus temporary working memory. Then I'd run the GPU budget, and fix in cost order: what
+> else is on the GPU, context and batch caps, a smaller cache, smaller weights, and only then more GPUs."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+This is a debugging question. The trap is in the word: `OOMKilled` is a Kubernetes host-memory event, while the
+fixes the interviewer expects are about GPU memory. A strong answer separates the two memories first, then works
+the GPU budget.
+
+A backend engineer has debugged plenty of out-of-memory kills: a JVM heap too big for its container, or a leak
+that grows until the kernel kills the process. What makes a model server different:
+
+1. **It has two separate memories.** The pod's host RAM (which Kubernetes limits) and the GPU's own memory
+   (which Kubernetes doesn't count). Each fails with a different error.
+2. **GPU memory is pre-claimed.** A serving engine grabs most of the GPU at startup and divides it up itself, so
+   GPU usage looks flat and full even when healthy.
+3. **The biggest growing item is by design.** Every active conversation holds a cache that grows with each
+   token. Running out of it is often a capacity problem, not a leak.
+
+(A CUDA prep guide, dated 2026-07-23, lists this question and expects an answer that "connects the KV cache
+growing with sequence length and batch size to the fix" <Cite id="s-55d540eda9" />.)
+
+## Clarify first
+
+- **What exactly does the pod status say?** "`OOMKilled` with exit code 137, or an error with a CUDA
+  out-of-memory trace?"
+- **At startup or under load?** "At startup points to loading the model; under load points to the cache pool or
+  temporary working memory."
+- **What's running?** "Which model, precision, engine, and limits: pod memory limit, max context, max sequences?"
+- **Is anything else on the GPU?** "I'll assume one engine per GPU unless told otherwise."
+
+## Answer
+
+### Words you need first
+
+- **CUDA**: NVIDIA's GPU programming layer. A "CUDA out-of-memory error" means GPU memory ran out.
+- **KV cache**: per-token working memory each active conversation keeps on the GPU, so the model doesn't re-read
+  the whole conversation for every new token. It grows with conversation length and with the number of
+  conversations. For Llama-3.1-70B it is 320 KiB per token, **2.68 GB per 8K-token conversation**.
+- **Activations**: temporary memory used while the model processes one step. The peak grows with how many tokens
+  the engine processes in that step.
+- **Preemption**: when the cache pool is full, the engine pauses a conversation and frees its memory instead of
+  crashing.
+
+### The picture
+
+```
+Kubernetes node
+┌──────────────────────────────────────────────────────────────┐
+│ Pod (container memory limit, in host RAM)                    │
+│   Python process: loader, tokenizer, request buffers         │
+│        │ copies weights to the GPU at startup                │
+│        ▼                                                     │
+│ GPU (80 GB, not counted in the pod limit)                    │
+│   weights │ activation peak │ KV cache pool                  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+The **pod** is where the Python process lives; its limit covers host RAM only. The **GPU** holds the weights,
+the activation peak and the cache pool. Kubernetes doesn't see that memory at all.
+
+### Step 1. Name the memory
+
+| Symptom | Memory | Likely cause | What to say in the interview |
+|---|---|---|---|
+| `OOMKilled`, exit code 137, restarts | Host RAM vs the container limit | Loader holding weights in host memory, CPU offload, big tokenizer or batch buffers | "This is the pod limit, not the GPU." |
+| CUDA out-of-memory error | GPU memory | Weights + KV pool + activation peak + other processes exceed 80 GB | "Now I run the GPU budget." |
+| Preemption warnings, no crash | The engine's KV pool | More in-flight context than the pool holds | "Working as designed; tune limits." |
+
+Kubernetes documents the first row: a container that keeps using memory beyond its limit is terminated, shown as
+`OOMKilled` with exit code 137, and restarted
+([Kubernetes](https://kubernetes.io/docs/tasks/configure-pod-container/assign-memory-resource/), fetched
+2026-10-12). GPU memory isn't part of that limit.
+
+### Step 2. Run the GPU budget
+
+An engine like vLLM claims a fixed fraction of the GPU at startup (`--gpu-memory-utilization`, default 0.92 in
+docs fetched 2026-10-12; 0.90 in older versions). It loads the weights, measures an activation peak, and makes
+the rest the KV pool. Work one case through it:
+
+| Case | Engine budget | Weights | Left for activations and cache | What it means |
+|---|---|---|---|---|
+| Llama-3.1-70B in fp8 on one 80 GB GPU | **73.6 GB** | 70.55 GB | about **3 GB** | Barely one 8K conversation; any long prompt overflows |
+| Llama-3.1-8B in bf16 on one 80 GB GPU | 73.6 GB | 16.06 GB | about 57 GB | Plenty; each 8K conversation needs 1.07 GB |
+
+Don't assume the activation share is small. A January 2025 vLLM log for Llama-3-8B on an A100 40GB shows a
+**9.37 GiB** activation peak ([issue 12330](https://github.com/vllm-project/vllm/issues/12330)), and it grows with
+the tokens processed per step.
+
+After startup, two things cause a CUDA out-of-memory error: **something else on the GPU** (a second process or
+replica) taking memory the engine counted as its own, or **an activation peak bigger than the one measured** at
+startup, from long prompts with a high batched-token limit.
+
+Say it like this: "fp8 70B on one 80 GB card leaves about 3 GB inside the engine's budget. That's one 8K
+conversation. The box is sized wrong, not buggy."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+engine budget = memory fraction × 80 GB ≥ weights + activation peak + KV pool, where KV pool = conversations ×
+context × 2 × layers × KV heads × head_dim × bytes.
+
+- 0.92 × 80 GB = **73.6 GB**. 73.6 − 70.55 = **3.05 GB** for activations and cache.
+- One 8K conversation on the 70B: 2 × 80 × 8 × 128 × 2 × 8,192 = **2.68 GB**.
+- The family walkthrough's fixed-overhead view (5 GB assumed instead of the engine fraction): 80 − 70.55 − 5 =
+  4.45 GB, still one 8K conversation.
+- 8B in bf16: 16.06 GB of weights; 2 × 32 × 8 × 128 × 2 × 8,192 = **1.07 GB** per 8K conversation.
+
+</details>
+
+### Step 3. Fix in order, cheapest first
+
+1. **Host side:** raise the pod limit to cover what the loader holds, or load so weights stream to the GPU; turn
+   off CPU offload you didn't intend.
+2. **GPU side:** check `nvidia-smi` (it lists processes on the GPU) for other processes; cap max context and max
+   sequences; lower max batched tokens to shrink the activation peak; lower the memory fraction if something else
+   needs headroom.
+3. **Make the cache smaller:** an fp8 KV cache halves bytes per token; paged allocation (most engines have it)
+   removes reservation waste.
+4. **Make the weights smaller:** int8/fp8 or int4 with group scales, after checking quality.
+5. **Add memory:** more GPUs with tensor parallelism (splitting the model across GPUs), or a 141 GB H200.
+
+Then prevent a repeat: alert on host memory against the limit and on the engine's preemption counter, and size
+limits from the arithmetic, not the model card's maximum context.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="OOMKilled"
+  senior={["Separates host OOM from CUDA OOM, works the GPU budget, and lists fixes in cost order."]}
+  staff={["Turns the incident into limits and alerts (per-tenant context caps, preemption and host-memory alerts) and a sizing check that runs on every model change."]}
+/>
+
+## Small-team version
+
+On a small team you are also the SRE for this pod. Three habits prevent most of these incidents:
+
+- **One engine per GPU**, so nothing else takes memory the engine counted on.
+- **Max context from your real traffic**, not the model card's maximum.
+- **A startup check**: compare the engine's startup log (cache capacity, maximum concurrency) with your
+  arithmetic.
+
+An agent can draft the fix; you verify it with a load test that sends your longest real prompts at peak
+concurrency.
+
+Cap context before you add hardware. A second H100 to buy headroom costs **$1,964–$2,548 a month** at RunPod
+list prices (fetched 2026-10-11). A context cap or an fp8 KV cache costs nothing but a config change and an eval
+run.
+
+## Pitfalls
+
+- **Treating `OOMKilled` as a GPU error, or a CUDA OOM as a pod-limit problem.** Each fix only works on its own
+  memory.
+- **Raising the memory fraction to cure a CUDA OOM caused by another process.** The engine then claims even more
+  of the card, and the other process has even less room.
+- **Assuming a fixed overhead.** Measure the activation peak; one real log shows 9.37 GiB.
+- **Adding GPUs before capping context.** The cheapest fix is usually a limit, not hardware.
+
+## Go deeper
+
+- Family walkthrough: [KV cache and GPU memory math](/system-design-labs/interviews/walkthroughs/kv-cache-memory-math/#derivations), section 8.
+- Related question on the same chip: [why decode is memory-bound](/system-design-labs/interviews/questions/infra-073/).
+- See an allocator return "no page" in <LabRef lab="llm-inference" inline />.

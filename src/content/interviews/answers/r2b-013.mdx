@@ -1,0 +1,173 @@
+---
+question: r2b-013
+family: llm-from-scratch
+status: published
+labs: [transformer, llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Attention is a weighted average. Each token makes a query, a key and a value. Its query is scored against
+> the keys of itself and every earlier token, a softmax turns the scores into weights that add up to 1, and
+> the output is the weighted mix of the values. Multi-head means doing that several times side by side on
+> slices of the vector, then joining the slices back. I'll write the shape on every line, mask before the
+> softmax, transpose the heads back before merging them, and test the whole thing against PyTorch's built-in
+> attention."
+>
+> The rest of this page explains each part of that answer.
+
+This is the most-asked component in LLM coding rounds. The interviewer wants clean, correct code where every
+array shape is accounted for, and a test that proves it.
+
+What makes it harder than it looks is that the bugs don't crash. In a typical coding problem, a wrong index
+throws an error or a test prints the wrong number. Here, every value is a floating-point number in a large
+array. Merging the heads in the wrong order, or applying the mask after the softmax instead of before, gives
+an array of exactly the right size, full of plausible numbers. The code runs. It is just wrong. So the
+candidate who writes shapes down and tests against a reference stands out.
+
+(The evidence is two question titles: Meta's "Implement the Forward Pass of Multi-Head Attention From Scratch",
+Sep 2026, and Apple's "Implement Masked Multi-Head Self-Attention", Apr 2026, with no body behind either
+<Cite id="s-be19e40ea6" />, <Cite id="s-0630fd2aff" />.) The follow-ups are unknown, so expect masking,
+complexity and a test.
+
+## Clarify first
+
+Ask quickly, and say the assumption you'll use:
+
+- **Library.** "NumPy or PyTorch? Is `nn.Linear` allowed? I'll assume PyTorch."
+- **Layout.** "Input is `(B, T, d_model)`: batch, tokens, numbers per token. I'll assume `d_model` divides
+  evenly by the number of heads."
+- **Which mask.** "Causal, padding, or both? I'd guess 'masked' means causal, so a token can't see later
+  tokens." Ask anyway.
+- **Return value.** "Do you want the attention weights back too? I'll assume no."
+- **Mode.** "Inference only, so no dropout (random zeroing used only in training)?"
+
+## Answer
+
+### Words you need first
+
+- **Token**: one small piece of text the model reads, such as a word piece. Each token is a row of `d_model`
+  numbers by the time it reaches attention.
+- **Query, key, value**: three vectors each token makes by multiplying its row by three learned matrices. The
+  query is what the token is looking for, the key is what it offers, the value is what it hands over. Think of
+  a soft hash-map lookup in which every key matches a little.
+- **Softmax**: turns a row of scores into weights between 0 and 1 that sum to 1.
+- **Causal mask**: a rule that hides every later token, so the model can't peek at the answer.
+- **Head**: one slice of the vector with its own attention. With `d_model` = 64 and 4 heads, each head gets
+  16 numbers.
+
+### Follow one sentence through it
+
+Take a 4-token input, `d_model` = 64, 4 heads, so `d` = 16 per head. Write this legend at the top of your file:
+`B` batch, `T` tokens, `h` heads, `d = d_model ÷ h`.
+
+| Step | Shape | What to say in the interview |
+|---|---|---|
+| Input `x` | `(1, 4, 64)` | "One sequence, four tokens, 64 numbers each." |
+| Project to q, k, v | `(1, 4, 64)` each | "Three learned matrices." |
+| Split into heads | `(1, 4, 4, 16)` = `(B, h, T, d)` | "View as 4 heads of 16, then move the head axis next to batch." |
+| Scores `q·kᵀ/√d` | `(1, 4, 4, 4)` | "Each of 4 tokens scores 4 tokens, per head." |
+| Mask, then softmax | `(1, 4, 4, 4)` | "Token 3 keeps weights on tokens 1–3 only; each row sums to 1." |
+| Weighted sum of v | `(1, 4, 4, 16)` | "Back to 16 numbers per head." |
+| Transpose back, merge, project | `(1, 4, 64)` | "Same shape as the input." |
+
+### The code
+
+```python
+def attention(q, k, v, mask=None):                       # (B, h, T, d) each
+    scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])   # (B, h, T, T)
+    if mask is not None:
+        scores = scores.masked_fill(~mask, float("-inf"))      # before softmax
+    return torch.softmax(scores, dim=-1) @ v                    # (B, h, T, d)
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.h, self.d = n_heads, d_model // n_heads
+        self.wq, self.wk, self.wv, self.wo = (nn.Linear(d_model, d_model, bias=False) for _ in range(4))
+
+    def forward(self, x, causal=True):                     # x: (B, T, d_model)
+        B, T, _ = x.shape
+        split = lambda t: t.view(B, T, self.h, self.d).transpose(1, 2)
+        q, k, v = split(self.wq(x)), split(self.wk(x)), split(self.wv(x))
+        mask = torch.ones(T, T, dtype=torch.bool).tril() if causal else None
+        out = attention(q, k, v, mask)
+        return self.wo(out.transpose(1, 2).contiguous().view(B, T, self.h * self.d))
+```
+
+### Three reasons to say out loud
+
+**Divide by √d.** A dot product of two random vectors of length d grows with d. Large scores make softmax put
+almost all the weight on one token. Dividing by √d keeps the scores' spread near 1, so softmax doesn't
+saturate.
+
+**Mask with minus infinity, before softmax.** `exp(-inf)` is exactly 0, so masked tokens get zero weight and
+every row still sums to 1. Zeroing weights after softmax leaves rows that sum to less than 1.
+
+**Transpose back before the merge.** The split went `view` then `transpose`. The merge must undo it in reverse
+order. A plain `reshape` from `(B, h, T, d)` runs fine and puts pieces of different tokens into one row.
+
+### Test it
+
+Compare with `F.scaled_dot_product_attention(q, k, v, is_causal=True)` on random inputs. Then check causality:
+change the last token and confirm that no earlier output moves. Say: "Ten lines of comparison code prove the
+whole thing."
+
+### Complexity
+
+Every token scores every visible token, so time is **O(T² · d) per head** and the score matrix takes **O(T²)
+memory**. FlashAttention, a fused GPU implementation, avoids storing that matrix by working in small tiles; the
+result is the same.
+
+If the interviewer pushes on generation, mention that the mask changes once you add a KV cache (stored keys and
+values of past tokens). The single new token sits at the last position, so the mask must line up with the
+bottom-right corner.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Multi-head attention"
+  senior={["Correct code with shapes, the mask before softmax, and a reference test."]}
+  staff={["Also says how the mask must change for a KV cache (bottom-right alignment), handles padding rows that would produce nan, and names the T² memory and the fix."]}
+/>
+
+## Small-team version
+
+You won't hand-write attention in a product. Knowing it still explains two things about cost and latency.
+First, reading a long prompt takes more than linearly more work, because every token scores every earlier
+token. You are billed per token, but very long prompts are slower to start answering. Second,
+because attention is causal, a provider can reuse the work for the start of your prompt (this is **prompt
+caching**). That only works if the start is byte-for-byte identical. Change one early token and everything after
+it must be recomputed.
+
+That second point is worth money. Take a 3,000-token prompt whose first 2,000 tokens are a stable system prompt.
+At Claude Sonnet 5's list prices ($2 per 1M input tokens, $0.20 per 1M cache reads, fetched 2026-10-11), the
+input costs **$0.0024 per request cached** against **$0.0060 uncached**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Uncached: 3,000 × $2/M = $0.0060.
+- Cached prefix: 1,000 × $2/M + 2,000 × $0.20/M = $0.0020 + $0.0004 = $0.0024.
+
+</details>
+
+Default: a managed API, with the stable parts of the prompt first. Reach for this knowledge when you debug cost
+or latency, not when you build features.
+
+## Pitfalls
+
+- **Merging heads with `reshape` straight from `(B, h, T, d)`.** The shapes look fine, but tokens are mixed
+  across rows.
+- **Applying the mask after softmax.** Rows no longer sum to 1, and the output is quietly wrong.
+- **Mixing mask conventions.** PyTorch's built-in call treats `True` as "attend" and `nn.MultiheadAttention`
+  treats it as "masked out", so the same mask means opposite things.
+- **No test at all.** Without a reference comparison you can't tell a correct module from a broken one.
+
+## Go deeper
+
+- Family walkthrough: [Stage 1](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#stage-1-softmax-and-attention) and [Stage 2](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#stage-2-multi-head-attention).
+- Next step up: [infra-064](/system-design-labs/interviews/questions/infra-064/) adds a KV cache and GQA.
+- Lab: <LabRef lab="transformer" inline />.

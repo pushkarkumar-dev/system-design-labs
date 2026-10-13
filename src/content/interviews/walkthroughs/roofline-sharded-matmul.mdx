@@ -1,0 +1,914 @@
+---
+title: "Roofline and sharded-matmul math"
+summary: "Count FLOPs, bytes and link traffic for a matmul, find the ridge point, explain why decode is memory-bound and prefill compute-bound, and shard on M, N or K (an FFN, an LM head, two GPUs) with the right collective."
+track: ai-infra
+format: estimation
+family: roofline-sharded-matmul
+smallTeamFocus: "Decode is memory-bound, so rent bandwidth and memory, not TFLOPS, for chat; prompt-heavy RAG favours compute. Batch before buying GPUs, and keep tensor parallelism off PCIe-only cards."
+rounds: [domain-deep-dive]
+level: both
+timeboxMin: 45
+order: 119
+status: published
+basedOn: [infra-070, infra-073, infra-037, infra-036, infra-039]
+askedAt: [anthropic, google, microsoft, nvidia, modal, together-ai, fireworks-ai, groq, cerebras, applied-ai-generic]
+labs:
+  - { lab: transformer, role: proof, note: "A GPT you can count: FLOPs per token and FFN shapes from code you trained yourself, then time forward passes at different batch sizes." }
+  - { lab: llm-inference, role: partial, note: "Prefill and decode branch in real code; its batching runs one forward pass per request, so it can't show the roofline crossover." }
+gapLabs: [training-parallelism]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "Every matrix multiply has two costs: the arithmetic, and fetching the numbers from GPU memory. The GPU does
+> whichever one takes longer. I count both, divide the arithmetic by the bytes, and compare that ratio with the
+> GPU's own ratio of compute speed to memory speed, which is about 295 on an H100. When a chat model writes its
+> reply one word at a time, each weight it reads is used for only one word per user, so the ratio is tiny and the
+> GPU waits on memory. Reading a long prompt uses each weight thousands of times, so that part waits on
+> arithmetic. When I split a multiply across GPUs, splitting rows or columns needs no extra traffic, but
+> splitting the inner dimension leaves partial sums that must be added up over the link, and on a slow link that
+> adding costs more than the math."
+>
+> The rest of this page explains each part of that answer, then works it through four real interview variants.
+
+### What makes this different from the performance math you already do
+
+You already reason about where time goes in a backend. A request is slow because it waits on the CPU, on the
+disk or on the network. You find the slowest resource, and that resource sets the time. A database query that
+scans a big table is "I/O-bound": a faster CPU would not help it.
+
+This round asks for exactly the same reasoning, one level down, inside a GPU. A GPU has two resources that
+matter here. It has math units that multiply and add numbers, and it has memory that feeds those numbers to the
+math units. Every operation needs some of each. The slower of the two sets the time.
+
+Three things make it feel unfamiliar:
+
+1. **The two resources are wildly unbalanced.** An H100 can do about a thousand trillion multiply-or-add
+   operations per second, but it can fetch only a few trillion bytes per second from its memory. So an
+   operation that uses each fetched number only once or twice will leave the math units idle almost all the time.
+2. **The shape of the work decides which resource is the limit.** The same weights, in the same model, are
+   memory-bound when the model writes a reply and compute-bound when it reads a prompt. Nothing about the code
+   changes. Only how many tokens are processed together.
+3. **Big models span several GPUs.** Then there is a third resource, the link between GPUs. Splitting the work
+   is like sharding a database: some splits need no cross-shard traffic, and some need a scatter-gather step
+   that can cost more than the work itself.
+
+So the interviewer isn't testing whether you can multiply. They want to see you count two quantities, compare
+them with the hardware's ratio, and name the limit, before you reach for an optimisation.
+
+### Words you need first
+
+- A **matrix multiply**, or **matmul**, is `C = A × B`, where A has M rows and K columns and B has K rows and
+  N columns. Each of the M × N numbers in C is a dot product of length K: K multiplies and K adds. Almost all
+  of a large language model's (**LLM's**) work is matmuls.
+- A **FLOP** is one floating-point operation, a multiply or an add. We count a multiply-add as 2 FLOPs, so a
+  matmul costs **2MKN FLOPs**. A GPU's **peak compute**, written `P`, is how many FLOPs per second it can do
+  at best. **TFLOPS** means 10¹² FLOPs per second.
+- **HBM** (high-bandwidth memory) is the GPU's own memory, 80 GB on an H100. Its **memory bandwidth**, written
+  `W`, is how many bytes per second it can feed to the math units.
+- **Arithmetic intensity** is FLOPs divided by bytes moved: how much math you get from each byte you fetch.
+  The GPU's own ratio, `P ÷ W`, is its **ridge point**. An operation whose intensity is above the ridge is
+  **compute-bound** (math sets the time). Below the ridge it is **memory-bound** (fetching sets the time). A
+  chart of this, with the "roof" bending at the ridge, is called a **roofline**.
+
+And four words about language models:
+
+- A **token** is a chunk of text of roughly ¾ of a word. A model's **weights** (or **parameters**) are the
+  numbers it learned in training. They are stored as big matrices, and every token is multiplied by them.
+- **Prefill** is the model reading the whole prompt in one pass: all its tokens go through the weights
+  together. **Decode** is the model then writing the reply one token at a time, one pass per token.
+- A **batch** is the set of users whose next tokens the GPU computes in the same pass. Serving software does
+  this so that one read of the weights serves many users.
+- **bf16** is a 16-bit number format, 2 bytes per value, the usual format for weights. The letter `s` on this
+  page means bytes per value: 2 for bf16.
+
+### The prompt as it is given
+
+Build a performance model for a matrix multiply, then for the ways serving and training split it across GPUs.
+Count FLOPs, bytes moved from memory and bytes sent between devices. Compare the arithmetic intensity with the
+ridge point. Do it for a large square multiply and for the small-M case of token generation. Then split on M,
+N or K, and name the **collective** (the group communication step, such as "add these partial results across
+all GPUs") that each split needs.
+
+The family has five variants, all from question sites and prep guides rather than first-hand accounts.
+**PracHub** is a site that collects reported interview questions:
+
+- **Anthropic** (a PracHub listing, onsite, 2026): the sharded-matmul performance model itself, including when
+  splitting on K becomes limited by the network.
+- **Anthropic** (PracHub, onsite, posted 2026-03-30): a feed-forward block's compute, memory traffic and
+  communication under three ways of splitting it, and why one of them needs an output reduction.
+- **Google** (PracHub, machine-learning engineer technical screen, 2025): a multiply on two GPUs that both
+  already hold A and B, with collectives, overlap of compute and communication, and CUDA streams and events
+  (**CUDA** is NVIDIA's platform for programming GPUs).
+- **Microsoft** (PracHub, onsite, 2026): split the model's final vocabulary layer two ways, and say why picking
+  the top k words per GPU gives the exact global top k but not an exact sample from the full distribution.
+- **GPU clouds** (a CUDA prep guide): why decode is memory-bound and prefill compute-bound, and whether
+  attention during single-request decode is memory- or compute-bound.
+
+<QuestionRow id="infra-070" />
+<QuestionRow id="infra-073" />
+<QuestionRow id="infra-037" />
+<QuestionRow id="infra-036" />
+<QuestionRow id="infra-039" />
+
+Memory sizing (how much GPU memory a conversation holds, and how many users fit) is in the sibling
+[KV cache and GPU memory math](/system-design-labs/interviews/walkthroughs/kv-cache-memory-math/) walkthrough.
+This page uses the same constants.
+
+### The worked example that runs through this page
+
+We follow one piece of one real model the whole way: **one feed-forward block of Llama-3.1-70B**, running on
+H100 GPUs.
+
+Llama-3.1-70B is an open model with about 70.55 billion weights in 80 **layers**. Each layer has two parts.
+**Attention** lets each token look at the earlier tokens. The **feed-forward block** (also called the **FFN**
+or **MLP**) then transforms each token on its own, with two big matmuls. Each token arrives as a vector of
+8,192 numbers (the model's **hidden size**, `H`). The first matmul, the **up-projection**, widens it to 28,672
+numbers (the **intermediate size**, `F`). The second, the **down-projection**, brings it back to 8,192.
+
+So the up-projection weight is a matrix with K = 8,192 rows and N = 28,672 columns: about 235 million numbers,
+470 MB in bf16. M is the number of token vectors pushed through it together. That one number, M, is what the
+whole page turns on.
+
+The table also mentions two links between GPUs. **NVLink** is NVIDIA's fast direct link between the GPUs in
+one machine. **PCIe** is the ordinary expansion bus, several times slower.
+
+| Step | What we do with this block | What we find | What to say in the interview |
+|---|---|---|---|
+| 1 | Decode one token for one user (M = 1) | Fetching the weight takes about 300× longer than the math | "At batch 1 the GPU is a memory-reading machine; the math units are idle." |
+| 2 | Decode for 64 users at once (M = 64) | 64× the math for almost the same time | "Below the ridge, extra users in a batch are nearly free." |
+| 3 | Read a 2,048-token prompt (M = 2,048) | Now the math takes longer than the fetch | "Prefill is compute-bound; decode is memory-bound. Same weights, different M." |
+| 4 | Split the up-projection's columns across 8 GPUs | Each GPU finishes its own slice; no traffic | "Splitting columns needs no communication." |
+| 5 | Split the down-projection's inner dimension across 8 GPUs | Partial sums must be added over the link (an **all-reduce**: every GPU ends up with the total); link time ≈ math time | "Splitting the inner dimension costs one all-reduce, about as long as the math on NVLink." |
+| 6 | Do step 5 over a slower link (PCIe instead of NVLink) | The link becomes the bottleneck by a wide margin | "Split a model across GPUs only over NVLink." |
+| 7 | Split the vocabulary layer at the end of the model | Splitting by vocabulary moves 15.7× fewer bytes | "Shard the head by vocabulary, and don't swap exact sampling for top-k." |
+
+Every step is explained in plain words below, with the arithmetic in boxes you can open.
+
+## What is being tested
+
+On PracHub only the question title comes from a candidate. The bodies, follow-ups and "what a strong answer
+covers" lists are the site's own write-ups. They still make a good checklist:
+
+- **Counting, then classifying.** Count FLOPs, bytes and bytes sent per device. Give a roofline verdict. Estimate
+  compute, memory and network time separately, then combine them. Use the **max** of the terms if they overlap
+  in time, and their **sum** if they don't (<Cite id="s-5198fc4992" />). The FFN item's setup counts a
+  multiply-add as two FLOPs. The matmul item doesn't state a convention, so say yours (<Cite id="s-1ffbee39ea" />).
+- **Stating assumptions.** The FFN item asks which tensors are copied to every device or split at the start and
+  the end, whether the in-between result is stored in memory, and what the hardware's compute, bandwidth and
+  collective latency are.
+- **Not swapping problems.** The LM-head item (about the model's final vocabulary layer) warns: "Exact full-distribution sampling is different from top-k
+  sampling; do not silently replace one with the other" (<Cite id="s-85ccfb1fcb" />).
+- **Engineering, not only algebra.** The two-GPU item asks for streams, events, buffer reuse, numerical precision
+  and synchronization (<Cite id="s-86daab52b4" />).
+- **Serving fluency.** A serving guide says "Prefill wants raw compute" and "Decode is memory-bandwidth-bound"
+  (<Cite id="s-75e82f8882" />). The CUDA prep guide asks whether single-request decode attention is memory- or
+  compute-bound. Its answer is memory-bound, because at batch one "you re-read the weights and the growing KV cache
+  for every token" (<Cite id="s-55d540eda9" />). (The **KV cache** is the model's saved memory of earlier
+  tokens; section 4 below explains it.)
+
+First-hand reports barely mention numbers. One Anthropic engineering-manager candidate described a round about
+"design judgment, communication, and review skills than deep calculations" (<Cite id="s-4e3dc29a95" />). In the
+estimation round itself, though, the constants and units are checked as closely as the algebra.
+
+## Clarify and scope
+
+Spend a minute fixing the setup, so your numbers mean something. Each question below has a sentence you can say.
+
+1. **Symbols or hardware?** "I'll derive it with symbols first: `P` for peak FLOPs per second, `W` for memory
+   bandwidth, `L` for link bandwidth in each direction, and `D` for the number of devices. Then I'll plug in
+   H100 numbers."
+2. **What precision?** "I'll assume bf16 inputs and fp32 sums inside the multiply." (**fp32** is the 4-byte
+   format. Adding in fp32 avoids rounding errors piling up.) This is the usual default.
+3. **Is one operand a weight that stays in memory?** In decode, B is a weight matrix and A is a few token vectors.
+   "Is B a weight, so A is small and B is big?"
+4. **Can communication overlap compute?** That decides max or sum. "Can the link transfer run while the next
+   multiply computes?"
+5. **Which link?** **NVLink** is NVIDIA's fast direct link between GPUs in one machine. **PCIe** is the ordinary,
+   slower expansion bus. Between machines there is a network. "Are the GPUs on NVLink?"
+6. **Peak or achieved?** "I'll use peak numbers and call every result a floor. Real kernels reach some fraction
+   of peak, and that fraction has to be measured."
+7. **Layout at the start and the end?** "Does every device need all of C at the end, or can C stay split for the
+   next layer?"
+
+Out of scope: how a kernel tiles its work beyond one follow-up, training memory, and mixture-of-experts beyond
+a line.
+
+## Constants (dated)
+
+### The machine these numbers describe
+
+```
+┌──────────────────────── one GPU (H100 SXM) ────────────────────────┐
+│                                                                     │
+│   Tensor Cores: the math units                                      │
+│   P ≈ 989.5 trillion bf16 FLOPs per second                          │
+│              ▲                                                      │
+│              │  every number the math uses comes up from memory     │
+│              │                                                      │
+│   HBM: 80 GB of GPU memory, holding the weights                     │
+│   W = 3.35 TB per second to the Tensor Cores                        │
+│                                                                     │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │  NVLink: L = 450 GB/s each way
+                               ▼
+┌──────────── 7 more H100s in the same machine (8 in all) ────────────┐
+└─────────────────────────────────────────────────────────────────────┘
+
+Cards without NVLink (L40S, L4) talk over PCIe Gen4 instead: about 32 GB/s each way.
+```
+
+**The Tensor Cores** are the parts of the GPU that do matrix math. Their peak, `P`, is the best case. It is
+reached only when the numbers arrive fast enough.
+
+**HBM** holds the model's weights. On every pass, the weights it needs must travel from HBM to the Tensor Cores
+at `W` bytes per second. On an H100, `P ÷ W` is about 295: the math units can do 295 FLOPs in the time it takes
+to fetch one byte. That ratio is the ridge point.
+
+**NVLink** connects the 8 GPUs inside one machine. Its speed, `L`, is about 7 times slower than HBM, so data
+that has to cross between GPUs is expensive. PCIe, used by cards without NVLink, is slower again.
+
+### The table
+
+Each row below gives one GPU's peak bf16 compute, its memory bandwidth, the ridge point that follows from them,
+and its link speed in each direction.
+
+| GPU | BF16 dense `P` | Bandwidth `W` | Ridge `P ÷ W` | Link per direction | Source (fetched) |
+|---|---|---|---|---|---|
+| A100 80GB SXM | 312 TFLOPS | 2,039 GB/s | 153 FLOP/B | NVLink 300 GB/s | <Cite id="s-8e443a8b66" label="NVIDIA A100" /> (2026-10-11) |
+| H100 SXM | ≈989.5 TFLOPS (1,979 printed, with sparsity) | 3.35 TB/s | 295 (fp8: 591) | NVLink 450 GB/s; PCIe Gen5 64 GB/s | [NVIDIA H100](https://www.nvidia.com/en-us/data-center/h100/) (2026-10-11) |
+| H200 SXM | ≈989.5 TFLOPS (1,979 with sparsity) | 4.8 TB/s | 206 | NVLink 900 GB/s total | [NVIDIA H200](https://www.nvidia.com/en-us/data-center/h200/) (2026-10-12) |
+| L40S | 362.05 TFLOPS | 864 GB/s | 419 | No NVLink; PCIe Gen4 64 GB/s bidirectional, so 32 each way | [NVIDIA L40S](https://www.nvidia.com/en-us/data-center/l40s/) (2026-10-12) |
+| L4 | ≈121 TFLOPS (242 with sparsity) | 300 GB/s | 403 | PCIe Gen4 | [NVIDIA L4](https://www.nvidia.com/en-us/data-center/l4/) (2026-10-12) |
+
+Four notes keep these numbers honest:
+
+- **Dense is half the sparse figure.** NVIDIA prints a second, larger number "with sparsity", which assumes half
+  the weights are zero in a special pattern. Normal models don't run that way, so use the **dense** figure. The
+  A100 table prints both (312 vs 624). The H100 and H200 tables print only "with sparsity" values. The L4 page says
+  specifications are "one-half lower without sparsity".
+- **fp8** in the H100 row is an 8-bit number format with its own, faster math. Section 2 explains why it doubles
+  the ridge.
+- **Link directions.** NVIDIA's [Hopper architecture blog](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/)
+  (fetched 2026-10-11) gives 18 NVLink links at 25 GB/s each way on H100 (450 GB/s each way, 900 total), 12 on
+  A100 (300 each way), and PCIe Gen5 as 128 GB/s total, 64 each way. A transfer in one direction gets the
+  each-way number.
+- **Model shapes**, Llama-3.1-70B (<Cite id="s-6fdd575dc5" />): hidden size 8,192, intermediate size 28,672,
+  80 layers, 64 query heads and 8 KV heads (both explained in section 4), head size 128, vocabulary 128,256 tokens, an output layer with its own
+  weights (untied); 70,552,387,584 parameters (computed from the config).
+- **Convention and assumptions.** A multiply-add counts as 2 FLOPs, so `C = A × B` with A `M × K` and B `K × N`
+  costs `2MKN`. **Assumed:** 100 GB/s per GPU for the generic ring example below, and list rental prices from this
+  guide's small-team research, fetched 2026-10-11 ([RunPod](https://www.runpod.io/pricing): A100 80GB
+  $1.39–$1.59, H100 SXM $2.69–$3.49, H200 $3.59–$4.59, L40S $0.79–$1.09, L4 $0.44–$0.49 per GPU-hour).
+
+## Derivations
+
+### 1. One matmul on the roofline
+
+Start with the bytes, because that is the part people forget. To compute `C = A × B`, the GPU must read A and B
+from memory and write C back. If each matrix crosses memory exactly once, the bytes are the sizes of all three
+matrices times `s`. The FLOPs are `2MKN`. Divide one by the other and you have the intensity.
+
+For a big square multiply, the intensity is huge. When M, K and N are all 4,096, the multiply does **1,365 FLOPs
+per byte**, far above the A100's ridge of 153. So it is compute-bound: on an A100 the math takes **440 µs** and the
+memory traffic only **49 µs**. On an H100, an 8,192-cubed multiply has an intensity of 2,731 and is compute-bound
+too.
+
+Say it like this: "For a square multiply, intensity grows with the size, so big square matmuls are always
+compute-bound. The interesting case is when one dimension is small."
+
+One caveat. The bytes term assumes each matrix crosses HBM once. Good **tiling** (keeping blocks of the matrices
+in the GPU's small on-chip memory and reusing them) gets close to that, but doesn't guarantee it. The tiling
+follow-up covers this.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Roofline for C = A × B"
+  expr="FLOPs = 2MKN;  bytes = s × (MK + KN + MN);  intensity = FLOPs ÷ bytes;  ridge = P ÷ W;  time ≥ max(FLOPs ÷ P, bytes ÷ W)"
+  vars={[
+    { sym: 'M, K, N', meaning: 'A is M × K, B is K × N' },
+    { sym: 's', meaning: 'bytes per element, 2 for bf16' },
+    { sym: 'P, W', meaning: 'peak FLOP/s and memory bandwidth' },
+  ]}
+  example={[
+    'A100, M = K = N = 4,096: 1.37 × 10¹¹ FLOPs over 1.01 × 10⁸ B; intensity 1,365 (4,096 ÷ 3); compute 440 µs against memory 49 µs',
+    'H100, M = K = N = 8,192: 1.10 × 10¹² FLOPs over 4.03 × 10⁸ B; intensity 2,731; 1,111 µs against 120 µs',
+  ]}
+/>
+
+</details>
+
+### 2. The small-M case: why decode is memory-bound
+
+Now the worked example. Take the up-projection (K = 8,192, N = 28,672) in bf16 on an H100. Remember what M
+means here: the number of token vectors multiplied together. In decode, that is the batch size, because each
+user contributes one new token per pass. In prefill, it is the prompt length.
+
+The weight matrix is the same 470 MB whatever M is. But the math grows with M. So at M = 1 the GPU fetches 470 MB
+to do one token's worth of math: the fetch takes about **140 µs** and the math under **half a microsecond**. The
+multiply is memory-bound by about **300×**. As M grows, the math catches up with the fetch. Near M = 295 they are
+about equal. Past that, the math takes longer and the multiply is compute-bound.
+
+| M | FLOPs | Bytes | Intensity | Compute | Memory | Bound |
+|---|---|---|---|---|---|---|
+| 1 | 4.70 × 10⁸ | 4.70 × 10⁸ | 1.0 | 0.47 µs | 140.2 µs | memory, by about 300× |
+| 16 | 7.52 × 10⁹ | 4.71 × 10⁸ | 16.0 | 7.6 µs | 140.6 µs | memory |
+| 64 | 3.01 × 10¹⁰ | 4.74 × 10⁸ | 63.4 | 30.4 µs | 141.6 µs | memory |
+| 295 | 1.39 × 10¹¹ | 4.92 × 10⁸ | 281.9 | 140.1 µs | 146.7 µs | about balanced |
+| 512 | 2.41 × 10¹¹ | 5.08 × 10⁸ | 473.9 | 243.1 µs | 151.5 µs | compute |
+| 2,048 | 9.62 × 10¹¹ | 6.21 × 10⁸ | 1,549.8 | 972.3 µs | 185.3 µs | compute |
+
+Look at the Memory column: it barely moves from M = 1 to M = 64. That is step 2 of the worked example. Serving 64
+users in one pass costs almost the same time as serving one.
+
+There is a one-line rule hiding in this table. When the weight dominates the bytes, the intensity is about
+`2M ÷ s`. In bf16, `s` is 2, so **the intensity is about M**, the number of tokens processed together. So:
+
+- **Decode stays memory-bound until the batch reaches about 153 on an A100, or about 295 on an H100.**
+- **Prefill, with M in the thousands, is compute-bound.**
+
+That is the whole decode-versus-prefill story. Both read every weight once per pass. Prefill does thousands of
+tokens of work with that read. Decode does one token per user. Say it like this: "Decode and prefill read the
+same weights. Prefill reuses each weight thousands of times; decode reuses it once per user in the batch. So
+decode is memory-bound until the batch reaches the ridge."
+
+Lower-precision weights change the rule slightly. **int4** stores each weight in 4 bits, with a small scale
+number shared by each group of 32 weights (written **g32**). **fp8** is an 8-bit format. Cutting the bytes per
+weight raises the intensity, so the crossover batch moves:
+
+- Weight-only int4 with g32 scales costs 0.5625 bytes per weight, so the H100 crossover drops to **M ≈ 83**. (If
+  you forget the scales you get 74, which is wrong.)
+- fp8 weights with fp8 math: both the bytes and the ridge change by 2×, so the crossover stays near **295**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **M = 1:** FLOPs = 2 × 1 × 8,192 × 28,672 = 4.70 × 10⁸. Bytes ≈ 2 × 8,192 × 28,672 = 4.70 × 10⁸ (the
+  weight; A and C add only 2 × (8,192 + 28,672) bytes). Compute 4.70 × 10⁸ ÷ 989.5 × 10¹² = 0.47 µs. Memory
+  4.70 × 10⁸ ÷ 3.35 × 10¹² = 140.2 µs. Ratio about 300.
+
+<Formula
+  title="Intensity when the weight dominates the bytes"
+  expr="intensity ≈ 2MKN ÷ (s × KN) = 2M ÷ s   →   in bf16, intensity ≈ M"
+  vars={[
+    { sym: 'M', meaning: 'tokens multiplied together' },
+    { sym: 's', meaning: 'bytes per weight' },
+  ]}
+  example={[
+    'Decode stays memory-bound until batch ≈ 153 on an A100 and ≈ 295 on an H100',
+    'Weight-only int4 with g32 fp16 scales: 0.5625 B per weight, intensity ≈ 3.56M, so the H100 crossover drops to M ≈ 83 (74 if the scales are ignored)',
+    'fp8 weights with fp8 compute: intensity ≈ 2M against a ridge of 591, so the crossover stays near 295',
+  ]}
+/>
+
+</details>
+
+### 3. Whole-model floors: decode and prefill
+
+Scale the same idea from one matrix to the whole model. A **floor** is the fastest the hardware could possibly
+go, using peak numbers. Real systems are slower.
+
+**Decode.** At batch 1, every pass must read every weight. So the time per token is at least the weight bytes
+on each GPU divided by `W`. Big models are split across several GPUs with **tensor parallelism** (each GPU holds
+a slice of every weight matrix; the number of GPUs is the **TP degree**). Each GPU then reads only its slice, in
+parallel. For the 70B model in bf16 split four ways on A100s, each GPU reads 35.28 GB per token: **17.3 ms per
+token, at most about 58 tokens per second**. On H100s it is **10.5 ms**, at most 95 tokens per second. This
+ignores the KV cache and the communication between GPUs, so real numbers are slower.
+
+**Prefill.** Reading a prompt is compute-bound, so its floor is FLOPs divided by peak compute. Roughly, each
+prompt token costs 2 FLOPs per weight. Attention adds a second term that grows with the square of the prompt
+length, because each token looks at every earlier token. A **2,000-token prompt** on 4 A100s needs about
+**226 ms** of math against a 17.3 ms weight read: compute-bound by about 13×. A **100,000-token prompt** on 8
+H100s needs about **3.4 s**, and almost half of that is attention.
+
+Say it like this: "At 3,600 tokens attention is about 3% of prefill FLOPs. At 100,000 tokens it is almost half,
+so long-context prefill has to count it."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Decode floor at batch 1"
+  expr="time per token ≥ weight bytes per GPU ÷ W"
+  vars={[{ sym: 'weight bytes per GPU', meaning: 'total weight bytes ÷ tensor-parallel degree' }]}
+  example={[
+    '70B bf16, TP = 4, A100: 35.28 GB ÷ 2,039 GB/s = 17.3 ms (≤ 57.8 tokens/s)',
+    'Same on H100: 10.5 ms (≤ 95 tokens/s)',
+  ]}
+  note="Ignores KV reads and all-reduce time, so real numbers are slower."
+/>
+
+<Formula
+  title="Prefill floor, including attention"
+  expr="prefill ≥ (2 × params × n + 2 × layers × hidden × n²) ÷ (GPUs × P)"
+  vars={[
+    { sym: 'n', meaning: 'prompt tokens' },
+    { sym: '2 × layers × hidden × n²', meaning: 'causal attention FLOPs (QKᵀ and AV, halved for the causal mask)' },
+  ]}
+  example={[
+    '2,000 tokens, 70B, 4×A100: 2 × 70.55 × 10⁹ × 2,000 ÷ (4 × 312 × 10¹²) = 226 ms, against a 17.3 ms memory floor: compute-bound by about 13×',
+    '100,000 tokens, 70B, 8×H100: weights 1.78 s plus attention 1.31 × 10¹⁶ FLOPs = about 3.4 s in total',
+  ]}
+/>
+
+</details>
+
+### 4. Attention during single-request decode
+
+The weights are not the only thing decode reads. To write the next token, attention compares it with every
+earlier token in the conversation. Recomputing those earlier tokens every time would be wasteful, so the model
+saves two vectors per earlier token per layer, a **key** and a **value**. This saved store is the **KV cache**.
+Each decode step reads all of it.
+
+Llama-3.1-70B uses **grouped-query attention** (**GQA**): its 64 query heads (the parts that ask "what should I
+look at?") share 8 sets of keys and values, so each cached key and value is used by 8 heads. That group size of 8
+is the only reuse attention gets during decode.
+
+So the intensity of decode attention is about **8 FLOPs per byte** for this model with a bf16 cache, against a
+ridge of 295. It is memory-bound, by a wide margin. And the context length cancels out: a longer conversation
+means more FLOPs and more bytes in the same proportion. So **single-request decode attention is memory-bound at
+any context length**.
+
+Batching doesn't fix it either. The weights are shared by every user in a batch, but each user has their own
+KV cache. A bigger batch adds bytes in proportion to the FLOPs. Say it like this: "Batching amortizes the
+weights, not the KV cache. A batch of 64 shares one weight read but does 64 separate cache reads."
+
+At long context the cache read gets big. At 100,000 tokens the 70B model's cache is **32.8 GB**. Split over 8
+H100s, each GPU reads 4.1 GB of it per step (**1.2 ms**), next to its 17.6 GB of weights (**5.3 ms**).
+
+Prefill attention is different. There, n prompt tokens all use each key and value, so its intensity grows with n
+and it is compute-bound.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Decode attention intensity"
+  expr="FLOPs per layer = 4 × n_heads × n_ctx × head_dim;  bytes = 2 × n_kv_heads × n_ctx × head_dim × s;  intensity = 2 × (n_heads ÷ n_kv_heads) ÷ s"
+  vars={[
+    { sym: 'n_ctx', meaning: 'tokens in the cache; it cancels' },
+    { sym: 'n_heads ÷ n_kv_heads', meaning: 'the GQA group size, 8 for Llama-3.1-70B' },
+  ]}
+  example={[
+    'Llama-3.1-70B, bf16 cache: 2 × 8 ÷ 2 = 8 FLOP/byte, against a ridge of 295',
+    'Multi-head attention (group 1): 1 FLOP/byte. An fp8 cache: 16',
+  ]}
+/>
+
+</details>
+
+### 5. Sharding one matmul on M, N or K
+
+Now split one multiply across `D` devices. **Sharding** means giving each device a slice. There are three
+dimensions to slice, and the choice decides the communication.
+
+- **Split M** (rows of A). Each device gets some rows of A and all of B. It computes complete rows of C. No adding
+  up is needed.
+- **Split N** (columns of B). Each device gets all of A and some columns of B. It computes complete columns of C.
+  Again, no adding up. This is step 4 of the worked example: give each of 8 GPUs 3,584 of the up-projection's
+  28,672 columns, and each one finishes its own slice alone.
+- **Split K** (the inner dimension). Each device gets some columns of A and the matching rows of B. Each dot
+  product is now cut into D pieces, so each device holds a **partial sum** of every number in C. Only adding the D
+  partial sums gives C.
+
+Three collectives come up again and again, so name them precisely:
+
+- **All-gather**: every device sends its slice to all others, so everyone ends up with the whole thing.
+- **All-reduce**: every device has a full-size partial result, and they all end up with the sum.
+- **Reduce-scatter**: like all-reduce, but each device ends up with only its own slice of the sum. It moves half
+  the bytes.
+
+| Split | Each device holds | Result per device | Collective |
+|---|---|---|---|
+| M (rows of A) | M/D rows of A, all of B | Its rows of C, complete | None for C; all-gather `(D − 1) ÷ D × MNs` if every device needs all of C. B is replicated |
+| N (columns of B) | All of A, K × N/D of B | Its columns of C, complete | Same as M |
+| K (inner dimension) | K/D columns of A, K/D rows of B | A partial sum of all of C | All-reduce, `2(D − 1) ÷ D × MNs` sent per device, or reduce-scatter (half) if C can stay sharded |
+
+How is an all-reduce done? The usual way is a **ring**: the devices pass chunks around a circle, adding as they
+go. A ring all-reduce over N devices takes 2(N − 1) steps, against O(N²) messages if every device sent to every
+other (<Cite id="s-028bbc6f1c" />). With 8 devices and 1 GB to reduce, each device sends **1.75 GB**, which
+takes **17.5 ms** at an assumed 100 GB/s.
+
+Say it like this: "Splitting rows or columns gives complete results. Splitting the inner dimension gives partial
+sums, and I pay an all-reduce of the full output, or a reduce-scatter if the next layer can take slices."
+
+### 6. When K-sharding becomes network-bound
+
+Step 5 of the worked example: the down-projection's inner dimension is K = 28,672. Split it 8 ways. Each GPU does
+1/8 of the math, but then must send almost twice the size of C over NVLink. Which takes longer?
+
+Work it out in symbols and something useful happens: M and N cancel. The ratio of link time to math time depends
+only on K, the number of devices, and the hardware's ratio of compute to link speed. So **batch size doesn't
+decide it**. On 8 H100s over NVLink, K-sharding is network-bound when K is below about **30,784**.
+
+- The down-projection, K = 28,672: ratio **1.07**, about balanced. Link time ≈ math time.
+- The attention output layer, K = 8,192: ratio **3.76**. Network-bound.
+- Over PCIe Gen5 at 64 GB/s each way, the threshold rises to **216,453**, about 7× higher. That is step 6 of the
+  worked example: on PCIe, every layer in this model is network-bound. Keep tensor parallelism inside NVLink.
+
+This is why tensor-parallel layers are built the way they are. In the **Megatron** layout (named after NVIDIA's
+Megatron-LM, which made it standard), the first matmul of a block is split on N (**column-parallel**, no
+communication), and the second on K (**row-parallel**), paying one all-reduce per block.
+
+How much is that all-reduce in practice? For 70B decode on 4 A100s with a batch of 64, each all-reduce moves only
+1 MiB, and the 160 all-reduces per step (two per layer) add **0.84 ms** to a 17.3 ms step: about 5%. The bigger
+cost at small batches is the fixed start-up time of each collective. Every 10 µs of it adds another **1.6 ms** per
+step. That is where a high TP degree hurts small batches.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="K-sharding, communication over compute (all-reduce, no overlap)"
+  expr="ratio = [2(D − 1) ÷ D × MNs ÷ L] ÷ [2MKN ÷ (D × P)] = (D − 1) × s × P ÷ (K × L)"
+  vars={[
+    { sym: 'K', meaning: 'full inner dimension before sharding' },
+    { sym: 'L', meaning: 'link bandwidth per direction' },
+  ]}
+  example={[
+    'Network-bound when K is below (D − 1) × s × P ÷ L. H100, bf16, D = 8, NVLink 450 GB/s: 30,784',
+    'Llama-3.1-70B down-projection, K = 28,672: ratio 1.07, about balanced. Attention output projection, K = 8,192: ratio 3.76',
+    'Over PCIe Gen5 at 64 GB/s each way the threshold is 216,453: keep tensor parallelism inside NVLink',
+  ]}
+/>
+
+- **Megatron decode all-reduce, 70B, TP = 4, batch 64:** 64 × 8,192 × 2 B = 1 MiB per all-reduce. Each GPU sends
+  1.57 MB, 5.2 µs at 300 GB/s. 160 of them (two per layer) add 0.84 ms to a 17.3 ms step. 160 × 10 µs = 1.6 ms of
+  fixed latency.
+
+</details>
+
+### 7. Two GPUs that both hold A and B
+
+The Google item fixes the inputs: A and B are already in memory on both GPUs (<Cite id="s-86daab52b4" />). So the
+inputs never move. Only C does. That one observation decides the design.
+
+- **Split M or N.** Each GPU computes half of C with no communication. If both GPUs need all of C, each sends its
+  half to the other.
+- **Don't split K.** Each GPU would produce a full-size partial C (134 MB in bf16 for 8,192 × 8,192, 268 MB if the
+  partial sums stay in fp32), then reduce it. That moves more bytes and adds rounding, and buys nothing when the
+  inputs are already everywhere.
+
+Take M = K = N = 8,192 on two H100s. The math is **556 µs** per GPU. Each half of C is 67.1 MB. Over NVLink the
+exchange takes **149 µs**, so it can hide under the math if the two overlap. Over PCIe Gen5 it takes **1,049
+µs**, so moving the result takes longer than computing it.
+
+**Overlap with streams and events.** A **CUDA stream** is a queue of GPU work that runs in order. Two streams can
+run at the same time. An **event** is a marker you record in one stream that another stream can wait on, like a
+future. **NCCL** is NVIDIA's library for collectives between GPUs.
+
+Split each GPU's half into chunks. On a compute stream, run the multiply (the **GEMM**, the standard name for a
+general matmul kernel) for chunk i and record an event. On a separate communication stream, wait on that event and
+send chunk i (NCCL send/recv or a peer copy) while chunk i + 1 computes. The exposed communication is then about
+one chunk: 149 µs ÷ 8 = **19 µs** with 8 chunks on NVLink.
+
+Three correctness rules:
+
+- Keep both streams off the **legacy default stream**, which waits for every other blocking stream and would
+  silently remove the overlap.
+- Don't reuse a receive buffer until the event recorded after its consumer completes.
+- The caller waits on the communication stream's final event before reading C.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Two-GPU split on M, with the halves exchanged"
+  expr="compute = 2MKN ÷ (2P);  exchange = (M ÷ 2) × N × s ÷ L"
+  vars={[{ sym: 'L', meaning: 'per-direction link bandwidth; both directions run at once' }]}
+  example={[
+    'M = K = N = 8,192, bf16, 2×H100: compute 556 µs per GPU; each half of C is 67.1 MB',
+    'NVLink at 450 GB/s: 149 µs, hidden under compute if overlapped. PCIe Gen5 at 64 GB/s: 1,049 µs, so the exchange, not the math, sets the time',
+  ]}
+/>
+
+</details>
+
+### 8. An FFN under three shardings
+
+The Anthropic item's FFN is `Y = activation(X W1) W2`, with X `[B, H]`, W1 `[H, F]`, W2 `[F, H]`, and no gate
+(<Cite id="s-1ffbee39ea" />). The **activation** is a simple function applied to each number on its own (such as
+GELU). It is not linear, which matters below. Llama's real FFN has a third, "gate" matrix; the item's has two. We
+write T for the number of tokens (the item's B).
+
+This is our worked block, written as one formula: W1 is the up-projection, W2 the down-projection, with H = 8,192
+and F = 28,672, in bf16, on 8 H100s with NVLink at 450 GB/s each way. Its weights are **939.5 MB**, and it costs
+**0.94 GFLOP per token per layer**.
+
+The three ways to split it:
+
+- **Data sharding** (split T). Each GPU gets all the weights and 1/8 of the tokens. No communication when serving.
+  In training, the weight gradients (the corrections computed from each GPU's tokens) must be added across GPUs.
+- **FFN-dimension sharding** (split F). Each GPU gets some columns of W1 and the matching rows of W2, and all of X.
+  This is the Megatron layout from section 6.
+- **Hidden-dimension sharding** (split H). Each GPU gets some columns of X, the matching rows of W1, and some
+  columns of W2.
+
+| Scheme | Each device holds | Communication (forward) | T = 4,096 | T = 64 (decode batch) |
+|---|---|---|---|---|
+| Data (shard T) | All of W1 and W2; T/D tokens | None for inference; a gradient all-reduce of the weights in training (1.64 GB sent per device per layer, 3.7 ms) | compute 486 µs; weight read 280 µs | weight read 280 µs per device, all devices reading everything |
+| FFN dimension (shard F) | W1 columns, W2 rows; all of X | All-reduce of Y, `T × H × s` | compute 486 µs; 117 MB sent, 261 µs (ratio 0.54) | weight read 35 µs; 1.8 MB sent, 4 µs plus latency |
+| Hidden dimension (shard H) | X columns, W1 rows, W2 columns | All-reduce of the intermediate, `T × F × s`, before the activation | compute 486 µs; 411 MB sent, 913 µs (ratio 1.88) | weight read 35 µs; 6.4 MB sent, 14 µs plus latency |
+
+**Why FFN-dimension sharding needs an output reduction.** W2 multiplies over the F dimension. Split F, and each
+GPU multiplies its slice of the in-between result by its slice of W2. That gives a partial sum of the full
+`[T, H]` output. Only adding them gives Y: an all-reduce, or a reduce-scatter if the next layer accepts sharded
+rows. The first matmul needs no communication, and the activation works on each number alone, so it applies
+locally.
+
+**Why hidden-dimension sharding needs a larger reduction.** Now the first matmul multiplies over the split H, so
+`X W1` is a partial sum of the `[T, F]` in-between result. The activation can't be applied to partial sums,
+because it isn't linear: activation(a) + activation(b) is not activation(a + b). So the sum must happen first,
+and it moves `T × F × s`, which is **3.5×** the FFN-dimension scheme's `T × H × s` (F ÷ H = 28,672 ÷ 8,192).
+
+**Which wins when.** The ratio of link time to math time doesn't depend on T. With a big batch (T = 4,096), FFN
+sharding's communication (ratio **0.54**) can hide under compute; hidden sharding's (**1.88**) can't. With a
+decode batch (T = 64), data sharding makes every GPU read all 939.5 MB of weights (280 µs), while FFN sharding
+reads 1/8 of them (35 µs).
+
+**Microbatching** splits T into smaller pieces, so one piece's reduction overlaps the next one's math. It can hide
+the 261 µs, but not the 913 µs. The fixed start-up time of each collective doesn't shrink with the message, so at
+T = 64 it, not bandwidth, dominates the 4 µs.
+
+Say it like this: "For low-batch serving I'd split the FFN dimension: each GPU reads an eighth of the weights and
+pays one small all-reduce. Splitting the hidden dimension moves 3.5× more bytes, before the activation."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Unsharded:** `4THF` FLOPs and `2HF × s` weight bytes = 2 × 8,192 × 28,672 × 2 = 939.5 MB. 4HF = 0.94 GFLOP
+  per token.
+- **T = 4,096, compute per GPU:** 4 × 4,096 × 8,192 × 28,672 ÷ 8 ÷ 989.5 × 10¹² = 486 µs. Weight read: 939.5 MB ÷
+  3.35 TB/s = 280 µs (35 µs for an eighth).
+- **FFN-dim all-reduce:** T × H × s = 67.1 MB; × 2 × 7 ÷ 8 = 117 MB sent per GPU; ÷ 450 GB/s = 261 µs.
+- **Hidden-dim all-reduce:** T × F × s = 234.9 MB; × 1.75 = 411 MB; ÷ 450 GB/s = 913 µs.
+- **Training gradient all-reduce (data sharding):** 939.5 MB × 1.75 = 1.64 GB; ÷ 450 GB/s = 3.7 ms.
+
+<Formula
+  title="Communication over compute (all-reduce, no overlap)"
+  expr="FFN-dim: (D − 1) × s × P ÷ (2 × F × L);   hidden-dim: (D − 1) × s × P ÷ (2 × H × L)"
+  vars={[
+    { sym: 'P', meaning: 'peak FLOP/s per device' },
+    { sym: 'L', meaning: 'link bandwidth per direction' },
+  ]}
+  example="D = 8: FFN-dim 7 × 2 × 989.5 × 10¹² ÷ (2 × 28,672 × 450 × 10⁹) = 0.54; hidden-dim 1.88. Neither depends on T"
+/>
+
+</details>
+
+### 9. Sharding an LM head by vocabulary or by hidden dimension
+
+The **LM head** is the model's last layer. It turns the final 8,192-number vector into one score per word in
+the vocabulary (V = 128,256 tokens). These scores are called **logits**. A **softmax** turns them into
+probabilities, and the **sampler** picks the next token from them.
+
+Llama-3.1-70B's LM head is 8,192 × 128,256 = 1.05 × 10⁹ weights, **2.10 GB** in bf16: 0.63 ms to read once on
+one H100, 78 µs per GPU split eight ways. Step 7 of the worked example splits it two ways:
+
+- **Vocabulary sharding** (`[H, V/D]` per GPU) is a split on N. Each GPU needs the whole hidden vector and
+  computes complete logits for its V/D tokens. No reduction is needed to get logits, only to combine decisions.
+  If the hidden vector arrives split, gathering it costs 16.4 KB per token.
+- **Hidden sharding** (`[H/D, V]` per GPU) is a split on K. Each GPU computes partial dot products for every
+  vocabulary entry, so the logits need an all-reduce (or reduce-scatter to vocabulary shards) of `B × V × s` for B tokens:
+  **256.5 KB per token** in bf16.
+
+That is the V ÷ H = **15.7×** difference, which is why vocabulary sharding is the usual choice. The item's third
+follow-up asks where communication moves if the previous layer already outputs hidden shards. Hidden sharding
+then avoids the 16.4 KB gather but still pays the large logits reduction (<Cite id="s-85ccfb1fcb" />).
+
+**Why local top-k gives an exact global top-k.** Suppose each GPU finds the k highest-scoring tokens in its own
+slice. Any token in the global top k is beaten by fewer than k tokens overall, so by fewer than k within its own
+slice. So it is in its slice's local top k. All-gather the D × k (value, index) pairs and take the top k of
+those: exact.
+
+**Why local candidates don't give exact full-softmax sampling.** Sampling from the full softmax means any token
+can be picked, in proportion to its probability, including the long tail that no slice's top k contains.
+Sampling only among the gathered candidates samples from a cut-off distribution. When the distribution is flat,
+the missing probability can be large. Two exact methods:
+
+- **Compute the global normalizer.** All-reduce each GPU's largest logit, then its sum of `exp(logit − max)`.
+  Pick a GPU in proportion to its share, then sample inside it. Two numbers per token cross the network.
+- **Gumbel-max.** Each GPU adds independent random noise of a particular kind (**Gumbel noise**) to its own
+  logits and returns its largest value and index. The global largest of these noisy values is an exact sample
+  from the softmax. One (value, index) pair per GPU.
+
+**Top-p** sampling (sample from the smallest set of tokens whose probabilities add up to p) needs the global
+sorted running total of probability, so it needs more than either. Say so if asked.
+
+Say it like this: "Top-k merges exactly from local top-k. Full-softmax sampling doesn't, because the tail
+matters. I'd use Gumbel-max: one pair per GPU, and it's exact."
+
+## Sanity checks
+
+Before you trust a number, check it against another number on the page. These are the checks to say out loud:
+
+- **The table obeys the rule.** M = 64 gives intensity 63.4, close to M.
+- **The ridge matches the decode ratio.** At M = 1 with K = N = 8,192 on an A100, memory time ÷ compute time =
+  65.8 µs ÷ 0.43 µs = 153, the ridge.
+- **No sparse peaks.** Using 1,979 TFLOPS as the H100's bf16 peak doubles the ridge to 591 and halves every compute
+  time: a plausible-looking 2× error.
+- **The K threshold reproduces the ratio.** 30,784 ÷ 28,672 = 1.07 and 30,784 ÷ 8,192 = 3.76.
+- **Attention intensity doesn't depend on context.** At 8,192 tokens, one 70B layer does 268 MFLOP of decode
+  attention over 33.5 MB of cache: 8 FLOPs per byte.
+- **The two FFN ratios differ by F ÷ H.** 1.88 ÷ 0.54 = 3.5.
+- **Max or sum, stated.** Every time above is a single term. When you combine them, say which.
+
+## What changes the answer
+
+Each row changes one assumption and says which result moves.
+
+| Change | What moves | How |
+|---|---|---|
+| A100 → H100 | Ridge 153 → 295 | Decode floors improve 3.35 ÷ 2.039 = 1.64×; compute improves 989.5 ÷ 312 = 3.2× |
+| Weight precision | Crossover batch | Weight-only int4 g32: crossover M ≈ 83 on H100; fp8 with fp8 compute: about 295 |
+| KV precision or GQA group | Decode attention intensity | fp8 cache doubles it; it stays far below the ridge |
+| Interconnect | K-sharding threshold | NVLink to PCIe raises it 7× on H100 |
+| Overlap | Total time | max of the terms instead of their sum |
+| Layout at exit | Collective | Reduce-scatter instead of all-reduce halves the bytes when the next layer takes shards |
+| Mixture of experts | FLOPs vs bytes | Active parameters set FLOPs, total set memory: the "671B total, 37B active" example is 74 GFLOP per token but 671 GB at fp8 (<Cite id="s-9e6b455b13" />) |
+| Achieved vs peak | Every floor | Measure achieved bandwidth and FLOP/s; a kernel at 60% of peak bandwidth stretches memory-bound times by 1 ÷ 0.6 |
+
+A **mixture-of-experts** (**MoE**) model has many FFN blocks ("experts") per layer but sends each token through
+only a few. So each token uses few weights (low FLOPs), but all of them must sit in memory.
+
+<AINative title="Let an agent run the arithmetic; you own the model">
+An agent will fill every table on this page in seconds and repeat the same four mistakes when its inputs are wrong:
+sparse TFLOPS, total instead of per-direction link bandwidth, int4 without scales, and a K-shard reduction counted
+once instead of 2(D − 1) ÷ D. Give it the formulas, make it print units at every step, and recompute one row by hand.
+Then ask for a sensitivity pass: change one assumption at a time and report which moves the answer most. That is
+usually achieved bandwidth or the overlap assumption, and those are the two worth measuring with a profiler on the
+real GPU. For the LM-head sampling claim, a twenty-line simulation comparing sharded Gumbel-max against a direct
+softmax sampler is a better check than a confident explanation.
+</AINative>
+
+## Small-team version
+
+You own AI at a 50–500 person company. You will likely never shard a matmul by hand. The roofline still decides
+three things you do own: which GPU to rent, how big a batch to allow, and whether a second GPU is worth it.
+
+### What the roofline says before you rent
+
+- **Chat-style decode is bandwidth-bound.** Below the ridge, a step costs one weight read whatever the batch. Rent
+  memory bandwidth and capacity, and push the batch up before adding GPUs.
+- **Prompt-heavy work is compute-bound.** A **RAG** request (one that pastes retrieved documents into the prompt)
+  with 2,000 input tokens and 300 output tokens spends 55% of a 4×A100 box's time in prefill even at peak (worked
+  in the [KV walkthrough](/system-design-labs/interviews/walkthroughs/kv-cache-memory-math/#small-team-version)).
+  There, TFLOPS per dollar matter.
+
+### Bandwidth and compute per dollar
+
+Using the dated RunPod range above (on-demand, per GPU-hour, fetched 2026-10-11). The last column is the decode
+floor from section 3 for an 8-billion-parameter model in bf16 (16.06 GB of weights, Llama-3.1-8B) at batch 1.
+
+| GPU | GB/s per $/hour | Dense BF16 TFLOPS per $/hour | 8B bf16 decode floor, batch 1 |
+|---|---|---|---|
+| L4 | 612–682 | 247–275 | 53.5 ms (and only 24 GB) |
+| L40S | 793–1,094 | 332–458 | 18.6 ms |
+| A100 80GB | 1,282–1,467 | 196–224 | 7.9 ms |
+| H100 SXM | 960–1,245 | 284–368 | 4.8 ms |
+| H200 | 1,046–1,337 | 216–276 | 3.3 ms |
+
+What this table says, under these list prices only:
+
+- **For decode-heavy chat, the A100 80GB gives the most bandwidth per dollar here.** The H100's 1.64× bandwidth
+  costs 1.9–2.2× as much per hour; its 3.2× compute is what you pay for.
+- **For prompt-heavy work on a model that fits in 48 GB, the L40S gives the most compute per dollar**, at the cost of
+  a slow decode floor and no NVLink.
+- **A faster GPU may not help a latency complaint** if the box runs at batch 1 and the latency is decode. The floor
+  moves with bandwidth, not TFLOPS.
+
+In money: an always-on A100 80GB is 730 hours × $1.39–$1.59 ≈ **$1,010–$1,160 a month**, and an always-on H100
+SXM is 730 × $2.69–$3.49 ≈ **$1,960–$2,550**.
+
+### Batch before you buy
+
+At batch 1 an H100 decoding an 8B model uses about 1/295 of its compute. Raising the batch toward the ridge costs
+almost nothing per step until KV reads grow. So set your serving engine's batch limit from the KV memory headroom
+and the latency budget before you add a replica. Measure the curve: tokens per second against batch size on your
+real prompts.
+
+### Skip the sharding half, unless the model doesn't fit
+
+Tensor parallelism is for models that don't fit one GPU. Prefer a **quantized** build (weights stored in fewer bits, such as int4 or fp8) that fits one card.
+If you must split, do it over NVLink. 70B bf16 on 4× L40S (PCIe only, 32 GB/s each way) has a **40.8 ms**
+weight-read floor plus about **7.9 ms** per step of all-reduce bandwidth at batch 64, against **17.3 ms plus
+0.84 ms** on 4×A100 over NVLink. It also leaves room for only 11 requests at 8K tokens (5 GB per GPU of other
+memory use assumed).
+
+### Revisit when
+
+You own a prefill-heavy workload at steady high volume (compute per dollar starts to matter), a model outgrows one
+GPU even quantized, or you start fine-tuning across GPUs (then the FFN and collective math is your problem; see
+[distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/)).
+
+## Senior vs Staff
+
+<LevelContrast
+  title="The roofline round"
+  senior={[
+    "Derives FLOPs, bytes and intensity in symbols, uses dense peaks, and says max or sum.",
+    "Explains decode vs prefill with intensity ≈ M and gets decode attention right (memory-bound at any context).",
+    "Names the collective for each split and why FFN-dimension sharding ends in a reduction.",
+  ]}
+  staff={[
+    "Derives the K-sharding threshold (D − 1)sP ÷ (KL) and uses it to justify column-then-row layers and keeping TP inside NVLink.",
+    "Keeps exact top-k and exact sampling apart for a vocabulary-sharded head, and offers Gumbel-max or a distributed normalizer.",
+    "Names the assumption the answer is most sensitive to (achieved bandwidth, overlap, collective latency) and how to measure it.",
+  ]}
+/>
+
+In plain words: a Senior answer counts correctly and names the limit. A Staff answer also derives *when* the limit
+changes (the K threshold, the crossover batch), uses that to explain why real systems are laid out the way they
+are, and says which assumption to measure first.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="(Listed on the PracHub page) How does on-chip tiling change real memory traffic?">
+    A kernel computes C in square tiles of side T, keeping them in fast on-chip memory (shared memory and the L2
+    cache). Each tile reads a T × K strip of A and a K × T strip of B, so effective intensity is about T ÷ s FLOPs
+    per byte. To clear an H100's bf16 ridge from reuse alone, T must approach s × 295 ≈ 590 across shared memory and
+    L2. Tiling can't rescue small-M decode: the weight still has to be read once (<Cite id="s-5198fc4992" />).
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page) How do lower-precision formats change compute, memory and network limits?">
+    fp8 doubles the H100's peak and halves bytes, so the ridge doubles to 591 and the decode crossover stays near
+    295. Weight-only int4 with g32 scales cuts weight traffic 3.6× and moves the crossover to about 83. Lower-precision
+    activations shrink the all-reduce too (<Cite id="s-5198fc4992" />).
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page) Why can hidden-dimension sharding of an FFN require a larger intermediate reduction?">
+    Its first matmul multiplies over the split H, so the `[T, F]` in-between result is a partial sum that must be
+    added up before the activation, which isn't linear. That is F ÷ H = 3.5× the bytes of the FFN-dimension scheme's
+    output reduction (<Cite id="s-1ffbee39ea" />).
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page) How do microbatching and collective startup latency change the result?">
+    Microbatching overlaps one microbatch's reduction with the next one's compute, hiding a communication term up to
+    the compute time. Startup latency is paid per collective, so at small T it dominates; fewer, larger collectives
+    win (<Cite id="s-1ffbee39ea" />).
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page) When does two-dimensional sharding beat one-dimensional?">
+    With 1D K-sharding each device's all-reduce traffic, about 2 × MNs, doesn't shrink as D grows. A √D × √D grid
+    of devices moves blocks that shrink roughly as 1 ÷ √D, so 2D wins once D is large. Inside one node, 1D is
+    usually enough.
+  </FollowUp>
+  <FollowUp q="(CUDA prep guide) A kernel runs at 15% of peak memory bandwidth. Why, and how do you make it faster?">
+    The guide frames this as the typical opener and points at warps (groups of 32 GPU threads that run together),
+    coalescing (neighbouring threads reading neighbouring addresses), occupancy (how many threads are active) and
+    profiling (<Cite id="s-55d540eda9" />). First compute its intensity: if it is memory-bound by design, 15% means
+    poor access patterns or too little parallelism, not too few FLOPs. The
+    [GPU kernel walkthrough](/system-design-labs/interviews/walkthroughs/gpu-kernel-perf/) goes further.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Sparse peaks.** NVIDIA's H100 and H200 tables print "with sparsity" figures; halve them.
+- **Total link bandwidth as per-direction.** 900 GB/s on H100 is 450 each way.
+- **int4 at 0.5 bytes with no scales.** That gives a crossover of 74 instead of 83.
+- **Calling decode attention compute-bound at long context.** Its intensity doesn't depend on context.
+- **Splitting K when inputs are already copied to every GPU.** It adds a full-size reduction for nothing.
+- **Replacing full-softmax sampling with sampling over local top-k candidates** without saying so. The LM-head item
+  warns against exactly this (<Cite id="s-85ccfb1fcb" />).
+- **Sum or max unstated.** The time you give is wrong by up to 2× if nobody knows which (<Cite id="s-5198fc4992" />).
+- **Calculating past the decision.** One Anthropic candidate describes being "too wordy and slower to land the
+  point" in a later round (<Cite id="s-4e04a1689c" />). Stop when the number has answered the question.
+
+## Prove it with a lab
+
+<LabRef lab="transformer" role="proof" note="Count FLOPs per token from the config, then time forward passes at batch 1, 8 and 64." />
+
+Count the lab GPT's parameters and FFN FLOPs with the formulas here. Its FFN is two matrices with GELU, the same
+shape as the Anthropic item. Then time a forward pass at several batch sizes on your own machine. On a laptop the
+absolute numbers mean little, but the shape (flat time until the batch grows large) is the roofline. Its benchmark
+rows are estimates, not measurements.
+
+<LabRef lab="llm-inference" role="partial" note="Read where prefill and decode branch, and why its batching can't show the crossover." />
+
+Prefill and decode are separate code paths with a real KV cache. Its batching runs one forward pass per request, so
+it can't demonstrate shared weight reads, and its throughput rows are estimates.
+
+There is no lab yet for tensor-parallel collectives; the planned training-parallelism lab would cover them.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-5198fc4992" />: PracHub, Anthropic onsite: sharded-matmul performance model
+- <Cite id="s-1ffbee39ea" />: PracHub, Anthropic onsite: FFN compute, memory and communication (posted 2026-03-30)
+- <Cite id="s-86daab52b4" />: PracHub, Google MLE screen: two-GPU matmul
+- <Cite id="s-85ccfb1fcb" />: PracHub, Microsoft onsite: LM-head sharding
+- <Cite id="s-55d540eda9" />: CUDA prep guide (2026-07-23): decode attention, the 15%-bandwidth opener
+- <Cite id="s-f07fcd5321" />: inference prep guide: decode vs prefill as a listed question
+- <Cite id="s-75e82f8882" />: serving guide: prefill and decode wording
+- <Cite id="s-028bbc6f1c" />: Yuan Meng: ring all-reduce step count
+- <Cite id="s-9e6b455b13" />: MoE prep guide: active vs total parameters
+- <Cite id="s-4e3dc29a95" />, <Cite id="s-4e04a1689c" />: Anthropic candidate reports
+- <Cite id="s-8e443a8b66" />: NVIDIA A100; [H100](https://www.nvidia.com/en-us/data-center/h100/), [H200](https://www.nvidia.com/en-us/data-center/h200/), [L40S](https://www.nvidia.com/en-us/data-center/l40s/), [L4](https://www.nvidia.com/en-us/data-center/l4/) spec pages (fetched 2026-10-11/12); [Hopper architecture blog](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/) (fetched 2026-10-11)
+- <Cite id="s-6fdd575dc5" />: Llama-3.1-70B config.json
+- [RunPod pricing](https://www.runpod.io/pricing) (fetched 2026-10-11)

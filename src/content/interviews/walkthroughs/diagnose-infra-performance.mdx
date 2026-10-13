@@ -1,0 +1,920 @@
+---
+title: "Diagnose slow or stuck infrastructure: Linux, Kubernetes, data pipelines"
+summary: "How to handle 'it's slow' and 'it's stuck' rounds: define slow, check how busy and how queued each resource is, run the one command that rules a guess out, then stabilize, fix and prove it. Eight worked cases."
+track: ai-infra
+format: deep-dive
+family: diagnose-infra-performance
+smallTeamFocus: "You are the on-call. Ask 'is it us or the provider, and what changed', keep structured logs, per-endpoint metrics and traces with token cost from day one, prefer managed GPU endpoints, and give agents read-only access."
+rounds: [debugging]
+level: both
+timeboxMin: 45
+order: 232
+status: published
+basedOn: [infra-078, infra-079, infra-080, infra-077, infra-094]
+askedAt: [together-ai, perplexity, coreweave, nvidia, anthropic]
+labs:
+  - { lab: kafka-lite, role: proof, note: "Consumer groups with committed offsets: the lag a slow Kafka consumer shows, and why a group with no commit starts from offset 0 and replays the whole log." }
+  - { lab: observability, role: partial, note: "Metrics, a structured logger and trace propagation in Go. Its logger writes every line under one mutex, the shape that saturates behind a slow sink. The package does not compile as of 2026-10-11." }
+  - { lab: container-orchestrator, role: partial, note: "A first-fit scheduler over CPU and memory requests: a pod no node can fit stays Pending. Its informer test fails and the suite times out." }
+  - { lab: container-runtime, role: partial, note: "Namespaces and cgroups v2 limits from the kernel side: what a CPU or memory limit is before Kubernetes wraps it. Its demo does not build." }
+  - { lab: io-model, role: background, note: "Blocking, threaded, epoll and io_uring servers: what 'the server is saturated' means at the syscall level. Linux-only C; not built for this guide." }
+gapLabs: [llm-observability]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "Before I touch anything, I want to pin down what 'slow' means: which number got worse, for whom, since
+> when, and what changed. Then I'll go resource by resource: CPU, memory, disk, network, and the software
+> limits like thread pools, queues and container quotas. For each one I ask three things: how busy is it, is
+> work queuing for it, and is it throwing errors. I'll run the cheapest command that can rule each guess
+> out, and I'll say what I expect to see before I run it. Once I find the cause, I stabilize first, then
+> fix, then prove it with the same measurement I started with."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+You already debug production systems. You have looked at a slow endpoint, found a missing index, and
+watched the p99 drop. This round looks like that, but three things are different, and the answer is built
+around them.
+
+1. **You get a symptom, not a bug report, and no dashboards.** The interviewer says "the server is
+   overwhelmed" or "the notebook is slow" and waits. You have no graphs and no history. You ask for a
+   number or a command's output, and the interviewer tells you what it shows. The path you take is what
+   gets graded, not just where you end up.
+2. **Many of the numbers lie, or rather, they don't mean what they seem to mean.** A disk at "100%
+   utilization" may have plenty of room left. A machine with a high load number may have idle CPUs. A
+   container may be stalled on a machine whose CPU graph is almost flat. Most of the follow-up questions
+   in these rounds are "this number looks bad: is it?" You pass them by saying what each number counts.
+3. **The layers stack up.** A request now passes through a Kubernetes pod, a container with its own CPU
+   and memory budget, a Linux kernel, a disk or network, and often a GPU or a remote API. Each layer has
+   its own way of being "full", and some of them look idle from the layer above.
+
+Here are the symptoms these rounds have used. A server is overwhelmed and logs may be involved. Network
+throughput inside containers is low. A Linux box is slow and CPU looks high. Storage I/O is suspected. A
+Kubernetes cluster has high tail latency, timeouts and autoscaling that keeps flipping up and down. A pod
+is stuck in Pending. An ML engineer says the notebook experiment behind Kafka is slow. A training data
+pipeline doesn't run, and once fixed, it is slow. In every case the task is the same: find out why, say
+what you'd run, and fix it.
+
+<QuestionRow id="infra-078" />
+<QuestionRow id="infra-079" />
+<QuestionRow id="infra-080" />
+<QuestionRow id="infra-077" />
+<QuestionRow id="infra-094" />
+
+### Where these were reported
+
+These come from five companies' rounds, read on 2026-10-12. On PracHub only the question title is
+candidate-reported; the follow-up lists are the site's own write-up.
+
+- **Together AI**, technical screen, four PracHub titles dated 2026-09-15: "Investigate a Server Saturated
+  by Logging", "Diagnose Slow Network Throughput Including Containers", "Diagnose CPU Performance Problems
+  on a Linux Server" and "Diagnose Storage I/O Performance and Identify the Workload"
+  <Cite id="s-8b84fedc37" />. Listed on the PracHub pages (Together AI): whether deleting an open log file
+  frees space at once, what happens when a remote log sink slows down, how a CPU bottleneck can look like a
+  network limit, why one connection can underuse bandwidth, why high load average can coexist with low CPU
+  utilization, how container CPU quotas affect a host that looks idle, and why a high utilization
+  percentage doesn't prove a device is saturated.
+- **Perplexity**, technical screen, PracHub title dated 2025-08-13: "Diagnose overloaded Kubernetes
+  cluster" <Cite id="s-161b75eab8" />. Listed on the PracHub page (Perplexity): high p95/p99 latency,
+  timeouts and autoscaling thrash on a typical stack (HPA, Kubernetes' Horizontal Pod Autoscaler; Prometheus and Grafana; central logs; tracing);
+  cover what to inspect, commands, hypotheses, immediate mitigations and longer-term fixes.
+- **CoreWeave**, Glassdoor snippets from 2025: a pod stuck in Pending, alongside a CoderPad exercise on
+  Linux, Kubernetes and Bash commands <Cite id="s-5e2c5b84e0" />. Snippets only, so low confidence.
+- **NVIDIA**, a first-hand Senior MLE (machine learning engineer) account from 2025. The first onsite showed architectures instead of
+  a design prompt and "kept the problem intentionally vague": Kafka, Jupyter and an experiment dashboard,
+  and "it's slow". The candidate started by "pulling the problem apart instead of jumping to a fix", and
+  said the interviewers "were definitely giving breadcrumbs based on my path" <Cite id="s-79598dd069" />.
+- **Anthropic**, a first-hand MLE account from 2025: "Here is a prewritten Python data pipeline for model
+  training that is not running correctly. Find and fix the bugs", with "at least two bugs", then "What is
+  making the script run inefficiently?" The candidate ran out of time on the debugging and was rejected at
+  that stage <Cite id="s-6f56a76a5b" />.
+
+## What is being tested
+
+**A method when the problem is vague.** The NVIDIA prompt was vague on purpose, and the interviewers
+steered by the path the candidate took. The Perplexity listing asks for five things in order: what to
+inspect, the commands, the hypotheses, the immediate mitigation and the long-term fix. Both reward the same
+visible loop. Define "slow". Write a short list of guesses. Run the cheapest command that can rule one
+out. Repeat. Say it like this: "I'll test the cheapest guess first and tell you what I expect to see, so
+you can stop me if I'm going the wrong way."
+
+**Knowing what the numbers mean.** The Together AI follow-ups are all of one kind: this metric looks bad,
+but is it? Load average against CPU busy. A disk's `%util` on a device that serves many requests at once.
+A host that looks idle while its containers are held back. A deleted file that still takes up disk. You
+can't pass these by listing tools. You pass them by saying what each number counts, and the core concepts
+below exist for that.
+
+**Staying calm on a clock.** The Anthropic candidate ran out of time. Yuan Meng's blog, describing
+LeetCode-style rounds rather than this one, puts it bluntly: "If you panic or can't think of what to look
+into, it's a strong signal for rejection" <Cite id="s-598c128e3b" />. That is one author's judgment. The
+point of the method is that you always have a next thing to look at, so you never freeze.
+
+**Fixing, then preventing.** The logging listing asks how you would "trace the cause, stabilize the
+service, and prevent the problem from recurring". Stabilizing means making users stop hurting now: shed
+some load, lower a log level, add a node. Fixing means removing the cause. Preventing means the defaults
+and alerts that stop it coming back. They are three different steps, and the interviewer expects all
+three.
+
+## Clarify and scope
+
+Before running anything, ask five questions. Each one cuts the search space.
+
+- **What is slow, for whom, measured how?** The median request or the slowest 1% (the p99)? One endpoint
+  or all of them? "The dashboard takes 40 s to show results" is a different problem from "the experiment
+  takes 40 minutes".
+- **Since when, and what changed?** A deploy, a config change, a traffic shift, a new tenant, a new model
+  or prompt version, a node pool upgrade. Most incidents follow a change, so this is the cheapest question
+  you will ever ask.
+- **One machine or many?** If every replica is slow at once, look at what they share first: a database, a
+  log collector, a network path.
+- **Is it us or a dependency?** A provider's API, a database, a remote disk, a log collector.
+- **What may I touch?** Read-only diagnosis is different from permission to restart, scale or change
+  config. In production this matters a lot. In the interview, say which permission you would need.
+
+Then write the answers as a one-line problem statement, and say it out loud: "p99 of `/generate` rose from
+2 s to 9 s at 14:05, on all replicas, after the 14:00 deploy." A sentence like that tells the interviewer
+you know what you are chasing. Leave out kernel tuning, rewriting the service and buying hardware until
+the data points there.
+
+## Core concepts
+
+### Words you need first
+
+Three words do most of the work in this round. They come from Brendan Gregg's **USE method**: "For every
+resource, check utilization, saturation, and errors."
+
+- **Utilization** is how busy a resource is. Gregg defines it as "the average time that the resource was
+  busy servicing work". A CPU that was busy 70% of the last second has 70% utilization.
+- **Saturation** is how much work is waiting for the resource. Gregg's words: "the degree to which the
+  resource has extra work which it can't service, often queued". A CPU with ten threads waiting to run is
+  saturated, whatever its utilization says.
+- **Errors** are what the name says, "the count of error events": failed disk reads, dropped packets,
+  rejected connections.
+
+A **resource** here is anything that can run out. The physical ones are CPU, memory, disk and network
+interfaces. The software ones matter just as often: thread pools, connection pools, file descriptors,
+queues, locks, and the CPU budget the kernel gives a container. Gregg reports that the method "solves
+about 80% of server issues with 5% of the effort", and is honest that it finds only bottlenecks and errors
+([USE method](https://www.brendangregg.com/usemethod.html), last updated 2017-08-24, read 2026-10-12).
+
+For a service that answers requests, add a second view called **RED**: for each endpoint, the **rate** of
+requests, the **errors**, and the **duration** (latency). RED tells you whether users feel a problem. USE
+tells you which resource causes it. Start from RED, because that is what users see, then go to USE, because
+that is what the machine is doing. Say it like this: "RED tells me users are hurting; USE tells me which
+resource is the reason."
+
+### A picture of where the time can go
+
+When a request is slow, the time is being spent in one of these layers. This picture is the map you walk
+through, top to bottom:
+
+```
+User / client
+   │  request
+   ▼
+Load balancer / Kubernetes Service ── picks a ready pod
+   │
+   ▼
+Pod ── one or more containers, placed on a node by the scheduler
+   │
+   ▼
+Container (cgroup) ── its own CPU and memory budget, enforced by the kernel
+   │
+   ▼
+Process ── threads, pools, locks, queues inside your code
+   │
+   ▼
+Node kernel ── CPU run queue · memory · disk queue · network stack
+   │
+   ▼
+Outside dependencies ── database · log collector · remote disk · model provider
+```
+
+**Load balancer or Service.** A Kubernetes **Service** is a stable address that spreads requests over the
+pods that report themselves ready. If pods keep dropping out of "ready", the rest get more load. That
+loop shows up in case 5.
+
+**Pod.** A **pod** is Kubernetes' unit of deployment: one or more containers that run together on one
+machine, called a **node**. The **scheduler** decides which node a pod goes on. If it can't find one, the
+pod waits in a state called Pending (case 6).
+
+**Container and cgroup.** A container's CPU and memory budget is enforced by a Linux kernel feature called
+a **cgroup** (control group). This is the layer that can make a container slow on a node that looks idle,
+because the container has used up its own budget (case 2).
+
+**Process.** Inside your code, requests wait for threads, connections and locks. A logging call that holds
+a lock while it writes to a slow disk turns every request into a queue behind that lock (case 1).
+
+**Node kernel.** The machine's shared physical resources: CPUs, memory, disks and network cards, each with
+its own queue (cases 2, 3 and 4).
+
+**Outside dependencies.** Anything over the network: a database, a log collector, a remote volume, a
+model API. When every replica is slow at once, start here.
+
+### Saturation is where latency comes from
+
+A resource that is 70% busy with nothing waiting is fine. A resource with a queue adds wait time to every
+request that joins it. That is why saturation, not utilization, predicts latency.
+
+One rule ties busy-ness, waiting and latency together. It is called **Little's law**: the average number of
+things in a system equals the rate at which they arrive times the average time each one spends inside
+<Cite id="s-b9e76e614c" />. You already use it when you size a connection pool: for example, 200 requests per
+second that each hold a connection for 50 ms keep about 10 connections busy. In this round it is a cross-check. If
+the disk statistics say a device completes so many operations per second at such an average wait, the
+queue length the tool reports should match their product.
+
+<Formula
+  title="Little's law as a cross-check on device metrics"
+  expr="average queue length ≈ throughput × average latency"
+  vars={[
+    { sym: 'throughput', meaning: 'completed operations per second (iostat r/s + w/s)' },
+    { sym: 'average latency', meaning: 'time per operation including queueing (iostat r_await / w_await), seconds' },
+  ]}
+  example="Assumed 20,000 IOPS at 0.5 ms average wait: 20,000 × 0.0005 = 10 operations in flight, which should match iostat's aqu-sz"
+/>
+
+(**IOPS** means I/O operations per second.) If the numbers don't agree, you are reading the wrong device,
+the wrong time interval or the wrong column. Saying so out loud is a good Staff-level move.
+
+### What Kubernetes requests and limits do
+
+Each container in a pod can declare two numbers for CPU and memory.
+
+- A **request** is what the container asks to be guaranteed. The scheduler uses requests, and only
+  requests, to place pods: "the kube-scheduler uses this information to decide which node to place the Pod
+  on".
+- A **limit** is the most the container may use. CPU limits "are enforced by CPU throttling": when the
+  container has used its share of CPU time, the kernel stops running it until the next time slice. Memory
+  limits "are enforced by the kernel with out of memory (OOM) kills", and only reactively, under memory
+  pressure ([Kubernetes resource management](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/),
+  read 2026-10-12).
+
+Two surprising results follow, and both are favourite follow-ups. A pod can be stuck waiting for a node
+on a cluster that is mostly idle, because the *requests* already add up to each node's capacity even though
+real *usage* is low. And a container can be slow on a node with spare CPU, because its own quota is spent
+for this time slice. Say it like this: "The scheduler counts requests, not usage, and the kernel enforces
+limits per container, not per node."
+
+Under cgroup v2 (the current version of cgroups), the CPU limit lives in a file called `cpu.max`. It holds
+two numbers, "$MAX $PERIOD": how many microseconds of CPU the container may use in each period of that many
+microseconds. The default is "max 100000", which means no limit, with a 100 ms period. A second file,
+`cpu.stat`, counts how often the limit bit: `nr_periods` (periods so far), `nr_throttled` (periods in which
+the container was stopped) and `throttled_usec` (total time stopped)
+([cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html), read 2026-10-12).
+
+### What Pending means
+
+Kubernetes' pod-lifecycle page defines **Pending** as: "The Pod has been accepted by the Kubernetes
+cluster, but one or more of the containers has not been set up and made ready to run. This includes time
+a Pod spends waiting to be scheduled as well as the time spent downloading container images over the
+network" ([pod lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/), read
+2026-10-12).
+
+So two different problems share one word. If the pod has no node yet, the scheduler couldn't place it. If
+it has a node, the scheduler did its job, and the delay is on that node: pulling the container image or
+mounting a volume. The first command you run tells you which.
+
+### Lag, not latency, for Kafka consumers
+
+Kafka stores messages in an append-only log split into **partitions**. Each message has a position called
+its **offset**. A **consumer group** is a set of readers that share the partitions, and it records how far
+it has read by **committing** an offset. The gap between the newest offset in a partition and the group's
+committed offset is called **lag**: the number of messages written but not yet processed.
+
+`kafka-consumer-groups.sh --bootstrap-server … --describe --group my-group` prints, per partition,
+`CURRENT-OFFSET`, `LOG-END-OFFSET` and `LAG`
+([Kafka operations](https://kafka.apache.org/43/operations/basic-kafka-operations/), read 2026-10-12). Lag
+that keeps growing means the consumers are slower than the producers. Lag at zero means the slowness is
+somewhere else. Either way, one command rules a whole hop in or out.
+
+## Worked examples
+
+The method is the same in every case, so it is worth seeing it once as a loop:
+
+```
+ define "slow" ──► list guesses, cheapest to test first
+       ▲                     │
+       │                     ▼
+ prove it with the     run one command, say what you
+ same measurement      expect before you read it
+       ▲                     │
+       │                     ▼
+ fix, then prevent ◄── stabilize (stop the user pain)
+```
+
+Case 1 follows that loop step by step, with real numbers. The other cases use the same loop more briefly.
+The commands below are standard Linux and Kubernetes tools; no output is reproduced from a real incident.
+Two examples (cases 1 and 8) were run on 2026-10-12 on an Apple M1 Ultra (Python 3.13.7) in a scratch
+copy, and say so.
+
+### 1. A server saturated by logging (Together AI): the full loop
+
+This is the worked example to know well, because it touches every idea above. The setup used to run it:
+a server with sixteen request threads. Each request does 1 ms of real work and writes five log lines. The
+log handler takes 2 ms per line, which stands for a slow disk or a slow remote log collector (an assumed
+figure). In Python, a logging handler takes a lock for each line it writes, so only one thread can write at
+a time.
+
+Here is the loop, one step at a time:
+
+| Step | What you do | What you find | What to say in the interview |
+|---|---|---|---|
+| 1. Define slow | Ask for throughput and latency | About 79 requests/s, median (p50) 201 ms | "Each request does 1 ms of work but takes 200 ms. Something is making it wait." |
+| 2. List guesses | Logging can exhaust three different resources | Disk space, disk bandwidth, or the request path itself | "Logs can fill the disk, clog the disk, or block the request. The fix is different for each." |
+| 3. Cheapest test first | `df -h`, then `iostat`, then look at where threads wait | In this setup the slow part is the sink: every thread waits for the handler's lock | "The threads are all waiting to write a log line, one at a time." |
+| 4. Explain the number | Little's law on the request path | 16 threads ÷ 79 req/s ≈ 200 ms each | "Sixteen threads at about 80 a second means each request spends about 200 ms inside. That matches the median." |
+| 5. Stabilize | Lower the log level or sample the noisy line | Fewer lines per request, so the lock is held less | "First I make users stop hurting. Then I fix the design." |
+| 6. Fix | Move logging off the request path with a queue | About 11,700 req/s, p50 1.3 ms | "Requests now drop the line into a queue and move on. A separate thread does the slow write." |
+| 7. Prevent and prove | Bounded queue, drop counter, alert | Same measurement, before and after | "The queue doesn't make the sink faster, so I bound it and count what I drop." |
+
+**The guesses, and the commands that test them.** Logging can saturate three different resources, and the
+fix differs for each. It can fill the disk (space). It can make other disk writes queue behind log writes
+(bandwidth). Or it can make each request wait for a log write to a slow sink (the request path). Run them
+cheapest first:
+
+```bash
+df -h; df -i                                   # space and inodes
+du -xh --max-depth=1 /var/log | sort -h        # which directory grew
+sudo lsof +L1                                  # deleted files still held open (space not freed)
+iostat -xz 1                                   # is the log disk busy and queued?
+pidstat -d 1                                   # which process is writing
+pidstat -u 1 -p $(pgrep -d, -f 'fluent|vector|promtail|journald')   # is the log shipper burning CPU?
+journalctl --disk-usage                        # if journald is the sink
+```
+
+`df -i` checks **inodes**, the per-file records a filesystem can run out of even when bytes are free. The
+last two lines check the **log shipper**, the agent (Fluent Bit, Vector, Promtail or journald) that reads
+log files and sends them to a central store.
+
+**Why `lsof +L1` is on the list.** Deleting a log file that a process still has open frees nothing. In
+Linux, a file's name is just a link to its data. Per unlink(2), "If the name was the last link to a file
+but any processes still have the file open the file will remain in existence" until the last descriptor
+closes ([unlink(2)](https://linux.die.net/man/2/unlink), read 2026-10-12). `lsof +L1` lists open files with
+no name left. That answers one of the listed follow-ups: truncate the file, or signal the process to reopen
+it.
+
+**What the run showed.** Here are both designs, measured three times each:
+
+| Setup (run 2026-10-12, three runs) | Throughput | p50 | p99 |
+|---|---|---|---|
+| Handler in the request path | 79 req/s | 201 ms | 354–390 ms |
+| `QueueHandler` + bounded queue (10,000) + listener thread | 11,684–11,946 req/s | 1.3 ms | 2.7–2.9 ms |
+
+The first row has a simple explanation. One sink that takes 2 ms per line can write **500 lines a second**.
+At five lines per request, the whole server tops out at **100 requests a second**, however many threads it
+has. The 79 measured is just under that ceiling.
+
+The second row uses Python's `QueueHandler`: the request thread puts the line into an in-memory queue and
+returns, and a separate listener thread does the slow writes. This removes the sink from the request path.
+But it does not create capacity. The sink still writes only 500 lines a second. With a smaller queue of
+1,000 entries and a counter for dropped lines, the same burst kept p99 at 1.7 ms and **dropped 6,947 of
+8,000 lines**.
+
+That is the trade-off to say out loud: "When the sink is slower than the traffic, I have three choices.
+Block the service, buffer without limit and risk running out of memory, or drop lines and count the
+drops." Python's docs say `QueueHandler` uses `put_nowait()` and, when a bounded queue is full, calls
+`handleError()`, which drops the record or prints to stderr
+([logging.handlers](https://docs.python.org/3/library/logging.handlers.html), read 2026-10-12).
+
+One surprise from the run: with the bounded queue still full, `QueueListener.stop()` itself raised
+`queue.Full`, because it puts its own stop marker on the queue with `put_nowait()`. That happened in one
+of two runs. It is the kind of detail that shows you have actually run the thing.
+
+**Fix and prevent.** To stabilize: lower the log level or sample the noisy line, free space by truncating
+(not deleting), and restart the shipper if it is stuck. To prevent: log asynchronously through a bounded
+buffer, export the drop counter as a metric, rate-limit repeated error messages, rotate log files by size,
+and alert on how long until the disk is full. At an assumed 3 MB/s of logs and 100 GB free, that is about
+**9.3 hours**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Sink ceiling:** 1 line ÷ 2 ms = 500 lines/s. At 5 lines per request: 500 ÷ 5 = **100 requests/s**,
+  however many threads.
+- **Why the median is about 200 ms:** Little's law on the request path. 16 requests in flight ÷ 79
+  requests/s ≈ 0.20 s ≈ **200 ms** each, against 1 ms of real work. The measured p50 was 201 ms.
+- **Time until the disk is full:** 100 × 10⁹ bytes ÷ (3 × 10⁶ bytes/s) ≈ 33,000 s ≈ **9.3 hours** (both
+  inputs assumed).
+
+</details>
+
+### 2. CPU high, or CPU throttled (Together AI)
+
+"CPU looks high" has at least three meanings, and each needs a different fix. Run these, in this order:
+
+```bash
+uptime                       # load averages: runnable + uninterruptible tasks
+vmstat 1                     # r (run queue) vs CPU count; b (blocked); wa; st (steal)
+mpstat -P ALL 1              # one core at 100% while others idle = a single hot thread
+pidstat -u 1; pidstat -t -p <pid> 1   # which process, which thread
+perf top -p <pid>            # native code; py-spy top --pid <pid> for Python
+cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/cpu.stat   # inside the container (cgroup v2)
+```
+
+A few columns need a word. In `vmstat`, `r` is the **run queue**, the number of threads waiting for a CPU;
+compare it with the number of CPUs. `b` is the number blocked on I/O. `wa` is CPU time spent idle while
+waiting for I/O. `st` is **steal**, time a virtual machine wanted the CPU but the hypervisor gave it to
+another guest. `perf` and `py-spy` are **profilers**: they sample what code is running so you can see the
+hot function.
+
+**Load average is not CPU use.** The **load average** that `uptime` shows is the average number of tasks
+that are either running, waiting for a CPU, or in "uninterruptible sleep". That last state usually means
+waiting on a disk or a network filesystem. So a high load with low CPU busy points at I/O, not compute.
+Check the `b` column and `wa` in `vmstat`. Say it like this: "On Linux, load average counts tasks stuck on
+disk too, so high load and idle CPUs means I look at I/O next."
+
+**One saturated thread.** If `mpstat` shows one core pinned at 100% while the rest idle, something is
+single-threaded: an event loop, Python's global interpreter lock (which lets only one thread run Python
+code at a time), or one thread holding a lock everyone needs. More cores won't help. More processes, or
+less work per request, will.
+
+**Throttled while the host looks idle.** This is the container case from the core concepts, with numbers.
+A container limited to 2 CPUs has `cpu.max` = "200000 100000": 200 ms of CPU time in every 100 ms period.
+Suppose 16 threads become runnable at once. Together they use up that 200 ms in **12.5 ms** of wall-clock
+time. Then the kernel stops the whole container for the remaining **87.5 ms** of the period. The node's
+average CPU looks low. The container's p99 grows by up to 87.5 ms every period it crosses. `nr_throttled`
+rising against `nr_periods` confirms it. The fixes: raise or remove the CPU limit, cut the thread count to
+match the quota, or move the work elsewhere.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Quota:** 2 CPUs × 100 ms period = 200 ms of CPU time per period, written "200000 100000" in
+  microseconds.
+- **Time to spend it:** 16 threads running in parallel burn 16 ms of CPU per 1 ms of wall time, so
+  200 ÷ 16 = **12.5 ms**.
+- **Time stopped:** 100 − 12.5 = **87.5 ms** of the period with no CPU at all.
+
+</details>
+
+### 3. Storage I/O (Together AI)
+
+```bash
+iostat -xz 1        # per device: r/s w/s, rkB/s wkB/s, r_await w_await, aqu-sz, %util
+pidstat -d 1        # per process read/write rates; or iotop
+cat /proc/<pid>/io  # bytes this process actually caused to hit storage
+strace -f -e trace=fsync,fdatasync -p <pid>    # is the app syncing on every write?
+```
+
+In `iostat`, `r/s` and `w/s` are reads and writes per second. `r_await` and `w_await` are the average time
+each one took, including time waiting in the queue. `aqu-sz` is the average queue size. `%util` is the
+column people misread. `strace` here watches for `fsync`, the call that forces data to disk; an app that
+syncs on every write can be slow on any disk.
+
+**`%util` is not saturation on every device.** `%util` is the fraction of time the device had *at least
+one* request outstanding. For a single spinning disk that does one thing at a time, 100% means busy. An
+SSD or a RAID set serves many requests in parallel, so it can show 100% while it still has room for more.
+Use latency (`r_await`, `w_await`) and queue size (`aqu-sz`) instead, and cross-check them with Little's
+law. Say it like this: "`%util` tells me the disk was never idle, not that it was full. I look at wait
+time and queue size."
+
+**Is the wait in the device or above it?** That is another listed follow-up. Compare the latency the
+application measures around its own I/O calls with the device's `await`. If the application sees 50 ms and
+the device says 2 ms, the time is being spent above the device: in the application, a filesystem lock or a
+connection pool.
+
+**Remote storage.** Network volumes have their own throughput and operation limits per volume, set by the
+cloud provider. Check the volume's configured limits before blaming the disk. The symptom is latency that
+rises sharply at a fixed throughput: the volume has hit its cap.
+
+### 4. Slow network inside containers (Together AI)
+
+```bash
+iperf3 -s; iperf3 -c <host> -P 1; iperf3 -c <host> -P 8   # host-to-host, then pod-to-pod; 1 vs 8 streams
+ss -ti dst <peer>                                         # per-connection rtt, cwnd, retransmits
+ping -M do -s 1472 <peer>                                 # 1472 + 28 header bytes = 1500: does a full frame pass?
+mpstat -P ALL 1                                           # %soft: one core spent on network interrupts
+conntrack -S                                              # connection-tracking drops (kube-proxy iptables mode)
+```
+
+A few terms first. `iperf3` measures raw throughput between two machines. **RTT** is round-trip time. The
+**congestion window** (`cwnd` in `ss`) is how much data TCP lets itself send before waiting for an
+acknowledgement. **MTU** is the largest packet a link carries, usually 1,500 bytes. Containers often talk
+over an **overlay network** that wraps each packet in another header, so the usable size shrinks. The
+`ping` line sends a full-size packet that must not be split, to test whether one fits. `%soft` in `mpstat`
+is time a core spends on deferred network-interrupt work. `conntrack` is the kernel's connection-tracking
+table, which kube-proxy uses in its iptables mode; when it fills, new connections are dropped.
+
+Compare layers before blaming the overlay: run the same test host-to-host, node-to-pod and pod-to-pod. If
+one stream is slow and eight streams are fast, it is a limit per connection, not the network. One TCP
+connection can never have more data in flight than its window, and it gets one window's worth through per
+round trip:
+
+<Formula
+  title="One TCP connection's ceiling"
+  expr="throughput ≤ window ÷ RTT"
+  vars={[
+    { sym: 'window', meaning: 'bytes in flight without acknowledgement (receive window or congestion window)' },
+    { sym: 'RTT', meaning: 'round-trip time' },
+  ]}
+  example="An assumed 64 KiB window: at 1 ms RTT, 65,536 ÷ 0.001 ≈ 65.5 MB/s (524 Mbit/s); at 10 ms, 6.6 MB/s"
+/>
+
+So with an assumed 64 KiB window and 10 ms of RTT, one connection tops out near **6.6 MB/s**, however fast
+the link. Say it like this: "One connection is capped at window divided by round-trip time. If eight
+streams are fast and one is slow, the network is fine."
+
+**A CPU problem can look like a network problem.** If the sender is throttled, or one core is saturated by
+interrupts or by encryption (TLS), the link sits idle while throughput stays flat. Packet loss from an MTU
+mismatch on an overlay shows up as retransmits in `ss -ti`.
+
+### 5. An overloaded Kubernetes cluster (Perplexity)
+
+The symptom: high p95 and p99 latency, timeouts, and autoscaling that keeps adding and removing pods. The
+autoscaler here is the **HPA** (Horizontal Pod Autoscaler), which adds or removes pod copies to keep a
+metric such as average CPU near a target. "Thrash" means it flips up and down without settling.
+
+```bash
+kubectl top nodes; kubectl top pods -A --sort-by=cpu        # needs metrics-server
+kubectl describe node <node>          # Conditions (MemoryPressure, DiskPressure, PIDPressure), Allocated resources
+kubectl get events -A --sort-by=.lastTimestamp | tail -50
+kubectl describe hpa <name>           # current vs target metric, recent scaling events
+kubectl get pods -o wide | grep -v Running
+```
+
+**Guesses to test one at a time.**
+
+- **Throttling plus CPU-based autoscaling.** Pods hit their CPU limit and latency rises. The HPA adds pods.
+  New pods take time to become ready. Load drops, the HPA removes them, and the cycle repeats. Kubernetes'
+  HPA page says its stabilization window "is used to restrict the flapping of replica count", with a
+  default of 300 seconds for scale-down
+  ([HPA](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/), read
+  2026-10-12). Put scaling events and latency on one graph and see whether they move together.
+- **A readiness cascade.** A **readiness probe** is the check Kubernetes runs to decide whether a pod
+  should receive traffic. Under load the probe times out, the pod leaves the Service, and the remaining
+  pods get more load and fail their probes too. Probes that call a database make this worse.
+- **Retry amplification.** If each layer makes up to three attempts, two such layers can send the slowest
+  layer up to **nine times** the traffic (3 × 3). Retries turn a slowdown into an outage.
+- **Overcommitted nodes.** If requests are set far below real usage, the scheduler packs too many pods on
+  a node, and they then fight over CPU or memory.
+
+**Mitigate first:** raise the HPA minimum so it stops removing pods, shed load at the edge, turn off
+retries in the inner layers, and cap how many requests each pod handles at once. **Then fix:** set requests
+from measured usage, autoscale on a signal closer to the user (queue depth, requests in flight, latency)
+rather than CPU alone, keep liveness probes cheap and readiness probes independent of downstreams, and add
+a **retry budget** (a cap on retries as a share of total traffic). Say it like this: "Stop the feedback
+loop first, then find which loop it was."
+
+### 6. A pod stuck in Pending (CoreWeave)
+
+```bash
+kubectl get pod <pod> -o wide           # NODE column empty: unscheduled. Set: pulling images or mounting volumes
+kubectl describe pod <pod>              # Events at the bottom: FailedScheduling and its reasons
+kubectl describe node <node> | sed -n '/Capacity/,/Allocated resources/p'   # nvidia.com/gpu capacity vs allocatable
+kubectl get nodes -L <gpu-label>        # which nodes carry the GPU label your selector asks for
+kubectl describe node <node> | grep -i taint
+kubectl get pvc; kubectl describe pvc <claim>          # an unbound claim, or one bound in another zone
+kubectl get pods -n kube-system | grep -i -E 'nvidia|device-plugin'   # is the GPU device plugin running?
+```
+
+The first line splits the problem in two, as the core concepts explained. If the pod has a node, look at
+image pulls and volume mounts there. If not, read why the scheduler said no.
+
+Kubernetes' debugging page says a Pending pod "can not be scheduled onto a node", usually from
+insufficient resources, and points at the scheduler's messages in `kubectl describe`
+([debug pods](https://kubernetes.io/docs/tasks/debug/debug-application/debug-pods/), read 2026-10-12).
+The FailedScheduling event lists how many nodes each reason ruled out; the exact wording varies by
+version. The usual reasons are these:
+
+- **Not enough requested CPU, memory or GPU** on any single node.
+- **A taint the pod doesn't tolerate.** A **taint** is a mark on a node that repels pods unless they carry
+  a matching **toleration**. GPU nodes are often tainted so ordinary pods stay off them.
+- **A `nodeSelector` or affinity rule** (a rule saying which nodes the pod may run on) that no node matches.
+- **An unbound volume claim.** A **PVC** (PersistentVolumeClaim) is a pod's request for storage. If it
+  isn't bound, or is bound to a disk in another zone, the pod can't start where the disk isn't.
+- **A `hostPort` conflict**, where two pods want the same port on the node.
+
+**GPU specifics.** Kubernetes doesn't know about GPUs by itself. A vendor's **device plugin**, a small
+agent on each node, tells Kubernetes how many GPUs the node has. The docs: "your cluster exposes a custom
+schedulable resource such as `amd.com/gpu` or `nvidia.com/gpu`", and GPUs "are only supposed to be
+specified in the `limits` section"
+([scheduling GPUs](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/), read 2026-10-12). If
+the device plugin isn't running on a node, that node advertises no GPUs. Every GPU pod then reports
+insufficient GPUs, even on a GPU machine.
+
+**Fragmentation.** Take four nodes with 8 GPUs each, and 7 in use on every node. There are 4 GPUs free in
+total, yet a pod asking for 2 stays Pending, because no single node has 2 free. Say it like this: "Totals
+across the cluster don't schedule pods. Free space on one node does." If a **cluster autoscaler** (the
+component that adds nodes) is installed, its events on the pod say whether it tried to add a node and why
+it didn't: no node group fits, a quota, or no capacity.
+
+### 7. The slow notebook behind Kafka (NVIDIA)
+
+Here the system is the problem, so draw it first. A plausible reading of the setup, to confirm with the
+interviewer:
+
+```
+Jupyter notebook (runs the experiment)
+   │  publishes results or metrics
+   ▼
+Kafka topic
+   │
+   ▼
+Consumer ── reads results, writes them to a store
+   │
+   ▼
+Results store
+   │  queried by
+   ▼
+Experiment dashboard
+```
+
+**The notebook** is an interactive Python session where the ML engineer runs the experiment. It can be
+slow on its own: slow Python, or a GPU that sits idle. **Kafka** carries the results. **The consumer**
+reads them and writes them down; if it falls behind, lag grows. **The store** keeps the results. **The
+dashboard** queries the store; an unindexed query over every experiment ever run can be the whole problem.
+
+Pull the path apart first, as the reporting candidate did. Ask which part the ML engineer means by
+"slow", then time each hop:
+
+```bash
+kafka-consumer-groups.sh --bootstrap-server <b> --describe --group <dashboard-consumer>   # LAG per partition
+py-spy dump --pid <kernel-pid>         # what the notebook's Python is doing right now
+nvidia-smi dmon -s u                   # is the GPU busy at all while the experiment "runs"?
+```
+
+**Guesses, each ruled in or out by one measurement above.** Consumer lag is growing, because there are too
+few consumers for the partitions or each message takes a slow write. The notebook rereads the whole topic
+on every run: a new consumer group with no committed offset starts from the beginning in kafka-lite, whose
+`FetchOffset` returns 0 for a group with no commit; real clients follow their offset-reset setting. The
+dashboard runs an unindexed query over all results. Or the experiment itself is CPU-bound in Python, or
+copies data off the GPU every step. The breadcrumbs the candidate describes are the interviewer reacting
+to which hop you measure first. Say it like this: "Lag takes seconds to check, so I check it first. If it's
+zero, Kafka is not the problem."
+
+### 8. A training data pipeline: fix it, then make it fast (Anthropic)
+
+A **data pipeline** for training reads raw examples, turns words into numbers the model can use, groups
+them into **batches** (here, 64 examples each), and feeds them to the model. One full pass over the data is
+an **epoch**. Turning words into numbers needs a **vocabulary**, a table from each word to an id.
+
+The report doesn't say what the bugs were, so here is a practice version, built for this page and run on
+2026-10-12: 20,000 JSON lines of 40 words each, batches of 64, with two correctness bugs and one hot spot.
+
+```python
+def encode(text, texts):
+    vocab = build_vocab(texts)              # HOT SPOT: rebuilt for every example
+    return [vocab[w] for w in text.split()]
+
+def batches(path, batch_size=64, seed=0):
+    texts, labels = load(path)
+    random.Random(seed).shuffle(texts)      # BUG 1: labels not shuffled with texts
+    random.Random(seed + 1).shuffle(labels)
+    for i in range(0, len(texts) - batch_size, batch_size):   # BUG 2: drops the tail
+        xs = [encode(t, texts) for t in texts[i:i + batch_size]]
+        yield xs, labels[i:i + batch_size]
+```
+
+**Correctness first.** Bug 1 shuffles texts and labels separately, so the model trains on random labels.
+The loss won't fall below chance, and nothing crashes. You catch it by asserting that a few examples still
+carry their original labels after batching. Bug 2 stops the loop one batch early. It silently drops the
+last 32 examples (312 batches instead of 313), and drops a full batch whenever the count is a multiple of
+64. You catch it by checking that examples per epoch equal the dataset size. Say it like this: "The bugs
+that cost the round are the ones that don't crash, so I check invariants, not just exceptions."
+
+**Then measure the input pipeline alone,** before blaming the model or the GPU. `cProfile` is Python's
+built-in profiler. Its trimmed output over two batches:
+
+```text
+slow: 5 batches in 26.02s
+   ncalls  tottime  cumtime  filename:lineno(function)
+      128   0.001   42.637  pipeline_slow.py:24(encode)
+      128  20.916   42.636  pipeline_slow.py:17(build_vocab)
+102400000  13.548   13.548  {method 'setdefault' of 'dict' objects}
+fixed: all 313 batches (one epoch, 20,000 examples) in 0.18s
+```
+
+Read it like this: `encode` was called 128 times (two batches of 64), and almost all its time is inside
+`build_vocab`, which made over 100 million dictionary calls. Profiling slowed it about fourfold here (21 s
+per batch profiled against 5.2 s without). Without the profiler, five batches took 26 s, about **81 ms per
+example**, so one epoch would take about **27 minutes**. The fixed version builds the vocabulary and
+encodes once, and does the whole epoch in **0.18 s**. Cache the encoded data to disk so the next epoch and
+the next run skip it.
+
+**Then the loader.** In PyTorch, the `DataLoader` that feeds batches to the model has a `num_workers`
+setting. It defaults to 0, and "0 means that the data will be loaded in the main process".
+`pin_memory=True` copies batches into page-locked ("pinned") memory for faster host-to-GPU transfer
+([torch.utils.data](https://docs.pytorch.org/docs/2.14/data.html), read 2026-10-12). Here is the sign to
+look for: GPU utilization drops between training steps while one CPU core is pinned at 100%. The GPU is
+waiting on input. More workers, prefetching and pre-tokenized data fix it; a bigger GPU doesn't.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Batches per epoch:** 20,000 ÷ 64 = 312.5, so 313 batches with the last one holding 32 examples. The
+  buggy `range(0, 20,000 − 64, 64)` stops before index 19,968, giving 312 batches and dropping those 32.
+- **Per example:** 26.02 s ÷ 5 batches ≈ 5.2 s per batch; 5.2 s ÷ 64 ≈ **81 ms per example**.
+- **Per epoch:** 20,000 × 0.081 s ≈ 1,620 s ≈ **27 minutes**, against 0.18 s once fixed.
+
+</details>
+
+## Common follow-ups in depth
+
+### "I deleted the log file and the disk is still full"
+
+The process still holds the file open, so the space stays allocated. `lsof +L1` lists deleted-but-open
+files. Truncate through the descriptor (`: > /proc/<pid>/fd/<n>`) or make the process reopen its logs.
+Log rotation by `copytruncate` (copy the file, then empty it in place) avoids this, at the cost of possibly
+losing lines written during the copy.
+
+### "What happens if the remote log sink slows down?"
+
+It depends on whether logging blocks. Synchronous logging turns sink latency into request latency: that is
+the 79 requests/s row in case 1. An unbounded buffer turns it into memory growth and, eventually, an OOM
+kill. A bounded buffer turns it into dropped lines. That is usually the right choice, as long as drops are
+counted and alerted on. Decide which logs may never drop, such as audit logs, and send those through a
+separate, durable path.
+
+### "High load average, low CPU utilization"
+
+Tasks in uninterruptible sleep count toward load. Look for blocked processes (`vmstat`'s `b` column, or
+`ps` showing state `D`), slow disks or a network filesystem, and `wa` time.
+
+### "How do you know the fix worked?"
+
+Take the same measurement before and after, under the same load. Take the user-facing number (p99, time
+per epoch, lag) and the resource number that explained it (throttled periods, queue length, dropped
+lines). Then add the alert that would have caught it earlier.
+
+### "Why is the GPU pod Pending when the cluster has free GPUs?"
+
+Per-node fragmentation, a taint the pod doesn't tolerate, a selector for a GPU type that is full, or a node
+whose device plugin isn't advertising GPUs. Each is visible in the pod's events and the node's allocatable
+resources.
+
+<AINative title="Agents during an incident: fast readers, confident guessers">
+An agent is useful for the reading: summarizing a thousand lines of events, explaining an unfamiliar
+`iostat` column, writing the `kubectl` or PromQL (Prometheus metrics) query you half remember, diffing two configs. It is
+dangerous in two ways. It will produce a root cause from one symptom with full confidence. And it will
+suggest commands that change things (restart, delete the pod, raise the limit), which destroy the evidence
+or widen the damage. Give it read-only credentials, as this guide's small-team defaults recommend for agent
+tools. Ask it for a ranked list of guesses and, for each, the command whose output would rule it out. Then
+run the command yourself and read the output yourself. A flag it invents fails loudly. A plausible
+misreading of `%util` or load average fails silently, and that is the one to check.
+</AINative>
+
+## Small-team version
+
+At a 50–500 person company, the AI engineer is often the person paged when the GPU pod is Pending or the
+ingestion job crawls. There is no separate SRE team. So the playbook has to fit one person and one hour.
+
+### Where to look first, in order
+
+1. **Is it us or the provider?** Look at error rate and latency **per provider and model** on your own
+   dashboard, then at the provider's status page. Provider outages are a routine failure for small teams.
+   OpenAI's 2024-12-11 incident, for example, lasted about 4 h 22 m and was triggered when a new telemetry
+   service overloaded Kubernetes control planes
+   ([status page](https://status.openai.com/incidents/ctrsv3lwd797)).
+2. **What changed?** Deploys, prompt or model version, config, and traffic by tenant, in the last hour.
+3. **RED per endpoint**, split into queue wait, time to first token (how long until the model's first word
+   comes back), generation time and tool calls, plus **tokens** per request. A token is the unit models
+   read and write, roughly three-quarters of a word. A latency jump with flat tokens is infrastructure. A
+   jump with doubled tokens is a prompt or retrieval change.
+4. **USE on the box or pod**: CPU throttling, memory, GPU utilization, disk, and the software resources
+   (worker pools, connection pools, how many calls the provider lets you make at once).
+
+### Cheap defaults to have before the first incident
+
+- Structured JSON logs with a request id, at INFO level, through an asynchronous handler with a bounded
+  buffer and a drop counter. Sample debug logs instead of turning them on everywhere.
+- RED metrics per endpoint and per provider, plus a spend metric. Alert on p95 latency, error rate, the
+  provider's rate-limit rejections (HTTP 429) and daily spend.
+- Traces from day one, with tokens and cost per request (OpenTelemetry, or an LLM tracing tool such as
+  Langfuse, which is open source and can be self-hosted).
+- **Quality checks, not just error rates.** Anthropic's September 2025 postmortem describes three
+  infrastructure bugs that degraded output quality while standard benchmarks, safety evals, spot checks and
+  canaries missed them ([postmortem](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues),
+  2025-09-17). A small team's version: a handful of fixed prompts with checked answers, run on a schedule
+  against production.
+
+### Build, buy, skip
+
+- **Buy hosted metrics and logs** while volume is small. You have no time to run a logging cluster. Size
+  the bill from volume first: at an assumed 2M requests a day, 20 lines each, 300 bytes a line, that is
+  **12 GB of logs a day**, times your vendor's price per GB (check it; it varies widely).
+- **Skip running your own GPU Kubernetes cluster** for one or two models. A managed endpoint or a
+  per-second serverless GPU platform removes the whole Pending-pod and device-plugin class of problems.
+  For example, Modal listed an H100 at $0.001097 per second (about **$3.95 an hour**) as of 2026-10-11
+  ([pricing](https://modal.com/pricing)). Revisit when your GPUs run near full all day, or when data
+  residency rules require your own nodes.
+- **Build** the runbook: the four steps above, the commands on this page that apply to your stack, and who
+  can approve a restart or a rollback.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Log volume:** GB/day = requests/day × lines per request × bytes per line ÷ 10⁹. With the assumed
+  inputs: 2 × 10⁶ × 20 × 300 = 1.2 × 10¹⁰ bytes = **12 GB/day**.
+- **Hourly GPU price:** $0.001097 × 3,600 s ≈ **$3.95 an hour**.
+
+</details>
+
+### What you still own
+
+The alert thresholds, the decision to drop logs rather than block, the rollback, and the change after the
+incident that would have caught it earlier. An agent can draft the postmortem; you decide what changes.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Diagnosing slow infrastructure"
+  senior={[
+    "Defines the symptom precisely, works resource by resource with the right commands, and knows what each number counts (load, %util, throttling, Pending).",
+    "Separates stabilizing from fixing and verifies the fix with the same measurement."
+  ]}
+  staff={[
+    "Starts from what changed and from user-facing RED metrics, ranks hypotheses by likelihood and cost to test, and narrates the plan so the interviewer can steer.",
+    "Turns the incident into prevention: defaults (async logging with drop counters, requests from measured usage, autoscaling on queue depth), alerts, and who owns each."
+  ]}
+/>
+
+In plain words: a Senior answer finds the cause and reads every number correctly. A Staff answer also
+chooses the order of guesses on purpose, talks through it so the interviewer can steer, and leaves the
+system with defaults and alerts so the same incident doesn't happen twice.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="Can deleting an open log file free the expected space immediately? (Listed on the PracHub page, Together AI)">
+    No. The file's data stays allocated until the last process that has it open closes it. Find it with
+    `lsof +L1`, truncate through `/proc/<pid>/fd`, or make the process reopen its log.
+  </FollowUp>
+  <FollowUp q="How can container CPU quotas affect a host that appears to have spare capacity? (Listed on the PracHub page, Together AI)">
+    The quota is per period. A 2-CPU limit spent by 16 threads in 12.5 ms leaves the container stopped
+    for the remaining 87.5 ms of each 100 ms period, while the host's average CPU looks low. `cpu.stat`'s
+    `nr_throttled` shows it.
+  </FollowUp>
+  <FollowUp q="Why might a single connection underuse available bandwidth? (Listed on the PracHub page, Together AI)">
+    It can't exceed window ÷ RTT. A 64 KiB window at 10 ms RTT caps it near 6.6 MB/s. Compare one stream
+    with eight in `iperf3`, and check `ss -ti` for retransmits and window size.
+  </FollowUp>
+  <FollowUp q="Tail latency, timeouts and autoscaling thrash: what do you mitigate first? (Listed on the PracHub page, Perplexity)">
+    Stop the thrash and the amplification: raise the HPA minimum, shed or rate-limit at the edge, disable
+    inner-layer retries. Then find the cause (throttling, readiness cascade, overcommitted nodes) with
+    events and HPA history on one timeline.
+  </FollowUp>
+  <FollowUp q="The pod is Pending and describe shows insufficient nvidia.com/gpu, but the nodes have GPUs. (Not reported; a natural next push)">
+    Check each node's allocatable `nvidia.com/gpu`. Zero means the device plugin isn't running or the
+    driver isn't loaded. If allocatable is fine, look for per-node fragmentation, taints and selectors.
+  </FollowUp>
+  <FollowUp q="What is making the script run inefficiently? (Reported, Anthropic)">
+    Measure the input pipeline alone, then profile it. In the practice version above, rebuilding a
+    vocabulary per example cost about 81 ms per example; doing it once made an epoch take 0.18 s. Then
+    check the loader (`num_workers`, prefetching) against GPU utilization.
+  </FollowUp>
+  <FollowUp q="How would you debug that architecture? (Reported, NVIDIA)">
+    Ask what "slow" means and for whom, draw the path (notebook, Kafka, consumer, store, dashboard), and
+    time each hop: consumer lag, the notebook's own profile, the dashboard query. Measure before proposing.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Proposing a fix before defining "slow".** You end up fixing the wrong hop; the NVIDIA prompt was vague
+  on purpose, and the reporting candidate pulled it apart first <Cite id="s-79598dd069" />.
+- **Treating utilization as saturation.** `%util` at 100% on an SSD, or a host at 30% CPU with throttled
+  containers, both mislead; queues and wait times are what predict latency.
+- **Deleting the open log file.** It frees nothing while a process holds it open; truncate it or make the
+  process reopen it.
+- **Totals instead of per-node numbers.** Free GPUs spread across the cluster don't schedule a 2-GPU pod;
+  only free space on one node does.
+- **Blaming the GPU for an input-bound job.** A GPU waiting on a slow loader won't get faster by being
+  bigger; measure the data pipeline alone first.
+- **Changing production while diagnosing.** Restarting the pod destroys the evidence; capture events,
+  profiles and logs first.
+- **Running out of time on the fix.** The Anthropic candidate ran out of time on the debugging
+  <Cite id="s-6f56a76a5b" />; fix the correctness bugs first, then state the slowness guess and the
+  measurement you'd run next even if you can't finish it.
+
+## Prove it with a lab
+
+<LabRef lab="kafka-lite" role="proof" note="Build consumer groups and committed offsets, then compute lag as log end minus committed offset; FetchOffset returns 0 for a group with no commit, which is how a new group replays the whole log." />
+<LabRef lab="observability" role="partial" note="Metrics, a structured logger and trace propagation. Read its logger: every line is written under one mutex, so a slow writer serializes every request. The package doesn't compile as of 2026-10-11." />
+<LabRef lab="container-orchestrator" role="partial" note="A first-fit scheduler over CPU and memory requests: Schedule returns an error when no node has capacity, and the pod stays Pending. Its informer test fails and the suite times out." />
+<LabRef lab="container-runtime" role="partial" note="cgroups v2 limits written by hand: what a container's CPU and memory limit is in the kernel. Its demo doesn't build." />
+<LabRef lab="io-model" role="background" note="Server I/O models from blocking accept to io_uring, for what saturation looks like in a server's own loop. Linux-only; not built for this guide." />
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-8b84fedc37" />
+- <Cite id="s-161b75eab8" />
+- <Cite id="s-5e2c5b84e0" />
+- <Cite id="s-79598dd069" />
+- <Cite id="s-6f56a76a5b" />
+- <Cite id="s-598c128e3b" />
+- <Cite id="s-b9e76e614c" />
+- PracHub (Together AI), [server saturated by logging](https://prachub.com/interview-questions/investigate-a-server-saturated-by-logging), [network throughput in containers](https://prachub.com/interview-questions/diagnose-slow-network-throughput-including-containers), [CPU on a Linux server](https://prachub.com/interview-questions/diagnose-cpu-performance-problems-on-a-linux-server), [storage I/O](https://prachub.com/interview-questions/diagnose-storage-i-o-performance-and-identify-the-workload) (dated 2026-09-15; read 2026-10-12)
+- PracHub (Perplexity), [Diagnose overloaded Kubernetes cluster](https://prachub.com/interview-questions/diagnose-overloaded-kubernetes-cluster) (dated 2025-08-13; read 2026-10-12)
+- Brendan Gregg, [The USE Method](https://www.brendangregg.com/usemethod.html) (last updated 2017-08-24; read 2026-10-12)
+- Kubernetes docs: [pod lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/), [debug pods](https://kubernetes.io/docs/tasks/debug/debug-application/debug-pods/), [resource management](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/), [scheduling GPUs](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/), [HPA](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/) (read 2026-10-12)
+- Linux kernel docs, [cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html); [unlink(2)](https://linux.die.net/man/2/unlink) (read 2026-10-12)
+- Apache Kafka, [basic operations: checking consumer position](https://kafka.apache.org/43/operations/basic-kafka-operations/) (read 2026-10-12)
+- Python docs, [logging.handlers](https://docs.python.org/3/library/logging.handlers.html); PyTorch, [torch.utils.data](https://docs.pytorch.org/docs/2.14/data.html) (read 2026-10-12)
+- OpenAI [status incident, 2024-12-11](https://status.openai.com/incidents/ctrsv3lwd797); Anthropic, [A postmortem of three recent issues](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues) (2025-09-17); Modal [pricing](https://modal.com/pricing) (fetched 2026-10-11)

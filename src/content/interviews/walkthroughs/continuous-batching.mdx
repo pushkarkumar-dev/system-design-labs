@@ -1,0 +1,918 @@
+---
+title: "Continuous batching: write the decode-loop scheduler"
+summary: "Write the loop that runs many text-generation requests through one model call per step, refills a slot the moment a request finishes, stays inside GPU memory and stops on disconnect; then explain why long prompts slow everyone down."
+track: ai-infra
+format: coding
+family: continuous-batching
+smallTeamFocus: "Don't build this loop: vLLM and similar engines already run it. Know it well enough to read their latency graphs and memory warnings, and to set their concurrency and memory limits from your own traffic."
+rounds: [practical-coding, domain-deep-dive]
+level: both
+timeboxMin: 45
+order: 349
+status: published
+basedOn: [infra-008, infra-010, infra-011]
+askedAt: [xai, together-ai, fireworks-ai]
+labs:
+  - { lab: llm-inference, role: partial, note: "Its BatchedEngine admits from a priority queue each step and frees paged KV blocks on completion, but runs one forward pass per request and ignores out-of-memory returns." }
+gapLabs: []
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll keep a fixed number of slots and a first-in, first-out queue. Every step, I fill each free slot from the
+> queue, call the model once for all active requests, and give the k-th token it returns to the k-th active
+> slot. After appending, I check the stop rules and free any slot that finished, so the next request takes it on
+> the very next step. I'll test it against a one-request-at-a-time version: batching must never change any
+> output. Then I'll add memory: admit only what fits, evict the newest request when memory runs out, and free a
+> request's slot as soon as its client disconnects."
+>
+> The rest of this page explains each part of that answer, and builds it in code, stage by stage.
+
+### Words you need first
+
+- A **large language model (LLM)** writes text one small piece at a time. Each piece is a **token**, roughly ¾ of
+  a word. In code a token is just an integer, such as `4127`.
+- To get the next token, you give the model everything written so far (the prompt plus the reply so far). That
+  list of tokens is the request's **prefix**. One call to the model that adds one token is a **step**. Writing a
+  reply this way, one token per step, is called **decode**.
+- A **batch** is a group of requests sent to the model in one call. The model returns one next token for each
+  prefix in the batch, in the same order. Each place in the batch is a **slot**.
+- Before the reply starts, the model has to read the whole prompt once. That first pass is called **prefill**.
+  You can ignore it until stage 3.
+
+### What makes this different from the batching you already know
+
+You have batched work before. You buffer database writes and flush them together, or you send 100 keys to a cache
+in one `MGET`. In those cases every item in the batch is one unit of work. The batch finishes, every caller gets
+an answer, and the next batch starts.
+
+Text generation breaks that pattern in two ways.
+
+1. **Each request is many steps, and the lengths differ wildly.** One user's reply is 50 tokens long. Another's is
+   1,000. Every request in the batch moves forward by exactly one token per step, so a batch runs in lock step.
+2. **One model call costs about the same whether it carries 1 request or 100.** On a GPU, most of a decode step is
+   spent reading the model itself out of memory. That read is shared by everyone in the batch. So an empty slot is
+   pure waste: you paid for the step and got nothing from that slot.
+
+Put those together and the simple approach goes badly. If you form a batch and wait until all of its requests
+finish, short replies end early and their slots sit empty while the longest one keeps going. This is called
+**static batching**. Think of a lift that won't let anyone on until everyone inside has got off.
+
+The fix is to refill a slot the moment its request finishes, at the very next step. This is called **continuous
+batching** (the research paper that introduced it, Orca, called it iteration-level scheduling). The lift lets a
+new person in at every floor.
+
+The code is short. The hard part is bookkeeping: slots empty and refill in the middle of a run, so you must never
+give a token to the wrong request.
+
+### Where this was asked
+
+Three reported variants make up this family. They are a coding round at xAI, a scheduler item in a Together AI
+prep guide, and a discussion topic in a Fireworks prep guide (details below):
+
+<QuestionRow id="infra-008" />
+<QuestionRow id="infra-010" />
+<QuestionRow id="infra-011" />
+
+- **xAI, the decode loop.** PracHub lists an xAI machine learning engineer (MLE) onsite coding title, "Implement dynamic batching for token
+  decoding". Its statement, which may be the site's own restatement, calls the model as
+  `model_next(batch_prefixes)`. Each request has `prompt_tokens`, `max_tokens` and exactly one of `stop_token` or
+  `stop_sequence`. Free slots refill from a FIFO queue. The stop token or sequence is included in the output, and
+  outputs come back "in the original request order". A request with `max_tokens == 0` "finishes immediately with
+  an empty generated output". Stated limits: batch size up to 1,000, up to 10,000 requests, at most 100,000
+  generated tokens (<Cite id="s-8d74591878" />, last updated 2026-05-24).
+- **Together AI, the scheduler under memory pressure.** A Together AI prep guide lists "continuous batching —
+  admitting new requests into a running batch as earlier sequences finish" and "deciding how to preempt or queue
+  when KV-cache memory runs short". A separate item on the same page covers "propagating a client disconnect back
+  to the scheduler" (<Cite id="s-0457784328" />). The KV cache is the GPU memory each request holds; it is
+  explained in the next section.
+- **Fireworks, a discussion.** A PracHub prep guide for Fireworks lists disaggregated prefill and decode as a
+  technical-review topic and notes it "can allow different pools and scaling decisions" (<Cite id="s-b6632d5df9" />). Stage 3 explains what
+  that means.
+
+The code on this page was written and tested for this walkthrough and run on 2026-10-12 (Python 3.14, standard
+library only). It is about 150 lines. In a 45-minute round, stage 1 is the bar and stage 2 is where seniority
+shows. Stage 3 is talk, not code.
+
+## What is being tested
+
+**Bookkeeping while the batch changes.** The loop itself is simple. The bugs live in the indices. Say slot 1
+finishes and a new request moves into it. On the next step, the token the model returns in position 1 belongs to
+the *new* request, not to the one that was there when the run began. The xAI statement says this mapping must not
+mix up outputs after refilling (<Cite id="s-8d74591878" />).
+
+**Edge cases you name before coding.** A request that asks for zero tokens. A batch that is only partly full when
+the queue runs dry. A stop sequence longer than one token. A stop token that also appears in the prompt. Results
+returned in the order requests were submitted.
+
+**Memory as the real limit.** On a real GPU, the number of slots isn't what runs out first. Memory is. While a
+request is being written, the GPU keeps a saved summary of every token so far, so it doesn't have to re-read the
+whole prefix each step. That saved summary is the **KV cache** (short for key-value cache, after the two kinds of
+numbers it stores). It grows by a fixed amount with every token. The Together guide treats it as the scarce
+resource, and a Together article says "at long context lengths the KV cache, not the weights, is what eats your
+VRAM" (<Cite id="s-9597947584" />). (VRAM is the GPU's own memory; the weights are the model itself.)
+
+**Constant factors.** The same article says infra interviewers "care about the constant factors, not only the
+big-O" (<Cite id="s-9597947584" />). The classic slip here is rebuilding every prefix from scratch on every step.
+
+**Explaining latency.** For the Fireworks discussion you need two latency words. **Time to first token (TTFT)** is
+how long a user waits before the first word appears. **Inter-token latency (ITL)** is the gap between one word and
+the next once the reply is flowing. Stage 3 explains what each prefill strategy does to both.
+
+## Clarify and scope
+
+Spend a minute on these. Say each assumption out loud and write it down.
+
+| Question | Assumption | Say it like this |
+|---|---|---|
+| Does one model call cost the same whatever the batch size? | Yes. During decode, a step is limited by reading the model from memory, not by arithmetic, until the batch gets very large | "I'll treat one model call per step as the unit of cost, so my goal is fewer steps with fuller batches." |
+| Is a stop sequence matched only against generated tokens, or across the prompt boundary too? | Generated tokens only; the stop sequence stays in the output | "A stop token sitting in the prompt shouldn't end the reply before it starts." |
+| Token-level or text-level stop sequences? | Token-level, as stated | "Text-level stop strings are harder; I'll come back to them if there's time." |
+| Order of admission | FIFO; no reordering by length unless asked | "First in, first out, so nobody starves." |
+| Results | Returned in submission order; each carries a finish reason | "Each result says why it ended: stop, length, cancelled or rejected." |
+| Is `model_next` pure and deterministic? | Yes, which makes a one-request-at-a-time reference possible | "Then I can test batching by comparing against running each request alone." |
+| Memory model for the KV stage | A fixed pool of blocks of 16 tokens each (assumed); a request needs blocks for its prompt, its output so far and one more token | "Memory comes in fixed-size blocks, like pages in an OS." |
+
+Out of scope unless asked: sampling (choosing among likely tokens at random), beam search (keeping several
+candidate replies), real tensors, and multiple GPUs.
+
+## Plan before code
+
+Say the plan in four lines before typing:
+
+1. **State.** A FIFO `waiting` queue. `slots`, a fixed-size array where `None` means free. Per slot, the prefix
+   list (prompt plus output so far), appended to in place.
+2. **Step.** Refill every free slot from the head of the queue, finishing zero-token requests on the spot. Collect
+   the indices of the active slots, in order. Call the model once with their prefixes. Give each returned token to
+   the request in the same position. Check the stop rules. Free finished slots.
+3. **Stop rules.** After appending a token: does the last token equal the stop token? Does the tail of the output
+   equal the stop sequence? Has the output reached `max_tokens`? Check stop before length, so a stop on the last
+   allowed token reports "stop", not "length".
+4. **Test.** The mock is deterministic, so each request's output must equal what it produces when run alone.
+   Batching must never change an output. Any slot-mapping bug shows up as a mismatch.
+
+### A picture of the loop
+
+```
+          submit()                      cancel(id)
+             │                              │
+             ▼                              ▼
+   ┌──────────────────┐            ┌─────────────────┐
+   │  waiting queue   │            │  cancelled ids  │
+   │  (FIFO)          │            │                 │
+   └────────┬─────────┘            └────────┬────────┘
+            │ refill free slots              │ applied at the top of each step
+            ▼                                ▼
+   ┌───────────────────────────────────────────────────┐
+   │  slots[0..N-1]   each holds one request + prefix  │
+   └────────┬──────────────────────────────────────────┘
+            │ active = occupied slot indices, in order
+            ▼
+   ┌───────────────────────────────────────────────────┐
+   │  model(prefixes)  ── one call, one token each      │
+   └────────┬──────────────────────────────────────────┘
+            │ k-th token → k-th active slot
+            ▼
+   ┌───────────────────────────────────────────────────┐
+   │  append, check stop rules, free finished slots    │
+   └────────┬──────────────────────────────────────────┘
+            │
+            └──────────── back to the top ──────────────
+```
+
+**The waiting queue** holds requests in the order they arrived. Nothing is reordered.
+
+**The slots** are the batch. A slot is either empty or holds one request plus its prefix.
+
+**The model call** happens once per step, with one prefix per active slot. It is the expensive part. Everything
+else is bookkeeping that should take microseconds.
+
+**Append and check** gives each token to its owner, decides who is finished, and frees those slots so the top of
+the next step can refill them.
+
+**The cancelled ids** box is only needed in stage 2. A disconnecting client drops its id there, and the loop acts
+on it before the next model call.
+
+### The worked example that runs through this page
+
+Follow one tiny workload through the loop. Use a toy model that you can run in your head: **it always returns
+the last token plus one, modulo 10**. So for the prefix `[3, 4]` it returns `5`. Use **2 slots** and four requests,
+submitted in this order:
+
+| Request | Prompt | `max_tokens` | Stop rule | What should come out |
+|---|---|---|---|---|
+| A | `[3]` | 4 | stop token 6 | `4, 5, 6`, then stop (reason "stop") |
+| B | `[1]` | 2 | stop token 9 | `2, 3`, then the length limit (reason "length") |
+| C | `[8]` | 0 | (none) | nothing at all (reason "length") |
+| D | `[0]` | 5 | stop sequence `3, 4` | `1, 2, 3, 4`, then stop (reason "stop") |
+
+Here is what the stage-1 loop does, step by step. This trace was produced by running the stage-1 code below with
+this toy model.
+
+| Step | Slot 0 | Slot 1 | Prefixes sent to the model | Tokens back | What to say in the interview |
+|---|---|---|---|---|---|
+| 1 | A | B | `[3]`, `[1]` | `4`, `2` | "Both slots filled from the queue; one call for both." |
+| 2 | A | B | `[3,4]`, `[1,2]` | `5`, `3` | "B has 2 tokens, its limit, so it finishes and slot 1 frees." |
+| 3 | A | D | `[3,4,5]`, `[0]` | `6`, `1` | "C asked for zero tokens, so it finished during refill without a slot. D took slot 1. The second token, `1`, goes to D, not B." |
+| 4 | (empty) | D | `[0,1]` | `2` | "A hit its stop token 6. The queue is empty, so the batch runs part-full. That's fine." |
+| 5 | (empty) | D | `[0,1,2]` | `3` | "One slot is active, so the model gets one prefix." |
+| 6 | (empty) | D | `[0,1,2,3]` | `4` | "D's last two tokens are 3, 4: the stop sequence. Done." |
+
+Six model calls in total. Step 3 is the one the interviewer is watching for. If your code had remembered "slot 1
+is B" from step 1, the token `1` would have been appended to B's finished output and D would have lost it.
+
+Now compare static batching on the same workload. It runs A and B together until both finish (3 steps, with B's
+slot empty on step 3), then C and D (4 steps). That is 7 calls instead of 6. On four tiny requests the gap is
+small. On real traffic it is not.
+
+### Why static batching wastes most of the GPU
+
+Say real replies are a mix: 90% are 50 tokens long and 10% are 1,000 tokens long (an assumed mix). In any large
+static batch, there is almost always one 1,000-token reply. So the batch runs for 1,000 steps, while the average
+request needed only 145. **Only about 14.5% of the slot-steps do useful work.** Continuous batching refills the
+other 85.5%, so its best-case gain on this mix is about **6.9×** fewer steps. The verification section shows the
+loop on this page getting close to that.
+
+Say it like this: "With static batching, every batch runs as long as its longest reply. With this length mix
+that wastes about 85% of the GPU's steps."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Mean length:** 0.9 × 50 + 0.1 × 1,000 = 45 + 100 = **145 tokens**.
+- **Static occupancy:** a batch lasts as long as its longest member, 1,000 steps. Useful work per slot is the
+  mean, 145. So occupancy is mean ÷ max = 145 ÷ 1,000 = **14.5%**.
+- **Continuous-batching ceiling:** if every slot is busy every step, steps fall from max per batch to mean per
+  slot. The best possible gain is max ÷ mean = 1,000 ÷ 145 ≈ **6.9×**.
+- Don't quote a single "continuous batching gives N×" figure. Published guides give about 2×
+  (<Cite id="s-f440daaea4" />), 3–5× (<Cite id="s-75e82f8882" />) and 10–20× (<Cite id="s-c12521aa7d" />). The real
+  gain depends on your length distribution, so derive it like this.
+
+</details>
+
+## Solution in stages
+
+### Stage 1: slots, refill, stop rules
+
+```python
+from __future__ import annotations
+from collections import deque
+from dataclasses import dataclass, field
+
+@dataclass
+class Request:
+    rid: str
+    prompt: list[int]
+    max_tokens: int
+    stop_token: int | None = None
+    stop_seq: tuple[int, ...] = ()
+    out: list[int] = field(default_factory=list)
+    reason: str | None = None          # "stop" | "length" | "cancelled" | "rejected"
+
+
+def stop_reason(r: Request) -> str | None:
+    """Check after appending one token. Stop token/sequence stay in the output."""
+    if r.stop_token is not None and r.out[-1] == r.stop_token:
+        return "stop"
+    n = len(r.stop_seq)
+    if n and len(r.out) >= n and tuple(r.out[-n:]) == r.stop_seq:
+        return "stop"
+    if len(r.out) >= r.max_tokens:
+        return "length"
+    return None
+
+
+def run_stage1(model, requests: list[Request], num_slots: int) -> list[Request]:
+    waiting = deque(requests)                 # FIFO, original order
+    slots: list[Request | None] = [None] * num_slots
+    seqs: list[list[int]] = [[] for _ in range(num_slots)]  # prompt + output so far
+    while waiting or any(s is not None for s in slots):
+        for i in range(num_slots):            # refill every free slot
+            while slots[i] is None and waiting:
+                r = waiting.popleft()
+                if r.max_tokens == 0:          # finishes with an empty output
+                    r.reason = "length"
+                else:
+                    slots[i], seqs[i] = r, list(r.prompt)
+        active = [i for i, r in enumerate(slots) if r is not None]
+        if not active:
+            break
+        nxt = model([seqs[i] for i in active])  # one model call per step
+        for i, tok in zip(active, nxt):        # i-th token belongs to i-th prefix
+            r = slots[i]
+            r.out.append(tok)
+            seqs[i].append(tok)
+            r.reason = stop_reason(r)
+            if r.reason:
+                slots[i] = None                # free the slot for the next step
+    return requests                            # same order as submitted
+```
+
+Five points to say while you write it. Each one maps to a line in the code.
+
+- **The mapping is rebuilt every step.** `active` is computed *after* the refill. `zip(active, nxt)` pairs the k-th
+  returned token with the k-th active slot. Storing a request index captured when the batch started is the bug
+  this round is built to catch. In the worked example, that bug would hand D's first token to B at step 3.
+- **Partial batches are normal.** When the queue drains, `active` shrinks. Nothing pads it up to `num_slots`. In
+  the worked example, steps 4 to 6 send a single prefix.
+- **Zero-token requests never take a slot.** If C were given a slot, it would receive one token before the stop
+  check ran. The inner `while` loop lets the same free slot take the next request instead, which is how D got slot
+  1 at step 3 even though C was ahead of it.
+- **Results come back in order for free.** The function returns the input list. Its objects were changed in place,
+  so the order is the submission order.
+- **Prefixes are appended, not rebuilt.** `seqs[i].append(tok)` adds one token, which is constant work. Rebuilding
+  `prompt + out` for every sequence on every step costs time in proportion to its length. Over 100,000 generated
+  tokens that adds up to a quadratic amount of copying.
+
+Say it like this: "I recompute the active list after refilling, every step, and pair tokens by position. That
+one line is where most bugs in this problem come from."
+
+### Stage 2: a memory budget, preemption and cancellation
+
+The Together variant adds memory. Here is what the memory is and why it changes the loop.
+
+**What the KV cache holds.** As the model reads each token, it computes two lists of numbers for it at every
+layer, called the key and the value. Later tokens look back at them. Keeping them saves recomputing them on every
+step. That stored data is the KV cache, and it is per request: each request's cache grows by one token's worth on
+every step, and is freed when the request ends. For a model the size of Llama-3.1-8B it is 128 KiB (131,072 bytes) per token, so a
+4,096-token conversation holds about half a gigabyte of GPU memory while it runs.
+
+**Why it is managed in blocks.** If you reserved one big contiguous area per request, sized for its maximum
+length, most of it would sit unused. The paper behind the vLLM engine describes the cache as memory that "grows and
+shrinks dynamically" and that is "significantly wasted by fragmentation and redundant duplication" when managed
+naively ([Kwon et al., SOSP 2023](https://arxiv.org/abs/2309.06180)). Their answer is to hand out memory in small
+fixed-size **blocks**, the way an operating system hands out pages. A request holds only the blocks it has
+filled so far, plus one it is filling. This is called **paged attention**, and vLLM is an open-source engine for
+serving models that uses it.
+
+**What the mock models.** We don't store real numbers. We just count blocks: a pool of `kv_blocks` blocks, each
+holding 16 tokens (assumed). A request with `n` tokens of prefix needs `ceil(n ÷ 16)` blocks.
+
+Now the five policy decisions. State each one aloud, with its reason.
+
+- **Admit only what fits.** Admit the queue head only if a slot is free *and* there are enough free blocks for its
+  prefix plus one new token. Use strict FIFO: if the head doesn't fit, stop admitting rather than skipping past
+  it. Otherwise a long prompt could wait forever while short ones keep slipping by.
+- **Grow, oldest first.** Each step, every active request needs room for one more token. When it crosses a block
+  boundary, it takes one more block. Serve the oldest requests first, because they have the most work invested.
+- **Preempt when growth fails.** **Preemption** means taking a running request out of the batch to free its
+  memory. Evict the newest admission, return its blocks to the pool, and put it back at the head of the queue
+  *with its generated tokens kept*. When it is readmitted, the model re-reads its prompt plus its output so far.
+  vLLM's docs describe this recompute mode as the default, and warn that "preemption and recomputation can
+  adversely affect end-to-end latency" ([vLLM docs](https://docs.vllm.ai/en/latest/configuration/optimization.html),
+  dated 2026-08-20).
+- **Reject at submit what can never fit.** If a request's prompt plus `max_tokens` needs more blocks than the whole
+  pool, it could never finish even alone. Admitting it would eventually freeze the loop, so mark it "rejected"
+  straight away.
+- **Cancel from any thread.** When a client disconnects, its HTTP handler calls `cancel(id)`, which only records the
+  id. The loop applies cancellations at the top of the next step. It frees the slot and blocks, and another request
+  can take them in that same step.
+
+Say it like this: "I admit on memory, not on slot count. When memory runs out mid-run, I evict the newest request,
+because it has done the least work, and I keep its tokens so nothing it produced is lost."
+
+#### The worked example, now with a tight memory budget
+
+Run the same four requests, with 2 slots, but now with memory. To keep the numbers small, shrink the block to
+**2 tokens** and give the pool only **3 blocks** (both toy values). This trace was produced by running the stage-2
+code below with those settings.
+
+| Step | What happens | Blocks in use | What to say in the interview |
+|---|---|---|---|
+| 1 | A (prefix 1 token + 1 new) and B (same) each need 1 block. Both admitted. D waits. C was finished at submit. | A 1, B 1 (2 of 3) | "Admission checks blocks, not just slots." |
+| 2 | Each now needs room for a 3rd token, so each needs a 2nd block. Only 1 is free. A is older, so A gets it. B can't grow, so B (the newest) is evicted and goes back to the head of the queue, keeping its token `2`. Only A runs this step. | A 2 (2 of 3) | "Grow oldest first; evict the newest; keep its tokens." |
+| 3 | B is at the head. It needs 2 blocks (prompt 1 + output 1 + 1 new); only 1 is free. Strict FIFO: admit nothing. A produces `6` and stops. | A 2, then freed | "A slot is empty this step because memory, not slots, is the limit." |
+| 4 | B is readmitted and re-reads `[1, 2]`. It produces `3` and finishes. D is admitted too. | B 2, D 1 (3 of 3) | "B re-prefilled its prompt and its saved output; its result didn't change." |
+| 5–7 | D runs alone and stops on `3, 4`. | D up to 2 | "When memory is tight we pay in extra steps, never in wrong answers." |
+
+Every output matches stage 1 exactly: A `4, 5, 6`, B `2, 3`, C empty, D `1, 2, 3, 4`. The tight budget cost one
+extra model call (7 instead of 6) and some recomputation. That is the trade preemption makes.
+
+#### The code
+
+```python
+import math, threading
+
+BLOCK = 16                                     # tokens per KV block (assumed)
+
+def blocks_for(tokens: int) -> int:
+    return math.ceil(tokens / BLOCK)
+
+
+class Scheduler:
+    def __init__(self, model, num_slots: int, kv_blocks: int):
+        self.model = model
+        self.slots: list[Request | None] = [None] * num_slots
+        self.held: dict[str, int] = {}         # rid -> KV blocks held
+        self.where: dict[str, int] = {}        # rid -> slot index
+        self.seq: dict[str, list[int]] = {}    # rid -> prompt + output so far
+        self.total = self.free = kv_blocks
+        self.waiting: deque[Request] = deque()
+        self.admit_order: list[str] = []       # newest last, for preemption
+        self.cancelled: set[str] = set()
+        self.lock = threading.Lock()           # submit/cancel come from other threads
+
+    def submit(self, r: Request) -> None:
+        if blocks_for(len(r.prompt) + r.max_tokens) > self.total:
+            r.reason = "rejected"              # could never fit, even alone
+            return
+        if r.max_tokens == 0:
+            r.reason = "length"
+            return
+        with self.lock:
+            self.waiting.append(r)
+
+    def cancel(self, rid: str) -> None:        # client disconnected
+        with self.lock:
+            self.cancelled.add(rid)
+
+    def _release(self, i: int) -> None:
+        r = self.slots[i]
+        self.free += self.held.pop(r.rid)
+        del self.where[r.rid], self.seq[r.rid]
+        self.admit_order.remove(r.rid)
+        self.slots[i] = None
+
+    def _apply_cancels(self) -> None:
+        with self.lock:
+            gone, self.cancelled = self.cancelled, set()
+            if gone:
+                for r in self.waiting:
+                    if r.rid in gone:
+                        r.reason = "cancelled"
+                self.waiting = deque(r for r in self.waiting if r.rid not in gone)
+        for i, r in enumerate(self.slots):
+            if r is not None and r.rid in gone:
+                r.reason = "cancelled"
+                self._release(i)
+
+    def _admit(self) -> None:
+        with self.lock:
+            for i in range(len(self.slots)):
+                if self.slots[i] is not None:
+                    continue
+                if not self.waiting:
+                    return
+                r = self.waiting[0]
+                need = blocks_for(len(r.prompt) + len(r.out) + 1)
+                if need > self.free:
+                    return                      # strict FIFO: don't skip the head
+                self.waiting.popleft()
+                self.slots[i] = r
+                self.held[r.rid] = need
+                self.where[r.rid] = i
+                self.seq[r.rid] = r.prompt + r.out   # a preempted one re-prefills all
+                self.free -= need
+                self.admit_order.append(r.rid)
+
+    def _grow_or_preempt(self) -> None:
+        # Oldest first: each sequence needs room for its prefix + this step's token.
+        for rid in list(self.admit_order):
+            if rid not in self.admit_order:
+                continue                        # evicted earlier in this pass
+            i = self.where[rid]
+            r = self.slots[i]
+            need = blocks_for(len(r.prompt) + len(r.out) + 1) - self.held[rid]
+            while need > self.free and self.slots[i] is r:
+                j = self.where[self.admit_order[-1]]   # evict the newest admission
+                v = self.slots[j]
+                self._release(j)
+                with self.lock:
+                    self.waiting.appendleft(v)  # keeps its tokens; re-prefills later
+            if self.slots[i] is r:
+                self.free -= need
+                self.held[rid] += need
+
+    def step(self) -> bool:
+        self._apply_cancels()
+        self._admit()
+        self._grow_or_preempt()
+        active = [i for i, r in enumerate(self.slots) if r is not None]
+        if not active:
+            return bool(self.waiting)
+        nxt = self.model([self.seq[self.slots[i].rid] for i in active])
+        for i, tok in zip(active, nxt):
+            r = self.slots[i]
+            r.out.append(tok)
+            self.seq[r.rid].append(tok)
+            r.reason = stop_reason(r)
+            if r.reason:
+                self._release(i)
+        return True
+
+    def run(self) -> None:
+        while self.step():
+            pass
+```
+
+The tested copy also counts model calls and recomputed tokens. Those two counters are left out here.
+
+**How to read it.** `step()` is the whole loop in four calls: apply cancellations, admit, grow or preempt, then
+run the model once. `_release` is the only place that frees memory, so there is exactly one place where a block
+leak could start. `admit_order` is a list with the newest request last, which makes "evict the newest" a lookup of
+the last element.
+
+**Why the lock covers only the queue and the cancel set.** Request handlers run on other threads and call `submit`
+and `cancel`. The model call runs *outside* the lock. So a slow model step never blocks a disconnecting client from
+recording its cancel. In an asyncio server the same shape works with the scheduler as one task, and handlers
+putting events on a queue that it drains between steps.
+
+Say it like this: "The scheduler owns all the state. Handlers only drop messages into a queue or a set, under a
+short lock. The GPU call never holds that lock."
+
+### Stage 3: explain prefill, chunked prefill and disaggregation
+
+The mock hides one important cost. When a request is first admitted, the model must read its whole prompt before
+it can write the first token. That is prefill. On a real GPU, prefill of a long prompt is a heavy computation, far
+longer than one decode step. Decode is limited by memory reads; prefill is limited by arithmetic, because it
+processes thousands of tokens at once.
+
+Here is the problem. If a new request's prefill runs in the same step as everyone else's decode, every running
+stream waits for it. Every user in the batch sees their words pause. In the two latency words from earlier: the new
+user's TTFT is fine, but everyone else's ITL spikes.
+
+There are three answers to know, and what each does to latency.
+
+**Chunked prefill.** Split a long prompt into slices, and process one slice per step alongside the normal decode
+work. Each step stays short, so streams keep flowing, and the new request's prompt is read over several steps.
+vLLM's docs say it "allows vLLM to process large prefills in smaller chunks and batch them together with decode
+requests". The knob is the number of tokens allowed per step, `max_num_batched_tokens`: smaller values "achieve
+better ITL" while higher ones "achieve better time to first token"
+([vLLM docs](https://docs.vllm.ai/en/latest/configuration/optimization.html)). Sarathi-Serve introduced the idea,
+with schedules that add new requests "without pausing ongoing decodes"
+([Agrawal et al., arXiv 2403.02310](https://arxiv.org/abs/2403.02310), 2024).
+
+**Disaggregated prefill and decode.** Run the two phases on separate groups of GPUs ("pools"). One pool only reads
+prompts. When it finishes, it ships the request's KV cache to the other pool, which only writes replies.
+
+```
+  new request
+      │
+      ▼
+ ┌──────────────┐     KV cache moves      ┌──────────────┐
+ │ prefill pool │ ──────────────────────▶ │ decode pool  │ ──▶ tokens stream to the user
+ │ reads prompt │   (over the network     │ writes reply │
+ │ (arithmetic) │    between machines)    │ (memory)     │
+ └──────────────┘                         └──────────────┘
+```
+
+The prefill pool is sized and tuned for heavy arithmetic. The decode pool is sized for memory and steady token
+output. Long prompts can no longer stall anyone's reply. DistServe reports that putting both on the same GPUs
+causes "strong prefill-decoding interferences" and couples the two phases' resource and parallelism choices
+([Zhong et al., OSDI 2024](https://arxiv.org/abs/2401.09670)). vLLM's page frames its purpose as "Tuning
+time-to-first-token (TTFT) and inter-token-latency (ITL) separately" and "Controlling tail ITL" (tail ITL means
+the worst gaps between words, say the 99th percentile). It also says
+plainly "Disaggregated prefill DOES NOT improve throughput", and marks the feature experimental
+([vLLM docs](https://docs.vllm.ai/en/latest/features/disagg_prefill.html), dated 2026-10-03).
+
+**The cost of disaggregation is the handoff.** The KV cache must move between machines, be found by name on the
+other side, and survive a failed transfer. The Fireworks prep guide makes the same point about where cached state
+lives and how failed transfers are handled (<Cite id="s-b6632d5df9" />).
+
+Say it like this: "Chunked prefill is one setting on one pool, so I'd try it first. Disaggregation is for a large
+fleet where tail inter-token latency is a product requirement. It buys smoother latency, not more throughput, and
+the KV handoff becomes a new thing that can fail."
+
+**How big should a chunk be?** Big enough to make progress on the prompt, small enough that the step still fits
+the ITL target. For a 70-billion-parameter model on 8 H100 GPUs (NVIDIA's
+Hopper-generation data-centre GPU), with a 50 ms ITL target and a decode step that
+already takes about 37.7 ms, the answer comes out at **about 688 prompt tokens per step**. The derivation is below.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Reading one prompt token costs about 2 × parameters of arithmetic (one multiply and one add per weight; attention
+is ignored, which is fine for short slices). The time left in each step after decode is the ITL budget minus the
+decode step. Multiply that by the GPUs' speed and divide by the cost per token.
+
+<Formula
+  title="Largest prefill slice that keeps ITL in budget"
+  expr="chunk ≈ (ITL budget − decode step) × P ÷ (2 × params)"
+  vars={[
+    { sym: 'ITL budget', meaning: 'target time between tokens for streams in the batch' },
+    { sym: 'decode step', meaning: 'time of the decode-only step at the current batch' },
+    { sym: 'P', meaning: 'dense compute of the GPUs serving the replica, FLOP/s' },
+    { sym: '2 × params', meaning: 'FLOPs per prompt token, counting a multiply-add as 2 (attention ignored)' },
+  ]}
+  example="Llama-3.1-70B on 8×H100 (7.916 × 10¹⁵ FLOP/s dense), 50 ms budget, 37.73 ms decode step (the chat walkthrough's 699-stream example): 0.01227 s × 7.916 × 10¹⁵ ÷ 1.411 × 10¹¹ ≈ 688 tokens per step"
+  note="The decode step and budget are assumptions of that example; the H100 compute is half the 'with sparsity' figure on NVIDIA's page."
+/>
+
+</details>
+
+## Verification
+
+The test that matters most is the comparison with a reference: run each request alone, then run the whole batch,
+and check that every output is identical. A reference implementation used this way is called an **oracle**.
+
+```python
+def reference(r: Request) -> list[int]:
+    """Oracle: run one request alone, no batching."""
+    out: list[int] = []
+    probe = Request(r.rid, r.prompt, r.max_tokens, r.stop_token, r.stop_seq, out)
+    if r.max_tokens == 0:
+        return out
+    while True:
+        out.append(mock_next(r.prompt + out))
+        if stop_reason(probe):
+            return out
+
+
+def test_stage2_matches_oracle_under_preemption():
+    rng = random.Random(2)
+    for trial in range(300):
+        reqs = make_requests(rng, rng.randrange(1, 25))
+        need_max = max(blocks_for(len(r.prompt) + r.max_tokens) for r in reqs)
+        s = Scheduler(mock_model, rng.randrange(1, 9), need_max + rng.randrange(0, 6))
+        work = clone(reqs)
+        for r in work:
+            s.submit(r)
+        while s.step():
+            assert s.free + sum(s.held.values()) == s.total     # no block leak
+            for i, r in enumerate(s.slots):                       # mapping intact
+                if r is not None:
+                    assert s.where[r.rid] == i
+        assert s.free == s.total
+        for got, want in zip(work, reqs):
+            assert got.out == reference(want)
+```
+
+**How the test works.** The mock model is a deterministic hash of the prefix, modulo a 40-token vocabulary. A
+small vocabulary means stop tokens and one- or two-token stop sequences fire often, so the edge cases get
+exercised. The test builds random workloads, sets the memory pool just above the largest single request so that
+preemption happens, and checks two invariants after every step:
+
+- **No leaked blocks:** free blocks plus held blocks always equal the pool.
+- **No mapping drift:** the `where` map agrees with what is actually in each slot.
+
+At the end it compares every output with the oracle. The equality check catches mapping bugs. The invariants catch
+accounting bugs earlier, before they turn into wrong outputs.
+
+**What was run.** The suite run on 2026-10-12 had seven tests, all passing:
+
+- stage 1 against the oracle over 300 random workloads (1 to 8 slots, every model call with at most `num_slots`
+  prefixes);
+- stage 2 against the oracle over 300 workloads with a KV budget just above the largest single request, which
+  forced preemption in more than 20 of them;
+- rejection of a request that can never fit;
+- cancellation of an active request (no more tokens, slot reused on the next step, blocks returned);
+- cancellation while still queued;
+- `max_tokens == 0` and a partial batch;
+- a two-token stop sequence kept in the output.
+
+**Does continuous batching actually save steps?** A second script counted decode steps on a scripted mock where
+every request's output length is fixed in advance: 90% at 50 tokens, 10% at 1,000, with 100 slots and five random
+seeds. With 10,000 requests, static batching kept **14.3–14.9%** of slot-steps busy and continuous batching
+**95.7–96.4%**, a **6.5–6.7×** reduction in steps. That is close to the 6.9× ceiling worked out earlier. With only
+1,000 requests the ratio was 4.4–4.9×, because at the end the last long requests run with empty slots around
+them. This counts steps on a mock, so it measures the scheduling, not GPU time.
+
+Say it like this: "My definition of done is that batched outputs equal the one-at-a-time outputs on hundreds of
+random workloads, including ones where memory is tight enough to force preemption."
+
+## Complexity and performance
+
+**Per step, the scheduler is cheap.** It does work in proportion to the number of slots to find free and active
+ones, plus one model call. A stack of free slot numbers and a list of active ones make it proportional to the
+active requests plus the newly admitted ones. `admit_order.remove` scans the list; an ordered dictionary would make
+it constant time.
+
+**The model's input in this mock is the whole prefix.** So the model's own work grows with length. A real engine
+passes only the one new token per request and reads everything earlier from the KV cache. That is the whole point
+of the cache.
+
+**Total steps** for one run are at least the longest reply (`max(len)`), and at least the total tokens divided by
+the number of slots (`Σ len ÷ slots`). Continuous batching gets close to the second bound when the queue stays
+full. Static batching is stuck near the first bound for every batch.
+
+**Memory** grows with the total number of tokens held in prefixes and outputs, plus a small record per request.
+
+**At the xAI statement's stated limits** (10,000 requests, 100,000 generated tokens, 1,000 slots), both stages
+finished in well under a second, in the 2026-10-12 run on an Apple M1 Ultra with a constant-time mock model. So
+the scheduler isn't the bottleneck; the model call is.
+
+**Preemption costs recomputation.** Each eviction means re-reading prompt plus output later. Evicting the newest
+admission keeps that cost small, because the newest has done the least work.
+
+Say it like this: "The scheduler is microseconds per step. All the real cost is in model calls, so I optimize for
+fewer, fuller steps and for not wasting memory."
+
+<AINative title="Let the agent write the loop; you write the oracle">
+An agent writes stage 1 correctly most of the time, and stage 2 plausibly but wrong in the places that matter:
+a block freed twice on cancel-after-finish, a preempted request that loses its generated tokens, a lock held
+across the model call. Reading 150 lines for those bugs is slow. Owning the oracle is fast: a deterministic mock,
+a one-request reference, randomized workloads with tight memory, and invariants checked after every step. Ask
+the agent for the implementation, keep the test harness in your own hands, and make "outputs equal the oracle"
+the only definition of done. In a live round, assume no AI help unless told otherwise.
+</AINative>
+
+## Small-team version
+
+At a company of 50 to 500 people you won't write this scheduler. You will run it, inside an engine such as vLLM or
+SGLang (both open-source servers for LLMs) or behind a hosted API. Your job is to be the person who can explain
+its behaviour when p95 latency jumps.
+
+### Build, buy or skip
+
+- **Buy** generation through a hosted API by default. In our reading of team reports, most small teams start there
+  and only switch for measured volume, data-residency rules, unit economics, or a narrow fine-tuned model (one trained further on your own data).
+- **Self-host with an engine** if one of those applies. vLLM gives you continuous batching, paged KV memory,
+  recompute preemption and chunked prefill (on by default in its V1 engine, per its docs).
+- **Skip** disaggregated prefill and decode. vLLM calls it experimental and says it does not improve throughput.
+  It is a tail-latency tool for large fleets.
+
+### Size the knobs from your own traffic
+
+The engine's main concurrency setting is `max_num_seqs`, the number of slots. The safe starting point is the number
+of full-length requests that fit in GPU memory after the model itself. For Llama-3.1-8B on one 80 GB GPU, with
+4,096-token requests and an assumed 8 GB of other overhead, **about 104 requests fit** at once in the worst case.
+Paged allocation reserves blocks only as tokens appear, so real concurrency is usually higher.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+The model's weights for 8 billion parameters at 2 bytes each take about 16 GB. The KV cache for this model costs
+2 × 32 layers × 8 KV heads × 128 values × 2 bytes = 131,072 bytes per token. In the formula, HBM is the GPU's
+on-board memory (80 GB here), and bf16 is the 2-byte number format the weights and cache are stored in.
+
+<Formula
+  title="Sequences that fit in KV memory on one GPU (worst case)"
+  expr="max sequences ≈ (HBM − weight bytes − overhead) ÷ (KV bytes/token × tokens per sequence)"
+  vars={[
+    { sym: 'KV bytes/token', meaning: '2 × layers × n_kv_heads × head_dim × bytes; 131,072 B for Llama-3.1-8B in bf16' },
+    { sym: 'overhead', meaning: 'activations, CUDA context, fragmentation (assumed 8 GB)' },
+  ]}
+  example="Llama-3.1-8B on one 80 GB GPU: (80 − 16 − 8) GB ÷ (131,072 B × 4,096) = 56 GB ÷ 0.537 GB ≈ 104 sequences of 4,096 tokens"
+  note="Paged allocation reserves blocks as tokens appear, so real concurrency is usually higher than this full-length worst case."
+/>
+
+The model's shape comes from its published configuration file (<Cite id="s-20bffa9709" />).
+
+</details>
+
+That number is your starting `max_num_seqs`. If the engine logs preemption warnings under normal load, its own
+docs say to lower `max_num_seqs` or `max_num_batched_tokens`, or give it more memory. Set the token budget per step
+from your ITL target: smaller favours smooth streaming, larger favours a fast first token.
+
+### What it costs
+
+One A100 80GB GPU (an older NVIDIA data-centre GPU, one generation before the H100) rented at RunPod's $1.39 an hour, serving an assumed 1,300 tokens a second, works out to **about
+$0.30 per million tokens if it is busy all the time, and $0.99 if it is busy 30% of the time**. Two of them for
+redundancy cost **about $2,030 a month** before any engineer time. Compare that with the per-token price you would
+otherwise pay a provider.
+
+The point for this page: the continuous-batching gain only shows up as dollars if the queue is full. A workload
+that is busy only in working hours spends most of its GPU-hours with empty slots. Cohorte's analysis of a 2×H100
+setup shows the same shape: **$0.30 per million tokens at full load around the clock, $4.26 at 30% load in working
+hours, $12.77 at 10%** ([Cohorte](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even), 2026-09-20;
+[RunPod pricing](https://www.runpod.io/pricing), fetched 2026-10-11).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Self-hosted cost per million output tokens"
+  expr="$ per M = GPU $/hour × GPUs ÷ (tokens/s × 3,600 × utilization) × 10⁶"
+  vars={[
+    { sym: 'tokens/s', meaning: 'throughput measured at your latency target, not a benchmark peak' },
+    { sym: 'utilization', meaning: 'share of the hour the GPU does useful work' },
+  ]}
+  example={[
+    "One A100 80GB at RunPod's $1.39/h serving an assumed 1,300 tokens/s: $0.30 per M at 100% utilization, $0.99 at 30%",
+    "Cohorte's 2× H100 analysis: $0.30 per M at full load around the clock, $4.26 at 30% load in working hours, $12.77 at 10%",
+  ]}
+/>
+
+- One A100 at 100%: 1,300 × 3,600 = 4.68 million tokens an hour; $1.39 ÷ 4.68 ≈ $0.297, about **$0.30 per million**.
+- At 30%: $0.297 ÷ 0.3 ≈ **$0.99 per million**.
+- Two GPUs for a month: 2 × $1.39 × 730 hours ≈ **$2,030**.
+
+</details>
+
+### Delivery plan and what to verify
+
+- **Days 1–2:** deploy the engine with defaults on one GPU. Replay a day of real prompts at 1×, 2× and 4× the
+  normal rate.
+- **Day 3:** plot TTFT and ITL percentiles against concurrency. Find the knee, where latency starts climbing fast.
+  Set `max_num_seqs` below it.
+- **Day 4:** test disconnects. Close the client mid-stream and confirm the engine stops generating (check its
+  request-abort logs or GPU token counters). A stream nobody reads still holds a slot and KV blocks.
+- **Day 5:** alert on preemption rate, queue wait and KV usage. Write the runbook line "preemptions rising: lower
+  concurrency or add a GPU".
+
+Before every engine upgrade, compare outputs at temperature 0 (no randomness in token choice) against the previous
+version. Batching changes can shift floating-point results slightly.
+
+### What small-company interviewers probe
+
+Employer-side reports describe coding exercises on cancelling async work when the user leaves and converting sync
+APIs to streaming (Elicit's hiring manager, [Latent Space](https://www.latent.space/p/hiring), 2024-06-21). An
+inference-owner posting asks for batching and caching work on vLLM, SGLang or TensorRT-LLM
+([vCluster posting](https://builtintoronto.com/job/senior-inference-engineer/10631066)). Expect "why did latency
+spike when we raised the batch limit?" more than "write the scheduler".
+
+### Revisit when
+
+- Prompts get long enough that prefill stalls show up in ITL: tune chunking.
+- Traffic is steady enough to keep slots full: self-hosting starts to pay.
+- Tail ITL becomes a product requirement at fleet scale: disaggregation is worth evaluating.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="The decode loop"
+  senior={[
+    "Rebuilds the list of active slots after every refill and gives the k-th returned token to the k-th active slot; handles zero-token requests and part-full batches.",
+    "Writes the one-request-at-a-time oracle and compares every output against it.",
+    "Appends each new token to the prefix instead of rebuilding prefixes every step.",
+  ]}
+  staff={[
+    "Admits on memory, not slot count; evicts the newest request when memory runs out and explains why (it has the least work to redo); rejects what could never fit.",
+    "Keeps the scheduler separate from request handlers, so a disconnect never waits on a model call.",
+    "Explains chunked versus disaggregated prefill in terms of first-token delay and the gap between tokens, and says disaggregation does not buy throughput.",
+  ]}
+/>
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="(Not reported; a natural next push on the xAI problem) Stop sequences are strings, not token ids. What changes?">
+    A stop string can span token boundaries, so match on decoded text. When streaming, hold back any output
+    suffix that is a prefix of a stop string until it either completes the stop (drop or keep it as specified)
+    or diverges (release it). Without holdback the client sees half a stop string.
+  </FollowUp>
+  <FollowUp q="(Together AI prep guide) KV memory runs out mid-generation. Preempt or queue?">
+    Queue new work first: stop admitting. If running sequences still can't grow, preempt the newest admission and
+    recompute it later, or copy its cache out to host memory if that transfer is cheaper than recomputing. Reject
+    at submit anything that could never fit (<Cite id="s-0457784328" />).
+  </FollowUp>
+  <FollowUp q="(Together AI prep guide) How does a client disconnect reach the scheduler?">
+    The HTTP or WebSocket handler notices the closed connection and calls `cancel(id)`. The loop applies it before
+    the next step, frees the slot and blocks, and drops queued tokens. Make cancel idempotent and safe for unknown
+    ids (<Cite id="s-0457784328" />).
+  </FollowUp>
+  <FollowUp q="(Fireworks prep guide) What does disaggregating prefill and decode change?">
+    Each pool scales and is tuned for its own phase, and long prefills stop stalling decode, which helps tail
+    ITL. You pay with a KV transfer per request and a new failure point at the handoff. vLLM says it does not
+    improve throughput (<Cite id="s-b6632d5df9" />).
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) Long prompts starve behind short ones, or short behind long. Fix it.">
+    Strict FIFO with a memory check can block everyone behind a large head. Skipping the head improves
+    utilization but can starve it. A middle path: allow skipping for a bounded number of steps, then reserve
+    memory for the head until it fits.
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) Two requests share a long system prompt. Can they share KV blocks?">
+    Yes, with prefix caching: hash full blocks of the prompt and reference-count them, copying on write when a
+    sequence diverges. The block layout is what makes sharing possible.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Mapping tokens by a stale index.** A request index captured before refills sends tokens to the wrong request;
+  recompute the active slots after every refill and pair by position.
+- **Checking length before stop.** A stop token on the last allowed step then reports "length" instead of "stop".
+- **Giving a zero-token request a slot.** It then receives one token, but the xAI statement says it finishes empty
+  (<Cite id="s-8d74591878" />).
+- **Rebuilding prefixes every step.** That turns linear work into quadratic copying; the Together article warns
+  about code that "allocates inside a hot loop" (<Cite id="s-9597947584" />).
+- **Admitting by slot count alone.** You then discover that memory is exhausted in the middle of generation, when
+  the only fix is eviction.
+- **Cancelling only queued requests.** Disconnected streams keep generating to nobody and hold their memory.
+- **Claiming disaggregation raises throughput.** vLLM's documentation says it does not; it smooths latency.
+
+## Prove it with a lab
+
+<LabRef lab="llm-inference" role="partial" note="BatchedEngine.scheduler_step admits from a priority queue up to max_batch_size, runs prefill or decode per request, frees paged blocks on EOS or length." />
+
+Read `labs/llm-inference/src/v2_batched.py` next to the stage-2 code above. It has the same shape: admission each
+step, per-request KV state, a block allocator with `PAGE_SIZE = 16`, and blocks freed on completion.
+
+It lacks what this walkthrough adds. Admission ignores memory: `allocate_page` returns `None` when the pool is
+empty, and the caller doesn't check. `record_token` returns `False` on out-of-memory, and that is ignored too.
+There are no stop sequences and no cancellation. And each active request gets its own forward pass in a loop,
+rather than one batched call.
+
+Porting the `Scheduler` policies onto it, then batching the forward pass with padding, is a good weekend exercise.
+Don't quote its throughput rows; they are estimates.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-8d74591878" />: PracHub, xAI decode-loop problem statement (last updated 2026-05-24)
+- <Cite id="s-0457784328" />: Together AI prep guide; scheduler, KV pressure, disconnect items
+- <Cite id="s-9597947584" />: Together AI article; KV cache as the scarce resource, constant factors
+- <Cite id="s-b6632d5df9" />: Fireworks prep guide (PracHub, 2026-09-03); disaggregated prefill and decode
+- [Orca, Yu et al., OSDI 2022](https://www.usenix.org/conference/osdi22/presentation/yu): iteration-level scheduling
+- [vLLM / PagedAttention, Kwon et al., SOSP 2023](https://arxiv.org/abs/2309.06180)
+- [Sarathi-Serve, Agrawal et al., arXiv 2403.02310](https://arxiv.org/abs/2403.02310) (2024): chunked prefills
+- [DistServe, Zhong et al., OSDI 2024](https://arxiv.org/abs/2401.09670): disaggregated prefill and decoding
+- [vLLM optimization docs](https://docs.vllm.ai/en/latest/configuration/optimization.html) (dated 2026-08-20) and [disaggregated prefill docs](https://docs.vllm.ai/en/latest/features/disagg_prefill.html) (dated 2026-10-03)
+- <Cite id="s-20bffa9709" />: Llama-3.1-8B config.json (mirror of Meta's config)
+- [Cohorte, self-hosted LLM break-even](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even) (2026-09-20); [RunPod pricing](https://www.runpod.io/pricing) (fetched 2026-10-11)

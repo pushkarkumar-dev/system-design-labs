@@ -1,0 +1,198 @@
+---
+question: infra-064
+family: llm-from-scratch
+status: published
+labs: [transformer, llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll build it in three steps and test each one before the next. First multi-head attention, checked against
+> PyTorch's built-in version. Then a KV cache: the model writes one token at a time, so I store each token's
+> keys and values once instead of recomputing them, and I prove it with a test that cached generation gives
+> exactly the same numbers as one full pass. Then grouped-query attention, which lets several heads share one
+> set of keys and values so the cache gets several times smaller. The one rule I won't break is to cache the
+> small tensors and expand them only afterwards."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer is checking whether you can write one correct piece of model code and then change it twice
+under time pressure without breaking it. Each change touches the same few lines, and each one can be wrong
+in a way that still runs.
+
+That is what makes this different from a normal coding exercise. In a backend service, a broken change
+usually throws an error or fails a test you already have. Here, every piece is an array of numbers. A mask on
+the wrong side or a position counter that restarts at zero still gives an array of the right size, full of
+plausible numbers. So the real skill is building the tests that would catch those bugs, then making the
+changes.
+
+(This was reported by a Blind poster, whose commenters suspect the post is a prep-site ad, so the "same hour"
+framing is weak evidence <Cite id="s-a129aa6451" />.)
+
+## Clarify first
+
+Say your assumptions out loud, so the interviewer can correct them early:
+
+- **Tools.** "I'll assume PyTorch is fine, and I'll use `F.scaled_dot_product_attention`, PyTorch's built-in
+  attention, only as a test reference."
+- **Shapes.** "Input is `(B, T, d_model)`: batch, tokens, numbers per token. Causal self-attention, inference
+  only, so no dropout (random zeroing used only in training)."
+- **Heads.** "How many KV heads? I'll assume the query heads divide evenly, for example 8 query heads and 2 KV
+  heads."
+- **Positions.** "I'll assume learned position vectors, and I'll say where RoPE (rotating vectors by position)
+  would change the code."
+- **Length.** "Is the maximum length known up front? Then I can preallocate the cache."
+
+## Answer
+
+### Words you need first
+
+- **Token**: a small piece of text, such as a byte or part of a word, that the model reads and writes as one
+  integer id.
+- **Attention**: each token builds a **query** (what it is looking for), a **key** (what it offers) and a
+  **value** (what it hands over). Its query is scored against the keys of itself and every earlier token. A
+  softmax turns the scores into weights that add up to 1, and the output is the weighted average of the values.
+  The **causal mask** hides later tokens.
+- **Multi-head attention (MHA)**: several attention steps run side by side, each on its own slice of the
+  vector. Each slice is a **head**.
+- **Prefill and decode**: the model reads the prompt in one pass (**prefill**), then writes one token per pass
+  (**decode**).
+- **KV cache**: the stored keys and values of every token so far, kept per layer so decode steps don't
+  recompute them.
+- **Grouped-query attention (GQA)**: fewer KV heads than query heads. Each KV head is shared by a group of query
+  heads. One KV head shared by all is **multi-query attention (MQA)**.
+
+### Follow one prompt through the three steps
+
+Take a small model: 4 query heads, 2 KV heads, 16 numbers per head. The prompt is 4 tokens long, and the model
+writes 2 more. Shapes are `(batch, heads, tokens, numbers per head)`:
+
+| Step | New tokens `T` | Visible tokens `S` | Cached K shape | Mask | What to say in the interview |
+|---|---|---|---|---|---|
+| Prefill | 4 | 4 | `(1, 2, 4, 16)` | 4 × 4 lower triangle | "The whole prompt goes through in one pass." |
+| Decode 1 | 1 | 5 | `(1, 2, 5, 16)` | 1 × 5, all allowed | "One new token, attending to everything cached. Its position is 4, not 0." |
+| Decode 2 | 1 | 6 | `(1, 2, 6, 16)` | 1 × 6, all allowed | "The cache grew by one row; nothing was recomputed." |
+
+The queries have 4 heads; the cache holds 2. That is GQA, and it halves the cache here.
+
+### Step 1: multi-head attention
+
+Project the input to q, k and v, split each into heads to get `(B, h, T, d)`, compute
+`softmax(q·kᵀ/√d + mask)·v`, transpose back, merge the heads and project out. Dividing by √d keeps scores in a
+range where softmax doesn't put all its weight on one key. Test against the built-in PyTorch call on random
+inputs.
+
+### Step 2: the KV cache
+
+Preallocate a buffer of shape `(B, h_kv, max_len, d)` per layer. Each call writes the new K and V into the
+next free rows and attends over all `S` stored positions. Writing in place beats growing the buffer with
+`torch.cat`, which copies the whole cache on every step.
+
+Two things change around the cache, and both are easy to miss:
+
+- **The mask is `T × S`, aligned bottom-right.** The newest query sits at the last position, so in a decode
+  step it may see every key. PyTorch's `is_causal=True` aligns a non-square mask to the top-left instead, so
+  the new token would see only the first key.
+- **Positions start at the cache length.** The fifth token is position 4.
+
+Test: prefill plus one-token steps must equal one full forward pass. Say: "Both cache bugs pass every
+full-sequence test, so the equivalence test is the one I write first."
+
+### Step 3: GQA
+
+Shrink the key and value projections (`wk`, `wv`) so they output `h_kv × d` numbers instead of `h × d`. Cache
+the small tensors, and expand them to match the query heads only afterwards:
+
+```python
+k = self.wk(x).view(B, T, self.h_kv, self.d).transpose(1, 2)   # (B, h_kv, T, d)
+v = self.wv(x).view(B, T, self.h_kv, self.d).transpose(1, 2)
+if cache is not None:
+    k, v = cache.append(k, v)                                   # cache the SMALL tensors
+rep = self.h // self.h_kv
+k, v = k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1) # query head j -> KV head j // rep
+out = attention(q, k, v, causal_mask(T, k.shape[2]))           # bottom-right aligned
+```
+
+`repeat_interleave` maps query head `j` to KV head `j // rep`, the same grouping PyTorch uses for its own GQA
+option. Setting `n_kv_heads = n_heads` gives MHA and setting it to 1 gives MQA, so one class covers all three.
+
+### Why it matters: memory and speed
+
+The point of GQA is the size of the cache. The cache stores one K and one V vector per KV head, per layer,
+per token:
+
+<Formula
+  title="KV cache per token"
+  expr="bytes = 2 × layers × n_kv_heads × head_dim × bytes_per_value"
+  vars={[{ sym: 'n_kv_heads', meaning: 'KV heads, not query heads' }, { sym: 'bytes_per_value', meaning: '2 for bf16' }]}
+  example="Llama-3.1-8B: 2 × 32 × 8 × 128 × 2 = 131,072 B per token; with 32 KV heads it would be 4× more"
+/>
+
+So Llama-3.1-8B, with 8 KV heads instead of 32, needs **128 KiB per token** instead of 512 KiB.
+
+The memory win is also a speed win. A decode step does little arithmetic but reads a lot of memory: every
+weight, plus the whole cache for every sequence in the batch. Reading memory is the bottleneck. A smaller
+cache means less to read on every step, so long-context batches decode faster. Say: "GQA isn't only about
+fitting more requests. Every decode step reads the cache, so a 4× smaller cache is a 4× smaller read."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Llama-3.1-8B per token, bf16 (2 bytes):** 2 × 32 layers × 8 KV heads × 128 × 2 B = 131,072 B (128 KiB).
+  With 32 KV heads: 524,288 B, 4× more.
+- **One 8,192-token request:** 8,192 × 131,072 B ≈ 1.07 GB.
+- **Toy model above, fp32 (4 bytes), 2 layers, after decode 2:** 2 × 2 × 2 × 16 × 6 × 4 B = 1,536 B, against
+  3,072 B with 4 KV heads.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="KV cache plus GQA in an hour"
+  senior={["Finishes all three steps with tests, and caches before expanding the heads."]}
+  staff={["Writes the cache-equivalence test before the cache, avoids the repeat copy by grouping queries, and sizes the cache in bytes per token for a real model."]}
+/>
+
+## Small-team version
+
+You won't write this at a 50–500 person company. If you host an open model yourself, it runs on a serving
+engine that already has GQA and paged caches (cache memory handed out in small fixed-size pages). What you keep is the arithmetic. The KV formula tells you how
+many long requests fit on the GPU you are about to rent, and why the engine's memory setting caps your batch.
+
+Worked example: Llama-3.1-8B in bf16 on one 80 GB GPU (an A100 80GB). The weights take 16.06 GB. Assume 5 GB
+of overhead. An 8,192-token request holds 1.07 GB of cache. That leaves room for **54 such requests** at full
+length (the same row as the KV-cache memory walkthrough). The GPU rents for $1.39–$1.59 an hour on demand at
+RunPod (fetched 2026-10-11), about **$1,015–$1,161 a month** around the clock. Lambda lists the A100 80 GB at
+$2.79 per GPU-hour, but only in 8-GPU machines (checked 2026-10-12).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- 80 GB − 16.06 GB weights − 5 GB assumed overhead = 58.94 GB for the cache.
+- 58.94 GB ÷ 1.07 GB per request ≈ 54.9, so 54 requests.
+- $1.39 × 730 hours ≈ $1,015; $1.59 × 730 ≈ $1,161.
+
+</details>
+
+Default: a managed API. There, the same mechanism appears as prompt caching, which only works if the start of
+your prompt is byte-for-byte the same on every request. Revisit self-hosting with steady volume in the hundreds
+of millions of tokens a month, a data-residency requirement, or a narrow task a small model wins.
+
+## Pitfalls
+
+- **Expanding K and V before caching them.** The output is correct, but the cache is as large as with no GQA.
+- **Using `is_causal=True` for a one-token decode step.** PyTorch aligns that mask top-left, so the new token
+  sees only key 0.
+- **Restarting position ids at zero on each decode step.** Every new token is treated as the first word, and
+  only a cache-equivalence test notices.
+- **Growing the cache with `torch.cat`.** It copies the whole cache on every step, so copy work grows with the
+  square of the length.
+
+## Go deeper
+
+- Family walkthrough: [Stage 3: KV cache](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#stage-3-kv-cache) and [Stage 4: grouped-query attention](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#stage-4-grouped-query-attention).
+- The bandwidth argument: [Complexity and performance](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#complexity-and-performance).
+- Build the base: <LabRef lab="transformer" inline />; a real cache on GPT-2: <LabRef lab="llm-inference" inline />.

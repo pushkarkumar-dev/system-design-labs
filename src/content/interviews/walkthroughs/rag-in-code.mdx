@@ -1,0 +1,965 @@
+---
+title: "Build a small RAG or semantic search in code, then measure it"
+summary: "Write the parts of a small RAG system yourself (chunking, vector search, keyword search, merging the two, a cited answer), then prove it works on a labeled question set and say what changes at 100× the data."
+track: ai-engineer
+format: coding
+family: rag-in-code
+smallTeamFocus: "Write the few hundred lines yourself, call a hosted embedding and chat API, keep vectors in NumPy or Postgres, and spend the saved time on a 50-question labeled set that gates every change."
+rounds: [practical-coding, take-home, debugging]
+level: both
+timeboxMin: 60
+order: 110
+status: published
+basedOn: [eng-010, eng-011, eng-012, eng-013, eng-039, eng-064, eng-067]
+askedAt: [amazon, applied-ai-generic, harvey, openai, promptlayer, scale-ai]
+labs:
+  - { lab: rag, role: proof, note: "The same pipeline built stage by stage (dense, BM25 plus dense with RRF, cross-encoder rerank) and measured on two BEIR datasets with paired intervals." }
+  - { lab: embedding-pipeline, role: proof, note: "The embed step done properly: batching, an exact-match cache, and a check before you swap embedding models." }
+  - { lab: llm-eval, role: proof, note: "Bootstrap confidence intervals and a paired test, which is how you tell whether hybrid really beat dense on your 50 questions." }
+  - { lab: vector-index, role: proof, note: "Flat, HNSW and IVF-PQ indexes for the 100x follow-up. Its benchmark rows are estimates." }
+  - { lab: search-engine, role: background, note: "An inverted index with BM25 over posting lists, which is what replaces the loop over every chunk in a hand-written BM25." }
+gapLabs: [llm-judge-evals]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'd split the documents into small pieces along their headings and paragraphs, and give each piece a stable
+> ID. I'd turn each piece into a vector that captures its meaning, and for a question I'd find the pieces whose
+> vectors are closest. I'd add a keyword search for exact terms like error codes, and merge the two ranked
+> lists. The model answers only from those pieces and cites them, and my code checks the citations. Then I'd
+> prove it works: 20 to 50 questions where I know the right documents, a hit rate and a recall at the number of
+> pieces I actually send, with an error bar, next to keyword-only and vector-only baselines."
+>
+> The rest of this page explains each part of that answer.
+
+In a notebook, a 60-minute round or a take-home, you build a small version of the system behind "chat with your
+documents". You split a small set of documents into pieces, make them searchable by meaning and by keyword,
+and have a model answer a question from the best pieces, citing them. Then you build a small set of questions
+with known answers and report how well the search works. The follow-ups ask what changes at 100× the data,
+under a provider's rate limits, and for searches that need exact rather than fuzzy matches.
+
+### What makes this different from search you have built before
+
+You have probably built search on a database: `WHERE title ILIKE '%refund%'`, or a keyword query against a
+search engine. That kind of search has a clear contract. A row matches or it does not, and a unit test can
+check it.
+
+This exercise is different in three ways, and a good answer is built around them:
+
+1. **It searches by meaning, not by matching words.** "Can I get my money back?" should find a paragraph
+   titled "Refunds", even though the two share no words. So the search never says "no match". It always
+   returns a ranked list of the closest pieces, and the closest piece can still be the wrong one.
+2. **A language model writes the final answer.** It reads the pieces you retrieved and writes a fluent reply.
+   If retrieval returned the wrong pieces, the reply is fluent and wrong, and nothing crashes.
+3. **"Correct" is a judgement, so you prove it with a measurement, not a unit test.** You write questions
+   whose right documents you know, run the pipeline, count how often the right document comes back, and say
+   how sure you are of that count. It is closer to an A/B test than to a test suite.
+
+The code is a few hundred lines. The round is usually decided by the third point.
+
+### Words you need first
+
+- **LLM** (large language model): the model that writes the answer, called through an API such as OpenAI's or
+  Anthropic's. It reads and writes text in **tokens**, pieces of words of roughly ¾ of a word each. Prices and
+  rate limits are counted in tokens.
+- **RAG** (retrieval-augmented generation): first retrieve a few relevant pieces of your documents, then paste
+  them into the LLM's prompt and ask it to answer from them. The retrieval half is ordinary code you write.
+  The generation half is one API call.
+- **Chunk**: one of those pieces, usually a paragraph or a short section. You search chunks rather than whole
+  documents because a prompt can hold only so much text, and a small piece is a sharper match.
+- **Embedding**: a list of numbers (a vector, for example 384 numbers long) that a small model computes from a
+  piece of text. Texts with similar meaning get vectors that point in similar directions. The model that
+  computes them is the **embedding model**. It is a different, much smaller model than the LLM.
+
+Other terms come up later, and each is defined where it first appears.
+
+### Where this was asked
+
+Seven questions in the bank are versions of this one exercise:
+
+- **Harvey.** A rejected candidate built "a bare-bones embedding/RAG system" in Google Colab. The last
+  question asked how they would improve the evaluation, "such as recall or hit rate" (<Cite id="s-74265be7ec" />,
+  August 2026). The post gives no reason for the rejection.
+- **Scale AI.** An object-oriented design round "based on a simple RAG pipeline", from a July 2025 loop that
+  ended in rejection. The candidate blames a different round, ML fundamentals (<Cite id="s-90185f6ee1" />).
+- **OpenAI forward-deployed engineer, take-home 1.** Semantic search over Amazon products that ChatGPT can
+  call, then a live walkthrough with the question "How specific do you want to be on certain searches?" The
+  candidate calls it a one-week take-home; the page's timespan field says two weeks (<Cite id="s-05342b6eb9" />).
+- **OpenAI forward-deployed engineer, take-home 2.** "About five hours of work, building something with
+  OpenAI's APIs", plus a recorded video. The follow-ups asked "why this chunking strategy, why not a different
+  retrieval method", what would change "if the dataset was 100x larger", then "API rate limiting, retry
+  patterns" (<Cite id="s-812dbc9385" />; the post shows no year).
+- **A prep guide's take-home.** "Here are 50 markdown docs. Build a Q&A system, an eval set of 20 questions,
+  and report recall@5 and faithfulness." This is the guide's own illustration, not a candidate report
+  (<Cite id="s-7d03a572e0" />).
+- **PromptLayer.** An interviewer-side post lists "Debug this code that processes embeddings" as a coding
+  exercise with an AI twist (<Cite id="s-1205b0cc50" />).
+- **Amazon.** A DEV playbook lists an "Amazon (GenAI, L6)" loop with "practical ML coding (cosine similarity in
+  NumPy)" under "Real loops (from candidate reports)", without naming a specific report (<Cite id="s-3e400c7e21" />).
+
+<QuestionRow id="eng-010" />
+<QuestionRow id="eng-011" />
+<QuestionRow id="eng-012" />
+<QuestionRow id="eng-013" />
+<QuestionRow id="eng-039" />
+<QuestionRow id="eng-064" />
+<QuestionRow id="eng-067" />
+
+## What is being tested
+
+The reports agree on four things. The fourth is where these rounds tend to be decided.
+
+1. **The core math, by hand, without bugs.** A similarity score between two vectors, picking the best few
+   results, a keyword score, and a rule that merges two rankings. Each is a few lines, and each is explained
+   in the stages below. The interviewer wants them correct on the first run, with every row of numbers still
+   matched to the right chunk ID. PromptLayer's advice to interviewers for these exercises: "Focus on clean
+   code, error handling, and understanding trade-offs" (<Cite id="s-1205b0cc50" />).
+2. **Structure.** Scale AI ran this as an object-oriented design round (<Cite id="s-90185f6ee1" />). A search
+   component you can swap, an embedding model behind an interface, and a test that uses a fake embedding model
+   show structure better than a long notebook cell.
+3. **Speed.** A Harvey Senior candidate's advice after a rejection: "You need to be really fast at coding"
+   (<Cite id="s-956f0bbc95" />). Have the skeleton in your fingers before the round.
+4. **A number for "it works".** The prep guide puts it bluntly: "Retrieval quality gets scored with recall@k and
+   precision@k, and ranking quality with MRR or NDCG when the order of results matters." Those are scores on a
+   labeled question set, and stage 5 defines each one. Without such a number, "the interviewer assumes you tuned
+   yours by feel" (<Cite id="s-7d03a572e0" />). Harvey's final question was about exactly this
+   (<Cite id="s-74265be7ec" />), and both OpenAI take-homes were defended live, choice by choice
+   (<Cite id="s-05342b6eb9" />, <Cite id="s-812dbc9385" />).
+
+My reading: a candidate who builds a clean pipeline but answers the metric question with "I'd look at some
+outputs" leaves the round with nothing to show. A candidate who has 30 labeled questions, a hit rate (the share of
+questions whose right document came back) with an error bar and two failure examples leaves with a defensible result, even if the code is plain.
+
+## Clarify and scope
+
+Ask these before writing code. When the interviewer has no answer, write your assumption down and move on.
+
+- **Corpus.** How many documents, what format, how long? *Assume 50 markdown files of 1,000–3,000 words.*
+- **What counts as a good answer?** One supporting passage, or several? Must every sentence cite a source?
+  *Assume answers cite chunk IDs and the system may say "I don't know".*
+- **Labels.** Is there a set of questions with known answers, or do you write one? *Assume you write 20–50
+  questions with the relevant document or chunk IDs, including a few the corpus cannot answer.*
+- **Allowed tools.** Hosted APIs (OpenAI's take-home was built on OpenAI's APIs), a local model, a keyword-search
+  library, a vector database? *Assume NumPy for vectors and a hand-written keyword score unless told otherwise.*
+- **Query mix.** Exact identifiers (error codes, product codes, names) or vague intent? This decides how much the
+  keyword side matters. It is also the OpenAI "how specific" follow-up in disguise.
+- **Latency and scale.** Interactive or batch? How big will it get? This sets up the 100× follow-up.
+
+One more point is worth saying aloud. The most text a model can read in one prompt is its **context window**,
+and 50 documents may fit inside it. Anthropic's contextual-retrieval post suggests that for a knowledge base under
+200,000 tokens you can "include the entire knowledge base in the prompt"
+([Anthropic, 2024-09-19](https://www.anthropic.com/news/contextual-retrieval)). Build retrieval anyway, because
+the exercise asks for it. But name the long-context version as the baseline your pipeline has to beat on cost or
+accuracy. Say: "For 50 documents I could paste everything into the prompt. I'll build retrieval because it's the
+exercise, and I'll treat paste-everything as the baseline to beat."
+
+Out of scope unless asked: who may see which document (access control), connectors and incremental sync,
+multiple customers in one index, and training your own embedding model.
+
+## Plan before code
+
+### The pipeline as a picture
+
+Say the plan in one breath, then build it so that you always have something that runs.
+
+```
+50 markdown files
+   │  1. split on headings and paragraphs
+   ▼
+Chunker ── chunks with stable IDs like "billing.md#2"
+   │                              │
+   │ 2a. embed each chunk         │ 2b. count the words in each chunk
+   ▼                              ▼
+Dense index                    BM25 index
+(vectors, cosine score)        (keyword score)
+   │                              │
+   └───────────────┬──────────────┘
+                   ▼  3. merge the two ranked lists (RRF)
+           Fused ranking ── optional reranker re-scores the top 20
+                   │  4. paste the top 5 into a prompt that demands citations
+                   ▼
+              LLM answer ── citation checker: every sentence cites a chunk it was given
+
+Labeled questions ──▶ 5. metrics on the ranked IDs: hit@k, recall@k, MRR, nDCG
+```
+
+**Chunker.** It splits each document into chunks and gives each one an ID such as `billing.md#2` (the second
+chunk of `billing.md`). The ID must come out the same on every run, because your labels and the model's
+citations point at it.
+
+**Dense index.** It holds one embedding per chunk, as rows of a matrix. Each row is scaled to length 1 once,
+when it is stored; this is called **normalizing**. A question is embedded the same way, and
+each chunk is scored by how closely its vector points in the question's direction. This score is called
+**cosine similarity**. "Dense" refers to the vectors: every position holds a number.
+
+**BM25 index.** BM25 is the standard keyword-ranking formula in search engines. It scores a chunk higher when it
+contains the question's words, especially rare ones. It catches what embeddings blur: an error code, a product
+code, a person's name.
+
+**Merge (RRF).** The two indexes give two ranked lists. **Reciprocal rank fusion** (RRF) merges them using only
+each chunk's position in each list, so you never have to compare a cosine score with a keyword score.
+
+**Reranker (optional).** A slower, more accurate model that re-scores only the top 20 or so. You keep it only if
+the measurement says it helps.
+
+**LLM answer and citation checker.** The top few chunks go into a prompt that says "answer only from these, cite
+each sentence, or say I don't know". Plain code then checks that every citation points at a chunk the model was
+actually given.
+
+**Metrics.** A small set of questions with known relevant chunks scores the ranked list before the LLM sees it.
+This is the number the round is decided on.
+
+### Follow one question through it
+
+Here is one question going through the pipeline. Assume the corpus is a software product's help center (an
+assumption for illustration). A user asks *"Can I get a refund on an annual plan after 30 days?"* Two chunks
+answer it: `billing.md#2` (heading "Billing > Refunds") and `plans.md#3` (heading "Plans > Annual billing").
+Call them A and B. A says what the refund window is, so it matters most. B adds the annual-plan detail. All values
+are illustrative.
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| 1. Chunk | The 50 files become about 500 chunks, each with an ID and its heading path. | "IDs are stable, so labels and citations survive a re-run." |
+| 2a. Dense search | The question becomes 384 numbers. The top 5 by cosine are `faq.md#7` (C), A, `account.md#1` (D), B, `billing.md#5` (E). | "Normalize once at index time, and search is one matrix multiply." |
+| 2b. Keyword search | BM25 ranks chunks containing "refund" and "annual" highest, so A and B both appear near the top. | "Keyword search catches exact words that embeddings blur." |
+| 3. Merge | RRF rewards chunks that both lists place high, so A and B move up. | "Fusion uses ranks, not scores, so I never put two scales on one axis." |
+| 4. Answer | The top 5 go into the prompt. The model answers with "[1]" and "[2]" citations, and the checker confirms both point at chunks it was given. | "An uncited sentence or a citation to a missing source fails without any judge." |
+| 5. Measure | Score the dense list [C, A, D, B, E] against the label \{A, B\}. | "A is at position 2, B at position 4. Top 3 finds one of two, top 5 finds both." |
+
+Step 5 is where the numbers come from. On this one question the dense list has a hit in the top 3 (hit@3 = 1),
+finds half the relevant chunks in the top 3 (recall@3 = 0.5) and all of them in the top 5 (recall@5 = 1.0).
+Stage 5 defines these metrics properly and computes the rest for this same list. Averaged over 20–50 such
+questions, they are the result you report.
+
+### The build order
+
+| Stage | What you write | Why this order |
+|---|---|---|
+| 0 | `cosine`, `normalize_rows`, `top_k` | Everything else calls them, and the Amazon variant is only this |
+| 1 | Markdown chunker with stable chunk IDs and heading paths | Labels and citations need IDs that survive a re-run |
+| 2 | `Embedder` interface, a dense index | Swapping the model or using a fake in tests is one line |
+| 3 | BM25, reciprocal rank fusion | Exact terms and identifiers that embeddings blur |
+| 4 | Cited prompt, citation checker, abstention | The answer step, plus checks that need no judge |
+| 5 | hit@k, recall@k, MRR, nDCG@k over a labeled set | The number the round is decided on |
+
+In a 60-minute round, a workable split is about 10 minutes for stage 0, 15 for chunking and embedding, 10 for
+BM25 and fusion, 10 for the answer step and 15 for the evaluation. In a take-home, add a README that leads with
+the numbers, two failure examples and a "what I'd change at 100×" section. Reviewers read the README before the
+code.
+
+Write the labeled questions **before** tuning anything. Mix single-fact questions, questions that need two
+chunks (like the refund example), keyword-heavy ones (codes, names), paraphrases that share no words with the
+source, and three or four the corpus cannot answer. If you tune chunk size on the same 20 questions you report,
+say so: it is a tuning set, not a test set.
+
+## Solution in stages
+
+The code below is one file plus a test file, written for this walkthrough. Its 18 tests and an end-to-end run
+on a public dataset were run on 2026-10-12 (Python 3.13.7, NumPy, sentence-transformers 6.1, Apple M1 Ultra).
+The results are under Verification.
+
+### Stage 0: cosine similarity and top-k
+
+Cosine similarity measures the angle between two vectors. It is 1 when they point the same way (same meaning),
+about 0 when they are unrelated, and −1 when they point in opposite directions. It ignores length, so a chunk is
+not favoured just because its numbers are bigger. The formula is the dot product divided by the two lengths.
+**Top-k** means the k chunks with the highest scores. This stage is the whole Amazon variant, and every later
+stage depends on it.
+
+```python
+import numpy as np
+
+def cosine(a, b, eps=1e-12) -> float:
+    a = np.asarray(a, dtype=np.float32); b = np.asarray(b, dtype=np.float32)
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    return float(a @ b / denom) if denom > eps else 0.0      # zero vector: 0, not NaN
+
+def normalize_rows(m, eps=1e-12):
+    m = np.asarray(m, dtype=np.float32)
+    return m / np.maximum(np.linalg.norm(m, axis=1, keepdims=True), eps)   # axis=1: rows
+
+def cosine_matrix(q, d):                                       # (n_q, dim) x (n_d, dim)
+    return normalize_rows(q) @ normalize_rows(d).T
+
+def top_k(scores, k):
+    k = min(k, scores.shape[-1])
+    part = np.argpartition(-scores, k - 1)[:k]                 # O(n), unordered
+    return part[np.argsort(-scores[part], kind="stable")]      # sort only the k winners
+```
+
+Say three things while you write it:
+
+- "I normalize once at index time. For vectors of length 1, cosine equals the dot product, so search is a single
+  matrix-vector product."
+- "I decide what a zero vector scores. `0 / 0` is NaN, and NaN sorts unpredictably, so it scores 0."
+- "`argpartition` finds the k winners in linear time; I only sort those k, not the whole corpus."
+
+### Stage 1: chunk markdown by structure
+
+The chunker decides what the search can find. A chunk that cuts a sentence in half, or loses the heading that
+says what the paragraph is about, is a worse match for every question.
+
+```python
+@dataclass(frozen=True)
+class Chunk:
+    chunk_id: str   # "billing.md#2": stable, so labels and citations survive re-runs
+    doc_id: str
+    heading: str    # "Billing > Refunds", kept for citations and prepended when embedding
+    text: str
+
+def chunk_markdown(doc_id, md, max_tokens=200, overlap_paras=1) -> list[Chunk]:
+    # 1. split into blocks on blank lines; a "#..." block updates the heading path
+    # 2. within each section, pack whole paragraphs until the next one would exceed max_tokens
+    # 3. split a single paragraph only if it alone exceeds the budget
+    # 4. carry the last paragraph into the next chunk as overlap
+    ...
+```
+
+The full function is about 30 lines. The design choice to defend is splitting on headings and paragraphs rather
+than fixed windows of N tokens. The prep guide calls fixed 512-token windows "the lazy default" because "they cut
+sentences in half" (<Cite id="s-7d03a572e0" />). Adding the heading path ("Billing > Refunds") to the front of each
+chunk gives both searches context that a bare paragraph lacks.
+
+Size chunks to the embedding model, not to a round number. Every embedding model reads at most a fixed number of
+its own tokens (for this model they are called word pieces) and silently ignores the rest.
+`all-MiniLM-L6-v2`, the small model used here, embeds at most 256 word pieces
+([its sentence-transformers config](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/blob/main/sentence_bert_config.json)).
+In the rag lab, about two thirds of the 512-approximate-token chunks were longer than that window, so their tails
+were never embedded. Even the 150-word chunks used in this walkthrough's run left about a quarter of chunks over
+the window. Say: "I measure how many chunks are longer than the embedder's window, because the extra text is cut
+off without an error."
+
+### Stage 2: embed behind an interface
+
+The embedding model is an outside dependency, like a database driver. Put it behind a small interface (in Python,
+a `Protocol`) so you can swap a local model for a hosted API, or use a fake in tests, without touching the
+search code.
+
+```python
+class Embedder(Protocol):
+    def embed(self, texts: Sequence[str]) -> np.ndarray: ...   # (n, dim) float32, unit rows
+
+class SentenceTransformerEmbedder:
+    def __init__(self, name="sentence-transformers/all-MiniLM-L6-v2", batch_size=64):
+        self.model = SentenceTransformer(name)
+        self.batch_size = batch_size
+    def embed(self, texts):
+        return self.model.encode(list(texts), batch_size=self.batch_size,
+                                 normalize_embeddings=True).astype(np.float32)
+
+class DenseIndex:
+    def __init__(self, embedder: Embedder):
+        self.embedder, self.chunks, self.matrix = embedder, [], None
+    def add(self, chunks):
+        vecs = self.embedder.embed([f"{c.heading}\n{c.text}" for c in chunks])
+        assert len(vecs) == len(chunks), "embedder dropped or added rows"
+        self.chunks += chunks
+        self.matrix = vecs if self.matrix is None else np.vstack([self.matrix, vecs])
+    def search(self, query, k):
+        scores = self.matrix @ self.embedder.embed([query])[0]
+        return [(self.chunks[i], float(scores[i])) for i in top_k(scores, k)]
+```
+
+In the OpenAI take-home you would put a hosted embedding call behind the same interface. The assertion on row
+count is cheap, and it catches a provider that returns a short batch. Row `i` of the matrix must always be chunk
+`i`. If they drift apart, every result is wrong and nothing crashes.
+
+### Stage 3: BM25 and reciprocal rank fusion
+
+Embeddings capture meaning, but they blur exact tokens: an error code, a product code, a person's name. Two
+error codes that differ by one digit get almost the same vector. Keyword scoring does not have this problem.
+
+BM25 combines three ideas. A chunk scores higher when it contains a query word more often, with diminishing
+returns (the knob `k1` sets how fast the returns diminish). Rare words count more than common ones; this weight
+is the **idf** (inverse document frequency). And long chunks are not rewarded just for being long (the knob `b`
+sets how much length is penalized).
+
+```python
+def tokenize(text):
+    return re.findall(r"\w+", text.lower())   # whitespace split keeps "limit," != "limit"
+
+class BM25Index:
+    def __init__(self, k1=1.2, b=0.75): ...
+    def search(self, query, k):
+        n, avgdl = len(self.chunks), sum(self.lengths) / len(self.lengths)
+        scores = np.zeros(n, dtype=np.float32)
+        for term in set(tokenize(query)):
+            df = self.df.get(term, 0)
+            if not df:
+                continue
+            idf = math.log(1 + (n - df + 0.5) / (df + 0.5))
+            for i, tf in enumerate(self.tf):            # a real engine walks a posting list
+                if f := tf.get(term, 0):
+                    norm = f + self.k1 * (1 - self.b + self.b * self.lengths[i] / avgdl)
+                    scores[i] += idf * f * (self.k1 + 1) / norm
+        return [(self.chunks[i], float(scores[i])) for i in top_k(scores, k) if scores[i] > 0]
+
+def rrf(rankings, k=60):
+    fused = {}
+    for ranking in rankings:
+        for rank, cid in enumerate(ranking, start=1):
+            fused[cid] = fused.get(cid, 0.0) + 1.0 / (k + rank)
+    return sorted(fused.items(), key=lambda kv: -kv[1])
+```
+
+The tokenizer line matters more than it looks. Splitting on whitespace keeps punctuation attached, so "limit,"
+and "limit" count as different words. The rag lab shows the cost. It was measured on BEIR SciFact, a public
+benchmark of science claims checked against paper abstracts, using **hit@3**: the share of questions whose right document
+was in the top 3 results (stage 5 defines it properly). The lab's BM25 split on whitespace, and its three stages
+scored <LabNumber lab="rag" metric="hit@3 on BEIR SciFact" /> (dense, hybrid, rerank), so adding BM25 (the
+"hybrid") added nothing over dense. Changing only the tokenizer to `\w+` raised hybrid to
+<LabNumber lab="rag" metric="BM25 tokenizer (SciFact)" />.
+
+Now the merge. Reciprocal rank fusion
+([Cormack, Clarke and Büttcher, SIGIR 2009](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf)) gives each
+chunk 1 ÷ (60 + its position) from each list and adds them up. It uses positions, not scores, so you never have to
+put a cosine of 0.4 and a BM25 score of 17 on one scale. A chunk that both lists place fairly high beats a chunk
+that only one list places first.
+
+<Formula
+  title="Reciprocal rank fusion"
+  expr="RRF(d) = Σ over rankings of 1 ÷ (k + rank(d))"
+  vars={[
+    { sym: 'rank(d)', meaning: "the document's 1-based position in one ranking" },
+    { sym: 'k', meaning: 'a damping constant; 60 in the original paper and in the rag lab' },
+  ]}
+  example={["1st in one list and 10th in the other: 1/61 + 1/70 = 0.0307", "3rd in both: 2/63 = 0.0317, so agreement beats one strong vote"]}
+/>
+
+A **reranker** is the optional last step. The embedding search compares two vectors that were computed
+separately. A reranker instead reads the question and one chunk together and outputs one relevance score. This
+kind of model is called a **cross-encoder**. It is more accurate and much slower, because it must run once per
+(question, chunk) pair at query time. The rag lab measured <LabNumber lab="rag" metric="Cross-encoder rerank, 20 candidates" />
+(CPU / Apple GPU) for 20 candidates. Say: "I rerank a short list, never the corpus."
+
+### Stage 4: answer with citations, or abstain
+
+The prompt gives the model numbered sources and three rules: answer only from the sources, cite every sentence
+with `[n]`, and say "I don't know" when the sources do not contain the answer. Saying "I don't know" is called
+**abstention**. Then plain code checks the reply.
+
+```python
+def build_prompt(question, chunks):
+    sources = "\n\n".join(f"[{i}] ({c.doc_id} - {c.heading})\n{c.text}"
+                          for i, c in enumerate(chunks, 1))
+    return ("Answer using only the sources below. Cite every sentence with [n]. "
+            "If the sources do not contain the answer, reply exactly: I don't know.\n\n"
+            f"Sources:\n{sources}\n\nQuestion: {question}\nAnswer:")
+
+def check_citations(text, chunks) -> Answer:
+    if text.strip().startswith("I don't know"):
+        return Answer(text, abstained=True)
+    problems, cited = [], []
+    for sent in re.split(r"(?<=[.!?])\s+", text.strip()):
+        refs = [int(n) for n in re.findall(r"\[(\d+)\]", sent)]
+        if not refs:
+            problems.append(f"uncited: {sent[:60]!r}")
+        for n in refs:
+            (cited.append(chunks[n - 1]) if 1 <= n <= len(chunks)
+             else problems.append(f"cites missing source [{n}]"))
+    return Answer(text, citations=list(dict.fromkeys(cited)), problems=problems)
+```
+
+The model call is an injected function, `llm(prompt) -> str`, so tests use a stub. In this walkthrough's run the
+generation stage was exercised only with a stub; no hosted model was called.
+
+An answer is **faithful** when every claim in it is supported by the chunks it was given. The citation checker
+is the first, free layer of faithfulness. An answer that cites a source it was never given, or makes an uncited
+claim, fails without any extra model. Say: "These checks cost nothing and catch the most embarrassing failures
+before I pay for a judge."
+
+### Stage 5: measure
+
+The **labeled set** (or eval set) is your list of questions, each with the IDs of the chunks or documents that
+answer it. The metrics below all compare one ranked list of IDs with one question's label, and you average them
+over the set.
+
+- **hit@k** (hit rate): 1 if at least one relevant item is in the top k, else 0.
+- **recall@k**: the share of *all* relevant items that made the top k. It is lower than hit@k whenever an answer
+  needs two chunks and you found one.
+- **precision@k**: the share of the top k that is relevant.
+- **Reciprocal rank**: 1 ÷ the position of the first relevant item. Its average over questions is **MRR** (mean
+  reciprocal rank). It rewards putting the right item first.
+- **nDCG@k** (normalized discounted cumulative gain): gives each relevant item a gain (2 for "essential", 1 for
+  "useful"), divides it by a penalty that grows with position, adds these up, and divides by the best possible
+  total. It is 1.0 for the perfect order.
+
+```python
+def hit_at_k(ranked, relevant, k):    return float(any(r in relevant for r in ranked[:k]))
+def recall_at_k(ranked, relevant, k): return len(set(ranked[:k]) & relevant) / len(relevant)
+def reciprocal_rank(ranked, relevant, k=None):
+    for i, r in enumerate(ranked[:k] if k else ranked, start=1):
+        if r in relevant:
+            return 1.0 / i
+    return 0.0
+def ndcg_at_k(ranked, gains, k):       # linear gain, log2 discount (trec_eval / BEIR convention)
+    dcg = sum(gains.get(r, 0) / math.log2(i + 1) for i, r in enumerate(ranked[:k], 1))
+    ideal = sorted(gains.values(), reverse=True)[:k]
+    idcg = sum(g / math.log2(i + 1) for i, g in enumerate(ideal, 1))
+    return dcg / idcg if idcg else 0.0
+
+def dedupe_docs(chunk_ids):            # chunk ranking -> document ranking, first hit wins
+    return list(dict.fromkeys(cid.split("#")[0] for cid in chunk_ids))
+```
+
+Back to the refund question. The dense ranking was [C, A, D, B, E], and A (gain 2) and B (gain 1) are relevant:
+
+| Metric | Value | Why |
+|---|---|---|
+| hit@5 | 1 | At least one relevant chunk is in the top 5 |
+| recall@3 | 0.5 | Only A is in the top 3; B is at position 4 |
+| recall@5 | 1.0 | Both are in the top 5 |
+| precision@5 | 0.4 | 2 of the 5 results are relevant |
+| Reciprocal rank | 0.5 | The first relevant chunk is at position 2 |
+| nDCG@5 | 0.6433 | Both found, but lower than the ideal order [A, B, …] |
+
+These are the exact values the test suite checks by hand arithmetic (see Verification).
+
+Know the difference between the two words Harvey's interviewer used. Hit rate and recall@k are different
+numbers. Many codebases blur them: the rag lab's own `Recall@k` is a hit rate, and its bench notes say so. Say:
+"I report which one I computed, at the k I actually pass to the model." The family walkthrough on
+[measuring retrieval](/system-design-labs/interviews/walkthroughs/rag-quality-debugging/) covers MRR and nDCG and
+when each one fits.
+
+Faithfulness needs a judge, usually another LLM call that grades the answer. This is called **LLM-as-judge**.
+Split the answer into claims and ask, per claim, whether the cited chunk supports it, with a yes/no verdict.
+Before you report a judge's number, label 20–30 answers yourself and check how often the judge agrees with you.
+The prep guide asks whether you would trust the judge before testing it against humans, and answers "The right
+answer is no" (<Cite id="s-7d03a572e0" />).
+
+### The object-oriented shape (the Scale AI variant)
+
+For an object-oriented round, present the same code as five small types with one job each:
+
+- a `Chunker`;
+- an `Embedder` protocol with a hosted and a fake implementation;
+- `DenseIndex` and `BM25Index`, sharing a `search(query, k)` signature;
+- a `HybridRetriever` that composes them and takes an optional reranker;
+- a `RagPipeline(retriever, llm, k)` whose `ask()` returns an `Answer` value object.
+
+An `Evaluator` takes any `retrieve(query) -> ids` function, so every configuration is measured the same way.
+Dependency injection is the point: the test suite runs the whole pipeline with a hashed bag-of-words embedder (a
+fake that turns words into vector positions, with no model) and a stub LLM in under a second, with no network.
+
+### Debugging embedding code (the PromptLayer variant)
+
+The reported prompt is one line, so this walkthrough assumes the usual shape: a short function that stores,
+normalizes and searches embeddings, runs without errors, and returns plausible but wrong results. This planted
+version has five bugs. One term first: **fp16** is a 16-bit floating-point number, half the size of a normal
+32-bit float, whose largest value is 65,504.
+
+```python
+def search_buggy(query_vec, doc_vecs, doc_ids, k=3):
+    docs = np.array(doc_vecs, dtype=np.float16)          # 1: fp16 overflows when squaring large values
+    docs = docs / np.linalg.norm(docs, axis=0)            # 2: normalizes columns, not rows
+    q = np.asarray(query_vec, dtype=np.float32)           # 3: query never normalized
+    scores = docs @ q
+    order = np.argsort(scores)[:k]                        # 4: ascending, so least similar first
+    ids = sorted(set(doc_ids))                            # 5: reorders ids away from their rows
+    return [(ids[i], float(scores[i])) for i in order]
+```
+
+The fix casts to float32, normalizes with `axis=1, keepdims=True` and an epsilon, normalizes the query, sorts
+descending, keeps `doc_ids` in row order, and raises when the query and document dimensions differ (for example
+384 against 1,536 means two different models).
+
+A sixth bug lives in batching code. It dedupes the texts with `set()`, embeds the unique texts, then `zip`s the
+results back onto the original list. A set has no order, so rows land on the wrong text and nothing crashes.
+Dedupe with `dict.fromkeys` to keep order, and map results back by key.
+
+Find these by testing, not by reading. Say: "Let me build a three-document corpus where I know the right
+answer." That one test exposes bugs 2–5 at once.
+
+## Verification
+
+### Tests
+
+The 18 tests passed on 2026-10-12. They check:
+
+- **Metrics against hand arithmetic.** Ranking [C, A, D, B, E] with A (gain 2) and B (gain 1) relevant gives
+  hit@5 = 1, recall@5 = 1.0, recall@3 = 0.5, precision@5 = 0.4, reciprocal rank 0.5 and nDCG@5 = 0.6433. This is
+  the refund example above; the nDCG arithmetic is in the box below.
+- **Fusion** against the two RRF values in the formula above.
+- **Cosine edge cases.** A zero vector scores 0, scaling doesn't change the score, and the matrix form matches the
+  pairwise form.
+- **Chunking.** IDs are stable, heading paths are kept, and a long paragraph is split rather than dropped.
+- **Citations.** A missing source and an uncited sentence are both flagged, and "I don't know" counts as an
+  abstention.
+- **The bug hunt.** The buggy search returns the wrong document on a three-document case where the fixed one is
+  right; fp16 really overflows; a dimension mismatch raises; the set-based batcher misaligns rows.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **nDCG@5 for [C, A, D, B, E]:** A is at position 2 and B at position 4, so
+  DCG = 2/log₂3 + 1/log₂5 = 1.6925. The ideal order [A, B] gives 2/log₂2 + 1/log₂3 = 2.6309.
+  nDCG@5 = 1.6925 ÷ 2.6309 = **0.6433**.
+- **fp16 overflow:** the squared length of a 384-number vector with values near 300 is 384 × 300² ≈ 34.6M, far
+  above fp16's maximum of 65,504, so it becomes infinity.
+
+</details>
+
+### An end-to-end run on a public dataset
+
+Unit tests prove the parts. To check the whole pipeline, the same code was run on 2026-10-12 against BEIR
+SciFact's test split ([Thakur et al., 2021](https://arxiv.org/abs/2104.08663)): 300 queries with document-level
+labels, 5,183 abstracts cut into 9,377 chunks of at most 150 words, MiniLM-L6 on the Apple GPU. This is a scratch
+run of this page's code, not one of the lab's recorded benchmarks. MRR@10 and nDCG@10 look only at the top 10.
+
+| System | hit@5 | recall@5 | MRR@10 | nDCG@10 |
+|---|---|---|---|---|
+| Dense only | 0.753 | 0.737 | 0.612 | 0.655 |
+| BM25 only (`\w+` tokens) | 0.747 | 0.724 | 0.616 | 0.649 |
+| Hybrid (RRF) | 0.790 | 0.767 | 0.659 | 0.696 |
+| Hybrid + cross-encoder | 0.790 | 0.770 | 0.669 | 0.704 |
+
+A gap of a few points on 300 questions could be luck, so each comparison comes with an interval. The method is a
+**paired bootstrap**: resample the 300 questions with replacement many times, recompute the difference between
+the two systems on the same resampled questions each time, and keep the middle 95% of those differences.
+"Paired" means both systems are scored on the same questions, which removes the noise that comes from some
+questions being harder than others. If the interval excludes zero, the gain is real.
+
+Hybrid beat dense by +3.7 points of hit@5 [+0.3, +7.0] and +4.1 points of nDCG@10 [+1.4, +6.9]. The reranker on
+top of that hybrid added +0.0 hit@5 [−3.7, +3.7] and +0.8 nDCG@10 [−2.2, +3.7]: nothing measurable.
+
+That differs from the rag lab, where reranking was the only one of the three lab stages that cleared its interval
+on SciFact. The lab's hybrid used the whitespace tokenizer, so its reranker was fixing what a better BM25 also
+fixes. The lab's own ablation (an experiment that changes one thing at a time) found the same: hybrid with `\w+` matched reranking without the reranker's latency.
+The lesson for an interview: whether a stage helps depends on the baseline under it. Say: "I measure each change
+against the configuration I would actually ship."
+
+The dense nDCG@10 is also a check on the metric code. MTEB, the public embedding benchmark, publishes a SciFact
+score for the same model; compare against it. A wrong discount or a chunk-versus-document mix-up usually lands
+far from it.
+
+### What to check live, in the round
+
+- Print the top 3 chunks for three questions and read them. It takes a minute and catches most bugs.
+- Assert row counts after every embed call, and check that one known-answer question comes back first.
+- Run BM25 alone and dense alone. If the hybrid is not better than both, look for a bug before you report it.
+- Put an error bar on the number. With 20 questions and a hit rate of 0.8, the 95% interval is about **±17.5
+  points**; with 200 questions it is about **±5.5**. Say: "Twenty questions can show the system works at all.
+  They cannot show that hybrid beat dense by 3 points."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+The normal-approximation interval for a rate p measured on n questions is ±1.96 × √(p(1 − p) ÷ n).
+
+- n = 20, p = 0.8: 1.96 × √(0.8 × 0.2 ÷ 20) = 1.96 × 0.0894 ≈ **±17.5 points**.
+- n = 200, p = 0.8: 1.96 × √(0.16 ÷ 200) = 1.96 × 0.0283 ≈ **±5.5 points**.
+
+</details>
+
+## Complexity and performance
+
+The simplest vector search compares the question with every chunk. This is called **flat** (or brute-force)
+search. Its cost grows with the number of chunks times the vector length, and it is exact: it always finds the
+true closest chunks.
+
+<Formula
+  title="Flat (brute-force) vector search"
+  expr="time per query ∝ N × d;   memory = N × d × bytes_per_value"
+  vars={[
+    { sym: 'N', meaning: 'number of chunks' },
+    { sym: 'd', meaning: 'embedding dimension (384 for MiniLM, 1,536 for text-embedding-3-small)' },
+    { sym: 'bytes_per_value', meaning: '4 for float32, 1 for int8' },
+  ]}
+  example={["50 docs → about 500 chunks (assumed): 500 × 384 × 4 = 0.77 MB", "100× → 50,000 chunks: 76.8 MB; 10M chunks: 15.4 GB, which no longer fits comfortably in one process"]}
+/>
+
+Measured on 2026-10-12 on the same machine under other load (load average 5–8), one 384-dimension query against
+random unit vectors took about **0.4 ms at 10,000 vectors, 4 ms at 100,000 and 44 ms at 1,000,000**. Time grows
+linearly with N, as the formula says. Flat search stays fine well past the 100× follow-up. Because it is exact, it
+is also the reference you measure a faster, approximate index against.
+
+The hand-written BM25 is the slow part. It loops over every chunk for every query word, so it costs
+O(N × query words) in Python. In the SciFact run, dense search took about 7 ms per query and the hybrid about
+43 ms. The rag lab's hybrid `retrieve()` took <LabNumber lab="rag" metric="Hybrid retrieve() v1" /> on 5,852 chunks
+(CPU / Apple GPU). A real search engine keeps an **inverted index**: for each word, a posting list of the chunks
+that contain it. It then touches only those chunks. The search-engine lab builds one.
+
+Embedding is the cost of loading documents in, called **ingestion**. The embedding-pipeline lab measured
+<LabNumber lab="embedding-pipeline" metric="1 vs 32 chunk-length texts per call (CPU)" /> for 256-token texts,
+one at a time versus batches of 32. At the batched rate, 50,000 chunks take about **450 s** on one CPU process
+(derived: 50,000 ÷ 112 ≈ 450).
+
+### What changes at 100× the data, and under rate limits
+
+This is OpenAI's reported follow-up (<Cite id="s-812dbc9385" />). Going from 50 documents to 5,000 changes less
+than candidates expect:
+
+- **Search.** Flat NumPy still works at about 50,000 chunks. Move to an **approximate nearest-neighbour index**
+  (HNSW and IVF are the common kinds: structures that find almost the closest vectors without comparing against
+  all of them) or a vector database at millions of vectors, or when you need filters and live updates. When you
+  do, measure how many of flat search's true top results the approximate index still finds.
+- **BM25.** Replace the loop with a real inverted index: Postgres full-text search, OpenSearch, or whatever the
+  company already runs.
+- **Ingestion becomes a job.** Hash each chunk (its text plus the embedding model's name) and skip unchanged
+  hashes, so a re-run or a retry never re-embeds or duplicates. Checkpoint progress. Re-embed everything when the
+  model changes, because vectors from two models aren't comparable.
+- **Rate limits.** Providers cap how many tokens you may send per minute (**TPM**, tokens per minute) and reply
+  with HTTP **429** ("Too Many Requests") when you go over. Batch many inputs per request, cap concurrency on
+  your side, and on a 429 back off with jitter and honour `Retry-After`. Cap total attempts, because retries
+  multiply load: three attempts with no budget can triple traffic during an incident.
+- **The eval set grows with the corpus.** 20 questions over 5,000 documents measure almost nothing.
+
+The rate limit also sets a floor on how long ingestion takes, however many workers you run. With assumed numbers
+(5,000 documents of 2,000 tokens each, and a 1M TPM limit), ingestion takes **at least 10 minutes**. Say: "Adding
+workers doesn't beat the TPM limit; I'd tell the user when it will finish."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Ingest time under a tokens-per-minute limit"
+  expr="T_ingest ≥ total_tokens ÷ TPM_limit"
+  vars={[
+    { sym: 'total_tokens', meaning: 'chunks × tokens per chunk' },
+    { sym: 'TPM_limit', meaning: "your account's embedding tokens-per-minute limit (check your tier; the value below is assumed)" },
+  ]}
+  example="5,000 docs × 2,000 tokens (assumed) = 10M tokens; at an assumed 1M TPM, at least 10 minutes however many workers you run"
+/>
+
+</details>
+
+### "How specific do you want to be?" (the product-search variant)
+
+For product search, the follow-up is about precision versus recall per kind of query (<Cite id="s-05342b6eb9" />).
+Product queries come in two kinds.
+
+"iPhone 15 Pro case MagSafe" has an exact intent. Return few results, all of which match brand, model and
+attribute, and return nothing rather than a near miss. "Gift for a runner" is broad. Return a varied set.
+
+A design that handles both works in four steps. It extracts structured filters from the query (brand, category,
+price, size). It applies them as hard filters. It runs hybrid retrieval inside them. And it uses a score
+threshold to return fewer results when the top matches are weak. Evaluate the two kinds separately: precision@5
+on exact-intent queries, recall and nDCG on broad ones.
+
+Amazon's public Shopping Queries Dataset labels each query-product pair Exact, Substitute, Complement or
+Irrelevant ([ESCI, Reddy et al., 2022](https://github.com/amazon-science/esci-data)), which maps directly onto
+graded nDCG gains. Mapping them to 3/2/1/0 is one reasonable choice, not the dataset's rule. ChatGPT calls this
+search as a tool, so it should return structured fields (title, price, ID, why it matched), not prose.
+
+## Small-team version
+
+At a 50–500 person company this exercise *is* the first version of the product. One engineer writes a few hundred
+lines, and then has to show the CEO a number.
+
+### Build
+
+- **The pipeline itself.** It is the code above. Plain API calls rather than a framework is Anthropic's advice
+  too: "start by using LLM APIs directly"
+  ([Building effective agents, 2024-12-19](https://www.anthropic.com/engineering/building-effective-agents)).
+- **The labeled set and the eval script.** 50 questions labeled by someone who knows the domain, a script that
+  prints hit@5, recall@5, MRR and nDCG@10 with intervals, and a check that runs on every change to chunking,
+  prompts or models.
+- **Citation checks and abstention.** They are free, and they keep a wrong answer from looking authoritative.
+
+### Buy or call as a service
+
+- **Embeddings and generation from a hosted API.** OpenAI's text-embedding-3-small lists at $0.02 per million
+  tokens ([OpenAI pricing](https://developers.openai.com/api/docs/pricing), fetched 2026-10-11), so embedding a
+  5,000-document corpus of 10M tokens costs about **$0.20**. Embedding cost never decides this.
+- **Vector storage where your data already lives.** In-process NumPy up to about a million vectors; pgvector (a
+  Postgres extension that stores and searches vectors) if you run Postgres. A practitioner who ran pgvector in
+  production warns that HNSW builds on a few million vectors can need 10+ GB of RAM on the primary database, and
+  recommends a dedicated store past that unless you have strong Postgres expertise
+  ([Alex Jacobs, 2025-10-29](https://alex-jacobs.com/posts/the-case-against-pgvector/)).
+- **Tracing.** Log every query's retrieved IDs, scores, prompt and answer, with an open-source tracer such as
+  Langfuse or a vendor. You will need those traces the first time someone reports a wrong answer.
+
+### Skip, until a number says otherwise
+
+- **A reranker.** The evidence is mixed. It was the only lab stage that cleared its interval on the lab's SciFact
+  run, and it added nothing on top of a well-tokenized hybrid in this page's run. Add it when your own eval shows
+  a gain worth its latency.
+- **Fine-tuning the embedding model, a dedicated vector database on day one, and an agent framework.**
+
+### Cost math (list prices fetched 2026-10-11; re-check before you rely on them)
+
+Generation is the larger bill, and it is still small. With assumed traffic of 5,000 queries a day, and assumed
+prompts of 5 chunks plus the question (2,200 input tokens) and 300-token answers, a query costs about **$0.00115
+on gpt-5-mini** and **$0.0074 on Claude Sonnet 5**. That is about **$173 versus $1,110 per 30 days**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Generation cost per query"
+  expr="cost = input_tokens × p_in + output_tokens × p_out"
+  vars={[
+    { sym: 'input_tokens', meaning: '5 chunks × 400 tokens + 200 for the question and instructions = 2,200 (assumed)' },
+    { sym: 'output_tokens', meaning: '300 (assumed)' },
+    { sym: 'p_in, p_out', meaning: 'list price per token' },
+  ]}
+  example={["gpt-5-mini at $0.25 / $2.00 per 1M: 2,200 × 0.25e-6 + 300 × 2e-6 = $0.00115", "Claude Sonnet 5 at $2 / $10 per 1M: 0.0044 + 0.003 = $0.0074", "At an assumed 5,000 queries a day: about $173 vs $1,110 per 30 days"]}
+/>
+
+</details>
+
+The real cost is people's time. 50 questions at an assumed 3 minutes each is about 2.5 hours of a domain
+expert, and that is the step teams skip.
+
+### A realistic delivery plan
+
+1. **Days 1–2.** Pipeline, 20 questions, a baseline number, and a README listing what fails.
+2. **Week 1.** Grow the set to 50 (paraphrases, identifiers, and questions the corpus can't answer). Compare
+   dense, BM25 and hybrid with paired intervals, and pick the simplest configuration that wins.
+3. **Week 2.** Ship behind a feedback button, with tracing on. Read 20–50 real traces a week and turn each new
+   failure into a labeled question.
+4. **Ongoing.** Every chunking, prompt or model change runs the eval before merge.
+
+### What you verify yourself
+
+- The metric code, against a hand-worked example like the refund question.
+- That IDs stay aligned through dedupe and batching.
+- That eval questions weren't generated from the same chunks they are scored on.
+- How many chunks the embedder truncates.
+- A sample of the judge's verdicts, against your own.
+
+### What small-company interviewers probe
+
+Employer-side accounts describe the same habits. An Elicit hiring manager says their coding exercise probes error
+handling, retries, fallbacks and timeouts rather than the happy path
+([Latent Space, 2024-06-21](https://www.latent.space/p/hiring)). Expect "would you even need retrieval for 50
+documents?", "what does this cost per month?" and "what happens when the embedding API is down during ingestion?"
+
+### Revisit when
+
+The corpus passes a few million chunks or needs filtered, real-time updates (move to a managed vector store).
+Query volume makes the reranker's latency matter. Regulated data forces you to run embeddings yourself. Or a
+second team wants the same retrieval, which is when it becomes a service with its own eval.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Small RAG in code"
+  senior={[
+    "Writes cosine, top-k, BM25 and fusion correctly and fast, with stable chunk IDs and a fake embedder in tests.",
+    "Reports hit@k and recall@k on a labeled set, says which is which, and puts an interval on them.",
+    "Answers the 100x and rate-limit follow-ups with concrete changes: hashing, batching, backoff, an approximate index.",
+  ]}
+  staff={[
+    "Asks whether retrieval is needed at all and names the long-context baseline it has to beat.",
+    "Treats the labeled set as the product's contract: who labels it, how it grows from production failures, and which change it blocks.",
+    "Measures each stage against the configuration that would ship, and drops a stage (often the reranker) when the paired interval says it adds nothing.",
+  ]}
+/>
+
+<AINative title="Let the agent type the pipeline; you own the IDs and the numbers">
+A coding agent writes all six stages of this pipeline in minutes, so in an AI-allowed round or a take-home the
+code itself proves little. What it gets wrong is the kind of bug in the PromptLayer variant: a normalization axis,
+an ascending sort, a dedupe that reorders rows, a metric called recall that is really a hit rate. Each one runs
+cleanly and produces a plausible number. Write the hand-checked metric test and the three-document known-answer
+test yourself, before you accept the agent's code, and read the top three chunks for a few questions with your own
+eyes. Don't let the agent write the eval questions from the same chunks it is retrieving: that inflates every
+keyword score. Your job is the labeled set, the interval and the decision about what ships.
+</AINative>
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="How would you improve the evaluation, for example recall or hit rate? (Reported, Harvey)">
+    Separate the two: hit@k (any relevant chunk in the top k) and recall@k (the share of all relevant chunks
+    found), at the k you pass to the model. Grow the labeled set from 20 to 50+ with questions the corpus can't
+    answer. Add MRR or nDCG if order matters, add a faithfulness check with a judge you have checked against your
+    own labels, and compare changes with a paired test on the same questions.
+  </FollowUp>
+  <FollowUp q="How specific do you want to be on certain searches? (Reported, OpenAI)">
+    It depends on intent. Exact queries (model numbers, brands) get structured filters, few results and a
+    threshold that returns nothing rather than a near miss. Broad queries get varied, recall-oriented results.
+    Evaluate the two groups separately.
+  </FollowUp>
+  <FollowUp q="Why this chunking strategy, and why not a different retrieval method? (Reported, OpenAI)">
+    Heading-and-paragraph chunks keep sentences and sections whole and carry the heading path. Size them to the
+    embedder's window. For retrieval, show the measurement: dense, BM25 and hybrid on the same labeled set with
+    intervals, and pick the simplest one that wins.
+  </FollowUp>
+  <FollowUp q="What would you change if the dataset were 100x larger? (Reported, OpenAI)">
+    Incremental ingestion keyed by a content hash, batched embedding under the rate limit, a real inverted index
+    for BM25, and an approximate vector index only when flat search gets too slow (around millions of vectors).
+    Grow the eval set too.
+  </FollowUp>
+  <FollowUp q="The embedding API starts returning 429s halfway through ingestion. What happens? (Reported topic, OpenAI: rate limiting and retries)">
+    Workers back off with jitter and honour Retry-After, under a cap on attempts. Because every chunk is keyed by
+    a content hash and progress is checkpointed, the job resumes without duplicates. Ingest time can't be shorter
+    than total tokens divided by the TPM limit, so tell the user when it will finish.
+  </FollowUp>
+  <FollowUp q="Some documents get a NaN score. Why? (Not reported; a natural next push)">
+    A zero vector (empty text, or a failed embedding stored as zeros) divided by its zero length. Guard with an
+    epsilon, score it 0, and find out why an empty chunk was indexed at all.
+  </FollowUp>
+  <FollowUp q="How do you know your faithfulness judge is any good? (Prep guide, techinterview.org)">
+    Label 20–30 answers yourself, compare with the judge, and report agreement as Cohen's kappa (agreement
+    corrected for what two raters would reach by chance), not raw agreement. Fix the judge prompt until it
+    agrees, and re-check it whenever you change the judge model.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Tuning by feel.** With no labeled set, "it works" is an anecdote; in the prep guide's words, "the
+  interviewer assumes you tuned yours by feel" (<Cite id="s-7d03a572e0" />).
+- **Calling a hit rate "recall".** They are different numbers, so say which one you computed and at what k.
+- **Declaring a winner on 20 questions.** The ±17.5-point interval swamps most differences, so use a paired
+  comparison and more questions.
+- **Generating the eval questions from the chunks you are retrieving.** The question shares the chunk's words,
+  so BM25 and dense search both look better than they are.
+- **Silent truncation.** Chunks longer than the embedder's window lose their tails, so measure how many do.
+- **Row and ID misalignment.** Dedupe, sorting, batching or normalizing along the wrong axis can attach scores
+  to the wrong chunks without any error.
+- **Fixed 512-token windows.** They cut sentences in half, which is why the prep guide calls them "the lazy
+  default".
+- **No abstention path.** A question the corpus can't answer still gets a fluent, confident answer.
+
+## Prove it with a lab
+
+<LabRef lab="rag" role="proof" note="Build the three stages and read its benchmark notes: hit@3 per stage on SciFact and NFCorpus with paired intervals, the tokenizer ablation and the reranker's latency." />
+
+The lab measured hit@3 on SciFact of <LabNumber lab="rag" metric="hit@3 on BEIR SciFact" /> (dense, hybrid,
+rerank), and on NFCorpus (a second BEIR benchmark) of
+<LabNumber lab="rag" metric="hit@3 on BEIR NFCorpus" />. With about 300 queries, gaps under about 4 points are
+noise. On NFCorpus no single step clears its interval.
+
+<LabRef lab="embedding-pipeline" role="proof" note="Batching (measured several-fold faster per text), the exact-match cache and the model-swap check for the ingest side." />
+
+<LabRef lab="llm-eval" role="proof" note="bootstrap_ci and paired_bootstrap_test are the interval and comparison this walkthrough asks you to report." />
+
+The llm-eval lab's simulation shows how big a gap a paired test can reliably see. At n = 500,
+<LabNumber lab="llm-eval" metric="Smallest true gap with 80% power, paired test, n=500" /> (for models that
+disagree on 20% / 40% of items, one-sided). "80% power" means a real gap of that size is detected four times in
+five.
+
+<LabRef lab="vector-index" role="proof" note="Flat, HNSW and IVF-PQ for the 100x follow-up; measure recall against flat search yourself, since its numbers are estimates." />
+
+<LabRef lab="search-engine" role="background" note="Posting lists and BM25, the replacement for the loop over every chunk." />
+
+No lab yet covers the faithfulness judge (a planned `llm-judge-evals` lab).
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-74265be7ec" />
+- <Cite id="s-90185f6ee1" />
+- <Cite id="s-05342b6eb9" />
+- <Cite id="s-812dbc9385" />
+- <Cite id="s-7d03a572e0" />
+- <Cite id="s-1205b0cc50" />
+- <Cite id="s-3e400c7e21" />
+- <Cite id="s-956f0bbc95" />
+- Anthropic, "Introducing Contextual Retrieval", 2024-09-19: [https://www.anthropic.com/news/contextual-retrieval](https://www.anthropic.com/news/contextual-retrieval)
+- Anthropic, "Building effective agents", 2024-12-19: [https://www.anthropic.com/engineering/building-effective-agents](https://www.anthropic.com/engineering/building-effective-agents)
+- Cormack, Clarke and Büttcher, "Reciprocal Rank Fusion outperforms Condorcet and individual rank learning methods", SIGIR 2009: [https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf)
+- Thakur et al., "BEIR: A heterogeneous benchmark for zero-shot evaluation of information retrieval models", 2021: [https://arxiv.org/abs/2104.08663](https://arxiv.org/abs/2104.08663)
+- sentence-transformers, all-MiniLM-L6-v2 `sentence_bert_config.json` (max_seq_length 256), fetched 2026-10-11: [https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/blob/main/sentence_bert_config.json](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/blob/main/sentence_bert_config.json)
+- Reddy et al., "Shopping Queries Dataset: A Large-Scale ESCI Benchmark for Improving Product Search", 2022: [https://github.com/amazon-science/esci-data](https://github.com/amazon-science/esci-data)
+- OpenAI API pricing, fetched 2026-10-11: [https://developers.openai.com/api/docs/pricing](https://developers.openai.com/api/docs/pricing)
+- Alex Jacobs, "The case against pgvector", 2025-10-29: [https://alex-jacobs.com/posts/the-case-against-pgvector/](https://alex-jacobs.com/posts/the-case-against-pgvector/)
+- Latent Space episode on hiring AI engineers (Elicit hiring manager), 2024-06-21: [https://www.latent.space/p/hiring](https://www.latent.space/p/hiring)

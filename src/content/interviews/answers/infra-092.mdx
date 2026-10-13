@@ -1,0 +1,192 @@
+---
+question: infra-092
+family: distributed-training
+status: published
+labs: [kafka-lite, llm-eval]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "It's a producer-consumer pipeline where the producer is the model being trained. Generators write responses to
+> prompts, reward workers score them, a bounded log buffers them, and a learner trains on them. Because generation
+> and training overlap, some data comes from an older version of the model, so I tag every response with the model
+> version that wrote it, bound how stale it may be, and correct for the gap in the loss. Copying new weights to the
+> generators is a real cost: 141 GB for a 70B model. Rollouts are a low-priority tenant that user traffic always
+> preempts, and no new model reaches users without evals and a canary."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see you run a training loop whose data comes from a model that is changing underneath it,
+next to a production service you must not hurt.
+
+### What makes this different from a normal data pipeline
+
+In a normal pipeline the data source doesn't care what the consumer does with the data. Here it does. The model
+being trained is also the model producing the training data. Every time the learner updates the model, data made by
+the previous version becomes slightly out of date. The faster the pipeline runs, the more stale data it carries.
+
+There is a second twist. The generators are inference engines, the same kind of machines that serve users. If they
+share hardware with the product, training can slow the product down.
+
+### Words you need first
+
+- **Reinforcement learning (RL) post-training**: improving an already-trained model by letting it answer prompts,
+  scoring the answers, and training it to make high-scoring answers more likely.
+- **Policy**: the model being trained, in RL language. Each update produces a new **policy version**.
+- **Rollout** or **trajectory**: one prompt plus the response the policy generated for it.
+- **Reward**: the score for a trajectory, from a **reward model** (another model trained to judge answers), an
+  automatic checker, or human raters.
+- **Log-probs**: the model's own probability (as a logarithm) for each **token** it generated, a token being a
+  piece of a word. Storing them lets the learner later tell
+  how much the policy has changed since the response was written.
+
+This question comes from PracHub's write-up of a Meta question. It lists generators, reward inference, learners,
+replay buffers, separate serving and training clusters, queues with backpressure, off-policy corrections, KL
+control, safety gates and rollout (<Cite id="s-096f521464" />). A commenter on that page adds that a strong answer
+covers weight transfer from the trainer to the generation engine.
+
+## Clarify first
+
+- **Model size?** "I'll assume 70B parameters in bf16 (2 bytes each), so 141.1 GB of weights."
+- **Feedback source?** "Human raters, a reward model, or automatic checks? How slow is each?"
+- **Hardware?** "May rollouts use the serving cluster's spare capacity, or only training hardware?"
+- **Staleness?** "How old may a trajectory's policy be? I'll assume at most 2 versions behind."
+- **Data rights?** "Which user conversations may be used as prompts, given consent and personal data?"
+
+## Answer
+
+### The system, top to bottom
+
+```
+Prompt source ── curated sets + filtered, consented production prompts (durable topic)
+   │
+   ▼
+Generators ── inference engines; several responses per prompt; tag policy_version, store log-probs
+   │
+   ▼
+Reward workers ── reward model and checkers score trajectories, asynchronously
+   │
+   ▼
+Trajectory buffer ── durable, bounded log; backpressure on generators when full
+   │
+   ▼
+Learner ── sharded training; penalty for drifting from a frozen reference model
+   │  every K steps
+   ▼
+Weight sync ──► back to the generators (new policy version)
+   │
+   ▼
+Release path ── checkpoint → evals → canary → users
+```
+
+**Prompt source.** Curated prompt sets plus filtered, consented production prompts, logged to a durable topic.
+
+**Generators.** Inference engines that produce several responses per prompt. Each trajectory carries its
+`policy_version` and its log-probs.
+
+**Reward workers.** They score trajectories asynchronously, so slow scoring doesn't block generation.
+
+**Trajectory buffer.** A durable, bounded log or queue. When it fills, generators slow down (**backpressure**)
+instead of piling up stale data.
+
+**Learner.** Sharded training (FSDP or Megatron, two ways of splitting a model across GPUs). It adds a penalty for
+drifting too far from a frozen copy of the starting model. That penalty uses a distance measure between the two
+models' outputs called **KL divergence**, and it keeps the policy from exploiting the reward in strange ways.
+
+**Weight sync.** Every K learner steps, the new weights are pushed to the generators.
+
+**Release path.** Checkpoints go through evals and a canary before any user sees them.
+
+### Follow one batch through the loop
+
+| Moment | What happens | What to say in the interview |
+|---|---|---|
+| Learner at version 7 | Generators still run version 7 and write responses tagged v7 | "Generation never stops while the learner trains." |
+| Learner reaches version 8 | Weight sync starts; generators keep writing v7 for a few seconds | "The sync takes time, so data written meanwhile is already one version old." |
+| v7 data reaches the learner at version 9 | It is 2 versions behind: still allowed | "I bound the lag and correct for it." |
+| v6 data arrives at version 9 | 3 versions behind: dropped | "Data past the limit is thrown away, not trained on." |
+
+**How to correct for staleness.** The learner compares the current policy's probability for each token with the
+stored log-probs from the policy that generated it. That ratio, called an **importance weight**, re-weights the
+data. **Clipping**, the trick used by PPO (proximal policy optimization, a standard
+RL training method), caps the ratio so one very stale sample can't dominate. Monitor the lag distribution as
+a first-class metric.
+
+Say it like this: "Every response carries the version that wrote it and its log-probs. That's what lets me bound and
+correct staleness."
+
+### Weight transfer is a real cost
+
+A 70B model in bf16 is **141.1 GB**. At an assumed 50 GB/s, broadcast in parallel, one sync takes about
+**2.8 seconds**. Across a slower link between clusters, it takes minutes. Choose K, the number of learner steps
+between syncs, so the sync is a small share of step time and staleness stays within bounds.
+
+The two sides also lay the model out differently. Training splits the model one way across its GPUs; inference
+splits it another way (**tensor parallelism**, each layer's math split across the GPUs of one machine). So the sync
+includes a **reshard**: rearranging the pieces on the way.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Weight sync time"
+  expr="t_sync ≈ weight bytes ÷ effective transfer bandwidth"
+  vars={[
+    { sym: 'weight bytes', meaning: 'params × 2 for bf16' },
+    { sym: 'bandwidth', meaning: 'trainer-to-generator path, measured' },
+  ]}
+  example="70B: 141.1 GB ÷ an assumed 50 GB/s = 2.8 s per sync if broadcast in parallel; across a slower cross-cluster link, minutes"
+/>
+
+</details>
+
+### Isolation from serving
+
+User traffic always preempts rollouts. Rollouts are a low-priority tenant with a GPU quota, and they are shed first
+under load. Training weights never reach the user-facing fleet directly; they go through the release path.
+
+### Safety
+
+- Content filters on prompts and outputs.
+- **Reward-hacking** checks: the reward keeps rising while held-out quality or answer diversity falls, which means
+  the model has found a way to please the scorer without getting better.
+- KL monitoring, so drift from the reference model is visible.
+- Canary rollout with automatic rollback.
+
+Say it like this: "If reward goes up and held-out quality goes down, the model is gaming the scorer. That signal
+stops a release."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Async RL beside serving"
+  senior={["Draws generators, reward, buffer, learner and weight sync, tags trajectories with versions, bounds staleness."]}
+  staff={["Prices the weight sync, makes rollouts a preemptible tenant of the serving fleet, and defines the reward-hacking signal that stops a release."]}
+/>
+
+## Small-team version
+
+A small team doesn't run online RL beside its product. The nearest realistic step is offline:
+
+1. Collect rated production outputs (with consent).
+2. Fine-tune, or apply preference tuning, on a managed service.
+3. Release behind an eval gate and a canary.
+
+The parts worth copying from the big design: record which model produced every training example, and never ship a
+model change without an eval that would catch a regression.
+
+## Pitfalls
+
+- **Ignoring policy lag, or not storing the generating policy's log-probs.** Without them you can't correct for
+  stale data.
+- **Forgetting weight transfer and resharding.** 141 GB per sync is not free.
+- **Letting rollouts compete with users at equal priority.** Training should never slow the product.
+- **Optimizing reward without a held-out quality check.** Rising reward alone can mean reward hacking.
+
+## Go deeper
+
+- Family walkthrough: [Distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/).
+- Pipeline parallelism inside another RL training loop (GRPO): [r2b-015](/system-design-labs/interviews/questions/r2b-015/).
+- Durable, bounded trajectory log: <LabRef lab="kafka-lite" inline />. Release gate statistics: <LabRef lab="llm-eval" inline />.

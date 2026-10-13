@@ -1,0 +1,179 @@
+---
+question: infra-072
+family: gpu-kernel-perf
+status: published
+labs: [llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "First I check the 15% myself: the fewest bytes the kernel must move, divided by its time, against the memory's
+> top speed. Then I check that memory speed is the right yardstick for this kernel at all. Then I profile it and
+> compare the bytes it really moved with my minimum. Far more bytes means threads read scattered addresses or
+> read the same data twice. The right bytes but slow means too few reads are in flight. I fix the cause the
+> profiler shows, then re-measure and check the output against a reference."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The interviewer wants to know whether you have a **method** for performance work, or only a list of tricks.
+
+In backend work you already have a method. A slow endpoint gets a trace, the trace points at one slow query, and
+you fix that query. GPU work needs the same habit, but the thing you measure is different.
+
+A GPU program, called a **kernel**, is one small function that the GPU runs on thousands of threads at once.
+Most kernels in AI do only a few arithmetic operations for every byte they read. A GPU can do arithmetic far
+faster than it can fetch bytes from its main memory, so those kernels spend their time waiting on memory. Their
+speed is set by **bandwidth**: how many bytes per second the memory delivers. "15% of peak bandwidth" means the
+kernel moves bytes at 15% of the speed the spec sheet promises.
+
+So the honest answer is about bytes: how many must move, how many actually moved, and why the two differ.
+
+(The framing comes from a techinterview.org prep article, July 2026, that names NVIDIA, Modal, Together,
+Fireworks, Groq and Cerebras; it cites no first-hand reports <Cite id="s-55d540eda9" />.)
+
+## Clarify first
+
+Ask these before you diagnose anything. Each one changes the answer.
+
+- **How was "15% of peak" computed?** Minimum bytes ÷ time against the spec-sheet peak, or a profiler counter?
+  Against which GPU? (An NVIDIA A100 80 GB SXM peaks at 2,039 GB/s, <Cite id="s-8e443a8b66" />.)
+- **What does the kernel do, and on what shapes and number formats?** A kernel on 4-byte floats moves twice the
+  bytes of one on 2-byte floats.
+- **Is it slow on its own, or only inside the full model step?** A gap between kernels is not a kernel problem.
+- **What tolerance must a faster version meet?** Faster kernels add numbers in a different order, so the last
+  digits change.
+
+## Answer
+
+### Words you need first
+
+- **Threads come in groups of 32 called warps.** "A warp is 32 threads that execute the same instruction in
+  lockstep" <Cite id="s-55d540eda9" />. Memory is fetched for a whole warp at once.
+- **HBM** is the GPU's main memory: big (80 GB on an A100) but far away, 400–600 cycles per read by the
+  article's estimate. **Shared memory** is a small, fast memory inside the chip, 20–30 cycles, shared by a group
+  of threads called a **thread block** <Cite id="s-55d540eda9" />.
+- **Effective bandwidth** is (bytes read + bytes written) ÷ kernel time. Divide by the peak to get the
+  percentage.
+
+### Follow one kernel through the method
+
+Use a concrete case so your numbers mean something. Say the kernel is a **softmax**: it takes rows of raw scores
+(a language model's **logits**, one score per word in its vocabulary) and turns each row into probabilities that
+add up to 1. There are 4,096 rows of 128,256 numbers, in fp32 (4 bytes each), on one A100. It takes 13.7 ms.
+
+| Step | What you do | What it shows here | What to say in the interview |
+|---|---|---|---|
+| 1. Recompute | Fewest bytes ÷ time | **4.20 GB** must move; the floor is **2.06 ms**; 13.7 ms is 15% | "I check how the 15% was computed before I trust it." |
+| 2. Check the yardstick | Compare the kernel's FLOPs per byte with the GPU's ridge point | Softmax does a few per byte; the A100's ridge is about **153** | "This kernel is limited by memory, so bandwidth is the right yardstick." |
+| 3. Profile | Nsight Compute: bytes moved and stall reasons | Compare its byte count with 4.20 GB | "Is the problem too many bytes, or bytes arriving too slowly?" |
+| 4. Fix | Apply the fix for that cause | See the table below | "I fix what the counter shows, not what I guessed." |
+| 5. Re-check | Re-measure and compare with a reference | Same answer within tolerance, less time | "A faster number I can't verify isn't a result." |
+
+**Step 2 needs one more idea.** A **FLOP** is one arithmetic operation. A kernel's **arithmetic intensity** is
+its FLOPs per byte moved. The A100 can do 312 trillion FLOPs per second on bf16 (a 2-byte number format) and move 2,039 GB per second
+<Cite id="s-8e443a8b66" />, so it can do about 153 FLOPs in the time it takes to fetch one byte. That
+crossover is the **ridge point**. A kernel far below it, like softmax, is **memory-bound**. A kernel far above
+it, like a big matrix multiply, is **compute-bound**, and 15% of bandwidth may be perfectly fine for it; you
+should look at compute instead.
+
+**Step 3 uses a profiler.** **Nsight Compute** is NVIDIA's profiler for one kernel. The article's own first step
+is "the achieved memory throughput and the warp stall reasons" <Cite id="s-55d540eda9" />. A **stall reason**
+says what a waiting warp was waiting for. Read the counters against your minimum:
+
+- **Far more bytes than the minimum** → threads read scattered addresses, or the kernel reads the same data
+  several times.
+- **About the minimum, but slow** → the waits on memory aren't hidden. Too few reads are in flight: few warps,
+  low **occupancy** (the share of the GPU's warp slots in use), or long stalls waiting on loads.
+- **Stalls on shared memory** → bank conflicts (explained below).
+- **A tiny kernel, or gaps between kernels in a timeline** → the CPU's cost of launching kernels. Fix it with
+  fusion (merging kernels) or CUDA graphs (recording the launches once and replaying them), not kernel tuning.
+
+### Why scattered reads land so close to 15%
+
+When a warp's 32 threads each read a 4-byte number, the GPU fetches memory in **segments** of 32 bytes. If the
+32 numbers sit next to each other, 4 segments cover them and every fetched byte is used. That is a **coalesced**
+read. If neighbouring threads read numbers further apart (a larger **stride**), more segments are fetched for
+the same useful bytes. NVIDIA's best-practices guide shows a stride of 2 halving load efficiency. Extending the
+same model, a stride of 8 or more moves 32 segments for 128 useful bytes: **12.5%**
+([CUDA Best Practices Guide §10.2.1](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html)). That
+alone explains a number near 15%.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Minimum bytes:** 4,096 × 128,256 × 4 B = 2.10 GB read, and the same written: **4.20 GB**.
+- **Floor:** 4.20 GB ÷ 2,039 GB/s = **2.06 ms**. At 15%: 2.06 ÷ 0.15 = **13.7 ms** (about 307 GB/s).
+- **Ridge point:** 312 × 10¹² FLOP/s ÷ 2,039 × 10⁹ B/s ≈ **153 FLOPs per byte** (A100, bf16, dense).
+- **Stride:** a warp wants 32 × 4 = 128 useful bytes. At a stride of 8 or more, each thread lands in its own
+  32-byte segment: 32 × 32 = 1,024 bytes fetched, 128 ÷ 1,024 = **12.5%**. A profiler showing about 8× the
+  minimum bytes points at this.
+
+</details>
+
+### Match the fix to the cause
+
+| Cause the profiler shows | Fix |
+|---|---|
+| Strided or scattered reads | Change the layout (a struct of arrays instead of an array of structs), stage the data through shared memory, or reassign threads so neighbours read neighbours |
+| Several passes over the same data | Fuse the kernels; an online softmax reads a row once for both the maximum and the sum |
+| Latency not hidden | 16-byte vector loads, several elements per thread, more blocks |
+| Bank conflicts | Pad the tile |
+| Launch-bound | Fuse neighbouring kernels, or use CUDA graphs |
+
+Two of these need a sentence of explanation. **Bank conflicts:** shared memory is split into 32 banks, and
+addresses in the same bank are served one after another. A 32 × 32 tile read by column hits one bank 32 times;
+padding it to 32 × 33 spreads the column across all 32 banks. **Fusion:** every separate kernel writes its
+output to HBM and the next one reads it back. Doing both steps in one kernel saves that round trip.
+
+**Then re-measure and re-verify** against a reference with a fixed tolerance.
+
+Say it like this: "Coalescing is the first suspect, because a strided read caps a float kernel near 12.5% of
+peak. But I let the byte count tell me, not my guess." The article's summary agrees: "Coalescing is the answer to
+most 'why is this slow' questions". It also warns that chasing 100% occupancy "is the wrong instinct"
+<Cite id="s-55d540eda9" />.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="The 15% kernel"
+  senior={["Computes effective bandwidth, profiles, and maps the counter to coalescing, latency hiding or bank conflicts."]}
+  staff={["Checks first whether this kernel matters to the end-to-end step, and whether the right fix is outside it (fusion, batching, graphs)."]}
+/>
+
+In plain words: a Senior answer fixes this kernel correctly. A Staff answer first asks whether this kernel is
+where the step's time goes. A kernel that is 2% of the step isn't worth a week.
+
+## Small-team version
+
+You will rarely own a custom kernel. The same method still applies to a slow self-hosted model: profile one
+step, compare what moves with what must move, and look for gaps between kernels. The fixes there are usually
+batch size, number format and CUDA graphs, not new CUDA code.
+
+What a custom kernel is worth, in money: on two rented H100 GPUs, a kernel that cuts step time by 20% saves **at
+most about $1,223 a month**. Writing it costs about **$14,900**: an assumed four weeks of a senior engineer's time. That is a payback of
+about **12 months at best**, before anyone maintains it. Buy (use the library kernel); write a kernel only when
+GPU spend spans several nodes, or no library supports the operation you need.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **GPU bill:** 2 × $4.19 per GPU-hour (Cohorte's figure) × 730 hours ≈ **$6,117 a month**; 20% of it ≈ **$1,223**.
+- **Engineer:** four weeks (assumed) at the BLS median developer wage of $135,980 ÷ 0.70 for benefits (assumed) ≈ $194,000 a year; ÷ 52 × 4 ≈ **$14,900**.
+- **Payback:** 14,900 ÷ 1,223 ≈ **12 months**. The family walkthrough shows the full derivation.
+
+</details>
+
+## Pitfalls
+
+- **Guessing a fix before naming the counter.** Without the byte count or stall reason, you are tuning blind.
+- **Using the profiler's byte count as the denominator.** The yardstick is the algorithm's minimum; the profiler's
+  count is what you compare against it.
+- **Raising occupancy without evidence.** Occupancy only helps when stalls show memory latency isn't hidden.
+- **Optimizing a kernel that is 2% of the step.** Even a perfect fix saves almost nothing end to end.
+
+## Go deeper
+
+- Family walkthrough: [GPU kernel performance](/system-design-labs/interviews/walkthroughs/gpu-kernel-perf/), worked example 1 and the coalescing table.
+- Profile a decode step in <LabRef lab="llm-inference" inline />.

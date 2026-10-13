@@ -1,0 +1,183 @@
+---
+question: infra-068
+family: llm-from-scratch
+status: published
+labs: [transformer, llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "An inference step has two halves. The first takes the model's scores for the next token, from the last
+> position only, and picks a token: the best one, or a random one after temperature, top-k and top-p filters.
+> The second turns the chosen tokens back into text: cut at the end-of-sequence token, decode the bytes, and cut
+> at any stop string. I'll fill in both, test them on a tiny model, and say how they change with a cache,
+> with batches and with streaming."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see that you understand one inference step well enough to finish someone else's
+half-written code, without help from an AI tool.
+
+What makes this different from finishing a normal function is that the inputs are probability-shaped. The
+model doesn't return an answer. It returns a score for every token in its vocabulary, at every position, and
+your code decides what to do with them. Small mistakes, such as reading the wrong position or applying
+temperature the wrong way, still produce fluent-looking text. You only notice when you check the numbers or
+look at many outputs.
+
+(A first-hand Anthropic ML Engineer (AI Safety Fellow) account describes a 55-minute Colab notebook round with
+"around 20 to 30 lines of Python skeleton code, basically two function shells", centred on getting LLM output
+"into the right processed form", and "strict about no LLM use" <Cite id="s-8f304f761b" />.) The candidate says
+it felt like debugging how an LLM works. The exact functions aren't published, so prepare the pieces any
+inference step contains.
+
+## Clarify first
+
+- **Inputs and outputs.** "What comes in: token ids, logits or text? What should come out: ids, text or
+  probabilities?"
+- **Batching.** "One example or a batch? Is there padding?"
+- **Sampling.** "Should I sample with temperature, top-k or top-p, or always take the most likely token?"
+- **Stopping.** "What ends generation: an end token, stop strings, a maximum length?"
+- **Setup.** The account says to test the Colab environment and GPU before the interview, so do that the day
+  before.
+
+## Answer
+
+### Words you need first
+
+- **Token**: a small piece of text, stored as an integer id. The **vocabulary** is the set of all ids, of size
+  `V`.
+- **Logits**: the model's raw scores, one per vocabulary entry, at each position. The scores at the last
+  position are the guess for the next token.
+- **Softmax**: turns logits into probabilities that add up to 1.
+- **Greedy decoding**: always take the highest-scoring token.
+- **Temperature**: divide the logits by a number before the softmax. Below 1 makes the choice sharper; above 1
+  makes it flatter.
+- **Top-k**: keep only the k highest-scoring tokens. **Top-p** (nucleus): keep the smallest set of tokens whose
+  probabilities add up to at least p.
+- **EOS**: the special end-of-sequence token that means "the reply is finished".
+- **Stop string**: text that should end the reply, such as a blank line.
+
+### A picture of one step
+
+```text
+token ids so far        (B, T)
+   │  model forward pass
+   ▼
+logits                  (B, T, V)
+   │  keep the last position only
+   ▼
+next-token scores       (B, V)
+   │  temperature ── top-k ── top-p ── softmax ── sample (or argmax)
+   ▼
+next token id           (B,)
+   │  ...repeat until EOS, a stop string or max tokens...
+   ▼
+postprocess ── cut at EOS ── decode to text ── cut at stop string ── strip
+   ▼
+reply text
+```
+
+### Follow one reply through it
+
+Say the model has written `[412, 88, 7, 2]` after the prompt, where 2 is the EOS id, and the text before EOS
+is `"Paris.\n\nNote"`. With `stop=("\n\n",)`:
+
+| Step | Value | What to say in the interview |
+|---|---|---|
+| Cut at EOS | `[412, 88, 7]` | "EOS marks the end; it isn't part of the reply." |
+| Decode | `"Paris.\n\nNote"` | "Decode the whole list at once, so multi-byte characters stay whole." |
+| Cut at stop string | `"Paris."` | "Cut at the first stop string." |
+| Strip | `"Paris."` | "Trim leftover whitespace." |
+
+### The two functions
+
+Expect two shells, something like "next-token step" and "postprocess". Know these by heart.
+
+```python
+@torch.no_grad()
+def next_token(model, ids, temperature=1.0, top_k=None, top_p=None, generator=None):
+    logits = model(ids)[:, -1, :]                              # (B, V): only the last position
+    if temperature == 0:
+        return logits.argmax(-1)                               # greedy
+    logits = logits / temperature
+    if top_k is not None:
+        kth = torch.topk(logits, top_k, dim=-1).values[:, -1:]
+        logits = logits.masked_fill(logits < kth, float("-inf"))
+    if top_p is not None:
+        srt, order = torch.sort(logits, descending=True, dim=-1)
+        p = torch.softmax(srt, -1)
+        drop = (p.cumsum(-1) - p) >= top_p                     # keep the smallest set reaching p
+        logits = logits.masked_fill(torch.zeros_like(drop).scatter(-1, order, drop), float("-inf"))
+    return torch.multinomial(torch.softmax(logits, -1), 1, generator=generator).squeeze(-1)
+
+def postprocess(tokenizer, new_ids, stop=("\n\n",), eos_id=None):
+    if eos_id is not None and eos_id in new_ids:
+        new_ids = new_ids[: new_ids.index(eos_id)]             # cut at EOS, exclude it
+    text = tokenizer.decode(new_ids, skip_special_tokens=True)
+    for s in stop:
+        if s in text:
+            text = text[: text.index(s)]                       # cut at the first stop string
+    return text.strip()
+```
+
+### Points to make while filling them in
+
+- **Last position only.** The logits at position `t` predict token `t + 1`, so the next token comes from
+  `[:, -1, :]`. Using position 0 is a classic skeleton bug.
+- **Temperature divides logits.** It does not multiply probabilities.
+- **Top-p always keeps the top token.** The filter drops a token only when the tokens ranked above it already
+  reach `p`, so at least one survives.
+- **Return log-probs if you return scores.** Sum logs rather than multiplying probabilities, which underflow
+  to zero over long sequences.
+- **Decode the whole sequence, not token by token.** A multi-byte character such as "é" can be split across
+  two tokens.
+- **Use a cache in a loop.** After the first step, pass the stored keys and values (the KV cache) and only the
+  new token, instead of re-running the whole text.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Filling an inference skeleton"
+  senior={["Correct last-position logits, sampling filters and stop handling, tested on a tiny model."]}
+  staff={["Also says what changes with a cache, with batching (per-row stop conditions, padding), and with streaming (holding partial characters)."]}
+/>
+
+## Small-team version
+
+These two functions are what a serving layer does around a self-hosted model. They are also what an API does
+for you when you set `temperature`, `top_p`, `max_tokens` and stop sequences. Knowing them helps you debug two
+common problems. A model that never stops usually has EOS missing from the stop list, or a chat-template
+mismatch (the wrong text format around each message). Output cut off mid-word usually comes from a stop
+string that matched too early.
+
+A runaway reply is a cost bug too. At $10 per 1M output tokens (Claude Sonnet 5 list price, fetched
+2026-10-11), a reply that runs to a 4,000-token cap instead of stopping at 400 costs **$0.040 instead of $0.004,
+ten times more**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- 4,000 × $10/M = $0.040; 400 × $10/M = $0.004; ratio 10×.
+
+</details>
+
+Default: a managed API with `max_tokens` and stop sequences set per feature, and an alert on replies that hit
+the cap.
+
+## Pitfalls
+
+- **Logits from the wrong position.** Position 0 predicts the second token of the prompt, not the next token of
+  the reply.
+- **Running softmax over the full sequence when only the last row is needed.** It wastes work and invites
+  indexing mistakes.
+- **A top-p filter that can remove every token.** Sampling then fails or returns nan; the top token must always
+  survive.
+- **Leaving EOS or special tokens in the returned text.** The user sees control markers in the reply.
+- **Spending interview time on setup.** The account says to test the environment beforehand.
+
+## Go deeper
+
+- Family walkthrough: [Stage 6: decoding](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#stage-6-decoding) and [Stage 7: tokenizers](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#stage-7-tokenizers) (streaming decode).
+- Labs: <LabRef lab="llm-inference" inline /> (the real loop around GPT-2), <LabRef lab="transformer" inline />.

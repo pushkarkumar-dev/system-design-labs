@@ -1,0 +1,186 @@
+---
+question: infra-046
+family: gpu-cluster-control-plane
+status: published
+labs: [container-orchestrator, dist-lock]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll keep nodes in buckets by how many GPUs they have free, zero to eight. To place a pod that needs g GPUs I
+> look in bucket g, then g + 1, up to 8, and take the first node I find. That is best-fit in at most nine lookups,
+> and it keeps empty nodes empty for big pods. Scheduling an already-placed pod returns its existing node, so
+> retries are safe. Removing a node moves its pods first and never drops one. I'll start with one lock, then
+> show compare-and-set on a per-node version for real concurrency."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants a small, correct object model built quickly, and then wants to see you defend it under
+concurrency, retries and node removal. It is a coding screen, so finishing the edge cases matters more than a clever
+data structure.
+
+### What makes this different from scheduling CPU pods
+
+In Kubernetes you already know, a pod asks for half a CPU and some memory, and those resources can be sliced
+finely. Almost any node with a little room will do.
+
+GPUs change that in two ways.
+
+1. **A GPU can't be split, and a pod can't span nodes.** A pod asks for 1, 2, 4 or 8 whole GPUs, and all of them
+   must be on one node. So "40 GPUs free in the cluster" doesn't mean an 8-GPU pod fits.
+2. **Leftover holes are expensive.** If small pods are scattered across many nodes, every node ends up with a few
+   free GPUs and no node has 8. That state is called **fragmentation**: capacity that exists but no waiting pod can
+   use. One H100 GPU rents for several dollars an hour, so stranded GPUs are real money.
+
+So the core of the answer is a placement rule that avoids holes, plus an index that makes the rule fast.
+
+PracHub lists this as a Together AI tech screen, dated 2025-08-07 (<Cite id="s-3a3d9c8dba" />).
+
+### The problem as stated
+
+Nodes have GPU counts; pods have GPU requirements; pods can't be split; any GPU is as good as any other. Build
+APIs to add and remove nodes and pods, schedule, and report utilization. Choose best-fit or first-fit with a reason.
+Keep the index updated on every operation. Handle concurrency and idempotency, give per-API complexity, and cover
+the edge cases of an oversized pod and fragmentation.
+
+### Words you need first
+
+- **Best-fit**: put the pod on the node with the **fewest** free GPUs that still fits it.
+- **First-fit**: put it on the first node, in some fixed order, that has room.
+- **Spreading**: put it on the node with the **most** free GPUs.
+- **Idempotent**: calling the same operation twice has the same effect as calling it once. A network retry then
+  can't create a second placement.
+
+## Clarify first
+
+- **Node size and count.** "I'll assume at most 8 GPUs per node and thousands of nodes."
+- **One scheduler or several?** "Single process first; then I'll show what changes with schedulers in parallel."
+- **What should remove_node do with running pods?** "Reject, or move them? I'll move them, and not drop any."
+- **Is there a pending queue?** "Or does schedule fail fast when nothing fits?"
+
+## Answer
+
+### The data
+
+Three structures:
+
+- `nodes[name]`: total GPUs, used GPUs, its pods, a **version** number that goes up on every change, and whether
+  it is schedulable.
+- `pods[name]`: how many GPUs it needs, and which node it is on (or none).
+- `buckets[f]`: the set of schedulable nodes with **exactly f free GPUs**, for f = 0 to 8.
+
+The buckets are the whole trick. They turn "find the tightest node that fits" into at most nine set lookups.
+
+### The operations
+
+- **schedule_pod(p).** If p is already bound, return that binding (idempotent). Reject p if it needs more GPUs than
+  any node has in total. Otherwise, for f from p.gpus up to 8, take any node from `buckets[f]`. The first hit is
+  the best fit. Bind the pod, bump the node's version, and move the node from bucket f to bucket f − p.gpus.
+- **remove_pod(p).** Free its GPUs and move the node up the same number of buckets. An unknown pod returns
+  success, so retries are harmless.
+- **remove_node(n).** Mark it unschedulable, which takes it out of every bucket. Reschedule each of its pods
+  elsewhere. Delete the node when it is empty or a deadline passes. Pods that fit nowhere stay **pending** and are
+  reported, never dropped.
+- **utilization().** Keep running totals of used and total GPUs, so this is a division.
+
+### Follow one sequence of calls
+
+Four nodes, A to D, with 8 GPUs each. At the start, `buckets[8] = {A, B, C, D}` and every other bucket is empty.
+
+| Call | What the scheduler does | Buckets afterwards | What to say in the interview |
+|---|---|---|---|
+| schedule p1 (3 GPUs) | Buckets 3–7 are empty; bucket 8 has A. Take A. | A in [5]; B, C, D in [8] | "Nothing tighter exists, so an empty node is the best fit." |
+| schedule p2 (4 GPUs) | Bucket 4 empty, bucket 5 has A. Take A. | A in [1]; B, C, D in [8] | "Best-fit fills the half-used node first." |
+| schedule p3 (1 GPU) | Bucket 1 has A. Take A. | A in [0]; B, C, D in [8] | "A is full, and three whole nodes are still free." |
+| schedule p4 (8 GPUs) | Bucket 8 has B. Take B. | A, B in [0]; C, D in [8] | "Because we packed A, the 8-GPU pod fits immediately." |
+| schedule p2 again (a retry) | p2 is already bound to A. Return A. | unchanged | "Retries can't create a second binding." |
+| remove_pod p1 | Free 3 GPUs on A. | A in [3]; B in [0]; C, D in [8] | "Move the node up three buckets." |
+| remove_node C | C has no pods; mark it unschedulable and delete it. | A in [3]; B in [0]; D in [8] | "With pods on it, I'd move them first." |
+
+Now replay the first three calls with **spreading**. p1 goes to A, p2 goes to B (it has the most free), p3 goes to
+C. Now A, B and C each have a hole, only D is whole, and the next 8-GPU pod after p4 has nowhere to go.
+
+### Why best-fit
+
+Best-fit refills holes on half-used nodes and leaves empty nodes empty for large pods. First-fit is fine when every
+pod is the same size, and degrades as pods of mixed sizes come and go. Spreading is the worst choice for large pods.
+
+A bigger picture of the same effect: 40 one-GPU pods on 10 eight-GPU nodes. Packed, they fill five nodes and leave
+**five 8-GPU slots**. Spread four per node, they leave **none**. There are 40 free GPUs either way.
+
+Say it like this: "Total free GPUs is the wrong number. What matters is whether the waiting pod's shape fits on one
+node."
+
+### Concurrency
+
+Say the simple version first: **one lock around the index**. It is correct and easy to reason about.
+
+Then the version that scales: **compare-and-set on the node's version**. A scheduler reads node A at version 17,
+decides to place a pod there, and writes "bind p to A, only if A is still at version 17". If another scheduler got
+there first, A is now at version 18, the write fails, and the loser re-reads and tries the next bucket.
+
+If a scheduler crashes halfway through, the binding written to the store is the truth. The bucket index is just a
+cache of it and is rebuilt from the store on restart.
+
+### Complexity
+
+| API | Cost | Why |
+|---|---|---|
+| schedule | O(max GPUs per node), so at most 9 lookups | One hash-set lookup per bucket |
+| remove_pod | O(1) | Move one node between two buckets |
+| utilization | O(1) | Running totals |
+| list | O(n) | Has to visit every node |
+
+### What breaks at 10× traffic
+
+Listed on the PracHub page: at ten times the traffic, the single lock and any full scans break first. The metrics to
+watch are fragmentation, how long pods wait by size, and how often compare-and-set writes conflict.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Pod scheduler"
+  senior={["Bucket index, best-fit, idempotent schedule and remove, a drain that never drops pods."]}
+  staff={["Adds a fragmentation metric and a reservation rule for large pods, and a randomized test that checks no GPU is ever double-bound."]}
+/>
+
+In plain words: a Senior answer gets the index and the edge cases right. A Staff answer also measures fragmentation,
+reserves room when big pods starve, and proves with a randomized test that no GPU is ever handed out twice.
+
+## Small-team version
+
+Kubernetes already does this with the NVIDIA **device plugin** (a per-node agent that tells Kubernetes how many
+GPUs each node has) and pods that ask for GPUs as `nvidia.com/gpu` in their `limits`. A small team learns the
+semantics, including the surprising one: a pod with no GPU request sees **all** of the node's GPUs. Then it uses the
+stock scheduler or Kueue (a Kubernetes job-queueing add-on). Writing a custom scheduler is interview practice, not a
+product need.
+
+When does building one pay? One loaded engineer costs about **$16,190 a month**. A custom scheduler pays for that
+only if it recovers 10% of the GPU-hours of about **70 reserved H100s** at $3.19 an hour (Together, fetched 2026-10-11). Revisit past
+that size, or when large pods wait while free GPUs sit fragmented.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+70 GPUs × $3.19 × 730 hours a month ≈ $163,000; 10% of that ≈ $16,300, about one loaded engineer
+(the family walkthrough's break-even gives 16,190 ÷ (0.10 × 3.19 × 730) ≈ 70).
+
+</details>
+
+Say it like this: "Below about 70 GPUs I'd use the stock scheduler and learn its rules. A custom one costs an
+engineer."
+
+## Pitfalls
+
+- **Coding the happy path and running out of time.** Removal and concurrency are half the grade.
+- **A schedule retry that creates a second binding.** Check for an existing binding first.
+- **Removing a node before its pods have somewhere to go.** Pods that can't move stay pending and are reported.
+- **Treating "enough free GPUs in total" as "fits".** A pod needs all its GPUs on one node.
+
+## Go deeper
+
+- Family walkthrough: [the GPU-aware pod scheduler](/system-design-labs/interviews/walkthroughs/gpu-cluster-control-plane/#deep-dives).
+- Serving-side packing: [Run many models for many tenants](/system-design-labs/interviews/walkthroughs/multi-tenant-gpu-serving/).
+- Labs: <LabRef lab="container-orchestrator" inline />, <LabRef lab="dist-lock" inline />.

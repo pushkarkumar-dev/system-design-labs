@@ -1,0 +1,170 @@
+---
+question: infra-022
+family: concurrent-io-workers
+status: published
+labs: [embedding-pipeline]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "First I'll run the tests you gave me, to see what 'done' means. Then I'll read the spec into a list of
+> steps and get **one** image through every step and onto disk, and open it. Then all images, one after
+> another, until the tests pass. Only then I'll parallelize, and because image work is CPU-heavy I'll use
+> separate processes, not threads. One bad image gets reported, not allowed to stop the batch, and every
+> output is written to a temporary name and renamed, so a crash never leaves a half-written file."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see whether you can work inside an unfamiliar project, read a spec file, use a
+library you may not know, and get output on disk before you optimize.
+
+This question looks like a concurrency question, and that is the trap. Most of the hour goes to ordinary
+work: finding the spec, learning the image library's calls, and getting the steps right. Parallelism is the
+last ten minutes, not the first. And unlike a crawler, this work is **CPU-bound**: the time goes to computing
+pixels, not to waiting on the network. That changes which concurrency tool is right.
+
+The Staff candidate who reported it for Anthropic had expected a multithreaded algorithm question. They found
+a project with test cases, image files and a pipeline spec, had to look up a library, "never even got one
+image fully working end to end", and were rejected without feedback (<Cite id="s-e9fee3985a" />). The reason
+isn't known, but the lesson the report supports is plain: one image through every step comes first.
+
+## Clarify first
+
+Ask these, and write the answers down:
+
+- **Where is the spec, and what format is it in? Are there tests?** Run the tests before writing code.
+- **Which operations, and which library?** The report names rotate, invert, recolor, crop and format
+  conversion. Use the library the project already imports.
+- **Where do outputs go, and what are they called?** Overwrite existing outputs, or skip them?
+- **What happens on a corrupt image?** "I'll skip it and report it, unless you want the run to fail."
+- **How many images, how large?** This decides whether parallelism matters at all.
+
+## Answer
+
+### Words you need first
+
+- **CPU-bound** work spends its time computing. **I/O-bound** work spends its time waiting on a disk or
+  network.
+- **GIL** (global interpreter lock): Python lets only one thread run Python code at a time. Threads still
+  help I/O-bound work, because a waiting thread releases the GIL, but they don't speed up CPU-bound work.
+- **Process pool**: `ProcessPoolExecutor` starts several separate Python processes, each with its own GIL,
+  and hands each one tasks. This is how Python uses several CPU cores at once.
+- **Atomic rename**: `os.replace(tmp, dst)` makes the finished file appear under its real name in one step,
+  complete or not at all.
+
+### Order of work
+
+1. **Run the provided tests** to see what "done" means.
+2. **Parse the spec** into a list of `(operation, args)` steps. Reject unknown operations before processing
+   anything, so a typo in the spec fails in the first second instead of after an hour.
+3. **Write `process(src, dst, steps)`** and run it on **one** image. Open the result and look at it.
+4. **Loop over all images** one at a time, and make the tests pass.
+5. **Only then parallelize.**
+
+Say it like this: "I'm going to get one image all the way through and look at it before I write any
+concurrency."
+
+### The pipeline as a picture
+
+```
+Spec file ── parsed once into steps: [("rotate", ["90"]), ("invert", []), ...]
+   │
+   ▼
+List of input images ── one task per image
+   │
+   ▼
+Process pool (N processes) ── each runs process(src, dst, steps) on one image
+   │  read → apply each step → write dst.tmp → os.replace to dst
+   ▼
+Collector (as_completed) ── records each success, or the error for that one image
+   │
+   ▼
+Report: images written, images failed and why
+```
+
+**The spec parser** runs once, before any image work, and fails fast on anything it doesn't recognize.
+
+**The process pool** is where the CPU work happens. `process` must be a plain function of its inputs, so it
+can be sent to another process.
+
+**The collector** uses `as_completed`, which hands back each task as it finishes. It wraps each result in a
+`try`, so one corrupt image becomes one line in the report, not a crashed batch.
+
+**The atomic write** goes to a temporary name and is renamed at the end. If the run crashes halfway, a rerun
+never finds a half-written file that looks finished and skips it.
+
+### Follow one batch through it
+
+The family walkthrough ran this on 2026-10-12. Pillow (the usual Python image library) wasn't installed in
+the scratch environment, so that version used NumPy on PPM files, a very simple image format. The batch was 48
+random 1024×1024 images plus one truncated file, through rotate, invert, blur, grayscale and crop.
+
+| Setting | Time | What to say in the interview |
+|---|---|---|
+| One process | 0.92 s | "This is my baseline, and the tests already pass." |
+| Four processes | 0.32 s | "About three times faster with four cores." |
+| Eight processes | 0.24 to 0.26 s | "Smaller gains past four processes, so I would stop adding them here." |
+| The truncated file | reported, not fatal | "48 written, one listed as failed with its error." |
+
+A thread pool would not have produced that speed-up, because the GIL lets only one thread compute at a time.
+Say it like this: "Image transforms are CPU-bound, so in Python I use processes, not threads."
+
+### Structure for the follow-ups
+
+Keep the operations in a dictionary from name to function, so adding a step is one line. Keep `process` a
+pure function of its inputs, so it can move to a process pool, a queue worker or a GPU later without changes.
+Typical next pushes are a new operation, a much larger batch, or images arriving continuously; each is
+easy if the structure above is in place.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Image pipeline"
+  senior={["One image end to end early, then all images, then a process pool with per-image error handling and atomic writes."]}
+  staff={["Treats the spec as an interface: validates it up front, makes steps composable and outputs idempotent, and says when the bottleneck moves to disk or decode rather than compute."]}
+/>
+
+In plain words: a Senior answer works in the right order and handles failures. A Staff answer also treats the
+spec as a contract to validate, makes reruns safe (**idempotent**: running twice gives the same result as
+once), and notices when reading and decoding files, not the transforms, becomes the slow part.
+
+## Small-team version
+
+The same pipeline shape prepares uploads before a vision model (a model that reads images) sees them: resize,
+strip metadata, convert formats, then **embed** (turn into a list of numbers used for search) or caption. The
+actions:
+
+- **Use a process pool or a queue worker**, and key each output by a hash of the input's content, so a
+  re-upload of the same image is skipped.
+- **Send failures to a list you review**, not to a crash.
+- **If images arrive continuously** rather than in a batch, move the same `process` function behind a job
+  queue instead of building a bigger pool.
+
+Size it from the measurement: 0.92 s for 48 images on one process is about **19 ms an image**, so 100,000
+uploads a day is about **32 minutes of one core**. That holds for these synthetic 1024×1024 transforms;
+decoding and resizing real photos will differ. One small worker is enough until a measurement says otherwise.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Per image:** 0.92 s ÷ 48 ≈ 0.019 s ≈ **19 ms**.
+- **Per day:** 100,000 × 0.019 s ≈ 1,900 s ≈ **32 minutes** of one core.
+
+</details>
+
+## Pitfalls
+
+- **Building the concurrent framework before one image works.** It is the reported failure: an hour of
+  structure and no output on disk.
+- **Threads for CPU-bound Python work.** The GIL lets only one thread compute at a time, so they add
+  overhead and no speed.
+- **Letting one bad file crash the batch.** Catch errors per image and report them.
+- **Writing outputs in place.** An interrupted run then leaves a corrupt file, or one a rerun silently skips.
+
+## Go deeper
+
+- Family walkthrough: [Concurrent I/O workers](/system-design-labs/interviews/walkthroughs/concurrent-io-workers/), "The same shape, four more times".
+- Batching per worker for model calls: <LabRef lab="embedding-pipeline" inline />.
+- Background-job design when work arrives continuously: [GPU job queue](/system-design-labs/interviews/walkthroughs/gpu-job-queue/).

@@ -1,0 +1,188 @@
+---
+question: eng-055
+family: concurrent-llm-client
+status: published
+labs: [rate-limiter, load-balancer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll write a generator that fetches one page at a time and yields its items. Every page request goes
+> through one retry function, so a failed page in the middle is retried like any other call. The loop stops
+> when the server sends no next cursor, and it raises if the server ever repeats a cursor, so it can't loop
+> forever. The computation keeps a running total, so only one page is in memory at a time."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer is checking whether you can write correct, boring API plumbing quickly. Paging through an API
+sounds trivial. You have probably written it many times. The round is hard for a different reason: it is the
+first of several parts, and the follow-ups decide it.
+
+What makes this version different from a quick script is that it has to keep working when things go wrong:
+
+1. **A page can fail in the middle.** Page 3 of 5 returns a server error. A script that only retries the first
+   request dies there, and you lose the whole scan.
+2. **The server can misbehave.** If it ever hands back a cursor it already gave you, a naive loop runs forever.
+3. **The data can change while you read it.** Items inserted or deleted during the scan can make you see one
+   twice or miss one.
+4. **The answer is a computation, not a list.** "Sum this field over every item" doesn't need every item in
+   memory at once.
+
+This round was reported first-hand by a Sierra L5 candidate. They were rejected, and advise practising "API
+calls, error handling, retries, pagination" and JSON wrangling (<Cite id="s-aa5a42ddc5" />). The account
+gives no reason for the rejection, so read it as a speed-and-care round: the code is short, and the
+follow-ups decide it.
+
+## Clarify first
+
+Ask these in the first minute, and say your assumption for each:
+
+- **Cursor or offset?** "I'll assume an opaque `next_cursor` that is missing on the last page."
+- **What does a failed page return?** "I'll assume 5xx and 429 are worth retrying and other 4xx are not."
+- **Page size limits?** "I'll assume a `limit` parameter with a server maximum."
+- **What is the computation?** A sum, a group-by, a top-k? It decides whether you can stream through the items
+  or must hold state.
+- **Can the data change while you page?** "I'll assume yes unless you tell me otherwise."
+
+## Answer
+
+### Words you need first
+
+- **Pagination** is how an API returns a long list a few items at a time. You ask for one page, then the next.
+- A **cursor** is an opaque string the server returns with each page. It means "continue from here". You send
+  it back to get the next page. The last page has no cursor.
+- **Offset pagination** is the other style: "give me items 10 to 14". It is simpler, but it breaks when the
+  list changes during the scan.
+- A **generator** (here an async generator) is a function that hands back items one at a time with `yield`,
+  instead of building a whole list first.
+- **429** is the HTTP status "Too Many Requests": you went over the API's rate limit, often with a **Retry-After** header
+  saying how many seconds to wait. **5xx** statuses mean
+  the server had a problem. Both are usually worth retrying after a short wait.
+
+### The shape of the code
+
+```
+total_tokens()            ← the computation: a running total
+   │  async for item in ...
+   ▼
+iter_items()              ← the generator: one page at a time, follows the cursor
+   │  one call per page
+   ▼
+_request()                ← the one retry function: retry 5xx/429/timeouts, raise on other 4xx
+   │
+   ▼
+GET /v1/items?limit=5&cursor=...
+```
+
+**`total_tokens`** is the computation the interviewer asked for. It never sees pages, only items. **`iter_items`**
+owns the cursor and the stopping rule. **`_request`** owns every decision about failures, so a failed page is
+handled the same way as any other failed call. Keeping these three separate is what lets the next follow-up
+change one box instead of all three.
+
+### The code
+
+Write the generator first, and route every page through the retrying request function:
+
+```python
+async def iter_items(self, page_size=5):
+    cursor, seen = None, set()
+    while True:
+        params = {"limit": page_size} | ({"cursor": cursor} if cursor else {})
+        page = (await self._request("GET", "/v1/items", params=params)).json()
+        for item in page["items"]:
+            yield item
+        cursor = page.get("next_cursor")
+        if not cursor:
+            return
+        if cursor in seen:
+            raise RuntimeError(f"cursor {cursor!r} repeated")
+        seen.add(cursor)
+```
+
+Then compute with a running total, not a list: `total += item["tokens"]` inside `async for`. That keeps one
+page in memory. For a group-by, keep a dict keyed by the group. For a top-k, keep a heap of size k.
+
+### Follow one scan through it
+
+The family walkthrough's version of this ran on 2026-10-12 against a fake server with 23 items in pages of 5,
+where the page at cursor 10 fails once with a 503. Here is what happens, step by step:
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| Page 1 | No cursor yet. Items 0–4 come back with a next cursor. | "No cursor on the first call; the server tells me where to go next." |
+| Page 2 | Items 5–9, next cursor points at item 10. | "Each item goes straight into the running total." |
+| Page 3, attempt 1 | The server returns 503. | "This is a server hiccup, so `_request` waits a moment and retries." |
+| Page 3, attempt 2 | Items 10–14 come back. | "The generator never knew there was a failure." |
+| Pages 4–5 | Items 15–19, then 20–22 with no next cursor. | "No cursor means we're done, so the loop returns." |
+| Result | Ids 0–22 exactly once, the sum matches, exactly one retry. | "That's what the test checks: every item once, one retry." |
+
+### Four things to say while you type
+
+1. **Termination.** The loop ends on a missing cursor. The `seen` set turns a server bug (a repeated cursor)
+   into an error instead of an infinite loop.
+2. **Retries live in one place.** `_request` holds the outcome table: retry 5xx, 429 and timeouts with
+   full-jitter backoff (a random wait that grows after each failure) and a capped Retry-After; raise on other
+   4xx.
+3. **Consistency.** With offset pagination, an insert before your offset makes you see an item twice, and a
+   delete makes you skip one. A cursor tied to a sort key avoids that. With offsets only, deduplicate by id.
+   Say it like this: "With offsets I'd dedupe by id, because the list can shift under me."
+4. **Pages are sequential.** Each cursor comes from the previous page, so you can't fan out. If the API
+   offers offsets or id ranges, you can fetch pages in parallel behind a semaphore (a cap on how many calls
+   run at once), at the cost of the consistency problem above.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Pagination"
+  senior={["Writes a terminating, retrying generator and a streaming computation in a few minutes, with a test that injects a failed page."]}
+  staff={["Raises consistency under concurrent writes and the cost of a full scan, and asks whether the API should offer a snapshot cursor or an export endpoint instead."]}
+/>
+
+In plain words: a Senior answer works and is tested. A Staff answer also asks whether a full scan is the right
+tool at all. If the job reads the whole dataset every night, a bulk export or a snapshot cursor (one that
+reads the data as it was at a single moment) may be cheaper and more correct than paging.
+
+## Small-team version
+
+You will write this loop for every SaaS integration your AI features read from: CRM records, tickets,
+documents to index. Here is what to buy, what to build, and what it costs.
+
+- **Buy:** use the vendor's SDK paginator when it exists. It usually handles cursors and retries for you.
+- **Build:** a checkpoint (store the last cursor so a crashed sync resumes where it stopped), deduplication by
+  id, and a pacer at the vendor's documented rate limit, so a backfill doesn't lock your production
+  integration out.
+- **Delegate:** an agent can write the loop. You write the test that fails page 3, and the one that repeats a
+  cursor.
+
+Size the backfill before you start. With assumed numbers, 1M records at 100 per page take about **17
+minutes** of API calls, and embedding them afterwards (turning each record into a list of numbers for search)
+costs about **$10**. The API quota, not money, is the constraint. The answer changes if the vendor charges per
+call.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Requests:** 1M records ÷ 100 per page = 10,000 requests (assumed record count and page size).
+- **Time:** at an assumed vendor limit of 10 requests/s, 10,000 ÷ 10 = 1,000 s, about 17 minutes.
+- **Embedding cost:** 1M records × 500 tokens each (assumed) = 500M tokens. With text-embedding-3-small at
+  $0.02 per 1M tokens (fetched 2026-10-11): 500 × $0.02 = $10.
+
+</details>
+
+## Pitfalls
+
+- **Collecting every page first.** Building a list of all items before computing wastes memory when a running
+  total would do.
+- **Retrying only the first request.** A 503 in the middle of the scan then kills the whole job.
+- **No guard against a repeated cursor.** A single server bug turns into a loop that never ends.
+- **Ignoring writes during the scan.** With offset pagination, inserts and deletes make you double-count or
+  skip items.
+- **Spending 20 minutes here.** The round has four more parts; practise until this takes five.
+
+## Go deeper
+
+- Family walkthrough: [Concurrent LLM API client](/system-design-labs/interviews/walkthroughs/concurrent-llm-client/), stage 4 and the retry loop in stage 3.
+- The retry budget idea in Go: <LabRef lab="load-balancer" inline />. Server-side limits you will hit while paging: <LabRef lab="rate-limiter" inline />.
+- Sibling: the fallback-id variant, [eng-056](/system-design-labs/interviews/questions/eng-056/).

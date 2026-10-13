@@ -1,0 +1,172 @@
+---
+question: infra-007
+family: batcher-to-fleet
+status: published
+labs: [llm-inference, embedding-pipeline]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "In a simple batch, every input is padded to the longest one, and a batch of generated replies holds every slot
+> until the longest reply finishes. With 90% short replies and 10% long ones, only about 15% of the GPU's slots do
+> useful work. The cheap fixes are length buckets and a token budget per batch. For generation, the real fix is
+> continuous batching: when a reply finishes, a new request takes its slot at the next step. Then the limit
+> becomes GPU memory for each reply's cache, so admission has to check memory, not just free slots."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you understand why varying lengths waste a GPU, and whether you can put a
+number on the waste before proposing a fix.
+
+Some words first. Language models read and write text as **tokens**, roughly three quarters of a word each. A
+**prompt** is the input text; an **output** or reply is the text the model writes back, one token per step.
+A GPU runs many requests together in a **batch**, because one pass of the model over many inputs costs about the
+same as one pass over a single input.
+
+How this differs from batching in a normal backend:
+
+1. **A batch is a rectangle.** The GPU runs every input in a batch in lockstep, so shorter inputs are **padded**
+   (filled out with blanks) to the length of the longest. One long input sets the cost of the whole batch.
+2. **Replies end at different times.** A model writing replies runs one step for the whole batch at a time. In a
+   simple batch, a slot whose reply is finished sits empty until the longest reply in the batch is done.
+3. **Short requests wait behind long ones.** This is **head-of-line blocking**: a quick request is stuck in a
+   batch, or a queue, behind a slow one.
+
+The source is a Together AI prep article, not a candidate report. It says "Requests have wildly different prompt
+and output lengths" and asks how batching stays efficient "without head-of-line blocking". It adds that strong
+answers "reach for continuous batching and talk about the KV cache as the actual scarce resource"
+(<Cite id="s-9597947584" />). This page explains both of those terms.
+
+## Clarify first
+
+- **Do prompts vary, outputs vary, or both?** "Outputs matter more when the model is generating text, because
+  they decide how long a slot is held."
+- **What does the length distribution look like?** "I'll assume 90% of replies are 50 tokens and 10% are 1,000."
+- **Interactive or offline?** "Interactive means short requests have a latency budget I must protect."
+- **Can I change the serving engine, or only the layer in front of it?** The fixes differ.
+
+## Answer
+
+### Put a number on the waste
+
+**Padding, with one long input.** Take a batch of 99 inputs of 100 tokens and one input of 4,000 tokens. Every
+input is padded to 4,000. Only **3.5%** of the GPU's work is on real tokens.
+
+**Generation, with one batch of replies.** Now follow one static batch of 100 requests with the assumed mix: 90
+short replies of 50 tokens and 10 long ones of 1,000.
+
+| Step | What is happening | Busy slots | What to say in the interview |
+|---|---|---|---|
+| 1–50 | All 100 replies are being written. | 100 of 100 | "Full batch, full use." |
+| 51 | The 90 short replies are done. Their slots sit empty. | 10 of 100 | "In a static batch, a finished slot can't be reused." |
+| 51–1,000 | The 10 long replies keep the batch alive for 950 more steps. | 10 of 100 | "The batch runs as long as its longest reply." |
+| End | Over 1,000 steps, the average slot was busy for 145 of them. | **14.5%** overall | "Only about 15% of the GPU's slots did useful work." |
+
+A batch of 100 almost always contains at least one long reply (the chance it doesn't is about 0.00003), so this
+is the normal case, not bad luck.
+
+Say it like this: "A static batch runs as long as its longest reply. With this mix, about 85% of slot-steps are
+wasted."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Useful work in a static batch"
+  expr="efficiency = Σ len_i ÷ (b × max len_i)"
+  vars={[
+    { sym: 'len_i', meaning: 'length of input i in tokens' },
+    { sym: 'b', meaning: 'inputs in the batch' },
+  ]}
+  example={[
+    '99 inputs of 100 tokens + 1 of 4,000: 13,900 ÷ 400,000 = 3.5%',
+    'Generation, 90% at 50 / 10% at 1,000 tokens: mean 145, so slot occupancy ≈ 145 ÷ 1,000 = 14.5%',
+  ]}
+/>
+
+- Mean reply = 0.9 × 50 + 0.1 × 1,000 = 145 tokens.
+- Chance a batch of 100 has no long reply = 0.9¹⁰⁰ ≈ 0.00003.
+- Continuous-batching ceiling = longest ÷ mean = 1,000 ÷ 145 ≈ 6.9×.
+
+</details>
+
+### The fixes, cheapest first
+
+1. **Length buckets.** Separate queues for short, medium and long prompts, so a batch holds similar sizes.
+2. **A token budget per batch** instead of a request count, so one batch never holds more total work than you
+   planned for.
+3. **A separate pool** of GPUs for very long requests, so they can't stall the common case.
+4. **Continuous batching** for generation. When a reply finishes, its slot takes a new waiting request at the
+   very next step, instead of waiting for the whole batch to end. For the mix above, the most this can save is
+   the longest reply divided by the average, about **6.9×** fewer steps. A mock simulation run on 2026-10-12
+   counted steps for 10,000 requests through 100 slots and got **6.5–6.7×** fewer steps, with slot occupancy
+   rising from about 15% to about 96%. It counts steps, not GPU time.
+5. **Chunked prefill.** Before writing a reply, the model reads the whole prompt in one big pass, called
+   **prefill**; writing the reply token by token is called **decode**. A very long prompt read in one go stalls
+   every other user's next token. **Chunked prefill** reads it in slices between decode steps, so others keep
+   getting tokens.
+
+Say it like this: "I'd bucket by length in front of the engine, and inside it I'd use continuous batching. The gain
+is roughly longest over average, so I'd derive it from our traffic instead of quoting a number."
+
+### Then the KV cache becomes the limit
+
+While a reply is being written, the GPU keeps saved intermediate results for every earlier token of that reply,
+so it doesn't redo them at each step. This is the **KV cache**. It grows with every token and stays in GPU memory
+until the reply finishes.
+
+Once continuous batching keeps every slot busy, slots are no longer the scarce thing; memory is. Long replies hold
+more KV memory for longer. So admission must check two things before letting a request in: is there a free slot,
+and is there enough memory for its cache to grow? When memory runs out mid-reply, the engine **preempts** a
+request: it pauses one, throws away its cache, and recomputes it later.
+
+Derive any gain from your own length distribution. Sources quote everything from about 2× to 20×.
+
+Two delays users feel are worth naming. **TTFT** (time to first token) is how long until the reply starts; a long
+prefill in front of you raises it. **ITL** (inter-token latency) is the gap between tokens after that; a long
+prefill running beside you raises it, which is what chunked prefill fixes.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Varying lengths"
+  senior={["Quantifies padding waste, buckets by length and proposes continuous batching for generation."]}
+  staff={["Derives the gain ceiling from the length distribution, moves admission to a KV-memory budget, and explains the TTFT and ITL effects of chunked prefill."]}
+/>
+
+## Small-team version
+
+You get continuous batching and chunked prefill from the vLLM serving engine by default, according to its docs
+(dated 2026-08-20). What you own is measurement. Log prompt and output lengths, look at the distribution, and set
+the engine's sequence and token limits from it. For **embedding** backfills you run yourself (turning documents
+into numbers for search), sort or bucket texts by length before batching. It costs a few lines and removes most
+padding.
+
+The money only matters if you pay for the GPU. On a hosted API you pay per token, and padding is the provider's
+problem. On one self-hosted NVIDIA L4 (a small data-centre GPU) at RunPod's $0.44 an hour, about **$321 a month**
+(fetched 2026-10-11), a batch running at 50% useful work means about **$160 a month** buys padding. At the 3.5%
+example above, almost all of it does.
+
+Revisit the engine's limits when the length distribution shifts, for example after a new feature starts sending
+long documents.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+$0.44 × 730 hours ≈ $321 a month. At 50% useful work, about $321 × 0.5 ≈ $160 pays for padding.
+
+</details>
+
+## Pitfalls
+
+- **Quoting a fixed continuous-batching multiplier.** The gain depends on the length mix; derive it.
+- **Bucketing too finely.** Each bucket gets so little traffic that its batches never fill.
+- **Forgetting the KV cache.** Long requests hold memory for their whole reply and can block admission.
+
+## Go deeper
+
+- Family walkthrough: [From one GPU batcher to a fleet](/system-design-labs/interviews/walkthroughs/batcher-to-fleet/), "Head-of-line blocking when lengths vary".
+- The scheduler in code: [Continuous batching](/system-design-labs/interviews/walkthroughs/continuous-batching/).
+- <LabRef lab="llm-inference" inline /> for a toy batched engine; <LabRef lab="embedding-pipeline" inline /> for measured batching of short versus chunk-length texts.

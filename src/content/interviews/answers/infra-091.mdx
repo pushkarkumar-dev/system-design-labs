@@ -1,0 +1,198 @@
+---
+question: infra-091
+family: distributed-training
+status: published
+labs: [transformer, lora-finetune]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Training needs about 16 bytes of GPU memory per parameter, so this 46.7-billion-parameter model needs 747 GB of
+> state and must be split. I'd put one expert per GPU inside each 8-GPU machine, so the experts' token traffic stays
+> on the fast links, copy that layout across the 32 machines, and split the optimizer's memory so each GPU holds
+> about 31 GB. That run takes about 28 days. On 1,024 GPUs it takes about 7, but the gradient exchange between
+> machines stops hiding behind the math, so it costs the same GPU-hours at best and more if utilization drops."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see you turn a hardware budget and a model shape into a plan using arithmetic: memory per
+GPU and bytes per link. The hardware is 256 A100 GPUs in 32 machines of 8. GPUs inside a machine talk over very fast
+links; machines talk over a much slower network.
+
+### What makes this different from a batch job you've run
+
+A Spark or MapReduce job is a pile of independent tasks. If a worker is slow or dies, only its task is affected.
+Training a large model is one program running on all 256 GPUs in lockstep. Every training step ends with all GPUs
+exchanging results, so the slowest link sets the pace for everyone. And the model's state is far bigger than one
+GPU, so you must decide how to split it. Those two facts, memory and traffic, drive every choice below.
+
+### Words you need first
+
+- **Parameter**: one number the model learns. Each takes 2 bytes in the usual 16-bit format, **bf16**.
+- **Training step**: run a batch through the model (**forward pass**), work out which way each parameter should
+  move (**backward pass**, producing **gradients**), then let the **optimizer** (Adam) update the parameters.
+- **Mixture of Experts (MoE)**: a model where part of each layer comes in several copies called **experts**, and a
+  small **router** sends each token (about ¾ of a word) to only a few of them. Here, 8 experts and **top-2**
+  routing.
+- **NVLink**: the direct GPU-to-GPU link inside one machine, called a **node**.
+
+This question is from PracHub's write-up of a Meta onsite question; only the title is candidate-reported, and the
+requirement list is the site's (<Cite id="s-40368f3e05" />).
+
+## Clarify first
+
+Say each assumption out loud:
+
+- **Model shape?** "I'll assume Mixtral 8x7B's published shape: 46.7B parameters in total, 12.9B active per token,
+  hidden size 4,096, 8 experts, top-2." (Mistral's
+  [announcement](https://mistral.ai/news/mixtral-of-experts) and
+  [config.json](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/raw/main/config.json), fetched 2026-10-12.)
+- **Network?** "Is 200–400 Gbps per node or per GPU? I'll assume per node, so 25–50 GB/s each way."
+- **Batch?** "What global batch have the researchers validated? I'll assume 4M tokens per step." (Researchers tune
+  this; it changes how the model learns, so you can't change it freely.)
+- **Budget and deadline?** "About 1T tokens per the write-up. When must it finish?"
+- **Storage and spares?** "I'll assume 100 GB/s for checkpoints. Are there spare nodes?"
+
+## Answer
+
+### Follow the plan, one number at a time
+
+| Step | The number | What to say in the interview |
+|---|---|---|
+| 1. Compute | about 28 days on 256 GPUs, 172,000 GPU-hours | "Assuming 40% utilization, which is good but realistic." |
+| 2. Memory, whole model | 747 GB | "16 bytes per parameter. It has to be split." |
+| 3. One expert per GPU in each node | 116 GB per GPU | "Still too big for 80 GB." |
+| 4. Split the optimizer state too | about 31 GB per GPU | "Fits, with room for the batch's working data." |
+| 5. Expert traffic | 0.1 s per step on NVLink | "Across the network it would be 4.8 s. Experts stay in the node." |
+| 6. Gradient traffic | 3.6–7.2 s per step | "Hidden behind 10 s of math at 256 GPUs." |
+| 7. Scale to 1,024 | math falls to 2.5 s, traffic stays 3.7–7.4 s | "Now the network is the bottleneck." |
+
+**Compute.** Training costs about 6 floating-point operations (**FLOPs**) per active parameter per token. A GPU never
+reaches its advertised peak; the share of peak spent on useful model math is called **MFU** (model FLOPs
+utilization). At an assumed 40%, the run takes **about 28 days**.
+
+**Memory.** Each parameter needs 2 bytes of weight, 2 bytes of gradient, and 12 bytes of optimizer bookkeeping (a
+32-bit master copy and Adam's two running averages). That is **16 bytes per parameter**, from the ZeRO paper, and
+747 GB for the whole model.
+
+The plan uses two splits. **Expert parallelism (EP = 8)** puts one of the 8 experts of every layer on each GPU in a
+node. **Data parallelism (DP = 32)** copies that layout to all 32 nodes, each training on different data. That still
+leaves 116 GB per GPU. So add **ZeRO-1**: GPUs that hold identical copies of some weights each keep only a slice of
+the optimizer state for them. That brings model state to **about 31 GB**, with room left for the batch's working data
+(with **selective recomputation**, which discards some intermediate results and recomputes them later to save
+memory).
+
+**No tensor parallelism.** Tensor parallelism splits each layer's matrix math across GPUs. It needs two exchanges
+forward and two backward in every layer. At this model's width (4,096) that traffic would cost about **39%** of the
+math time even on NVLink. It pays only for much wider models.
+
+**Collectives.** A **collective** is an operation where every GPU contributes data and gets a combined result. Name
+one for each split. **All-to-all** moves tokens to their experts and back, inside the node. **Reduce-scatter** and
+**all-gather** average the gradients and share the optimizer slices, across nodes. Point-to-point sends appear only
+if you add pipeline stages.
+
+**Expert traffic.** Each GPU sends about 30 GB per step to the other GPUs holding the experts its tokens chose. Over
+NVLink at 300 GB/s each way that is **0.1 s**. If the experts sat on different nodes, the same traffic would take
+about **4.8 s** per step through a 50 GB/s network.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Compute: 6 × 12.88 × 10⁹ × 10¹² = 7.7 × 10²² FLOPs. 256 × 312 × 10¹² (A100 dense bf16 peak) × 0.4 =
+  3.19 × 10¹⁶ FLOP/s → about 28 days, 172,000 GPU-hours.
+- Memory: 16 × 46.7 × 10⁹ = 747 GB. Per GPU: shared layers 1.61B, one expert per layer 5.64B. Unsplit:
+  16 × 1.61B + 16 × 5.64B = 116 GB. ZeRO-1: 4 × 1.61B + 12 × 1.61B ÷ 256 + 4 × 5.64B + 12 × 5.64B ÷ 32 ≈ 31 GB.
+
+<Formula
+  title="MoE all-to-all per GPU per step"
+  expr="bytes ≈ tokens × MoE layers × 4 × k × hidden × 2 B"
+  vars={[
+    { sym: '4', meaning: 'dispatch and combine, forward and backward' },
+    { sym: 'k', meaning: 'experts per token' },
+  ]}
+  example="16,384 × 32 × 4 × 2 × 4,096 × 2 B = 34.4 GB; 7/8 leaves the GPU → 0.10 s on NVLink at 300 GB/s, about 4.8 s per node if it crossed a 50 GB/s network"
+/>
+
+16,384 tokens per GPU is the 4M-token batch divided by 256 GPUs.
+
+</details>
+
+### Expert capacity: what happens when routing is uneven
+
+Each expert gets a fixed number of slots per step, its **capacity**: tokens × top-k ÷ experts, times a headroom
+multiplier called the **capacity factor** (CF). Tokens beyond capacity are dropped: they skip that expert. With the
+32,768 tokens a node exchanges per step, each expert's fair share is **8,192 slots**; at CF 1.25, **10,240**.
+
+Add the Switch Transformer paper's extra **load-balancing loss**, which penalizes uneven routing, and keep the
+router's math in 32-bit floats. Then alarm on the share of dropped tokens. A capacity factor absorbs noise, not
+collapse: an expert getting 8.5× its share drops **85%** of its tokens at CF 1.25.
+
+Say it like this: "Capacity factor is headroom for noise. If one expert gets most of the traffic, that's a router
+collapse, and I treat it as a training incident."
+
+### Checkpointing
+
+A **checkpoint** saves everything needed to resume. Here that is 14 bytes per parameter (the gradients are left
+out), **654 GB**, plus the data loader's position. Each GPU writes its own piece in the background. The interval
+comes from a classic formula: about the square root of (2 × the pause per checkpoint × the mean time between
+failures).
+
+### Scaling to 1,024 GPUs
+
+This is the "controlling cost" half. Averaging gradients across nodes uses a **ring all-reduce**, where each node
+sends about twice its gradient size no matter how many nodes join: 181–185 GB per step, **3.6–7.4 s**. Meanwhile the
+math per GPU falls from **10.1 s to 2.5 s**, because each GPU gets a quarter of the batch. The network time no
+longer fits behind the math, so MFU falls and GPU-hours rise. Dropping from 40% to 30% MFU costs about **33% more**.
+
+Say it like this: "More GPUs buy calendar time, not fewer GPU-hours. At a fixed batch, the bigger cluster waits on
+the network."
+
+The fixes, cheapest first: a larger global batch the researchers have validated, overlapping the gradient exchange
+with the backward pass, pipeline stages across pairs of nodes (halving each node's gradient bytes), then a faster
+network.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Ring all-reduce sends 2(N − 1) ÷ N × S per node. S = 2 B × 46.7B = 93.4 GB. 32 nodes: 181 GB → 3.6 s at
+  50 GB/s, 7.2 s at 25 GB/s. 128 nodes: 185 GB → 3.7 / 7.4 s.
+- Math per GPU at 256 GPUs: 6 × 12.88 × 10⁹ × 16,384 = 1.27 × 10¹⁵ FLOPs ÷ (312 × 10¹² × 0.4) ≈ 10.1 s; a quarter
+  of that at 1,024 GPUs, 2.5 s.
+- Capacity: 32,768 × 2 ÷ 8 = 8,192; × 1.25 = 10,240. Dropped share at 8.5×: 1 − 1.25 ÷ 8.5 = 85%.
+- Checkpoint: 14 × 46.7B = 654 GB.
+- 1,024 GPUs at 30% MFU: 229,000 GPU-hours against 172,000 at 40%, about 33% more.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="MoE pretraining"
+  senior={["Derives the 31 GB per-GPU plan, keeps EP on NVLink, sets capacity and balancing loss."]}
+  staff={["Shows the 1,024-GPU run is network-bound at a fixed batch, prices it in GPU-hours, and asks whether the deadline is worth 33% more spend."]}
+/>
+
+## Small-team version
+
+A 50–500 person company doesn't pretrain MoE models. The realistic version is **fine-tuning** (continuing to train
+an existing open model on your own examples) or **LoRA** (training a small add-on while the original weights stay
+frozen) on a 7–8B model, on one machine or through a managed API. The GPU bill for 150M training tokens is tens of
+dollars.
+
+What transfers from this question is the habit: compute memory per GPU and FLOPs before renting anything, checkpoint
+with a resume path you have tested, and gate the result with an eval.
+
+## Pitfalls
+
+- **Using sparse or missing peaks.** The H100 page's TFLOPS figures assume sparsity and must be halved, and the A100
+  has no 8-bit floating-point (FP8) units at all.
+- **Spreading experts across nodes without pricing it.** The all-to-all goes from 0.1 s to 4.8 s per step.
+- **Expecting 4× faster at 1,024 GPUs.** At the same global batch, per-node gradient traffic doesn't shrink.
+- **Treating capacity factor as the fix for router collapse.** It only absorbs noise.
+
+## Go deeper
+
+- Family walkthrough: [Distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/), especially its back-of-envelope and MoE deep dive.
+- Count optimizer-state bytes in a real training loop: <LabRef lab="transformer" inline />. The small-team job: <LabRef lab="lora-finetune" inline />.

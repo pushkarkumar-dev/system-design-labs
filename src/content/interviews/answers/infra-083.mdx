@@ -1,0 +1,164 @@
+---
+question: infra-083
+family: design-doc-critique
+status: published
+labs: [llm-inference, observability]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll treat this as a review, not a redesign. First I'll restate the goal and walk one request through it, then
+> one that fails. Then I'll look at capacity, overload, failure, mixed workloads and monitoring. I'll come back
+> with the three changes that matter most, each with a test that proves it and an owner, and I'll leave the parts
+> that work alone."
+>
+> The rest of this page explains each part of that answer.
+
+Can you lead a review conversation about an unfinished design? You are shown a partly built system for running a
+machine-learning model, and asked to walk through it, critique it and suggest improvements. The skill is judgment
+and communication more than calculation.
+
+How is this different from a normal system-design round? In a blank-sheet round you choose every box. Here the
+author has already made choices, some of them for reasons the doc doesn't state. Your job is to find the two or
+three choices that will cause trouble, explain why, and propose the smallest change that fixes each one, while
+keeping the author on your side.
+
+It also helps to know what's special about this kind of system. **Inference** means running a trained model to
+get an answer. It runs on GPUs (graphics processors used for a model's heavy math), which are expensive and can't
+be added quickly when traffic grows. To use them well, the service groups requests into a **batch** and runs the
+group in one go. **Batch inference** usually means large offline jobs (scoring a million documents overnight), as
+opposed to interactive requests where a user is waiting. Most findings in this round come from those facts:
+scarce hardware, grouped work, and two kinds of traffic competing for it.
+
+An Anthropic engineering-manager (EM) candidate for data infrastructure expected a blank-sheet design. Instead,
+"they showed me a partially built design and asked me to review it", on inference and batch inference. The prompts
+were to walk the end-to-end flow, critique it, name the weak points and suggest improvements. The candidate found
+it "much more about design judgment, communication, and review skills than deep calculations"
+(<Cite id="s-4e3dc29a95" />). That loop ended in rejection, and the written feedback cited the people-management
+round, not this one.
+
+## Clarify first
+
+- **What is the design for: interactive inference, offline batch inference, or both?** Both on one fleet is often
+  the biggest finding.
+- **What is already built, and what is still open?** Spend your review on decisions that can still change.
+- **Which constraints are fixed?** Hardware, budget, deadline.
+- **Who owns the design?** Agree how you'll give feedback before you start.
+
+Say it like this: "Before I start: which parts are built and which are still open? I'd rather spend our time on
+decisions that can still change."
+
+## Answer
+
+Run a review, not a redesign. Here is an example design to practise on (invented, with the usual gaps):
+
+```
+Interactive callers          Nightly batch jobs
+        │                            │
+        └──────────┬─────────────────┘
+                   ▼
+            One shared queue ─── no size limit
+                   │  every 100 ms, up to 32 requests
+                   ▼
+              Dispatcher ─────── one process
+                   │
+                   ▼
+              GPU workers ────── monitored by GPU utilization only
+```
+
+**Interactive callers** are services waiting for an answer within about a second. **Nightly batch jobs** submit
+millions of requests and don't care when each one finishes. Both feed **one shared queue**, which has no size
+limit. The **dispatcher** is a single process that every 100 ms takes up to 32 requests and sends them to a
+**GPU worker**. The only monitoring is how busy the GPUs are.
+
+### Follow the review through 30 minutes
+
+The family walkthrough's six-step method, compressed to five here (the capacity math folds into the lenses),
+applied to the example with a rough clock:
+
+| Clock | Step | What you find in the example | What to say in the interview |
+|---|---|---|---|
+| 0–3 min | **1. Restate** the goal and key numbers | Serve interactive requests fast and finish nightly jobs by morning | "So the goal is fast answers by day and a finished batch by morning. Is that right?" |
+| 3–10 min | **2. Walk the flow**, then a failure at each hop | An interactive request lands behind a million batch requests | "At 2 a.m. the batch job fills the queue, and an interactive request waits behind all of it." |
+| 10–20 min | **3. Weak points** through five lenses | See the list below | "Let me go through capacity, overload, failure, mixed workloads and monitoring." |
+| 20–25 min | **4. Rank** by incident risk | Mixed queue, unbounded queue, no lease | "Three of these cause incidents. The rest are improvements." |
+| 25–30 min | **5. Narrow changes**, each with a test and owner | See the list below | "Here's what I'd change, how we'd know it worked, and who'd own it." |
+
+The five lenses in step 3, applied to the example:
+
+- **Capacity:** sizing done at the maximum batch and 100% utilization (the fraction of time a GPU is busy), so
+  there is no headroom for a burst.
+- **Overload:** an unbounded queue, no admission control (nothing decides at the door whether to accept a
+  request), and retries at several layers that multiply load.
+- **Failure:** no **lease** on in-flight batches (a time-limited claim that returns the batch to the queue if the
+  worker dies), a single dispatcher, and poison inputs that crash worker after worker.
+- **Mixed workloads:** offline batch jobs competing with interactive traffic, or several models sharing one queue.
+- **Observability:** only GPU utilization, with nothing on queue wait or rejections. A GPU at 100% could be
+  healthy or drowning.
+
+The narrow changes in step 5, each with how you'd verify it:
+
+- **A separate deep queue for offline batch inference,** running on spare capacity. Verify: interactive p99 stays
+  flat while a nightly job runs.
+- **Time-bounded interactive queues** that reject early with a "retry later" once the estimated wait passes the
+  budget. Verify: replay at twice peak traffic.
+- **Leases and requeue.** Verify: kill a worker mid-batch in staging and check no request is lost.
+- **Queue-wait and rejection metrics.** Verify: they're on the dashboard before launch.
+
+### How to say it
+
+Lead with the outcome and the three changes, then take questions: "The biggest risk is that a nightly job can
+starve interactive users. I'd split the queues, bound the interactive one by time, and lease batches. Everything
+else is secondary."
+
+Write comments the way a Fireworks prep guide describes a useful one: it "names behavior, a reproducer and a
+narrow change" (<Cite id="s-b6632d5df9" />). For example: "When the nightly job starts, interactive p99 goes past
+1 s (reproduce by starting the job during a load test); give batch work its own queue."
+
+Ask why before asserting, because the author may know a constraint the doc omits: "Was one queue a deliberate
+choice? Maybe the batch volume is smaller than I'm assuming."
+
+As an EM, also say who would own each fix and in what order: "Queue split first, owned by the serving team,
+because it's the biggest risk. Leases second. Metrics alongside both, owned by whoever is on call."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Half-built design"
+  senior={["Walks the flow, finds the main overload and failure gaps, and proposes concrete fixes."]}
+  staff={["Runs the review as a conversation, ranks by risk, sequences fixes with owners and verification, and leaves the author's structure intact where it works."]}
+/>
+
+In plain terms: a Senior reviewer finds the right problems and fixes them. A Staff reviewer (or an EM) also runs
+the conversation, decides the order of work and who does it, and doesn't rebuild the parts that are fine.
+
+## Small-team version
+
+On a small team, design review is informal: one other engineer, a half-page template and 30 minutes. A design doc
+drafted with an AI assistant can read confidently and still skip the failure paths. Keep a checklist:
+
+- A timeout on every external call.
+- Retries at one layer only.
+- A bound on every queue.
+- Spend caps on calls priced per token (the unit, about three-quarters of a word, that model providers bill by).
+- A fallback provider.
+- Three named metrics.
+- A cost comparison in the cost section: what the same work costs from a provider versus on your own GPUs.
+
+Say it like this: "I'll spend 30 minutes with the checklist; if it passes all seven, ship it."
+
+## Pitfalls
+
+- **Treating it as a blank-sheet design round.** You were asked to review; rebuilding the design throws away the
+  author's decisions and the time you have.
+- **Detailed calculations at the expense of judgment.** The format rewards ranking and communication; a long
+  calculation eats the time you need for both.
+- **Unranked, vague feedback.** "This won't scale" gives the author nothing to act on; name the behaviour and the
+  change.
+
+## Go deeper
+
+- Family walkthrough: [Critique a batch-inference design doc](/system-design-labs/interviews/walkthroughs/design-doc-critique/), "A review method you can run in 30 minutes" and "Saying it like a reviewer".
+- Review a real small engine: <LabRef lab="llm-inference" inline />. Metrics a doc should promise: <LabRef lab="observability" inline />.

@@ -1,0 +1,196 @@
+---
+question: r2a-021
+family: kv-store-durable-log
+status: published
+labs: [wal, kafka-lite, kv-cache, lsm-kv]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Forcing the log to disk takes milliseconds, so one thread can only commit a few hundred times a second. I'll
+> let one background thread own the log file. Writers add their record to an open batch and wait; the thread
+> writes the whole batch, forces it to disk once, and wakes everyone in it. While one flush runs, the next batch
+> fills, so the batch grows with the load on its own. Each caller waits a little longer, but throughput goes up
+> by the batch size. And the store's lock is never held while waiting for the disk."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+This is the write path of a storage engine. You know that databases write a log before they change data. The new
+part is the cost model: **the scarce resource is not CPU or memory but the drive's flush time**, and many
+callers have to share it.
+
+Three things make it different from ordinary concurrent code:
+
+1. **The slow step is shared, not parallel.** Forcing data onto the drive is a system call named `fsync`. Ten
+   threads calling it at once do not get ten times the work done. They queue behind the same drive.
+2. **"Done" means "on the drive".** You cannot return to a caller before its record has been forced to disk, so
+   every caller's latency includes at least one flush.
+3. **Locks interact with the disk.** If you hold the store's lock while waiting for the flush, every writer waits
+   in single file, and batching is impossible.
+
+The evidence is one first-hand Staff account from a Databricks AI platform team loop. The low-level design round
+asked about "WAL log batch writes"; an added round was switched to the same topic; and in a key-value store round,
+"I finished the basic implementation and locking, and then batch write came up again" (<Cite id="s-d6af500d84" />).
+The candidate reports no LLM questions in the loop and no offer, and gives only their own reading of why. The
+lesson: AI platform roles can be storage interviews.
+
+## Clarify first
+
+Spend a minute on the contract. Say your assumptions out loud:
+
+- **What "written" means.** "In memory, handed to the operating system, or forced to disk? I'll assume forced to
+  disk before the call returns."
+- **Load.** "How many writers, and how big are records? I'll assume many threads and small records."
+- **Latency budget.** "Is a few milliseconds per write fine? Then there is room to batch."
+- **Ordering.** "Per writer, or one global order? I'll assume a global sequence number."
+- **Growth.** "Can the log grow forever? I'll assume checkpoints and segment files come later."
+
+## Answer
+
+### Words you need first
+
+- **fsync** forces a file's bytes from the operating system's memory onto the drive, and waits until they are
+  there. It is the expensive step: about 5 ms on the machine used in the family walkthrough.
+- A **write-ahead log** (WAL) is an append-only file where every change is recorded, and forced to disk, before
+  it is acknowledged.
+- **Group commit** means making several writers' records durable with one shared fsync.
+- The **flusher** is the one background thread that owns the log file and does the writing.
+- **Backpressure** means making producers wait when the system is full, instead of letting a queue grow without
+  limit.
+
+### The picture
+
+```
+ writer threads (many)
+      │ 1. append framed record to the OPEN batch, then wait on that batch
+      ▼
+┌──────────────────────────┐
+│ open batch               │  fills while the previous flush is running
+└──────────────────────────┘
+      │ 2. flusher swaps it for an empty batch
+      ▼
+┌──────────────────────────┐
+│ flusher thread           │  3. one write() + one fsync() for the whole batch
+└──────────────────────────┘
+      │ 4. wake every writer in that batch
+      ▼
+ writers return: their records are durable
+```
+
+**The writers** never touch the file. They add a **framed** record (length, CRC32 checksum, payload) to the open
+batch and block. **The open batch** is where records collect; it has a byte cap, and when it is full, writers
+wait (backpressure). **The flusher** takes the whole batch, writes it in one call, forces it once and wakes
+exactly that batch's writers. Because the next batch fills while the current flush runs, the batch size follows
+the load without any timer.
+
+### Follow one write through it
+
+Picture a credit-tracking service. Alice sends Bob 30 credits while 255 other threads are also writing.
+
+| Moment | What happens | What to say in the interview |
+|---|---|---|
+| t = 0 | The transfer's record joins the open batch, behind about 124 others that arrived during the current flush. | "Batch size equals the writers who arrived during one flush." |
+| ≈ 5 ms | The current flush ends. The flusher swaps in an empty batch and starts writing ours. | "The new batch starts filling right away." |
+| ≈ 10 ms | One fsync makes all 125 records durable. All 125 callers wake. | "125 commits for the price of one fsync." |
+| after | The transfer's `commit` returns. | "Acknowledged means durable." |
+
+In this simple model, each caller waits between one and two flush times, about **5–10 ms**, and throughput is
+about **25,000 writes a second** instead of 200.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="What batching buys"
+  expr="throughput ≈ B ÷ t_sync     caller wait ≈ up to 2 × t_sync"
+  vars={[
+    { sym: 'B', meaning: 'records per fsync (roughly the writers waiting during one fsync)' },
+    { sym: 't_sync', meaning: 'one write plus fsync' },
+  ]}
+  example="Assumed t_sync = 5 ms: B = 1 gives 200/s; B = 100 gives 20,000/s, each caller waiting 5–10 ms."
+/>
+
+With B = 125: 125 ÷ 0.005 = 25,000 a second. The wait bound comes from a caller arriving just after a flush
+starts: it waits for that flush (up to t_sync), then for its own (t_sync).
+
+</details>
+
+The assumption matches a run in the family walkthrough on an M1 Ultra (2026-10-12). Forcing each append to disk
+on its own (`F_FULLFSYNC`, the macOS call that also flushes the drive's cache) gave 193–205 appends a second.
+Group commit with 256 threads batched about 125 records per fsync and gave 12,500–19,900 a second, with a median
+caller latency of 11–19 ms. Python's thread overhead is one reason the measured wait is above the model's 10 ms.
+
+Say: "Batching bought roughly 60 to 100 times the throughput, and each caller waited two to four times longer.
+That's the trade I'd make for a log."
+
+### What else to say in the design round
+
+- **A byte cap per batch**, for memory and backpressure.
+- **Fail-stop on errors.** If a write or fsync fails, fail every waiting caller, refuse new writes, restart and
+  recover. Never retry the fsync.
+- **Recovery** cuts off a torn record at the end of the log before accepting new writes.
+- **Checkpoints** save a snapshot and let you delete old log segments.
+
+### The coding round: locking, then batch writes
+
+Now put a key-value store on top. Lock the store for the in-memory part only. Under the lock, assign the
+sequence number (LSN), submit the record to the log and apply it in memory. Outside the lock, wait for the
+batch's fsync.
+
+```python
+def write(self, writes):
+    with self._lock:
+        self.lsn += 1
+        batch = self.log.submit(encode_ops(self.lsn, writes))  # log order = LSN order
+        self.kv._apply(writes)
+    batch.wait()        # durable before we acknowledge
+    return self.lsn
+```
+
+Why this order? Submitting under the lock keeps log order equal to LSN order, so replay rebuilds the same state.
+Waiting outside the lock lets the next writer join the same batch. If you held the lock across the fsync, every
+writer would wait in single file behind the disk, and batches would never be bigger than one.
+
+A batch-write API, `write_batch(items)`, becomes one log record, so it is all-or-nothing on disk.
+
+One trade-off to state: another thread may read a value a moment before it is durable. If that matters, publish
+writes to readers only after the durable LSN passes them.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Batched WAL writes"
+  senior={["A working group-commit writer with framing, recovery, backpressure and a lock that excludes the fsync."]}
+  staff={["Starts from the durability contract and the cost model, states the latency price of batching, treats fsync errors as fail-stop, and covers checkpoints, segments and the visibility-before-durability choice."]}
+/>
+
+In plain words: a Senior candidate builds group commit correctly. A Staff candidate starts from what "written"
+means, puts numbers on both sides of the trade, and decides whether readers may see writes before they are
+durable.
+
+## Small-team version
+
+You will tune this, not build it. Postgres already forms commit groups, and its `commit_delay` knob helps only
+"when there are some concurrently committing transactions" and throughput is limited by commit rate
+([PostgreSQL 18 docs](https://www.postgresql.org/docs/current/wal-configuration.html)). For a high-volume trace
+table, setting `synchronous_commit = off` per transaction trades a bounded loss window for throughput.
+
+So: keep the defaults; measure commit rate before touching either knob; hand-roll a log only for a local spool,
+and test it with `kill -9` first.
+
+## Pitfalls
+
+- **Holding the store lock across fsync.** Every writer waits in line and batches never form.
+- **A fixed timer instead of flushing when the previous fsync completes.** It makes a lone writer wait for nothing, while
+  flushing as soon as the disk is free already sizes batches to the load.
+- **Retrying a failed fsync.** It can report success for data that never reached disk.
+- **No bound on queued bytes.** A slow disk turns into unbounded memory growth.
+- **Benchmarking plain `fsync` on macOS.** It does not flush the drive cache, so durability looks nearly free.
+
+## Go deeper
+
+- Family walkthrough: [Key-value store to durable log](/system-design-labs/interviews/walkthroughs/kv-store-durable-log/), stage 5 and Complexity and performance.
+- Sibling questions: [durable event writer](/system-design-labs/interviews/questions/r2b-020/), [buffered logger](/system-design-labs/interviews/questions/r2b-021/).
+- Labs: <LabRef lab="wal" inline />, <LabRef lab="kafka-lite" inline />, <LabRef lab="lsm-kv" inline />.

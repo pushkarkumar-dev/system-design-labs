@@ -1,0 +1,1057 @@
+---
+title: "Caches in coding rounds: LRU and LFU, TTL, threads, snapshots and coalesced chunk fetches"
+summary: "Build an LRU cache, then add expiry, threads, save and restore, LFU, and a cache of 200 MB remote chunks that many callers miss at once. Get the core right fast, then reason about time, locks and bytes."
+track: cross
+format: coding
+family: cache-coding
+smallTeamFocus: "Use a library cache in-process and managed Redis when shared. What you build is the policy: exact-match caches for embeddings and repeatable calls, provider prompt caching for long prompts, and one fetch per costly miss."
+rounds: [coding-dsa, practical-coding, ai-assisted-coding]
+level: both
+timeboxMin: 60
+order: 105
+status: published
+basedOn: [infra-023, infra-024, infra-032, infra-097, infra-100, r2a-019, r2b-001, r2b-022]
+askedAt: [anthropic, nvidia, modal, openai, linkedin, databricks]
+labs:
+  - { lab: kv-cache, role: background, note: "Not an LLM lab: a Redis-style cache with lazy TTL expiry and an append-only file. Its v2 LRU finds the victim with an O(n) scan, which is the answer an interviewer will push you past." }
+  - { lab: cdn-edge, role: partial, note: "Request coalescing (one origin call for many concurrent misses) and a byte-bounded LRU. All its tests pass as of 2026-10-13, after the stale-if-error and tier-promotion bugs were fixed." }
+  - { lab: embedding-pipeline, role: proof, note: "An LRU cache in front of an embedding model, with a measured hit rate on a skewed synthetic stream: the cache a small AI team actually runs." }
+gapLabs: []
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll keep a hash map from each key to a node, and keep the nodes in a doubly linked list ordered by how
+> recently they were used, so `get` and `put` are both constant time. Every later requirement hooks into the
+> same two helpers. Expiry adds a clock check. Threads add one lock, because a read also reorders the list.
+> Saving to disk walks the list from oldest to newest. Least-frequently-used swaps the list for buckets of keys
+> grouped by use count. For big remote objects I count capacity in bytes, let only one caller fetch a missing
+> object while the others wait for it, and never hold the lock during the network call."
+>
+> The rest of this page explains each part of that answer, and builds it in code, stage by stage.
+
+### What makes this different from the caches you already use
+
+You have used caches for years: Redis in front of a database, Caffeine or Guava inside a JVM service, an HTTP
+cache at the edge. You pick an expiry time, you watch a hit rate, and the library does the rest. In this round
+**you are the library**. Three things make that harder than the textbook version.
+
+1. **The requirements arrive in waves.** You write a basic cache. Then the interviewer adds expiry, then threads,
+   then saving to disk, then a different eviction rule. The candidate who passes is the one whose first version
+   absorbs each wave with a small change. A candidate who has to start over at wave three runs out of time.
+2. **The hard parts are time, locks and bytes, not pointers.** Most candidates know the hash-map-plus-list trick.
+   The round is decided by other questions. What happens to an expired entry that nobody reads? Why does a read
+   need an exclusive lock? What must a saved file contain so the cache still makes sense after a restart? How
+   much memory does a cache of 200 MB objects really use?
+3. **At AI companies there may be an assistant in the room, and the last wave is about big files.** Some rounds
+   let you use an AI coding assistant, and then the test is whether you catch its mistakes. At
+   infrastructure-heavy companies the final wave moves from small values to large chunks of container images or
+   remote files. There, two callers missing the same chunk at the same moment is the problem to solve.
+
+The interviewer is not checking whether you have memorized the textbook structure. They want a small, correct
+core, built fast, that stays correct as the requirements grow.
+
+### Words you need first
+
+- **LRU** (least recently used) is an eviction rule: when the cache is full, throw out the entry that has gone
+  longest without being read or written. **LFU** (least frequently used) throws out the entry with the fewest
+  uses so far.
+- **O(1)**, said "constant time", means the operation takes the same time whether the cache holds ten entries or
+  ten million. The prompt demands it for both `get` and `put`.
+- **TTL** (time to live) is how long an entry stays valid after it is written. After that the entry is
+  **expired**, and the cache must behave as if it were never there.
+- An **AI-assisted round** is a coding interview where you may use a chat assistant built on a large language
+  model (**LLM**), the kind of model behind ChatGPT or Claude. You still own the code. The round tests how you use,
+  check and reject the assistant's output.
+
+Other terms (sentinel node, monotonic clock, min-heap, lock striping, single flight, pinning) are defined where
+they first appear.
+
+### The prompt as it is given
+
+Implement a cache with O(1) `get` and `put` that evicts the least recently used entry when full. Then the
+interviewer adds requirements one at a time: entries that expire after a per-entry TTL, many threads calling it
+at once, saving it to disk and restoring it, evicting the least *frequently* used entry instead, and finally
+caching large remote objects where two callers can miss the same object at the same moment.
+
+No single report covers every wave. The pieces come from reports at Anthropic, NVIDIA, LinkedIn, OpenAI and
+Databricks, plus a prep guide's Modal question; what each source says is in the next section.
+
+<QuestionRow id="infra-023" />
+<QuestionRow id="r2b-001" />
+<QuestionRow id="infra-032" />
+
+### The worked example that runs through this page
+
+Follow one small cache through every stage. It has room for 3 entries, and the keys are single letters. The times
+and keys are illustrative; the point is what each stage does to them.
+
+| Stage | What happens to the example | What to say in the interview |
+|---|---|---|
+| 1. LRU | `put a`, `put b`, `put c`, then `get a`. The cache is full and `a` is now the most recent. `put d` evicts `b`, the least recently used. | "Eviction takes the oldest node in the list, and the node carries its key, so I can delete it from the map too." |
+| 2. TTL | At time 0 the program updates `c` with a TTL of 5 seconds. Any `get c` at time 5.0 or later is a miss. | "An entry is dead at exactly `now >= expires_at`. My tests move a fake clock instead of sleeping." |
+| 2. Full, with a dead entry | Nobody reads `c`. At time 6, `put e` arrives and the cache is full. The dead `c` goes, not the live `a`. | "A dead entry still takes a slot. I drop expired entries before I evict a live one." |
+| 3. Threads | Thread 1 calls `get a` while thread 2 calls `put f`. Both rewire the same list. | "A read moves a node, so a read is a write. One lock around both, not a read-write lock." |
+| 4. Save and restore | The cache is saved as JSON, oldest first, with each expiry written as a wall-clock time. The process restarts 10 seconds later. | "Replaying oldest-first through `put` rebuilds the order. Entries that expired while we were down are dropped." |
+| 5. LFU | Switch the policy. `a` has been used 4 times, `d` and `e` once each, and `d` is older. A new key arrives. `d` goes. | "Buckets by use count, oldest first inside each bucket, plus the current minimum count." |
+| 6. Big chunks | Now each entry is a 200 MB chunk of a remote file. Two containers ask for chunk 2 at the same moment. | "One fetch. The second caller waits for it. The network call runs outside the lock, and capacity is counted in bytes." |
+
+The code for each stage follows the same order. All code is Python 3.13 except the C version. The 20 Python tests
+and the C tests (with AddressSanitizer and UndefinedBehaviorSanitizer) passed when run on 2026-10-12 on an Apple
+M1 Ultra, Python 3.13.7, Apple clang 21.
+
+## What is being tested
+
+Three things, in the order the round reveals them.
+
+**Can you produce the O(1) structure quickly and correctly?** A hash map from key to node, plus a doubly linked
+list ordered by recency, is the standard answer. Nobody is impressed that you know it. They notice when you get it
+wrong: forgetting to delete the evicted key from the map, evicting when an existing key is updated, or losing a
+node's neighbours while relinking. One Anthropic candidate called the round "a time-management test as much as a
+coding test" (<Cite id="s-42f1c7f6dd" />). So plan to finish stage 1 in roughly 15 minutes of a 60-minute round.
+
+**Can you reason about time, threads and bytes, not just pointers?** TTL means you need a clock and a plan for
+expired entries that nobody reads. Threads mean a lock, and the question of which lock. Saving to disk means
+deciding what survives a restart, including the TTL. Large objects mean eviction by bytes, not by count. A prep
+guide puts it this way: interviewers "want to see you think about contention, beyond correctness on the happy
+path" (<Cite id="s-86890a1069" />). **Contention** here means many threads competing for the same lock or the same
+missing object.
+
+**In the AI-assisted variant: can you catch the assistant's mistakes faster than you could type the code?** In
+LinkedIn's version the assistant answers in a chat panel but, per Hello Interview, "it can't directly modify your
+code" (<Cite id="s-4225f96d88" />). A candidate who posted on PracHub (a site where candidates share interview
+reports) says the interviewer told them the algorithm had to be theirs. They report that the assistant "forgot to
+remove the corresponding entry from the map" during eviction and "invented variables that the problem had never
+defined". They finished two of four tasks and were rejected (<Cite id="s-8e19cb9489" />). The relayed feedback was
+the task count. The candidate's own reading was that reviewing the assistant made them slower than typing. Hello
+Interview's summary: "LinkedIn wants to see that you're not blindly accepting AI output"
+(<Cite id="s-4225f96d88" />).
+
+### What the reports say
+
+Each wave of the prompt was reported somewhere:
+
+- An Anthropic Senior candidate describes an LRU cache where "they added complexity in multiple waves", with
+  follow-ups on handling files and on serialization trade-offs (<Cite id="s-42f1c7f6dd" />).
+- An NVIDIA Senior candidate's first screen was an LRU cache followed by "How would you make this work in a
+  multi-threaded setting if needed?" (<Cite id="s-7dd221b925" />). Another NVIDIA candidate was asked, in C/C++,
+  to implement an LRU cache "with serialization and evolving constraints" and to design a hash map "without any
+  STL" (<Cite id="s-21ef4a7dbc" />).
+- LinkedIn's AI-assisted round is reported as four staged tasks: standard LRU, LRU plus TTL, a third part the
+  candidate doesn't remember, and thread safety (<Cite id="s-8e19cb9489" />).
+- A techinterview.org prep guide (no first-hand sources cited) describes a Modal coding question: a cache for
+  container-image chunks where two containers miss the same chunk together, then "What if the chunk is 200 MB and
+  you're memory constrained?" (<Cite id="s-86890a1069" />).
+- An OpenAI LRU or LFU question in a 90-minute CoderPad round is known only from a Glassdoor search snippet, so
+  treat it as low confidence (<Cite id="s-9daac2715f" />).
+- A Databricks candidate (below Senior) got a "System Programming" round: a `cacheFile` class fetches remote files
+  by name and size, an API client reads by offset and length, and the question is how the client should read and
+  write efficiently, in concurrency pseudocode (<Cite id="s-7e1349c451" />).
+
+## Clarify and scope
+
+Ask these before writing code. If the interviewer leaves a choice to you, say the assumption out loud and write it
+at the top of the file.
+
+- **Key and value types.** Assume hashable keys and opaque values. In C, assume `int` keys and values unless told
+  otherwise.
+- **Capacity in entries or bytes?** Entries for stages 1–5; bytes for the chunk cache. Say: "For small values I'll
+  count entries. If the values get big, I'll switch to counting bytes."
+- **Does `put` on an existing key count as a use?** Assume yes: it moves the key to most recent and never evicts.
+- **What does `get` return on a miss?** A default value the caller chooses (`default=None`), so a stored `0` or `""`
+  is still a hit. LeetCode's `-1` is fine if they ask for it.
+- **TTL rules.** Per entry, set at `put`. An entry is dead at exactly `now >= expires_at`. Reading it does not
+  extend its life; that would be a **sliding TTL**, so ask.
+- **Concurrency model.** Threads in one process? Mostly reads or mostly writes? Is approximate LRU acceptable?
+  This decides between one lock and several.
+- **What "serialize" must preserve.** Contents, recency order, remaining TTL. Will the saved file be read only by
+  this version of the program, or by a future one too?
+
+Out of scope unless asked: caching across machines, invalidating the cache when a database changes, and
+**write-back** (the cache holding writes and sending them to storage later). Say so out loud: "I'm leaving out
+distributed caching and invalidation unless you want them." Naming what you leave out is a Staff habit.
+
+## Plan before code
+
+Spend two minutes on the plan, and say it as one sentence per structure. A picture helps. Here is the example cache
+after stage 1 (`put a, b, c`, `get a`, `put d`):
+
+```
+map (key → node):    "d" ─┐      "a" ─┐      "c" ─┐
+                          ▼           ▼           ▼
+            head  ⇄    [ d ]   ⇄   [ a ]   ⇄   [ c ]   ⇄  tail
+          (sentinel)  most recent              least recent   (sentinel)
+                                               evicted next
+```
+
+1. **The map** goes from key to node, so finding a key is O(1).
+2. **The doubly linked list** holds the nodes in recency order. Two **sentinel nodes**, `head` and `tail`, are
+   dummy nodes that never hold data. Because the list always has them at both ends, there is no "is this the first
+   node?" branch, and that branch is where pointer bugs live. `head.next` is the most recent entry and
+   `tail.prev` is the least recent.
+3. **Two helpers** do all the list work: `unlink(node)` and `push_front(node)`. `get` is unlink plus push. `put` on
+   an existing key is update, unlink, push. `put` on a new key first evicts `tail.prev` if the cache is full, then
+   pushes.
+4. **Every later requirement hooks into those helpers.** TTL adds a check in `get` and a smarter choice of victim.
+   Threads wrap the public methods in a lock. Saving walks the list. LFU replaces the list with buckets by use
+   count.
+
+Say: "Map for lookup, list for order, two helpers for every change. Each new requirement should touch one helper,
+not the whole class."
+
+Pacing for a 60-minute round: stage 1 with tests by minute 15–20, TTL by 30, threads by 40, then whatever the
+interviewer chooses. One OpenAI report of an LRU/LFU question gives a 90-minute round (from a Glassdoor snippet,
+<Cite id="s-9daac2715f" />); in a round that long, expect two more stages.
+
+## Solution in stages
+
+### Stage 1: LRU with O(1) get and put
+
+This is the structure from the picture. Read `_evict_lru` closely: it is the line people forget.
+
+```python
+class _Node:
+    __slots__ = ("key", "val", "prev", "next", "expires_at")
+
+    def __init__(self, key=None, val=None, expires_at=None):
+        self.key, self.val, self.expires_at = key, val, expires_at
+        self.prev = self.next = None
+
+
+class LRUCache:
+    """O(1) get/put: dict for lookup, doubly linked list for recency."""
+
+    def __init__(self, capacity):
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self.cap = capacity
+        self.map = {}
+        self.head, self.tail = _Node(), _Node()  # sentinels: head.next = MRU, tail.prev = LRU
+        self.head.next, self.tail.prev = self.tail, self.head
+
+    def _unlink(self, n):
+        n.prev.next, n.next.prev = n.next, n.prev
+
+    def _push_front(self, n):
+        n.prev, n.next = self.head, self.head.next
+        self.head.next.prev = n
+        self.head.next = n
+
+    def _evict_lru(self):
+        lru = self.tail.prev
+        self._unlink(lru)
+        del self.map[lru.key]  # forgetting this line leaves a ghost key in the map
+
+    def get(self, key, default=None):
+        n = self.map.get(key)
+        if n is None:
+            return default
+        self._unlink(n)
+        self._push_front(n)
+        return n.val
+
+    def put(self, key, val):
+        n = self.map.get(key)
+        if n is not None:  # update moves to front, never evicts
+            n.val = val
+            self._unlink(n)
+            self._push_front(n)
+            return
+        if len(self.map) >= self.cap:
+            self._evict_lru()
+        n = _Node(key, val)
+        self.map[key] = n
+        self._push_front(n)
+```
+
+The node stores its own key. Without it, eviction can find the oldest node but cannot delete it from the map,
+which leaves a "ghost" key that points at a node no longer in the list. That is exactly the bug the LinkedIn
+candidate reports the assistant writing (<Cite id="s-8e19cb9489" />). In our example, `put d` evicts `b`: the code
+unlinks `b`'s node and deletes `"b"` from the map in the same step.
+
+If the interviewer allows `collections.OrderedDict` (or `LinkedHashMap` with `accessOrder=true` in Java), say so
+and use it. Both are a map and a linked list already joined together. Most interviewers want to see the list, so
+ask first: "Can I use `OrderedDict`, or do you want the list by hand?"
+
+### Stage 2: per-entry TTL with an injected clock
+
+Two decisions matter here.
+
+**Where time comes from.** Pass the cache a `clock` function instead of calling the system clock inside it. In
+tests you pass a fake clock and move time by assignment, so the TTL test runs in microseconds and never sleeps. In
+production you pass a **monotonic clock**: a clock that only moves forward and does not jump when someone, or a
+time-sync service, changes the system time (`time.monotonic` in Python). With the wall clock, a time jump could
+expire every entry at once or bring dead ones back.
+
+**What to do with expired entries nobody reads.** The simplest rule is **lazy expiry**: check the time in `get`,
+and if the entry is dead, delete it and report a miss. That is enough for correctness. But look at the example: at
+time 6 the dead `c` still occupies a slot, so a full cache would evict the live `a` while `c` sits there. To fix
+that, keep a **min-heap** of expiry times. A min-heap is a priority queue that always hands you the smallest item
+first (Python's `heapq`). When the cache is full, `put` pops expired entries off the heap before it evicts a live
+one.
+
+One wrinkle: when a key is overwritten, its old heap row stays behind. Searching the heap to remove it would cost
+O(n). Instead, when you pop a row, check whether its expiry still matches the node; if not, skip it. That trick is
+called **lazy deletion**.
+
+```python
+class TTLCache(LRUCache):
+    """LRU plus per-entry TTL. Time comes from an injected monotonic clock."""
+
+    def __init__(self, capacity, clock=time.monotonic):
+        super().__init__(capacity)
+        self.clock = clock
+        self._heap = []  # (expires_at, seq, key): lazy deletion, stale rows skipped
+        self._seq = 0
+
+    def _expired(self, n, now):
+        return n.expires_at is not None and now >= n.expires_at
+
+    def _remove(self, n):
+        self._unlink(n)
+        del self.map[n.key]
+
+    def get(self, key, default=None):
+        n = self.map.get(key)
+        if n is None:
+            return default
+        if self._expired(n, self.clock()):
+            self._remove(n)  # lazy expiry on read
+            return default
+        self._unlink(n)
+        self._push_front(n)
+        return n.val
+
+    def _purge_expired(self, now):
+        """Drop expired entries (cheapest first) before evicting a live one."""
+        freed = 0
+        while self._heap and self._heap[0][0] <= now:
+            exp, _, key = heapq.heappop(self._heap)
+            n = self.map.get(key)
+            if n is not None and n.expires_at == exp:  # skip rows for overwritten keys
+                self._remove(n)
+                freed += 1
+        return freed
+
+    def put(self, key, val, ttl=None):
+        now = self.clock()
+        exp = None if ttl is None else now + ttl
+        n = self.map.get(key)
+        if n is not None:
+            n.val, n.expires_at = val, exp
+            self._unlink(n)
+            self._push_front(n)
+        else:
+            if len(self.map) >= self.cap and not self._purge_expired(now):
+                self._evict_lru()
+            n = _Node(key, val, exp)
+            self.map[key] = n
+            self._push_front(n)
+        if exp is not None:
+            self._seq += 1
+            heapq.heappush(self._heap, (exp, self._seq, key))
+```
+
+The heap makes `put` O(log n) **amortized** when TTLs are used. Amortized means averaged over many calls: one
+`put` may pop several stale rows, but each row is pushed and popped only once. `get` stays O(1). If the interviewer
+wants strict O(1) everywhere, drop the heap and accept that expired entries are evicted in LRU order like any other
+entry. A background sweeper thread is the third option; it adds a thread to reason about and still needs the lock.
+
+Say: "Lazy expiry keeps `get` O(1). The heap is only there so a full cache throws out dead entries before live
+ones."
+
+### Stage 3: thread safety
+
+The first answer is one **mutex** (a lock that only one thread can hold at a time) around each public method. The
+interesting part is explaining why the obvious "optimization" fails. A **read-write lock** lets many readers in
+together and gives a writer exclusive access. It sounds right for a read-heavy cache, but **a read-write lock does
+not help an LRU cache, because `get` writes**. Every hit moves a node to the front of the list. In the example,
+thread 1's `get a` rewires four pointers, just as thread 2's `put f` does, so both need exclusive access.
+
+```python
+class LockedCache:
+    """One mutex. get() reorders the list, so a read-write lock would not help."""
+
+    def __init__(self, inner):
+        self._c, self._lock = inner, threading.Lock()
+
+    def get(self, key, default=None):
+        with self._lock:
+            return self._c.get(key, default)
+
+    def put(self, key, val, **kw):
+        with self._lock:
+            self._c.put(key, val, **kw)
+
+
+class StripedCache:
+    """N independent shards, each with its own lock and capacity // N.
+    Eviction becomes per-shard LRU: approximate, not global."""
+
+    def __init__(self, capacity, shards=16, factory=LRUCache):
+        per = max(1, capacity // shards)
+        self._shards = [LockedCache(factory(per)) for _ in range(shards)]
+
+    def _shard(self, key):
+        return self._shards[hash(key) % len(self._shards)]
+
+    def get(self, key, default=None):
+        return self._shard(key).get(key, default)
+
+    def put(self, key, val, **kw):
+        self._shard(key).put(key, val, **kw)
+```
+
+The second class shows **lock striping**: split the cache into N independent shards, each with its own lock and
+its own share of the capacity, and send each key to a shard by its hash. Threads that touch different shards no
+longer wait for each other. The price is exactness. Eviction becomes per-shard LRU, so a shard full of hot keys can
+evict while another shard holds cold ones. Other options to name, with what they cost:
+
+- **Approximate recency.** Record hits in a per-thread buffer and apply them to the list in batches under the
+  lock. Or sample a few keys and evict the oldest of the sample, as the kv-cache lab's notes describe Redis doing.
+  Both give up exact LRU order to take the list update off the read path.
+- **Lock-free structures.** Possible but rarely worth it in an interview. Say you'd use a proven library (Caffeine
+  on the JVM) rather than write one.
+
+Don't assume Python's **GIL** (global interpreter lock, which lets only one thread run Python bytecode at a time)
+protects you. Without the lock, the same 8-thread workload broke the list-and-map invariants in 6 to 9 of 20 runs at
+Python's default thread switch interval, and in 20 of 20 with the interval forced down to 1 µs (CPython 3.13.7 with
+the GIL enabled, run on 2026-10-12). The GIL makes single bytecodes atomic, not a four-pointer splice.
+
+Say: "One lock first, because reads mutate the list. If lock wait time shows up in a profile, I'd stripe by key
+hash and accept per-shard LRU."
+
+### Stage 4: serialize and restore
+
+**Serialize** means turning the cache into bytes you can write to a file; **restore** means building the cache back
+from those bytes. The Anthropic report lists "What are the serialization tradeoffs?" as its own question
+(<Cite id="s-42f1c7f6dd" />), so say each of these three decisions out loud:
+
+1. **Order.** Write entries from least to most recent. Replaying them through `put` in that order rebuilds the
+   recency order, so you don't need to store it as a separate field.
+2. **Time.** A monotonic clock's value means nothing after a restart; it starts from an arbitrary point each time
+   the process boots. So store each expiry as an absolute wall-clock time when you save, and convert it back on
+   load. Entries that expired while the process was down are skipped. In the example, the process restarts 10
+   seconds later, so anything with less than 10 seconds left is gone.
+3. **Format and safety.** JSON with a version number is readable and safe to load. Python's `pickle` would
+   round-trip any value, but loading a pickle file from an untrusted source runs code from that file. Binary
+   formats are smaller and faster; their price is a schema you must version.
+
+```python
+    def to_json(self, wall=time.time):
+        """Entries LRU->MRU; TTL as absolute wall time (monotonic time dies with the process)."""
+        now_m, now_w = self.clock(), wall()
+        rows, n = [], self.tail.prev
+        while n is not self.head:
+            if not self._expired(n, now_m):
+                exp_w = None if n.expires_at is None else now_w + (n.expires_at - now_m)
+                rows.append([n.key, n.val, exp_w])
+            n = n.prev
+        return json.dumps({"version": 1, "capacity": self.cap, "entries": rows})
+
+    @classmethod
+    def from_json(cls, text, clock=time.monotonic, wall=time.time, capacity=None):
+        doc = json.loads(text)
+        if doc.get("version") != 1:
+            raise ValueError(f"unknown snapshot version {doc.get('version')!r}")
+        c = cls(capacity or doc["capacity"], clock)
+        now_m, now_w = clock(), wall()
+        for key, val, exp_w in doc["entries"]:  # replaying LRU->MRU rebuilds the order
+            if exp_w is None:
+                c.put(key, val)
+            elif exp_w > now_w:
+                c.put(key, val, ttl=exp_w - now_w)
+        return c
+
+    def save(self, path):
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            f.write(self.to_json())
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)  # atomic: a crash leaves the old snapshot or the new one
+```
+
+`save` writes to a temporary file, calls **fsync** (the system call that forces the file's bytes from the
+operating system's memory onto the disk), then renames the temporary file over the old snapshot. A rename on the
+same file system is atomic, so a reader sees either the old snapshot or the new one, never half of one. (Strictly,
+the rename itself is durable only after an `fsync` of the directory; mention it.)
+
+When restoring into a smaller capacity, replaying oldest-first means the oldest entries are the ones evicted, which
+is what you want. If the interviewer pushes on "the cache must survive a crash between snapshots", that is a
+**write-ahead log** (an append-only file of every change, replayed after a crash), a different problem covered in
+[the key-value store to durable log family](/system-design-labs/interviews/walkthroughs/kv-store-durable-log/).
+
+Say: "Order comes free from writing oldest first. Time has to be converted to wall-clock time, because monotonic
+time dies with the process."
+
+### Stage 5: LFU in O(1)
+
+LFU evicts the key with the fewest uses, and among ties the least recently used one. Hello Interview's LinkedIn
+write-up lists a variant "implementing LRU eviction as a tiebreaker for elements with the same rank"
+(<Cite id="s-4225f96d88" />).
+
+The O(1) structure is three maps and one number. `vals` maps key to value. `freq` maps key to its use count.
+`buckets` maps a use count to an insertion-ordered set of the keys with that count, oldest first. `min_freq` is the
+smallest count that has any keys. In the example, `buckets` is `1: [d, e]`, `4: [a]`, and `min_freq` is 1, so the
+victim is the first key in bucket 1: `d`.
+
+```python
+class LFUCache:
+    def __init__(self, capacity):
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self.cap = capacity
+        self.vals = {}      # key -> value
+        self.freq = {}      # key -> use count
+        self.buckets = {}   # count -> OrderedDict of keys, oldest first
+        self.min_freq = 0
+
+    def _touch(self, key):
+        f = self.freq[key]
+        bucket = self.buckets[f]
+        del bucket[key]
+        if not bucket:
+            del self.buckets[f]
+            if self.min_freq == f:
+                self.min_freq = f + 1
+        self.freq[key] = f + 1
+        self.buckets.setdefault(f + 1, OrderedDict())[key] = None
+
+    def get(self, key, default=None):
+        if key not in self.vals:
+            return default
+        self._touch(key)
+        return self.vals[key]
+
+    def put(self, key, val):
+        if key in self.vals:
+            self.vals[key] = val
+            self._touch(key)
+            return
+        if len(self.vals) >= self.cap:
+            bucket = self.buckets[self.min_freq]
+            victim, _ = bucket.popitem(last=False)  # least frequent, then least recent
+            if not bucket:
+                del self.buckets[self.min_freq]
+            del self.vals[victim], self.freq[victim]
+        self.vals[key] = val
+        self.freq[key] = 1
+        self.buckets.setdefault(1, OrderedDict())[key] = None
+        self.min_freq = 1  # a new key always has the lowest count
+```
+
+The `min_freq` bookkeeping is the whole trick. It only moves up by one, and only when a touch empties its bucket,
+because the touched key now sits at the next count. It resets to 1 on every insert, because a new key always has
+the lowest count. Nothing ever has to scan for the minimum.
+
+Know LFU's weakness before the interviewer asks: a key that was hot yesterday keeps a high count forever and never
+leaves. Fixes include decaying counts periodically or a windowed admission policy such as the one Caffeine uses.
+Naming the problem is enough in a coding round.
+
+### Stage 6: large remote chunks, coalesced misses, reads by offset
+
+This is the Modal and Databricks shape. A file lives on a remote store, and the cache holds it in fixed-size
+pieces called **chunks**. Three things change. A miss is slow, because it is a network fetch. The same chunk is
+wanted by many callers at once. And each chunk is big enough (200 MB in the Modal prompt) that capacity must be
+counted in bytes, not entries.
+
+Here is the system:
+
+```
+  Container 1          Container 2          Container 3
+  read(file, off, n)   read(file, off, n)   read(file, off, n)
+          │                    │                    │
+          └──────────┬─────────┴──────────┬─────────┘
+                     ▼                    ▼
+   ┌───────────────────────────────────────────────────────┐
+   │ ChunkCache          (one lock guards the maps below)  │
+   │   data:     chunk key → bytes, oldest first           │
+   │   pins:     chunk key → number of readers holding it  │
+   │   inflight: chunk key → future, if a fetch is running │
+   │   used:     total bytes cached                        │
+   └───────────────────────────┬───────────────────────────┘
+                               │ one fetch per missing chunk,
+                               │ made outside the lock
+                               ▼
+                    Remote store (slow, priced per request)
+```
+
+**The callers** ask for a byte range of a file, not a chunk. `read` turns `(offset, length)` into chunk numbers.
+
+**The cache** holds four things under one lock. `data` is the byte-bounded LRU itself. `pins` counts readers
+currently copying from each chunk. `inflight` holds a **future** for each chunk being downloaded right now: an
+object a thread can wait on until another thread puts a result or an error into it. `used` is the running byte
+total that eviction compares with the budget.
+
+**The remote store**, often called the **origin**, is slow and often charged per request, so every avoidable fetch costs time and money.
+
+Four rules make this correct:
+
+1. **Single flight.** The first caller to miss a chunk registers a future in `inflight` and fetches. Later callers
+   for the same chunk find the future and wait on it. The prep guide's phrase is "a single-flight pattern so you
+   don't stampede the backend" (<Cite id="s-86890a1069" />). A **stampede** is many callers fetching the same
+   missing thing at once.
+2. **No I/O under the lock.** The lock protects the maps; the fetch runs outside it. Holding a lock across a
+   network call makes every miss for every key wait behind that one call.
+3. **Errors reach every waiter and are not cached.** The first caller removes the in-flight entry and sets the
+   exception on the future, so everyone waiting sees the error and the next caller retries.
+4. **Pin while reading.** A reader holding a chunk increments its **pin** count, and eviction skips pinned chunks.
+   Without pins, the byte count says memory is free while a reader still holds 200 MB.
+
+```python
+class ChunkCache:
+    def __init__(self, fetch, chunk_size, max_bytes):
+        self.fetch = fetch                # fetch(name, index) -> bytes; slow, remote
+        self.chunk_size = chunk_size
+        self.max_bytes = max_bytes
+        self.lock = threading.Lock()
+        self.data = OrderedDict()         # (name, idx) -> bytes, LRU first
+        self.pins = {}                    # (name, idx) -> readers holding it
+        self.inflight = {}                # (name, idx) -> Future
+        self.used = 0
+
+    def _evict_until_fits(self, need):
+        for k in list(self.data):         # oldest first; pinned chunks are skipped
+            if self.used + need <= self.max_bytes:
+                return
+            if self.pins.get(k, 0) == 0:
+                self.used -= len(self.data.pop(k))
+
+    def _acquire(self, key):
+        """Return the chunk's bytes and pin it. Exactly one caller fetches a missing key."""
+        with self.lock:
+            if key in self.data:
+                self.data.move_to_end(key)
+                self.pins[key] = self.pins.get(key, 0) + 1
+                return self.data[key]
+            fut = self.inflight.get(key)
+            leader = fut is None
+            if leader:
+                fut = self.inflight[key] = Future()
+        if leader:
+            try:
+                blob = self.fetch(*key)   # network I/O happens outside the lock
+            except BaseException as e:
+                with self.lock:
+                    del self.inflight[key]  # don't cache the failure; next caller retries
+                fut.set_exception(e)
+                raise
+            with self.lock:
+                self._evict_until_fits(len(blob))
+                self.data[key] = blob     # may overshoot if everything else is pinned
+                self.used += len(blob)
+                del self.inflight[key]
+            fut.set_result(blob)
+        blob = fut.result()               # followers wait here; errors re-raise
+        with self.lock:
+            self.pins[key] = self.pins.get(key, 0) + 1
+        return blob
+
+    def _release(self, key):
+        with self.lock:
+            self.pins[key] -= 1
+            if self.pins[key] == 0:
+                del self.pins[key]
+
+    def read(self, name, offset, length):
+        out = bytearray()
+        end = offset + length
+        while offset < end:
+            idx, start = divmod(offset, self.chunk_size)
+            key = (name, idx)
+            blob = self._acquire(key)
+            try:
+                take = min(end - offset, len(blob) - start)
+                if take <= 0:             # read past the end of the file
+                    break
+                out += blob[start:start + take]
+                offset += take
+            finally:
+                self._release(key)
+        return bytes(out)
+```
+
+In the example, containers 1 and 2 both ask for chunk 2. Container 1 gets the lock first, sees no data and no
+future, creates the future and fetches. Container 2 gets the lock, sees the future, and waits on it. One download
+serves both.
+
+`read` maps `(offset, length)` onto chunk numbers with `divmod`. Say the chunks are 200 MB and a caller asks for 20
+MB starting at offset 390 MB. Chunk 1 covers 200–400 MB and chunk 2 covers 400–600 MB, so the read takes the last 10
+MB of chunk 1 and the first 10 MB of chunk 2. That boundary case is the Databricks client question
+(<Cite id="s-7e1349c451" />). The efficiency answers to give there: align reads to chunk boundaries when you can,
+**prefetch** chunk `i + 1` (start fetching it before anyone asks) when a caller reads sequentially, and never fetch
+a whole remote file to serve a 4 KB read.
+
+When every chunk is pinned, this version admits the new chunk anyway and goes over the budget. The alternative is
+to make the caller wait until a pin is released. Either is defensible; pick one and say which failure you prefer,
+memory pressure or latency.
+
+Peak memory, the most the process holds at any moment (monitoring shows it as **peak RSS**, resident set size), is
+also not `max_bytes`. Each download holds its chunk in a buffer before the cache admits it, so the
+real peak is the budget plus every chunk still downloading. With an assumed 4 GB budget and 16 distinct chunks
+downloading at once, the peak is about **7.2 GB**, not 4 GB. Say: "I'd bound concurrent downloads with a semaphore (a counter that lets only N threads through at once),
+because each one can hold 200 MB before the budget even sees it."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Worst-case memory of a byte-bounded chunk cache"
+  expr="peak ≈ max_bytes + in_flight_fetches × chunk_size + pinned_overshoot"
+  vars={[
+    { sym: 'max_bytes', meaning: 'the configured budget for cached chunks' },
+    { sym: 'in_flight_fetches', meaning: 'distinct chunks being downloaded at once (each holds a buffer before admission)' },
+    { sym: 'chunk_size', meaning: 'bytes per chunk' },
+    { sym: 'pinned_overshoot', meaning: 'bytes admitted beyond the budget because every eviction candidate was pinned' },
+  ]}
+  example="Assumed: a 4 GB budget holds 4,000 MB ÷ 200 MB = 20 chunks. With 16 distinct chunks downloading at once, 16 × 200 MB = 3.2 GB more is in buffers, so peak ≈ 7.2 GB before any pinned overshoot."
+  note="All values are assumptions for the example. Bound in_flight_fetches with a semaphore if the host cannot take the peak."
+/>
+
+</details>
+
+At 200 MB per chunk you would also stop holding chunks in the program's own memory. Write them to local disk and
+**memory-map** them (ask the operating system to make a file look like memory). The budget then becomes disk bytes,
+and the operating system's **page cache** (the memory it keeps for recently used file data) decides what stays in
+RAM. The 200 MB follow-up in the prep guide leads to "eviction policy and whether you pin hot chunks"
+(<Cite id="s-86890a1069" />).
+
+### The C variant: no STL, hash map by hand
+
+NVIDIA's C/C++ report asks for the hash map too (<Cite id="s-21ef4a7dbc" />). Without the STL (C++'s standard
+library of containers) you write three things yourself. Use **separate chaining**: each bucket of the table holds a
+linked chain of the nodes whose keys hash there. Make each node **intrusive**, meaning it carries the pointers for
+both the bucket chain and the recency list, so there is one allocation per entry. Use a power-of-two bucket count
+so the index is a cheap bit mask, and reuse the evicted node instead of a `free`/`malloc` pair.
+
+```c
+typedef struct Node {
+    int key, val;
+    struct Node *prev, *next;   /* recency list */
+    struct Node *chain;         /* next node in the same hash bucket */
+} Node;
+
+typedef struct {
+    Node **buckets;
+    size_t nbuckets, size, cap;
+    Node head, tail;            /* sentinels: head.next = MRU, tail.prev = LRU */
+} LRU;
+
+static size_t bucket_of(const LRU *c, int key) {
+    uint32_t h = (uint32_t)key * 2654435761u;   /* Knuth multiplicative hash */
+    return h & (c->nbuckets - 1);               /* nbuckets is a power of two */
+}
+
+int lru_put(LRU *c, int key, int val) {
+    Node *n = find(c, key);
+    if (n) { n->val = val; unlink_node(n); push_front(c, n); return 1; }
+    if (c->size == c->cap) {                /* reuse the LRU node: no free/malloc pair */
+        n = c->tail.prev;
+        unlink_node(n); map_remove(c, n);
+        c->size--;
+    } else if (!(n = malloc(sizeof *n))) {
+        return 0;
+    }
+    n->key = key; n->val = val;
+    size_t b = bucket_of(c, key);
+    n->chain = c->buckets[b]; c->buckets[b] = n;
+    push_front(c, n);
+    c->size++;
+    return 1;
+}
+
+/* Format: magic "LRU1", u64 cap, u64 size, then (i32 key, i32 val) pairs LRU -> MRU. */
+LRU *lru_load(FILE *f) {
+    char magic[4]; uint64_t cap, size;
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "LRU1", 4) != 0) return NULL;
+    if (fread(&cap, 8, 1, f) != 1 || fread(&size, 8, 1, f) != 1) return NULL;
+    if (cap == 0 || size > cap || cap > (1u << 30)) return NULL;   /* never trust a length field */
+    LRU *c = lru_new((size_t)cap);
+    if (!c) return NULL;
+    for (uint64_t i = 0; i < size; i++) {
+        int32_t kv[2];
+        if (fread(kv, 4, 2, f) != 2 || !lru_put(c, kv[0], kv[1])) { lru_free(c); return NULL; }
+    }
+    return c;
+}
+```
+
+Size the table at twice the capacity. The **load factor** (entries divided by buckets) then stays at or below 0.5
+without ever resizing, because an LRU cache never holds more than `cap` keys. The loader writes and checks a
+**magic number** (fixed bytes at the start of the file that say what kind of file it is) and checks every length
+field before trusting it, so a corrupted `size` can't become a giant allocation. Mention byte order: this format is
+only portable between machines with the same **endianness** (the order in which a machine stores the bytes of a
+number) unless you fix it.
+
+## Verification
+
+Write these tests in this order during the round. Each one maps to a bug you have now seen:
+
+- **Eviction order:** put a, put b, get a, put c → b is gone.
+- **Update doesn't evict** and moves the key to the front.
+- **Capacity 1**, and capacity 0 rejected.
+- **Falsy values are hits:** `put("z", 0)` then `get("z", "miss") == 0`.
+- **TTL boundary:** alive at `ttl − ε`, dead at exactly `ttl`, using the injected clock.
+- **Expired entries are evicted before live ones** when the cache is full (the `c` and `a` case from the example).
+- **Stale heap rows are ignored** after a key is overwritten without a TTL.
+- **Snapshot round trip** with a new monotonic origin and the wall clock moved forward, checking order and that
+  an entry that expired during the downtime is gone.
+- **LFU tie-break** by recency.
+- **Chunk cache:** 50 threads missing the same chunk cause exactly one fetch; a fetch error reaches all 10
+  waiters and the next read retries; eviction is by bytes; a read spanning two chunks and a read past the end of
+  the file both return the right bytes; a pinned chunk survives eviction pressure.
+
+Then add a **randomized test against a slow oracle**. An **oracle** is a simple implementation you already trust;
+for LRU, an `OrderedDict`. Run a few hundred random gets and puts on both and compare the full key order after
+every step. Any ghost key or broken link shows up within a few operations. In the scratch run, 200 trials of 300
+operations each, with capacities 1 to 6, matched the oracle. The C version used the same idea with a plain array as
+the oracle, plus a save-and-load round trip in every trial, under AddressSanitizer (a compiler option that crashes
+the program on any out-of-bounds or use-after-free memory access).
+
+For thread safety, the minimum is a stress test that hammers the cache from 8 threads and then checks
+**invariants**: facts that must always hold, such as no duplicate keys, list length equals map size, and size never
+above capacity. Lowering the thread switch interval (`sys.setswitchinterval(1e-6)`) makes threads swap far more
+often, which is how the unlocked failures above were made to show up in every run.
+
+Say: "Before I optimize anything, I want an oracle test and an invariant check, so I can change the code fast
+without breaking it."
+
+## Complexity and performance
+
+| Operation | LRU | LRU + TTL (heap) | LFU | Chunk cache |
+|---|---|---|---|---|
+| get | O(1) | O(1) | O(1) | O(1) + fetch on miss |
+| put | O(1) | O(log n) amortized | O(1) | O(evicted chunks) |
+| memory | O(n) nodes | + O(n) heap rows, stale rows until popped | O(n) | bytes, see the formula |
+| snapshot | O(n) | O(n) | O(n) | usually not snapshotted |
+
+The heap can hold more rows than live keys when keys are overwritten often. Rebuild it when it grows past a
+multiple of `len(map)` if that matters.
+
+Big-O hides constant factors, and here they matter. Run on 2026-10-12 (Apple M1 Ultra, Python 3.13.7, 400,000 mixed
+operations over 20,000 keys, three runs), the hand-written linked-list LRU did about 3.2 million operations per
+second against about 6.1 million for an `OrderedDict`-based one, whose list is implemented in C.
+
+With 8 threads, one lock managed about 1.7 million operations per second and 16 shards about 1.35 million. Striping
+was *slower* there because the GIL already serializes Python bytecode, so the shards add hashing and indirection
+without adding parallelism. In Java, Go or C++ the comparison flips: striping exists to let several cores work at
+once. The point for the interview: say which runtime you're reasoning about before claiming a concurrency speedup.
+
+Say: "In Python, striping won't buy parallelism because of the GIL. In Java or Go it would, and I'd measure lock wait
+time before and after."
+
+## Small-team version
+
+You own AI at a 50–500 person company. You will not hand-write an LRU cache in production. You will make several
+caching decisions in front of LLMs and embedding models, and those are where the money and the wrong answers are.
+
+Two words first. LLM providers charge per **token**, a piece of text of roughly ¾ of a word, counted separately for
+the text you send (input) and the text the model writes (output). An **embedding** is a list of numbers a model
+computes for a piece of text, so that texts with similar meaning get similar numbers; search features are built on
+them.
+
+### Buy, don't build, the cache itself
+
+In-process: the standard library (`functools.lru_cache`, `cachetools` in Python; Caffeine on the JVM). Shared across
+replicas: a managed Redis or Valkey with `SET key value EX ttl`. What you still write is the **policy**: the key, the
+TTL, what gets cached, and single flight on expensive misses. The stage 6 code is the part worth keeping in your
+head, because a popular query that misses at the same moment on ten workers is ten paid LLM calls instead of one.
+Across processes, the usual pattern is a short-lived lock key (`SET lock:<key> 1 NX PX 30000`): one worker computes,
+and the others poll the result key briefly or fall back to computing.
+
+### Three caches an AI feature actually has
+
+**1. Embedding cache (build this first).** For a fixed embedding model, the same text always gives the same vector,
+so an exact-match cache keyed by `hash(model_id, model_version, normalized_text)` is safe. Hit rates depend on how
+skewed your traffic is. The embedding-pipeline lab measured
+<LabNumber lab="embedding-pipeline" metric="LRU hit rate, Zipf s=1.0 over 100k texts, cache 10,000" /> on a skewed
+synthetic stream (a few texts repeat very often and most appear rarely), and much less on uniform traffic or bulk
+ingestion, where nothing repeats. Measure your own hit rate before assuming a saving. Put the model version in the
+key: after an embedding model upgrade, every old entry must miss.
+
+**2. Exact-match response cache (use carefully).** This stores the model's answer for a given input. Key on
+everything that changes the answer: model, prompt template version, system prompt (the fixed instructions sent
+before the user's message), tool definitions, temperature (the setting that controls how random the output is) and
+the normalized user input. Cache only outputs that are deterministic enough and not personalized: a classification
+label, an extraction, a summary of a fixed document. Never share entries across tenants or users unless the input
+carries no private data, and set a TTL tied to how fast the underlying data changes.
+
+**3. Provider prompt caching (usually the biggest saving, and you don't store anything).** Long, stable beginnings
+of a prompt (system prompt, tool definitions, retrieved documents reused across turns) can be cached by the
+provider, which then charges much less to read them again. Anthropic's docs, fetched 2026-10-12, say the default
+cache lifetime is 5 minutes, refreshed for free each time it is used, with a 1-hour option at a higher write price.
+Cache writes cost 1.25× the base input price (2× for the 1-hour cache), reads 0.1× with some per-model exceptions,
+and hits require "100% identical prompt segments"
+([Anthropic prompt caching docs](https://platform.claude.com/docs/en/build-with-claude/prompt-caching), fetched
+2026-10-12). OpenAI's docs, fetched the same day, say caching is on by default for supported models, the whole
+rendered prefix must match, and the minimum cacheable prompt is 1,024 tokens for GPT-5.6 and later
+([OpenAI prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching), fetched 2026-10-12).
+
+The engineering rule that follows: put stable content first and variable content last, and don't put a timestamp or
+request id at the top of the system prompt. One changed character early in the prompt makes everything after it a
+miss.
+
+What it is worth, on an assumed workload of 3,000 input tokens (2,000 of them a stable prefix) and 400 output tokens
+per request at Claude Sonnet 5 list prices: about **1 cent per request uncached** and about **0.64 cents cached**,
+roughly 36% less. At an assumed 50,000 requests a day, that is about **$15,000 a month uncached against $9,600
+cached**. Say: "Prompt caching is a key-design problem: stable things first, and nothing that changes per request at
+the top."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="API cost per request with a cached prefix"
+  expr="cost = in_uncached × p_in + in_cache_read × p_cache + cache_write × p_cw + out × p_out"
+  vars={[
+    { sym: 'in_uncached, in_cache_read, cache_write, out', meaning: 'token counts for one request' },
+    { sym: 'p_in, p_cache, p_cw, p_out', meaning: 'prices per token for uncached input, cache reads, cache writes and output' },
+  ]}
+  example="Assumed workload: 3,000 input tokens of which 2,000 are a cached prefix, 400 output tokens, at $2 / $0.20 / $10 per 1M (input / cache read / output, a Claude Sonnet 5 list price fetched 2026-10-11). Uncached: 3,000 × $2 + 400 × $10 per 1M = $0.010. Cached: (1,000 × $2 + 2,000 × $0.20 + 400 × $10) per 1M = $0.0064, about 36% less, ignoring cache writes."
+  note="Per month at an assumed 50,000 requests a day: 50,000 × 30 × $0.010 = $15,000 uncached, 50,000 × 30 × $0.0064 = $9,600 cached. At that volume the prefix is reused many times within each 5-minute window, so write charges are small; at a few requests an hour the cache expires between requests and you pay writes without reads."
+/>
+
+</details>
+
+### Semantic caching: skip it until you can measure it
+
+A **semantic cache** returns a stored answer when a new query's embedding is close to an old one, instead of
+requiring an exact match. The failure is quiet: "cancel my order" and "don't cancel my order" can sit close together
+in embedding space, and the cache answers the wrong question with confidence. If a product owner asks for it, build
+it as an experiment. Collect pairs of queries labelled "same answer" or "different answer", pick the similarity
+threshold from those labels, and track the wrong-answer rate on a held-out set (labelled pairs you did not use to
+pick the threshold). Without that, an exact-match cache plus prompt caching gets most of the saving with none of the
+risk.
+
+### Revisit when
+
+- Redis becomes a meaningful bill or a latency hop: move hot keys into a small in-process cache in front of it.
+- A response cache shows up in an incident (a stale or cross-tenant answer): shorten TTLs, add the tenant to the
+  key, or remove that cache.
+- Traffic gets bursty on a few keys: add single flight before adding capacity.
+
+<AINative title="Reviewing an assistant's cache code">
+The LinkedIn report is the template for what goes wrong: the assistant wrote plausible LRU code that updated the
+map on insert and forgot to remove the evicted key, and later outputs didn't match earlier ones
+(<Cite id="s-8e19cb9489" />). Two habits make you faster than the assistant. First, own the invariants and say
+them before any code is generated: "map size equals list length, never above capacity, every map value is in the
+list". Then you review against three sentences, not 80 lines. Second, ask the assistant for the randomized
+oracle test before the implementation; a 20-line test that compares against `OrderedDict` catches the ghost-key
+bug on its first run. In a round where the assistant can't edit your code, type the core structure yourself and
+use the assistant for the boring parts (test scaffolding, the serializer). That matches what the candidate says
+the interviewer asked for: the algorithm theirs, the assistant for implementation.
+</AINative>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Same cache, different bar"
+  senior={[
+    "Writes the map-plus-list LRU with sentinels in about 15 minutes, with tests for eviction order, updates and capacity 1.",
+    "Adds TTL with an injected clock and explains lazy expiry; wraps the cache in one lock and explains why a read-write lock doesn't help.",
+    "Serializes in LRU order with a version field and handles TTL across restarts.",
+  ]}
+  staff={[
+    "Names the contention and memory failure modes before being asked: hot keys on one lock, stampedes on a popular miss, pinned chunks overshooting a byte budget.",
+    "States which guarantees are being traded (exact LRU vs striping, overshoot vs waiting) and which metric would show the choice was wrong (lock wait time, origin fetches per miss, peak RSS).",
+    "Connects the toy to the job: which caches an AI product needs, what must be in the key, and when a cache creates a correctness or data-isolation bug.",
+  ]}
+/>
+
+In plain terms: at Senior, the round is mostly won in the first 20 minutes, with code that is fast, correct and
+tested. At Staff, the interviewer expects you to raise contention and failure on your own; the prep guide's framing
+is that you "narrate the failure modes before they ask" (<Cite id="s-86890a1069" />). Peak RSS, from stage 6, is the
+number that tells you whether the chunk cache's overshoot is real.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="Reported (NVIDIA, first-hand): make it work with multiple threads.">
+    One mutex first, and say why: `get` reorders the list, so it writes. Then offer striping by key hash if
+    contention shows up, and say it makes eviction per-shard. In C++, `std::mutex` per shard; in Java,
+    `ReentrantLock` per shard or just Caffeine. Prove it with a stress test that checks invariants
+    (<Cite id="s-7dd221b925" />).
+  </FollowUp>
+  <FollowUp q="Reported (Anthropic, first-hand): how would you handle files, and what are the serialization trade-offs?">
+    Files: write a snapshot to a temp file, fsync, rename. Trade-offs: JSON is readable and safe but slow and big;
+    a binary format is compact but needs versioning and endianness rules; pickle is convenient and unsafe on
+    untrusted input. TTL must be stored as absolute time. If no acknowledged write may be lost, you need a log, not
+    a snapshot (<Cite id="s-42f1c7f6dd" />).
+  </FollowUp>
+  <FollowUp q="Reported (Modal, prep guide): two containers miss the same chunk at the same time.">
+    Single flight: one in-flight future per key, fetch outside the lock, every waiter gets the result or the error,
+    and the failure isn't cached. Then the 200 MB part: evict by bytes, pin chunks while they're being read, bound
+    concurrent fetches, and keep chunks on disk rather than in the heap (<Cite id="s-86890a1069" />).
+  </FollowUp>
+  <FollowUp q="Reported (Databricks, first-hand): the client reads by offset and length. How should it read and write efficiently?">
+    Map the range onto chunk indices, fetch only the chunks it touches, coalesce concurrent misses, prefetch the
+    next chunk on sequential reads, and serve reads from cached chunks without copying the whole file. For writes,
+    ask whether files are immutable; if they are, writes are uploads and invalidate cached chunks by version
+    (<Cite id="s-7e1349c451" />).
+  </FollowUp>
+  <FollowUp q="Reported (LinkedIn, Hello Interview): LRU as the tiebreaker for elements with the same rank.">
+    That is LFU with an LRU tie-break: count buckets, each an insertion-ordered set, plus the minimum count
+    (<Cite id="s-4225f96d88" />).
+  </FollowUp>
+  <FollowUp q="Not reported; a natural next push: a sliding TTL (reads extend the lifetime).">
+    Reset `expires_at` in `get` and push a new heap row. The heap now grows with reads, so either rebuild it when
+    stale rows dominate or drop the heap and rely on LRU eviction. Ask whether writes alone should extend it.
+  </FollowUp>
+  <FollowUp q="Not reported; a natural next push: the cache is now shared by many services. What changes?">
+    It becomes a network cache (Redis or Memcached), the key needs a namespace and version, eviction is the
+    server's policy, and the dangerous part is invalidation: a deleted or permission-changed record must leave
+    the cache within a stated time. Single flight now needs a distributed lock or a lease.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Not deleting the evicted key from the map.** The node must carry its key, or eviction leaves a ghost entry;
+  this is the specific assistant bug the LinkedIn candidate reports (<Cite id="s-8e19cb9489" />).
+- **Evicting on an update.** `put` on an existing key must not change the size, so check for the key before you
+  check capacity.
+- **`if cached:` instead of `is None`.** A stored `0`, `""` or empty list then counts as a miss.
+- **Reading the wall clock inside the cache.** The tests then need real sleeps, and a clock jump can expire
+  everything at once.
+- **A read-write lock for an LRU.** Reads mutate the list, so they need exclusive access anyway.
+- **Holding the lock during the fetch.** Every miss for every key then waits behind one network call.
+- **Caching the error.** A transient 503 becomes a permanent failure until the TTL runs out.
+- **Counting entries when the objects are 200 MB.** Eviction by count lets ten large chunks exhaust memory.
+- **Preparing only one shape.** The Databricks candidate prepared data writers and felt lost when the round was a
+  cache read by offset (<Cite id="s-7e1349c451" />), so practise the chunk cache too.
+- **Letting the assistant design it in an AI-assisted round.** The LinkedIn candidate reports being told the
+  algorithm had to be their own (<Cite id="s-8e19cb9489" />).
+
+## Prove it with a lab
+
+No lab builds the interview cache end to end. These cover the pieces.
+
+<LabRef lab="kv-cache" role="background" note="Not an LLM lab. A Redis-style cache with lazy TTL expiry, LRU eviction and an append-only file. Its v2 eviction scans every key for the oldest access time (O(n)); rewriting it as map plus list is a good O(1) exercise, and its comments describe Redis's sampled approximate LRU." />
+
+<LabRef lab="cdn-edge" role="partial" note="Read coalesce.go: one in-flight request per key, waiters block on a channel, the fetch runs outside the lock. Its tests pass. Until 2026-10-13 a 5xx from the origin came back as a successful fetch, so the stale fallback never ran; how that bug was found is worked in the read-and-debug family." />
+
+<LabRef lab="embedding-pipeline" role="proof" note="An LRU cache in front of an embedding model with a measured hit rate on a skewed synthetic stream; compare it with uniform and bulk-ingestion traffic before you promise a saving." />
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-42f1c7f6dd" />
+- <Cite id="s-b305f78fa5" />
+- <Cite id="s-7dd221b925" />
+- <Cite id="s-21ef4a7dbc" />
+- <Cite id="s-9daac2715f" />
+- <Cite id="s-8e19cb9489" />
+- <Cite id="s-1980a339c0" />
+- <Cite id="s-4225f96d88" />
+- <Cite id="s-86890a1069" />
+- <Cite id="s-7e1349c451" />
+- [Anthropic, Prompt caching (docs)](https://platform.claude.com/docs/en/build-with-claude/prompt-caching), fetched 2026-10-12
+- [OpenAI, Prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching), fetched 2026-10-12
+- [Anthropic, Pricing](https://platform.claude.com/docs/en/about-claude/pricing), list prices fetched 2026-10-11

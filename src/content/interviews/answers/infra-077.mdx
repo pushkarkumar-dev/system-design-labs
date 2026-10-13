@@ -1,0 +1,165 @@
+---
+question: infra-077
+family: diagnose-infra-performance
+status: published
+labs: [kafka-lite, observability]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Before I fix anything, I want to know what 'slow' means here: the experiment itself, the results showing
+> up on the dashboard, or the dashboard loading. Then I'll draw the path, notebook to Kafka to consumer to
+> store to dashboard, and attach one cheap measurement to each hop. I'll check the fastest ones first,
+> consumer lag and the dashboard query, and tell you what I expect before I look, so you can steer me."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see whether you can take a vague complaint about a system you didn't build and
+turn it into measurements.
+
+This is different from a normal design round. You are not asked to build anything. You are shown a system
+and told "it's slow", with no numbers. The vagueness is the test. A candidate who proposes a fix in the
+first minute ("add partitions", "get a bigger GPU") has guessed. A candidate who asks what slow means,
+draws the path and measures one hop at a time has shown a method. The interviewer reveals information as
+you ask for it, so the order of your questions is what gets graded.
+
+(The NVIDIA Senior MLE (machine learning engineer) candidate describes an onsite that showed architectures instead of a design prompt
+and "kept the problem intentionally vague": Kafka, Jupyter and an experiment dashboard, and "it's slow".
+They started by "pulling the problem apart instead of jumping to a fix", and felt the interviewers "were
+definitely giving breadcrumbs based on my path" <Cite id="s-79598dd069" />.)
+
+## Clarify first
+
+- **Slow at what?** The experiment run, results appearing on the dashboard, or the dashboard itself
+  loading?
+- **How slow, compared with when, and what changed?** Data volume, a library upgrade, a new topic or
+  consumer?
+- **Where do results flow?** Notebook → Kafka → consumer → store → dashboard? Ask; don't assume.
+- **Every engineer and every experiment, or one?**
+- **What hardware does the notebook run on, and is the GPU used?**
+
+## Answer
+
+### Words you need first
+
+- **Kafka** stores messages in an append-only log split into **partitions**. Each message has a position
+  called its **offset**.
+- A **consumer group** is a set of readers sharing the partitions. It records how far it has read by
+  **committing** an offset.
+- **Lag** is the gap between the newest offset and the group's committed offset: messages written but not
+  yet processed. Growing lag means the readers are slower than the writers.
+- A **Jupyter notebook** is an interactive Python session; the process behind it is called the
+  **kernel**.
+
+### Draw the path
+
+Confirm this picture with the interviewer before measuring anything:
+
+```
+Jupyter notebook (runs the experiment)
+   │  publishes results or metrics
+   ▼
+Kafka topic
+   │
+   ▼
+Consumer ── reads results, writes them to a store
+   │
+   ▼
+Results store
+   │  queried by
+   ▼
+Experiment dashboard
+```
+
+**The notebook** can be slow by itself: slow Python, or a GPU sitting idle. **The producer step** can be
+slow if the notebook sends one message per row. **The consumer** can fall behind, and lag grows. **The
+store and dashboard** can be slow if the dashboard scans every experiment ever run.
+
+### Follow one complaint through
+
+Take the complaint "results take ages to show up on the dashboard". Here is the order to work in, with the
+reasoning for each step. The interviewer supplies the readings; what matters is that you know what each
+one would mean.
+
+| Step | What you check | If you see this | What to say in the interview |
+|---|---|---|---|
+| 1 | Consumer lag | Lag growing on every partition | "The consumer can't keep up. Too few consumers, or a slow write per message." |
+| 1 | Consumer lag | Lag at zero | "Kafka and the consumer are fine. The time is before or after them." |
+| 2 | The dashboard's query time and plan | A scan over all results | "The query needs an index or a filter on experiment id." |
+| 3 | The notebook's profile | Most time in one cell | "The experiment itself is slow. That's not a pipeline problem." |
+| 4 | GPU activity during the run | GPU mostly idle | "The GPU is waiting on Python or on data copies." |
+| 5 | Messages read per run | The whole topic on every run | "A new consumer group is replaying from the start." |
+
+Lag and the dashboard query come first because they take seconds to check and rule out whole hops. Say
+each result out loud. The interviewer's "breadcrumbs" are reactions to which hop you check first.
+
+### The commands for each hop
+
+- **Notebook compute:** `%time` and `%prun` on the experiment cell (Jupyter's built-in timer and
+  profiler). `py-spy dump --pid <kernel>` shows what the Python process is doing right now. `nvidia-smi
+  dmon` shows whether the GPU is busy or idle.
+- **Producer to Kafka:** produce latency and batching. Is the notebook sending one message per row?
+- **Consumer:** `kafka-consumer-groups.sh --describe --group <group>` shows `CURRENT-OFFSET`,
+  `LOG-END-OFFSET` and `LAG` per partition
+  ([Kafka operations](https://kafka.apache.org/43/operations/basic-kafka-operations/), read 2026-10-12).
+  Growing lag means the consumer can't keep up. Zero lag rules this hop out.
+- **Store and dashboard:** the dashboard's query time and query plan. Is it scanning every experiment ever
+  run?
+
+### Guesses worth naming
+
+- **Consumer lag:** fewer consumers than needed, or a slow write per message.
+- **The notebook rereads the whole topic every run.** A fresh consumer group with no committed offset
+  starts from the beginning in kafka-lite, whose `FetchOffset` returns 0 for a group with no commit. Real
+  clients follow their offset-reset setting, so check it.
+- **The dashboard query has no index or filter** on experiment id.
+- **The experiment itself:** CPU-bound loops over pandas data frames, data copied off the GPU every step,
+  or the GPU not used at all.
+
+Say it like this: "I'll test the cheapest guess first and tell you what I expect, so you can stop me if
+I'm heading the wrong way."
+
+### Fix and confirm
+
+Fix the hop that owns the time, then repeat the same end-to-end measurement you started with. Then add a
+timestamp per hop to each result message. The next time someone says "it's slow", a dashboard answers the
+question instead of an engineer.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Vague slow notebook"
+  senior={["Defines slow, maps the pipeline, measures each hop with the right tool, and narrows to one cause."]}
+  staff={["Uses the ambiguity to steer the conversation, ranks hypotheses by cost to test, and leaves per-hop latency instrumentation so the question never needs an engineer again."]}
+/>
+
+In plain words: a Senior answer finds the slow hop. A Staff answer also chooses the order of checks on
+purpose, talks through it so the interviewer can steer, and leaves timing on every hop so nobody has to
+debug this by hand again.
+
+## Small-team version
+
+A small AI team rarely runs Kafka for experiment results. A table in Postgres and an experiment-tracking
+tool are more common. The method still transfers. When someone says "evals are slow" or "the RAG answer
+takes 20 s" (RAG: the app first retrieves documents, then asks the model to answer using them), time each
+hop with a trace before touching anything: retrieval, the model call, post-processing, the UI.
+
+A trace costs little to add and pays for itself the first time someone complains. An agent can read the
+trace and suggest suspects. Ask it which measurement would rule each suspect out, then take that
+measurement yourself.
+
+## Pitfalls
+
+- **Proposing a fix before defining "slow".** More partitions or a bigger GPU may fix a hop that was never
+  slow.
+- **Measuring only end to end.** A total tells you that it's slow, not where.
+- **Ignoring the notebook itself.** Many "pipeline" problems are one slow cell.
+- **Fighting the vagueness.** It is deliberate; clarifying questions are how you narrow it, and the
+  interviewer is grading them.
+
+## Go deeper
+
+- Family walkthrough: [Diagnose slow or stuck infrastructure](/system-design-labs/interviews/walkthroughs/diagnose-infra-performance/), worked example 7.
+- Consumer groups and committed offsets: <LabRef lab="kafka-lite" inline />. Traces and metrics in one middleware: <LabRef lab="observability" inline />.

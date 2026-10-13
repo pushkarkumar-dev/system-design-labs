@@ -1,0 +1,203 @@
+---
+question: infra-021
+family: concurrent-io-workers
+status: published
+labs: [rate-limiter, io-model]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll write the plain sequential crawler first and get the right set of pages printing, because that
+> becomes the test for the concurrent one. Then I'll add a fixed pool of threads that only do the fetching.
+> One coordinator thread owns the set of pages already seen, so I need no locks. The crawl ends when nothing
+> is waiting to be fetched **and** nothing is still being fetched. Every request gets a timeout, so one slow
+> page can't stall the whole crawl."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know one thing: can you get a correct crawler running quickly, then make it
+concurrent without losing pages, fetching a page twice, or hanging at the end?
+
+A crawler looks like an ordinary batch job, but it differs in one way that matters. **The work creates more
+work.** You fetch a page and find links to new pages. So you never know the full list of jobs up front. At any
+moment the queue can be empty while a worker is still fetching a page that will add ten more jobs. Most of
+the bugs in this round come from forgetting that.
+
+The baseline is a warm-up. What decides the round is how quickly you reach a concurrent version that ends
+correctly, and whether you can say why it does. In the reported Anthropic Staff phone screen, the candidate
+had a working baseline fast, ran out of time on the multithreaded version, and was rejected overall
+(<Cite id="s-2348518c66" />).
+
+## Clarify first
+
+Spend one or two minutes on these, and say your assumptions out loud:
+
+- **What counts as the same URL?** "I'll drop the `#fragment` and tracking query strings, strip trailing
+  slashes and lowercase the host." The report says "strip extra URL details".
+- **How far to go?** "Same host only, with a page cap as a safety net."
+- **Politeness?** "Is there a rate limit or a robots.txt to honor? I'll assume none on the toy site, but
+  leave a hook for one."
+- **Failures?** "One failed page doesn't fail the crawl. I'll record it and continue."
+- **Language?** The report describes Replit. Use the language you are fastest in.
+
+## Answer
+
+### Words you need first
+
+- **Frontier**: the list of URLs found but not yet fetched.
+- **Seen set**: every URL already found, so each one is queued only once.
+- **In flight**: a fetch a worker has started but not finished.
+- **Termination rule**: the test for "we are done". Here it is: the frontier is empty **and** nothing is in
+  flight.
+- **Oracle**: a simple version you trust, used to check the clever one. The sequential crawler is the
+  oracle.
+
+### Step 1: sequential first (about 10 minutes)
+
+Write a **breadth-first search**: take the oldest URL from the frontier (a `deque`, a list that is fast to pop
+from the front), fetch it, and add each new link to the back. Pass every link through a `normalize()`
+function. It resolves relative links with `urljoin`, drops the fragment and query, and keeps only the same
+host. Print the sorted set.
+
+Mark a URL seen when you **enqueue** it, not when you fetch it. If you mark on fetch, two pages that both link
+to `/p/7` can each queue it before either fetch happens, and it gets fetched twice. Say it like this: "I add
+to the seen set when I queue a link, so nothing is queued twice."
+
+### Step 2: threads, with one owner of state
+
+Say the termination rule before you type. Then use the simplest correct design, a **coordinator**:
+
+```
+Coordinator (main thread) ── owns the frontier and the seen set
+   │  submits at most W fetches
+   ▼
+Thread pool (W threads) ── each one only fetches a URL and returns the HTML
+   │  returns a finished future
+   ▼
+Coordinator ── parses the HTML, adds new links to the frontier
+   │
+   ▼
+Loop while the frontier is not empty OR fetches are in flight
+```
+
+**The coordinator** is the main thread. It is the only code that reads or changes the frontier and the seen
+set, so no locks are needed.
+
+**The thread pool** is a `ThreadPoolExecutor`. Each submitted fetch returns a **future**: an object that will
+hold the HTML, or the error, when the fetch finishes. The coordinator keeps a dictionary of in-flight futures
+and waits with `wait(..., return_when=FIRST_COMPLETED)`, which returns as soon as any one is done.
+
+**The loop condition** is the termination rule in code: `while frontier or in_flight`. The family walkthrough
+has the full 25-line version.
+
+Threads work well here even in Python. Python's **GIL** (global interpreter lock) lets only one thread run
+Python code at a time, but a thread waiting on a socket releases it. A crawler spends nearly all its time
+waiting.
+
+### Follow one crawl through it
+
+The family walkthrough tested this against a fake 200-page site, run on 2026-10-12 on an Apple M1 Ultra. Each
+response was made to sleep 50 ms to imitate the network (an assumption, not a real site's latency). 188 pages
+were reachable.
+
+| Version | Time | What to say in the interview |
+|---|---|---|
+| Sequential | 10.2 s | "Correct but slow: 188 pages, each waiting 50 ms in turn." |
+| 16 threads | 0.79 to 0.86 s | "Same 188 pages. I predicted about 0.59 s; the rest is overhead." |
+| 64 threads | 0.40 to 0.43 s | "Close to the floor. The site is 7 links deep, so it can't beat 0.35 s." |
+| Ends on an empty queue (the bug) | returns 1 page | "An empty queue is not the end. A fetch was still running." |
+
+Predict the speed-up before measuring. Three things limit a crawl, and the slowest one wins: how many workers
+you have, how deep the chain of links goes (you can't fetch a page before the page linking to it), and any
+rate limit.
+
+<Formula
+  title="Crawl time lower bound"
+  expr="T ≥ max(N × L ÷ W, D × L, N ÷ R)"
+  vars={[
+    { sym: 'N, L', meaning: 'requests and latency per request' },
+    { sym: 'W', meaning: 'workers in flight' },
+    { sym: 'D', meaning: 'longest chain of discoveries (levels)' },
+    { sym: 'R', meaning: 'rate limit per host, if any' },
+  ]}
+  example="188 pages at an assumed 50 ms: W = 16 → 0.59 s predicted; run on 2026-10-12 against a fake site, 0.79 to 0.86 s vs 10.2 s sequential"
+/>
+
+With 64 workers the measured time sat just above the 7-level discovery floor, so more threads would not
+help. Say it like this: "Past about 16 workers, the depth of the site is the limit, not the pool."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Sequential floor:** 188 pages × 0.05 s = **9.4 s**; measured 10.2 s with parsing overhead.
+- **16 workers:** 188 × 0.05 ÷ 16 = 0.5875 s ≈ **0.59 s**.
+- **64 workers:** 188 × 0.05 ÷ 64 ≈ 0.15 s, but the discovery term is 7 levels × 0.05 s = **0.35 s**, so
+  0.35 s is the real floor.
+
+</details>
+
+### What breaks
+
+The common bug is ending the crawl when the queue is empty. Run on 2026-10-12, a version that polled
+`q.empty()` returned one page out of 188 in all ten runs. The first worker took the seed, which left the queue
+empty while the seed was still being fetched, so the main thread decided it was done. Count in-flight work
+instead: the coordinator's `in_flight` dictionary, Python's `task_done()` and `join()` (`join()` returns only
+when every queued job is marked done), or a `WaitGroup` in Go (a counter of running tasks).
+
+Then add a timeout on every request. Without one, a single hung page holds a worker, and the crawl, for as
+long as the server likes.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Crawler to threads"
+  senior={["Reaches a threaded crawler that terminates correctly and matches the sequential output, with timeouts and per-page error handling."]}
+  staff={["Predicts which limit (workers, discovery depth, rate) bounds the crawl, and adds politeness, retries with a total deadline and a resumable frontier when asked about scale."]}
+/>
+
+In plain words: a Senior answer is correct and finishes. A Staff answer also says, before measuring, which
+limit will set the time, and keeps going when the interviewer adds rate limits, retries and crashes.
+
+## Small-team version
+
+You will rarely crawl the web, but you will write this exact loop for ingestion: walk a docs site, a
+Confluence space or a storage bucket, fetch each item, and **embed** it (turn its text into a list of numbers
+used for search). The same rules apply:
+
+- **Keep the coordinator shape.** One owner of the seen set, a bounded pool doing the fetches.
+- **Size the pool from the source's rate limit**, not by guessing: workers ≈ rate × latency.
+- **Persist the seen set**, so a crash resumes instead of starting over.
+- **Check the final count** against the source's own count of pages.
+
+An AI assistant can write the loop. You write the comparison test and the stop condition. Default: one script
+with a bounded pool and an id-keyed results table in the Postgres you already run.
+
+The bill is the embedding step, and it is small: 100,000 pages of 500 tokens (a **token** is roughly ¾ of a
+word, the unit embedding APIs bill by) at $0.02 per million tokens (OpenAI text-embedding-3-small, fetched
+2026-10-11) is about **$1**. Revisit with a job queue when ingestion runs continuously or several sources feed
+it.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+100,000 pages × 500 tokens = 50 million tokens; 50 × $0.02 = **$1.00**.
+
+</details>
+
+## Pitfalls
+
+- **Polling `queue.empty()` to decide you're done.** A fetch can still be running and about to add work; the
+  tested version found 1 page of 188.
+- **Marking pages seen on fetch.** Two workers can queue the same page before either fetches it, so it is
+  fetched twice.
+- **No timeout.** One slow page holds a worker, and the whole crawl, hostage.
+- **Spending the hour on a perfect baseline.** That leaves no time for the threads, which is the reported
+  failure.
+
+## Go deeper
+
+- Family walkthrough: [Concurrent I/O workers](/system-design-labs/interviews/walkthroughs/concurrent-io-workers/), especially "Solution in stages" and "Verification".
+- Rate limiting the crawler: <LabRef lab="rate-limiter" inline />. Why event loops scale: <LabRef lab="io-model" inline />.
+- The Glean variant with an AI pair: [eng-093](/system-design-labs/interviews/questions/eng-093/).

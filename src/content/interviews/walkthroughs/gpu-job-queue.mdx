@@ -1,0 +1,682 @@
+---
+title: "Async GPU job system: queueing, leases, fencing and no lost work"
+summary: "Design a job queue for long GPU tasks such as text-to-video: accept a job so it is never lost, share GPUs fairly with a paid tier, re-run crashed work safely, contain a model that breaks on some GPU types, and survive bursts."
+track: ai-infra
+format: design
+family: gpu-job-queue
+smallTeamFocus: "Build it: a Postgres jobs table claimed with SKIP LOCKED, a lease and a fence column, workers on GPUs rented by the second. Switch to dedicated GPUs only when they would be busy more than about 45–62% of the time."
+rounds: [system-design]
+level: both
+timeboxMin: 45
+order: 223
+status: published
+basedOn: [infra-045, infra-015, infra-050]
+askedAt: [openai, nvidia, modal]
+labs:
+  - { lab: dist-lock, role: proof, note: "Leases plus a monotonically increasing fencing token that a storage server checks, exactly the mechanism that stops an expired worker from overwriting output." }
+  - { lab: kafka-lite, role: proof, note: "A segmented, durable log: the acceptance path that lets you acknowledge a burst only after it is on disk." }
+  - { lab: faas-runtime, role: proof, note: "A warm instance pool in front of cold starts. Its cold start is a 50 ms sleep, so the GPU-scale numbers here come from formulas, not the lab." }
+  - { lab: message-queue, role: partial, note: "SQS-style visibility timeouts, receipt handles and a dead-letter queue. The delayed-message test panics as of 2026-10-11." }
+  - { lab: container-orchestrator, role: partial, note: "A first-fit scheduler and reconcile loop with no GPU resource type; its informer test fails and the suite times out." }
+gapLabs: [gpu-scheduler]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "This is a job queue, like the ones I've built for emails or reports, but each job holds a whole GPU for a minute
+> or more, so losing or repeating one costs real money. I write every job to a database before I return its ID, and
+> that table is the only source of truth. Workers borrow a job for a short time and keep renewing the loan. Every
+> loan gets a new number, and a worker can save its result only if its number is still the current one, so a
+> worker that froze and woke up late can't overwrite anything. GPUs are shared by GPU time used, not by job count,
+> with a weight for the paid tier. And when demand outruns the fleet, I say no at the door instead of accepting work
+> I can't finish."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+Users submit text-to-video requests: "a 12-second clip of a fox running through snow". Each request becomes a task
+that runs on exactly one GPU for a minute or more. Design the backend: how a request is accepted so it is never
+lost, how tasks share the fleet fairly with a paid tier that must get results faster, how a crashed or stalled
+worker is detected and its task safely re-run, how a new model version that fails only on some GPU types is
+contained, and how the system copes when thousands of tasks arrive at once.
+
+### What makes this different from a normal job queue
+
+You have probably built a background job queue: send an email, resize an image, build a PDF report. Those jobs take
+milliseconds to seconds. They run on cheap CPU machines you can add in seconds. If one runs twice, a user gets two
+emails and nobody loses much.
+
+A GPU job queue keeps the same shape but changes three things, and the whole design follows from them:
+
+1. **Each job is long and expensive.** A video task holds one GPU (a graphics processor rented for about one or two
+   dollars an hour) for 90 seconds or more. Losing a job means a user who paid and got nothing. Running it twice means paying
+   twice and maybe delivering two different videos.
+2. **The hardware is not all the same.** A fleet often mixes two or more GPU types. A new model version can work on
+   one type and crash on another, so a failure can come from the job, the machine, or the pairing of model and GPU
+   type.
+3. **You can't add capacity quickly.** A new GPU worker must first load the model, which can be tens of gigabytes.
+   That takes tens of seconds, so you can't simply "autoscale" your way out of a sudden burst.
+
+Three reported questions are the same problem at three zoom levels: the whole scheduler, the "never lose a request"
+guarantee, and the burst.
+
+<QuestionRow id="infra-045" />
+<QuestionRow id="infra-015" />
+<QuestionRow id="infra-050" />
+
+They were reported for OpenAI (a question title on PracHub, an interview-question aggregator), NVIDIA (a Glassdoor
+snippet) and Modal, a serverless GPU platform (a prep article); the next section says what each source does and doesn't tell you <Cite id="s-725e58e60a" />.
+
+## What is being tested
+
+The interviewer is checking whether you can design a job queue where every step can fail, and make re-running a
+task safe. Most of the score comes from failure handling, not from the happy path.
+
+### What the sources say
+
+- **OpenAI (text-to-video scheduler).** Only the title is candidate-reported, dated 2026-09-28. The rest of the page
+  is PracHub's write-up. It covers request flow and fair queueing, and says failure handling is "the core of the
+  discussion". It lists three follow-ups (a paid tier, a model that fails on certain GPU types, honest wait
+  estimates) and a checklist: a durable job store (one that survives crashes) as the source of truth, fairness in weighted GPU time, leases,
+  heartbeats, fencing tokens, bounded retries, and throughput estimates for admission control
+  <Cite id="s-725e58e60a" />. It gives no numbers, so you are expected to ask for them. (Each of those terms is
+  explained below, where the design uses it.)
+- **Modal (burst).** A July 2026 prep article poses "Ten thousand short tasks land in a single second" with no
+  answer. It treats the pool of ready workers as something a control loop sizes, and calls "just keep instances
+  always on" a weak answer because idle GPUs are expensive. It cites no first-hand sources
+  <Cite id="s-86890a1069" />.
+- **NVIDIA (5,000 concurrent requests, none lost).** This rests on a Glassdoor snippet whose author was unsure
+  which review it came from <Cite id="s-28f1d2740e" />. Treat its details as unknown.
+- **General.** A prep guide summarizing Anthropic-style design rounds says strong candidates raise crash and
+  overload cases without being asked and keep queues bounded <Cite id="s-5f44d8637a" />.
+
+### What this adds up to
+
+This is a distributed job queue, which most backend engineers have built, with the three GPU twists from above:
+expensive work units, mixed hardware, and slow-to-add capacity. Say that framing early. It tells the interviewer
+you will reuse what you know and spend your time on the parts that are new.
+
+"I'll design this like a normal durable job queue, then spend most of the time on the three things GPUs change:
+each lost or duplicated job costs real money, failures can depend on the GPU type, and I can't add workers fast
+enough to absorb a burst."
+
+## Clarify and scope
+
+Spend two or three minutes pinning down numbers, because every later decision depends on them. Say each assumption
+out loud.
+
+1. **Rates and durations.** How many tasks arrive per second, and how bursty is it? How long does a task use the
+   GPU, on average and in the worst case? "Let's assume 2 tasks a second on average and 90 seconds of GPU time per
+   task, with a long tail."
+2. **Fleet.** How many GPUs, of which types? "Assume 200 GPUs across two types."
+3. **Fairness unit and tiers.** Is fairness per user, per organization or per tier? What does "faster" mean for the
+   paid tier: a wait-time target, a guaranteed share, or the right to interrupt free work?
+4. **Durability.** Define "lost". Propose: "We returned a job ID, and then the job never reached a final state the
+   user can see." Turning a request away before you give it an ID is allowed; that's not loss.
+5. **Delivery and cancellation.** Does the user poll for the result, get a callback (a **webhook**: an HTTP call we
+   make to a URL they gave us), or both? Can they cancel a queued or running task?
+6. **Checkpointing.** Can a task save its progress partway and resume after a crash (a **checkpoint**), or must it
+   restart from zero? "Assume it restarts from zero."
+
+**Out of scope, said out loud:** the video model itself, content moderation details, and billing beyond quotas.
+
+## Back-of-envelope
+
+Three numbers shape this design: how busy the fleet is, how long a burst takes to clear, and how much GPU time a
+crash wastes. Explain what each one means before you compute it.
+
+### Words you need first
+
+- **Utilization**: the share of the fleet that is busy on average. Written **ρ** (the Greek letter rho). At 50%
+  utilization a new job usually finds a free GPU. Near 100%, any small burst makes a queue that takes a long time to
+  clear.
+- **Little's law**: on average, the number of things inside a system equals the rate they arrive times how long
+  each one stays. Here: GPUs busy = tasks per second × GPU seconds per task. It is the one formula you need.
+- **GPU-seconds**: one GPU busy for one second. A 90-second task costs 90 GPU-seconds. This is the unit of work,
+  and later the unit of fairness.
+
+### How busy is the fleet?
+
+With our assumptions, Little's law gives **180 GPUs busy out of 200, so the fleet is 90% utilized**. That sounds
+efficient. It is also dangerous: there is only a little spare capacity, so any burst piles up.
+
+"At 90% utilization I only have about 10% spare capacity, so a burst doesn't just cause a short delay. It creates a
+backlog that takes a long time to drain."
+
+### How long does a burst take to clear?
+
+The fleet can finish about **2.2 tasks a second** (200 GPUs, each finishing a task every 90 seconds). Suppose a
+10-minute burst arrives at 5 tasks a second. The queue grows by the difference, and ends up about **1,667 tasks
+deep**. When traffic falls back to 2 a second, the fleet has only about 0.22 spare tasks a second to drain it, so the
+backlog takes **about 2 hours** to clear.
+
+That is the number that justifies **admission control**: deciding at the front door whether to accept a job, based
+on how long it would wait. Without it, a 10-minute burst becomes two hours of slow results for everybody. With it,
+you can turn away or delay free-tier work, or add capacity, before the queue gets that deep.
+
+The same arithmetic gives the **honest wait estimate** the write-up asks for: the GPU-seconds of work ahead of you
+in your tier's queue, divided by the GPU-seconds per second your tier is getting right now.
+
+### How much does a crash cost?
+
+A worker borrows a job for a limited time and renews the loan by sending a small "still here" message every few
+seconds, called a **heartbeat**. The length of the loan is its **TTL** (time to live). If heartbeats stop and the
+TTL runs out, the system assumes the worker is dead and gives the job to someone else. Assume a heartbeat every 10 seconds and a 30-second TTL. Then a crash is noticed **within 30 seconds**. With no
+checkpoints, a crash at a random point of a 90-second task wastes **about 45 seconds of work plus up to 30 seconds
+of waiting to notice**.
+
+### Two more numbers for the follow-ups
+
+- **The Modal burst.** 10,000 short tasks of an assumed 0.5 seconds each are 5,000 GPU-seconds of work. On 250 warm
+  containers (assumed; a **warm** container already has the model loaded and can start a task at once) that clears in **about 20 seconds**. A new container must first load a 40 GB model (the size
+  in the Modal article), which at an assumed 2 GB/s also takes **about 20 seconds**. So starting new containers
+  during a one-second burst only helps tasks that would otherwise wait longer than about 20 seconds.
+- **The NVIDIA "5,000 concurrent" question.** If each request takes 2 seconds end to end (assumed), 5,000
+  concurrent requests means **2,500 new requests a second** to write durably. That sounds like a lot of disk
+  writes, but the database can save them in groups (explained in the deep dive), which brings it down to about
+  **200 disk flushes a second**. One well-provisioned database or log can absorb that.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="GPUs busy (Little's law)"
+  expr="busy GPUs = λ × W     utilization ρ = busy ÷ fleet"
+  vars={[
+    { sym: 'λ', meaning: 'task arrival rate' },
+    { sym: 'W', meaning: 'mean GPU time per task' },
+  ]}
+  example="2 tasks/s × 90 s = 180 GPUs busy; on 200 GPUs, ρ = 0.9 and queues grow fast on any burst"
+/>
+
+<Formula
+  title="Backlog during a burst"
+  expr="backlog after T = (λ_burst − fleet ÷ W) × T     drain time = backlog ÷ (fleet ÷ W − λ_after)"
+  vars={[
+    { sym: 'fleet ÷ W', meaning: 'service rate, tasks per second' },
+  ]}
+  example={[
+    "Service rate 200 ÷ 90 = 2.22 tasks/s. A 10-minute burst at 5/s adds (5 − 2.22) × 600 ≈ 1,667 queued tasks",
+    "Back at 2/s, the spare rate is 0.22/s → about 7,500 s, roughly 2 hours to drain",
+  ]}
+/>
+
+<Formula
+  title="Lease timing"
+  expr="detection ≤ lease TTL     wasted GPU time per crash ≈ time since last checkpoint + TTL"
+  vars={[
+    { sym: 'TTL', meaning: 'lease length; renewed by heartbeats' },
+  ]}
+  example="Heartbeat every 10 s, TTL 30 s (assumed): a crash is noticed within 30 s; with no mid-task checkpoints a crash at a random point wastes about 45 s of a 90 s task plus up to 30 s"
+/>
+
+- **Burst:** 10,000 × 0.5 s = 5,000 GPU-seconds; 5,000 ÷ 250 containers = 20 s. Cold start: 40 GB ÷ 2 GB/s = 20 s
+  before a new container's first task.
+- **Durable acceptance:** 5,000 concurrent ÷ 2 s = 2,500 accepts per second. Saving to disk in groups every 5 ms
+  (assumed) is 1,000 ÷ 5 = 200 flushes per second, so 2,500 ÷ 200 ≈ 12.5 requests share each flush.
+
+</details>
+
+## High-level design
+
+Here is the whole system. The rule that holds it together: **the job table in the database is the only truth.**
+Everything else (queues in memory, the scheduler's view of who is running what) is a copy that can be rebuilt from
+that table.
+
+```
+Client
+   │  1. POST /jobs  (with an idempotency key)
+   ▼
+API ── writes the job row and commits it to disk, THEN returns the job ID
+   │
+   ▼
+Job store (database) ── one row per job: state, tier, attempt, fence, lease expiry, output path
+   │  2. scheduler reads queued jobs
+   ▼
+Scheduler ── per-tenant queues, picks the next job by fair share of GPU-seconds,
+   │          matches it to a free GPU of a compatible type
+   │  3. grants a lease and a new fence number
+   ▼
+GPU workers ── heartbeat to renew the lease, run the model
+   │  4. write the video to object storage under outputs/<job>/attempt-<fence>/
+   │  5. commit to the job store ONLY IF the fence is still theirs
+   ▼
+Notifier ── reads finished jobs from an outbox table, calls the user's webhook (with retries)
+```
+
+**API.** It takes `POST /jobs` with an **idempotency key**: a unique string the client makes up for each request
+and sends again on every retry, so the server can tell "a retry of the same request" from "a new request". The API
+returns a job ID only after the database has saved the row. It also serves `GET /jobs/:id` for status, an optional
+webhook, and `DELETE` to cancel.
+
+**Job store.** One row per job, with these columns: `id, tenant, tier, model_version, gpu_type_constraint, state,
+attempt, fence, lease_owner, lease_expires_at, output_ref, error, created_at`. A **tenant** is one customer (a user or
+an organization). The states run: queued → leased → running → succeeded, failed or dead.
+
+**Scheduler.** It builds one queue per tenant from the store, picks the next job by a weighted fair share of
+GPU-seconds, matches it to a free GPU of a type that can run it, and grants a lease. Everything it holds in memory is
+a cache.
+
+**Workers.** A worker on each GPU takes a lease, heartbeats to renew it, writes output to a path that includes its
+attempt number, then commits.
+
+**Notifier.** It reads finished jobs from an **outbox table** (a table of "messages to send", written in the same
+transaction as the state change) and calls webhooks with retries.
+
+### Follow one job through it
+
+Maya, on the free tier, asks for "a 12-second clip of a fox running through snow". The task needs 90 seconds of GPU
+time. Here is what happens, with a running clock. The timings are illustrative and assumed, but the mechanics are
+exactly what you would build. In this story one worker freezes halfway, which is the case the interviewer cares
+about most.
+
+| Clock | What happens | Row in the job store | What to say in the interview |
+|---|---|---|---|
+| 0 s | Maya's app sends `POST /jobs` with idempotency key `k-7f3`. The API inserts the row and commits it. | state queued, attempt 0, fence 0 | "I return the ID only after the commit. Before that, nothing is promised." |
+| 0.01 s | Her connection drops before the reply arrives. The app retries with the same key. The API finds the existing row and returns the same ID, `J-1042`. | unchanged | "The retry finds the same job, so a timeout can't create a duplicate." |
+| 40 s | The scheduler picks J-1042 by fair share and leases it to worker W1 on a type-A GPU. | leased, attempt 1, fence 1, expires at 70 s | "Every lease grant bumps the fence number." |
+| 50 s, 60 s, 70 s | W1 sends heartbeats. Each one pushes the expiry 30 seconds later. | expires at 100 s after the 70 s heartbeat | "Heartbeats keep the loan alive while the worker is healthy." |
+| 70 s | W1 freezes: a stuck driver call or a network split. Heartbeats stop. | unchanged | "From outside, frozen and dead look the same." |
+| 100 s | The lease has expired. The scheduler grants J-1042 again, to worker W2. | leased, attempt 2, fence 2, owner W2 | "The job is re-run. The fence is now 2." |
+| 190 s | W2 finishes, writes the video to `outputs/J-1042/attempt-2/`, and commits "where fence = 2". One row changes. An outbox row is written in the same transaction. | succeeded, output_ref set | "Only the holder of the current fence can finish the job." |
+| 191 s | The notifier sends Maya's webhook. | | "If the notifier crashes here, the outbox row is still there, so it sends again." |
+| 200 s | W1 wakes up, finishes, and tries to commit "where fence = 1". Zero rows change. W1 gives up. Its files under `attempt-1/` are cleaned up later. | unchanged | "The stale worker's write is rejected. Duplicate results can't happen." |
+
+Maya got exactly one video. The freeze cost her job 30 seconds of thrown-away work plus 30 seconds before anyone
+noticed: **60 seconds lost**, in line with the crash-cost estimate above (about 45 seconds of work plus up to 30). (W1's own GPU was also stuck while it was
+frozen; the progress watchdog in the next section is what frees it.) The rest of this page explains each mechanism in
+that table.
+
+## Deep dives
+
+### Accepting without losing anything
+
+"Never lose a request" needs a precise meaning, and you should give it: **once you return a job ID, the job reaches
+a final state the user can see.** That final state may be success, a visible failure, or cancelled. Silence is the
+only thing not allowed.
+
+Three rules deliver that guarantee:
+
+1. **Acknowledge only after the durable write.** A write is **durable** when it is on disk (or on several machines)
+   and would survive a crash. The API commits the row first, then returns the ID. Commit and truth are the same
+   thing: there is no second copy that could disagree.
+2. **Make retries harmless.** Client retries reuse the idempotency key, so a timeout after the commit doesn't create
+   a second job. Further down, each step runs **at least once** (it may run twice after a crash) and is
+   **idempotent** (running it twice has the same effect as once). A job may be picked up twice, as in Maya's story,
+   but only one completion is saved.
+3. **Look for stragglers.** A **reconciler** is a background job that scans for jobs stuck in a non-final state past
+   their deadline, and re-queues them or fails them visibly. It is also your lost-work detector: its count is how
+   you measure "lost", and you alarm when it is not zero.
+
+**Overload is handled before acceptance, not after.** When the estimated wait is longer than the tier allows, reply
+with HTTP 429 (too many requests) or 503 (unavailable) and a hint about when to retry. The wrong move is to accept
+the job into memory and drop it later. That is how requests get lost.
+
+**Saving 2,500 jobs a second.** Writing each job to disk on its own would need one **fsync** per job. An fsync is the
+call that forces data out of memory onto the disk, and it is the slow part of every durable write. Databases and
+logs use **group commit** instead: they collect every write that arrives in a short window (say 5 ms, assumed) and
+flush them with a single fsync. Each caller waits at most one window, and the disk sees about 200 flushes a second
+instead of 2,500. "The hard part of 5,000 concurrent requests isn't the connections. It's 2,500 durable writes a
+second, and group commit is how one database handles that."
+
+### Leases, heartbeats and fencing
+
+A **lease** is a time-limited loan: "worker W may run job J until time T". The worker renews it with heartbeats. If
+the lease runs out, the scheduler may give the job to someone else. A message queue such as Amazon SQS calls the
+same idea a **visibility timeout**: a message you received is hidden from other consumers until the timeout passes.
+
+A lease alone is not safe. A worker can pause without dying: a long garbage-collection pause, a network split, a
+driver call that hangs. It then wakes up after its lease expired, unaware, and writes its output anyway. Now two
+workers have both "finished" the job. That is W1 in Maya's story.
+
+Martin Kleppmann's
+[2016 post](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) gives the fix. The lock
+service hands out a number that increases on every grant, called a **fencing token**. The storage side remembers
+the highest number it has seen and rejects writes that carry an older one. His example: token 33 is rejected after
+34 has written.
+
+Here the fence is simply a column on the job row, incremented on every lease grant. The worker writes output to
+`outputs/J/attempt-<fence>/`, so two attempts never write to the same files. Then it commits with a conditional
+update:
+
+```sql
+-- the worker's commit; it only succeeds if no one has been granted the job since
+UPDATE jobs
+SET state = 'succeeded', output_ref = 'outputs/J-1042/attempt-2/'
+WHERE id = 'J-1042' AND fence = 2;
+-- 1 row updated: we own the result. 0 rows: we were fenced out; stop and clean up.
+```
+
+A stale worker's update matches zero rows, and its files are garbage-collected later. Duplicate results become
+impossible at the commit, not merely unlikely. "A lease decides who should be working. The fence decides whose
+result counts."
+
+**Heartbeats prove the process is alive, not that it is making progress.** A GPU **kernel** (a program running on
+the GPU) can hang while the worker process keeps heartbeating happily. Add **progress heartbeats** (frames rendered,
+or the model's refinement steps done) and a maximum runtime
+per model, so a hung task can't hold a GPU forever.
+
+### Fair queueing with a paid tier
+
+**Count fairness in GPU-seconds, not tasks.** If fairness counts tasks, a user sending 10-minute videos gets the
+same "one task" credit as a user sending 10-second clips, but uses sixty times more GPU. Counting GPU-seconds makes
+each tenant pay for what they actually use.
+
+The standard tool is **deficit round robin**: go around the tenants in turn; each turn, give each tenant a credit of
+GPU-seconds in proportion to its weight; a tenant may start a job when its credit covers the job's estimated cost.
+(A "virtual-time" scheduler is a smoother version of the same idea.) Add three guards:
+
+- **A weight per tier**, so the paid tier gets a bigger share.
+- **A cap on how many GPUs one tenant can hold at once**, so one huge customer can't take the fleet.
+- **No saving up credit while idle**, so a tenant who was quiet all night doesn't return and take over the fleet.
+
+The paid-tier follow-up has three answers. Each has a cost, and naming the cost is the point:
+
+| Option | What paid users get | What it costs |
+|---|---|---|
+| Higher weight (e.g. 4:1) | proportionally more share when the fleet is busy | no hard wait guarantee |
+| Reserved capacity | a floor of GPUs that are always theirs | reserved GPUs sit idle when paid demand is low, unless lent to free work and taken back when needed |
+| **Preemption** of free tasks (stopping a running free task to make room) | the lowest paid wait | wasted free-tier GPU time, unless tasks checkpoint |
+
+A common combination: weights for the normal case, plus a small reserved pool that free work may borrow under a
+lease the scheduler can revoke.
+
+One more GPU-specific problem: each task holds a whole GPU, so long tasks block short ones behind them. Separate the
+pools or queues by duration class, or cap task duration and split long videos into segments.
+
+### A model version that fails only on some GPU types
+
+When a task fails, first ask **why**. There are three kinds of cause:
+
+- **Job-caused**: bad input. It will fail anywhere. Retrying is waste.
+- **Node-caused**: this particular GPU is unhealthy. Retry somewhere else; count it against the node.
+- **Model-by-GPU-type**: the new model version crashes on one GPU type (a driver or kernel difference). It will fail
+  on every GPU of that type.
+
+Record failure counts per pair of (model_version, gpu_type). When one pair's failure rate crosses a threshold, open
+a **circuit breaker** for it: stop placing that model on that GPU type, route its jobs to other types, and alert.
+Retries go to a different GPU, and after a type-specific failure, to a different type.
+
+**Bound the retries** (say 3 attempts). After the last one, the job moves to a **dead-letter** state: a final
+"failed, here is why" state the user can see. Without a cap, a **poison job** (one that always fails) loops forever,
+burning GPU time.
+
+**Prevent it in the first place with a canary**: roll the new model version out to a small share of traffic on
+*each* GPU type separately, compare its failure rate and output-quality checks with the old version, and widen only
+when both look healthy. "I canary per GPU type, because a version that's fine on one type can crash on another, and
+a fleet-wide canary average would hide it."
+
+### 10,000 tasks in one second
+
+This is the Modal follow-up. Recall that a warm container already has the model loaded in GPU memory and can start
+a task at once. A **cold start** is everything a new container must do before its first task, mostly
+loading the model weights.
+
+Walk it in order:
+
+1. **Accept in batches.** Append the burst to the durable log in batches. Don't do 10,000 single-row transactions,
+   each taking a lock; that makes the database the bottleneck.
+2. **Dispatch by pull, not push.** Each warm container leases a batch of tasks (20 at a time means 500 lease grants
+   instead of 10,000) and runs them back to back, or batched on the GPU if the model allows. Pulling balances load
+   by itself: a fast container simply comes back for more sooner.
+3. **Prefer containers that already have the model loaded.** Send only the overflow to containers that would have to
+   load it.
+4. **Size the warm pool with a control loop**, which is the framing the Modal article suggests: predict demand, hold
+   enough warm containers for the latency target, and start cold containers early when the backlog's expected wait
+   is longer than a cold start.
+
+From the back-of-envelope, this burst clears on the warm pool in about 20 seconds, and a cold container needs about
+20 seconds before its first task. "Starting cold containers for this burst would mostly add cost. They'd be ready
+just as the warm pool finishes."
+
+### Cancellation and result delivery
+
+**Cancellation is a state change, not a kill signal.** Cancelling a queued job moves it straight to cancelled in the
+store. Cancelling a running job sets a cancel flag. The worker sees it in its next heartbeat reply, stops, and frees
+the GPU.
+
+The fence makes this race-free. If the worker finished first, its commit wins, and the cancel is reported as too
+late. If the cancel won, the scheduler bumps the fence, and the worker's late commit is rejected. Either way the user
+sees exactly one outcome.
+
+**Delivery has the same at-least-once shape as execution.** The final state change and its outbox row are written
+in the same transaction. The notifier sends webhooks from the outbox with retries and a signature (so the receiver
+can check the call came from you). A crash between "job done" and "webhook sent" therefore re-sends instead of
+forgetting. Receivers must tolerate duplicates, so include the job ID and attempt number.
+
+Keep polling available as the fallback, because webhooks fail in ways you don't see. Store outputs in object storage
+and hand out a time-limited **signed URL** (a link that works only for a while) instead of streaming large video
+files through the API. Delete outputs on a retention schedule the tenant can see.
+
+## Failure modes and overload
+
+Walk these in order of how often they happen. For each, say what breaks and why the design survives it.
+
+- **Worker crash or network split.** The lease expires and the job is granted again with a new fence. The old
+  worker's commit fails. (Maya's story.)
+- **Hung task.** Heartbeats continue but progress doesn't. The progress watchdog or the maximum runtime kills it.
+- **Scheduler crash.** It holds no truth. A replacement rebuilds the queues from the store. Leases already granted
+  continue and commit normally. Run two schedulers, with a leader chosen by a lease and fenced the same way, so two
+  schedulers never both think they are in charge.
+- **Job-store outage.** Stop accepting and return 503. Accepting into memory is how requests get lost.
+- **Object-store errors.** The worker retries the upload. The commit happens only after the output exists.
+- **Retry storms.** When many clients or workers retry at once, they can knock over a recovering service. Use
+  exponential backoff (wait longer after each failure) with jitter (a random spread so retries don't line up), and a
+  retry budget per model version.
+- **Overload.** Admission control on estimated wait per tier. Turn away or delay free work first.
+- **A bad GPU.** Node-caused failures feed a per-node health score. Drain the node (stop sending it work) after
+  repeated failures across different models.
+
+## Evals and observability
+
+You prove the system works with a handful of numbers. Each one answers a question someone will ask you:
+
+- **"Are paid users getting what they paid for?"** Queue wait p50 and p95 per tier, against the target, and how far
+  off the wait estimate shown to users was.
+- **"Is it fair?"** Each tenant's and tier's actual share of GPU-seconds, against their weights.
+- **"Is failure handling working?"** Lease expiries, fence rejections, retries per job, dead-letter count. Fence
+  rejections should be rare but not zero; zero may mean fencing isn't wired up at all.
+- **"Is a model broken on some hardware?"** Failure rate per (model_version, gpu_type), and which breakers are open.
+- **"Are we wasting money?"** GPU busy fraction, warm-pool size, cold starts per minute.
+- **"Did we lose anything?"** The reconciler's count of jobs past their deadline in a non-final state. This is your
+  definition of lost work, measured.
+- **"Is the new model any good?"** Output quality checks per model version on the canary, not just crash rates.
+
+## Trade-offs
+
+| Decision | You gain | You give up | Revisit when |
+|---|---|---|---|
+| Database as the queue | one source of truth, transactions | a ceiling on how fast you can hand out jobs | job dispatch shows up in database CPU or lock waits |
+| Fairness in GPU-seconds | long jobs can't crowd out short ones | needs duration estimates | durations are nearly uniform |
+| Pull with batch leases | natural load balancing, fewer grants | a batch held by a crashed worker waits for the TTL | tasks are long; then lease one at a time |
+| Short TTL | fast detection | more heartbeat traffic, false expiries on slow networks | expiries without crashes appear |
+| No mid-task checkpoints | simpler workers | a crash wastes the whole attempt | tasks grow past several minutes |
+
+<AINative title="Where an agent helps and what you still check">
+An agent can write the jobs table, the lease and heartbeat code, the scheduler and the retry wiring in an afternoon.
+It is just as likely to write a completion update without the fence condition, or a retry loop with no cap. What you
+check: a test that pauses a worker past its lease, lets another worker finish, then resumes the first and asserts its
+commit is rejected; a test that kills the scheduler mid-dispatch and asserts every accepted job still finishes; and a
+load test that bursts past capacity and asserts the API rejects instead of accepting and dropping.
+</AINative>
+
+## Small-team version
+
+This family matters to small teams. Any company running image, video, transcription or batch LLM (large language model) jobs on a handful
+of GPUs needs exactly this queue, and the good news is that most of it is a database table you already know how to
+run.
+
+### Build
+
+**A Postgres `jobs` table is the queue.** Workers claim a job with `SELECT … FOR UPDATE SKIP LOCKED`. `FOR UPDATE`
+locks the row you picked; `SKIP LOCKED` makes other workers skip rows that are already locked instead of waiting for
+them. The [Postgres docs](https://www.postgresql.org/docs/current/sql-select.html) describe SKIP LOCKED as a way "to
+avoid lock contention with multiple consumers accessing a queue-like table". Add `lease_expires_at`, `attempt` and
+`fence` columns and the conditional completion update shown in the fencing deep dive.
+
+A sketch of the claim, in the same transaction:
+
+```sql
+-- claim one queued (or expired) job, bump its fence, and take a 30 s lease
+UPDATE jobs
+SET state = 'leased', attempt = attempt + 1, fence = fence + 1,
+    lease_owner = 'worker-7', lease_expires_at = now() + interval '30 seconds'
+WHERE id = (
+  SELECT id FROM jobs
+  WHERE state = 'queued' OR (state IN ('leased', 'running') AND lease_expires_at < now())
+  ORDER BY (tier = 'paid') DESC, created_at   -- paid first, then oldest
+  FOR UPDATE SKIP LOCKED
+  LIMIT 1
+)
+RETURNING id, fence;
+```
+
+A Redis queue also works. StoryGraph, a two-person team, is reported to run about a dozen self-hosted models on
+Hetzner (a German hosting provider) GPU servers behind a Redis queue
+([ZenML summary](https://www.zenml.io/llmops-database/scaling-llm-and-ml-models-to-300m-monthly-requests-with-self-hosting)).
+
+If you use a managed queue, its lease is the visibility timeout. Amazon SQS sets it to 30 seconds by default, lets
+you extend it while you work, caps it at 12 hours, and may still deliver a message more than once
+([SQS docs](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html)).
+So you still need the idempotent, fenced completion.
+
+### Buy
+
+**Rent GPUs by the second, at least at first.** "Serverless" GPU providers bill only for the seconds a GPU is busy.
+Dedicated GPUs bill every hour whether busy or idle, but cost less per hour.
+
+A worked example with list prices fetched 2026-10-11: 20,000 jobs a day at an
+assumed 30 GPU-seconds each is **166.7 GPU-hours a day**. On RunPod's serverless L40S (a mid-range data-center GPU)
+at $1.75 an hour, that is **about $292 a day, or $8,750 per 30 days**, paid only for busy seconds.
+
+When do dedicated GPUs win? When they would be busy enough. RunPod's dedicated L40S costs $0.79 an hour (community)
+or $1.09 (secure). Dedicated is cheaper once the pool is busy more than **45% (community) or 62% (secure)** of the
+time.
+
+Average demand here is about **7 busy GPUs**. But you must size a dedicated pool for the peak, not the average. If
+peaks are 3× the average (assumed), a pool sized for the peak is busy only about **33%** of the time, below break-even,
+so per-second billing wins. "I'd rent by the second until steady load would keep a dedicated pool more than about
+half busy." The common middle path: a few dedicated GPUs for the steady base load, plus per-second capacity for
+peaks.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Daily GPU time:** 20,000 × 30 s = 600,000 GPU-seconds ÷ 3,600 = 166.7 GPU-hours. At $1.75/h: 166.7 × 1.75 ≈
+  $292 a day; × 30 ≈ $8,750.
+- **Average busy GPUs:** 166.7 ÷ 24 ≈ 6.9.
+
+<Formula
+  title="Dedicated versus per-second GPUs"
+  expr="dedicated is cheaper when utilization > dedicated $/h ÷ per-second $/h"
+  vars={[
+    { sym: 'utilization', meaning: 'busy hours ÷ paid hours on the dedicated pool' },
+  ]}
+  example="RunPod L40S $0.79 (community) or $1.09 (secure) vs serverless $1.75 → break-even at 45% or 62% utilization"
+/>
+
+- **Peak-sized pool:** a pool sized for 3× the average runs at about 1 ÷ 3 ≈ 33% utilization.
+
+</details>
+
+### Skip
+
+Multi-region schedulers, preemption, and elaborate fair-share math. Start with a cap on concurrent jobs per tenant
+and a queue that serves paid jobs first, with an age boost so free jobs still finish.
+
+### Still own
+
+Idempotency keys, the fence check, bounded retries with a visible dead-letter state, per-tenant cost caps, and the
+reconciler that proves nothing accepted was lost.
+
+### Revisit when
+
+Dispatch load shows in database metrics, a dedicated pool would be busy past break-even, tenants complain about
+fairness, or tasks get long enough that mid-task checkpoints pay for themselves.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="GPU job system"
+  senior={[
+    "Acknowledges only after a durable write, uses leases with heartbeats, fencing on commit, bounded retries and a dead-letter state.",
+    "Measures fairness in GPU-seconds and caps per-tenant concurrency.",
+  ]}
+  staff={[
+    "Derives queue growth and drain time from Little's law and uses it for admission control and honest wait estimates.",
+    "Contains a bad model per GPU type with a breaker and canary, and defines lost work as a metric the reconciler measures.",
+  ]}
+/>
+
+In plain words: a Senior answer builds a queue that is correct when things crash. A Staff answer also puts numbers
+on how the queue behaves under load and turns them into policy: when to say no, what wait to promise, and how to
+roll out a model safely across mixed hardware.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="A paid tier must get results faster. Weights, reservation or preemption? (Listed on the PracHub page, OpenAI)">
+    Weights give more share but no guarantee; reservation gives a floor but can sit idle; preemption gives the lowest
+    wait but wastes free-tier work. Combine weights with a small reserved pool lent out under revocable leases.
+  </FollowUp>
+  <FollowUp q="A new model version fails on some GPU types. How do you contain it? (Listed on the PracHub page, OpenAI)">
+    Track failures per model version and GPU type, open a breaker on the bad pair, route to other types, cap retries,
+    and canary each version per GPU type next time.
+  </FollowUp>
+  <FollowUp q="How do you show users an honest wait estimate? (Listed on the PracHub page, OpenAI)">
+    GPU-seconds of work ahead of them in their tier divided by the GPU-seconds per second the tier is receiving, shown
+    as a range, and measure how wrong the estimate was.
+  </FollowUp>
+  <FollowUp q="Ten thousand short tasks land in one second. How are they placed? (Modal prep guide)">
+    Accept them into a durable log in batches, dispatch by pull with batch leases to warm containers that have the
+    model loaded, and start cold containers only when the expected wait is longer than a cold start.
+  </FollowUp>
+  <FollowUp q="How do you size the warm pool? (Modal prep guide)">
+    As a control loop: predict demand, hold enough warm instances for the latency target, shrink when traffic falls.
+    Keeping everything on is the answer the guide calls weak.
+  </FollowUp>
+  <FollowUp q="The scheduler itself crashes. What is lost? (Listed on the PracHub page, OpenAI)">
+    Nothing, if the job store is the truth: a new leader rebuilds queues from it, in-flight leases keep running, and
+    commits still check the fence.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Acknowledging before the durable write.** A crash between "OK" and the write loses a job you promised to run.
+- **Buffering accepted jobs in memory during a database outage.** A restart drops them all; return 503 instead.
+- **Leases without fencing.** A worker that paused past its lease can still overwrite the real result.
+- **Fairness by task count.** Users with long jobs get far more GPU than users with short ones.
+- **Unbounded retries.** A poison job, or a model that crashes on one GPU type, burns GPUs forever.
+- **Treating heartbeats as progress.** A hung kernel still heartbeats.
+- **No admission control.** At 90% utilization a 10-minute burst becomes about two hours of queueing (see the
+  back-of-envelope).
+
+## Prove it with a lab
+
+<LabRef lab="dist-lock" role="proof" note="Run its fencing test: acquire, let the lease expire, acquire again, and watch the storage server reject the stale token." />
+<LabRef lab="kafka-lite" role="proof" note="The durable log for batch acceptance: acknowledge only after the segment is written." />
+<LabRef lab="faas-runtime" role="proof" note="Warm pool versus cold start, with a simulated cold start you can lengthen to GPU scale." />
+<LabRef lab="message-queue" role="partial" note="Visibility timeouts and a dead-letter queue, the managed-queue version of a lease." />
+<LabRef lab="container-orchestrator" role="partial" note="Add a GPU type to its first-fit scheduler to practise type-aware placement." />
+
+The dist-lock lab is the one to run first: it is Maya's story in miniature, with a storage server that rejects the
+stale token. A GPU-aware scheduler lab is planned but not built.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-725e58e60a" />
+- <Cite id="s-86890a1069" />
+- <Cite id="s-28f1d2740e" />
+- <Cite id="s-5f44d8637a" />
+- Martin Kleppmann, [How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) (2016-02-08)
+- PostgreSQL, [SELECT: the locking clause](https://www.postgresql.org/docs/current/sql-select.html) (fetched 2026-10-12)
+- AWS, [Amazon SQS visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html) (fetched 2026-10-12)
+- ZenML LLMOps database, [StoryGraph self-hosting summary](https://www.zenml.io/llmops-database/scaling-llm-and-ml-models-to-300m-monthly-requests-with-self-hosting) (secondary)
+- [RunPod pricing](https://www.runpod.io/pricing) and [Modal pricing](https://modal.com/pricing) (fetched 2026-10-11)

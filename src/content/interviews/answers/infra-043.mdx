@@ -1,0 +1,161 @@
+---
+question: infra-043
+family: multi-tenant-gpu-serving
+status: published
+labs: [container-orchestrator, llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Route by model first, then by free memory; batch only within one model; and for allocation, memory isn't the
+> conflict, coupling is. The small model fits beside the big one, but every big-model step then waits for the
+> shared GPU, and that GPU's lost memory roughly halves the big model's batch. So I'd either let the node take
+> turns between the models with a guaranteed share for the big one, shrink the big model, or ask for more
+> hardware. If one GPU of the eight fails, the whole big replica is down; I'd restart it on four healthy GPUs, never
+> seven."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see whether you can keep the books straight when one model needs all eight GPUs of a
+machine and another needs one.
+
+In a normal cluster, a job that needs eight CPUs can usually take any eight. Here it can't. A large model is split
+across eight GPUs that work together on every step, so those eight GPUs behave like one big GPU. If any one of them
+is busy, or full, or broken, the whole group is held back. That is the idea the whole question turns on.
+
+Anthropic's tech screen on PracHub (posted 2026-09-08) has three parts (routing, batch formation, GPU allocation)
+and two follow-ups: a GPU in the eight-GPU group fails, and small-model traffic delays the eight-GPU work
+indefinitely (<Cite id="s-62f6a22994" />). The follow-ups decide it.
+
+### Words you need first
+
+- **Weights.** The model's learned numbers. At 2 bytes each, a 70-billion-parameter model (70B) is about 140 GB and
+  an 8B model about 16 GB. Each GPU here has 80 GB of memory.
+- **Tensor parallelism (TP).** Splitting one model across several GPUs so they compute each step together.
+  "TP = 8" means eight slices on eight GPUs. They exchange data on every layer of every step.
+- **KV cache.** While the model writes a reply one token (about ¾ of a word) at a time, the GPUs keep a saved
+  summary of every token so far. This memory sets how many requests (**sequences**) fit in a batch at once.
+
+## Clarify first
+
+- **Model sizes and context.** "I'll assume a 70B at TP = 8 and an 8B, on 80 GB GPUs, with sequences of up to 4,096
+  tokens."
+- **Do both models need low latency at the same time, or can one wait?** This decides whether taking turns is
+  allowed.
+- **Traffic mix and latency targets per model.**
+- **May the two models share a GPU?**
+
+## Answer
+
+### The picture
+
+```
+Router ── by model and version, then by free KV memory
+   │                         │
+   ▼                         ▼
+70B queue                 8B queue        (batches never mix models)
+   │                         │
+   ▼                         ▼
+┌──── one node, 8 GPUs ─────────────────────────┐
+│ GPU0 GPU1 GPU2 GPU3 GPU4 GPU5 GPU6 GPU7        │  70B: one slice on each GPU (TP = 8)
+│  +8B?                                          │  8B: where does it go?
+└────────────────────────────────────────────────┘
+```
+
+**Routing.** Route by model and version first. Then, among replicas that can serve it, pick by estimated work and
+free KV memory, not by connection counts. Each model has admission control with bounded queues and a clear overload
+answer: a queue position with an estimated wait, or a 503.
+
+**Batching.** Requests share a batch only within one model and version. Cap each batch by KV memory and by how long
+its oldest request has waited. Generation needs **continuous batching**: finished requests leave and waiting ones
+join between steps, rather than fixed batches that wait for the slowest member.
+
+### Allocation: memory isn't the conflict, coupling is
+
+Follow the numbers on our one node.
+
+| Step | What you find | What to say in the interview |
+|---|---|---|
+| **Weights per GPU** | The 70B takes 140 ÷ 8 = **17.5 GB** on each GPU. The 8B (16 GB) fits beside it. | "Memory fits. That's not the problem." |
+| **Step-time coupling** | Every 70B step finishes only when its slowest slice finishes. Put the 8B on GPU 0, and every 70B step waits whenever GPU 0 runs 8B work. | "The 8B adds jitter to every 70B token." |
+| **Memory coupling** | Each 70B sequence spreads its KV cache evenly over all eight GPUs, so the fullest GPU sets capacity. Alone, the replica holds **about 324 sequences**. With the 8B and an assumed 10 GB of its KV on GPU 0, it holds **about 169**. | "One small model on one GPU roughly halves the big model's batch." |
+
+So the honest options are four:
+
+1. **Take turns.** The node runs one model at a time, with a switch cost each way. With weights waiting in the
+   server's ordinary memory (host DRAM), a switch takes about 0.9 s, and 30-second turns keep **97%** of the time
+   useful.
+2. **Share** a GPU, at the cost above.
+3. **Shrink the big model**, for example to 8-bit weights on four GPUs (TP = 4), freeing four GPUs for small
+   replicas. This needs a quality check, and the split must divide the model's 64 query heads and 8 key-value heads
+   evenly.
+4. **Add hardware**, if both models need low latency at once.
+
+### Follow-up 1: one GPU in the group fails
+
+The whole 70B replica is down, because every token needs every slice.
+
+1. Stop routing to it. Retry requests that haven't started streaming.
+2. For replies already streaming, send an error or **resume**: another replica reads the prompt plus the tokens
+   already sent and carries on.
+3. Mark the GPU bad.
+4. Restore on another node, or relaunch at **TP = 4** on four of the seven healthy GPUs. That holds **about 110
+   sequences**, a third of the full node. **TP = 7 isn't valid**, because 7 divides neither 64 nor 8.
+
+### Follow-up 2: the small model starves the big one
+
+If the node takes turns, a rule of "switch when the node is idle" never fires, because small-model traffic never
+stops. Instead: once the big model's oldest request passes a wait bound, admit no new small work, let in-flight
+small work finish up to a deadline, and switch. Report the big model's maximum wait as a metric.
+
+Say: "Idle-triggered switching starves the big model under continuous traffic. I give it a bound, and I measure
+its maximum wait."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **KV per token per GPU at TP = 8:** 2 × 80 layers × 8 KV heads × 128 × 2 bytes = 327,680 B per token, split
+  over 8 GPUs = **40,960 B per token per GPU**.
+- **Alone:** 80 − 17.5 − 8 (assumed overhead) = 54.5 GB per GPU → about 324 sequences of 4,096.
+- **With the 8B on GPU 0:** 54.5 − 16 − 10 = 28.5 GB. 28.5 × 10⁹ ÷ 40,960 ≈ 696,000 tokens ≈ **169 sequences**.
+- **Taking turns:** useful share = T ÷ (T + s). Weights in DRAM, s ≈ 0.9 s (140 GB at 8 × 20 GB/s, assumed): a
+  30 s turn keeps 30 ÷ 30.9 ≈ **97%**.
+- **TP = 4 after a failure:** 320 − 140 − 32 = 148 GB → 148 × 10⁹ ÷ 327,680 ≈ 451,000 tokens ≈ **110 sequences**.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Eight GPUs, two models"
+  senior={["Shows memory fits but step time and KV capacity couple, and handles both follow-ups."]}
+  staff={["Names the measurements that would validate the choice (big-model max wait, p99 per model) and says plainly when the answer is more hardware."]}
+/>
+
+The Staff move is saying which numbers would prove the choice right, and being willing to say "this needs another
+node" instead of engineering around a hardware shortage.
+
+## Small-team version
+
+At a small company, don't put two models on one node. Run the large model on its own node or, more likely, call it
+through an API. Put small models on separate GPUs or a per-token (serverless) endpoint. The co-location engineering
+only pays when GPUs are scarce and both models are yours to serve.
+
+**For scale:** a node of 8 H100s rented at about $3.99 per GPU-hour (Lambda's 8-GPU list price,
+fetched 2026-10-11) costs about **$23,300 a month** (8 × 3.99 × 730). Check that the large model's traffic really
+fills it before you rent one.
+
+## Pitfalls
+
+- **"The 8B fits in memory, so share the GPU."** It fits, but it slows every big-model step and halves its batch.
+- **Proposing TP = 7 after a failure.** The model's heads don't divide by 7; use 4.
+- **An idle-triggered switch.** Under continuous small traffic it never fires, and the big model starves.
+- **Balancing on request counts.** Requests differ hugely in memory; balance on free KV memory.
+
+## Go deeper
+
+- Family walkthrough: [one node, a large and a small model](/system-design-labs/interviews/walkthroughs/multi-tenant-gpu-serving/#deep-dives) and its failure section.
+- KV arithmetic: [KV-cache memory math](/system-design-labs/interviews/walkthroughs/kv-cache-memory-math/).
+- Labs: <LabRef lab="container-orchestrator" inline />, <LabRef lab="llm-inference" inline />.

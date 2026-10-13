@@ -1,0 +1,193 @@
+---
+question: r2b-020
+family: kv-store-durable-log
+status: published
+labs: [wal, kafka-lite]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Thousands of threads can't each force the file to disk; they'd queue behind the drive. So one background
+> writer owns the file. Threads put their event on a bounded queue and wait. The writer takes everything waiting,
+> writes it in one call, forces it to disk once, and answers each thread. The queue bound makes a slow disk slow
+> the producers down instead of eating memory, each thread is woken only by its own batch, and after one disk
+> error every later write fails."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+You have written thread-safe code before: put a lock around the shared thing. Here that is the wrong answer,
+and the reason is the disk. Three things make this different:
+
+1. **Every event must be durable before the call returns.** "Durable" means forced onto the drive, which takes
+   milliseconds per flush. A lock held across that flush means one event per flush, total, for the whole
+   process.
+2. **There are thousands of callers.** Any design that wakes every waiting thread whenever anything finishes
+   creates a **thundering herd**: thousands of threads wake, check, and go back to sleep, burning CPU for
+   nothing.
+3. **Memory has to stay bounded.** If the disk slows down and callers keep producing, a naive queue grows until
+   the process is killed.
+
+The evidence is a title on PracHub (a site that collects reported questions), "Thread-Safe Durable Event Writer Shared by Thousands of Threads", tagged
+Databricks; only the title is candidate-reported (<Cite id="s-6db00549b3" />). The same idea, batching writes
+to a log, came up three times in one reported Databricks Staff loop (<Cite id="s-d6af500d84" />).
+
+## Clarify first
+
+Spend a minute on the contract. Say your assumptions out loud:
+
+- **Durable.** "Must an event be forced to disk before the call returns? I'll assume yes."
+- **Ordering.** "Must each thread's events stay in order? I'll keep per-thread order, and global order by
+  arrival."
+- **Size and rate.** "Small events at a high rate? Then the disk's flush time is the limit."
+- **Slow disk.** "When the disk falls behind, do we block producers or drop events? I'll block, since these
+  events must not be lost."
+- **Process.** "One process owns the file? I'll assume yes."
+
+## Answer
+
+### Words you need first
+
+- **fsync** (in Go, `File.Sync`) forces a file's bytes from the operating system's memory onto the drive and
+  waits. It is the slow step.
+- **Group commit** means one fsync makes a whole batch of events durable, so its cost is shared.
+- **Backpressure** means that when the system is full, producers wait, instead of a queue growing without limit.
+- **Fail-stop** means that after one write error, the writer refuses everything, rather than guessing what
+  reached the disk.
+
+### The picture
+
+```
+ 2,000 goroutines
+      │ Append(event): send a request carrying its own reply channel
+      ▼
+┌──────────────────────────────┐
+│ bounded channel (the queue)  │  full → senders block (backpressure)
+└──────────────────────────────┘
+      │ flusher drains whatever is waiting, up to a maximum batch
+      ▼
+┌──────────────────────────────┐
+│ flusher goroutine            │  one Write + one Sync for the batch
+└──────────────────────────────┘
+      │ send the result on each request's own reply channel
+      ▼
+ each caller wakes alone, only when its own event is durable
+```
+
+**The channel** is the queue. Its fixed capacity is the memory bound: when it is full, `Append` blocks.
+**The flusher** is a single goroutine. It takes the first request, then grabs everything else already waiting
+without blocking, writes the frames in one call and syncs once. **The reply channels** are one per request, so
+finishing a batch wakes exactly the goroutines in it and nobody else. No thundering herd.
+
+### Follow one event through it
+
+Picture an audit service: 2,000 worker goroutines each record events such as "user 17 approved agent action 9".
+
+| Moment | What happens | What to say in the interview |
+|---|---|---|
+| 1 | A worker calls `Append`. Its event is framed (length, checksum, payload) and sent on the channel. | "Each record is framed, so recovery can find and cut a torn last record." |
+| 2 | The flusher is busy with the previous batch, so the event waits with others that arrive meanwhile. | "The batch is whatever arrived during one flush. No timer." |
+| 3 | The flusher drains them, writes them in one call and calls `Sync` once. | "One fsync for the whole batch." |
+| 4 | The flusher sends `nil` on each request's reply channel. Our worker returns. | "Only the workers in this batch wake." |
+| 5 | Had the disk failed at step 3, every request in the batch, and every later one, would get the error. | "Sticky failure: never retry a failed fsync." |
+
+### The code
+
+In Go, a bounded channel is the queue and each request carries its own reply channel:
+
+```go
+func (w *Writer) Append(p []byte) error {
+	r := req{frame: Frame(p), done: make(chan error, 1)}
+	w.reqs <- r      // bounded: a full channel blocks producers
+	return <-r.done  // nil only after the batch's fsync
+}
+
+func (w *Writer) flusher() {
+	var failed error
+	for first := range w.reqs {
+		batch := []req{first}
+	drain:
+		for len(batch) < w.maxB {
+			select {
+			case r, ok := <-w.reqs:
+				if !ok {
+					break drain
+				}
+				batch = append(batch, r)
+			default:
+				break drain
+			}
+		}
+		err := failed
+		if err == nil {
+			buf := concatFrames(batch)
+			if _, err = w.f.Write(buf); err == nil {
+				err = w.f.Sync() // one fsync for the whole batch
+			}
+			failed = err // sticky: never retry after a failed fsync
+		}
+		for _, r := range batch {
+			r.done <- err
+		}
+	}
+}
+```
+
+The `select` with a `default` is the key move: it takes every request already waiting, and stops the moment the
+channel is empty, so a lone event is never held back waiting for company.
+
+In the family walkthrough this ran with 2,000 goroutines × 10 appends under `go test -race` (Go's data-race
+detector) three times on 2026-10-12. All 20,000 records came back, with 41 fsyncs per run and no race reports.
+That works out to about 490 events per fsync on average (20,000 ÷ 41). Go's `File.Sync` on macOS issues `F_FULLFSYNC`, the call that also
+flushes the drive's own cache (Go 1.26 `internal/poll/fd_fsync_darwin.go`), so those syncs were real.
+
+### Points to say
+
+- **Batch size sets itself.** The flusher takes everything that arrived during the last fsync.
+- **Backpressure.** The channel bound caps memory; a slow disk slows producers instead of growing a queue.
+- **No thundering herd.** Per-request reply channels (or one event per batch, in a language without channels)
+  wake only that batch.
+- **Failure.** A write or fsync error fails the batch and every later append; restart and recover from the log
+  ([PostgreSQL wiki on fsync errors](https://wiki.postgresql.org/wiki/Fsync_Errors)).
+- **Shutdown.** Close the channel under a write lock so no producer sends on a closed channel, then let the
+  flusher drain what is left.
+
+Say: "Throughput scales with the batch, and while the queue isn't full each caller waits one to two flushes. If some events can
+tolerate loss, I'd ask whether they need fsync at all."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Shared durable writer"
+  senior={["One flusher, per-batch fsync, bounded queue, per-request completion, and a race-detector test with thousands of goroutines."]}
+  staff={["Quantifies throughput against caller latency, decides block versus shed per event class, makes errors sticky, and asks whether every event truly needs fsync or whether a bounded loss window is acceptable."]}
+/>
+
+In plain words: a Senior candidate builds a correct, bounded, well-tested writer. A Staff candidate also puts
+numbers on the trade, decides per kind of event whether to block or drop, and questions whether every event
+needs to be durable in the first place.
+
+## Small-team version
+
+At a small company, "durable events from many workers" usually means rows in Postgres, or messages in a managed
+queue whose delivery guarantees you check in its documentation. Postgres groups concurrent commits on its own
+([PostgreSQL 18 docs](https://www.postgresql.org/docs/current/wal-configuration.html)), so you get this design
+without writing it.
+
+Write it yourself only for a local spool on a worker that must keep going while the database is unreachable,
+and test it with `kill -9` before you trust it.
+
+## Pitfalls
+
+- **A global lock held across `write` and `fsync`.** Every producer waits in line and throughput is one event
+  per flush.
+- **An unbounded queue.** A slow disk becomes a memory leak, then a killed process that loses everything queued.
+- **`notify_all` on one condition variable.** Every waiter wakes after every flush; that is the thundering herd.
+- **Acknowledging before the batch's fsync.** The event can be lost after the caller was told it was safe.
+
+## Go deeper
+
+- Family walkthrough: [Key-value store to durable log](/system-design-labs/interviews/walkthroughs/kv-store-durable-log/), stage 5 (Python and Go).
+- Siblings: [batched WAL design](/system-design-labs/interviews/questions/r2a-021/), [buffered logger](/system-design-labs/interviews/questions/r2b-021/).
+- Labs: <LabRef lab="wal" inline /> and <LabRef lab="kafka-lite" inline />.

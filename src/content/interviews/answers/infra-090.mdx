@@ -1,0 +1,189 @@
+---
+question: infra-090
+family: distributed-training
+status: published
+labs: [lora-finetune, dist-lock]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "This is a multi-tenant job platform whose jobs happen to be GPU training runs. Memory decides the hardware: a
+> full fine-tune of an 8B model needs about 128 GB and a whole 8-GPU machine, while LoRA or QLoRA fits on one GPU.
+> So the scheduler has two job shapes, small ones it can pack and big ones that need all their GPUs at once. Jobs
+> checkpoint and resume under a lease, each tenant's data and weights are isolated and encrypted with their own
+> keys, quotas are priced in GPU-hours before admission, and nothing deploys until it beats the base model on the
+> tenant's eval set."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see a solid backend platform design. The hard parts aren't the training math. They are
+choosing hardware per method, isolating tenants' data and weights, quotas, jobs that survive failures, and a path
+from a finished run to a served model.
+
+### What makes this different from a normal job platform
+
+You may have built a job runner: a queue, workers, retries, per-customer limits. This is that, with three twists.
+
+1. **Jobs differ hugely in size.** For the same 8B model, one method needs about 4.5 GB and another 128 GB. Some fit
+   on one GPU; others need a whole 8-GPU machine, and all 8 GPUs
+   must start together. A scheduler that treats them alike wastes most of the fleet.
+2. **Jobs run for hours and are expensive to retry.** A retry that starts from step 0 burns real money.
+3. **The output is a model trained on a customer's private data.** The weights are derived from that data, so isolation
+   covers datasets, checkpoints and the served model, not only the API.
+
+### Words you need first
+
+- **Fine-tuning**: continuing to train an existing open model on a customer's own examples. A **full** fine-tune
+  updates every **parameter** (learned number) in the model.
+- **LoRA** (low-rank adaptation): freeze the original weights and train a small add-on, called an **adapter**,
+  usually well under 1% of the model's size.
+- **QLoRA**: LoRA on a copy of the base model compressed to about 4 bits per weight, so it fits in much less memory.
+- **Token**: a piece of a word, about ¾ of a word. Datasets and prices are measured in tokens.
+
+This question comes from PracHub's write-up of an OpenAI-tagged question; only the title is candidate-reported.
+The write-up asks for datasets, LoRA, QLoRA and full fine-tuning, distributed training with checkpointing,
+deployment, quotas, isolation, reproducibility and observability (<Cite id="s-a6d1d2135d" />).
+
+## Clarify first
+
+- **Base models?** "I'll assume 8B and 70B open models."
+- **Methods?** "LoRA, QLoRA and full? Full fine-tuning of the 70B changes the hardware story."
+- **Volume?** "Dataset sizes per job, say 10M to 1B tokens, and how many jobs per day?"
+- **Isolation bar?** "May two tenants share a GPU, or does each job get dedicated machines?"
+- **Delivery?** "Does each tenant get a dedicated endpoint, or adapters served on a shared base model?"
+
+## Answer
+
+### The flow, end to end
+
+```
+Tenant uploads dataset
+   │  validate: schema, token count, personal-data scan, dedup
+   ▼
+Job spec ── base model, method, settings, pinned versions (stored, reproducible)
+   │  quota check: estimated GPU-hours vs the tenant's budget
+   ▼
+Queue
+   │
+   ▼
+Scheduler ── packs small jobs onto single GPUs; reserves whole machines for big ones
+   │
+   ▼
+Isolated training container ── no network egress; tenant key mounted
+   │  checkpoints every N steps to the tenant's encrypted storage prefix
+   ▼
+Eval step ── must beat the base model on the tenant's eval set
+   │
+   ▼
+Artifact registry ──► Deploy (adapter on a shared base, or dedicated replicas)
+```
+
+**Validation** stops bad data before it costs GPU time: wrong schema, a token count far above the quota, or
+personal data the tenant shouldn't be uploading. **The job spec** pins every version so a run can be repeated.
+**The quota check** estimates GPU-hours before the job is admitted. **The scheduler** handles the two job shapes
+described next. **The training container** runs one job and cannot reach the network. **The eval step** blocks
+deployment of a model that is worse than the base. **The registry** records which tenant owns each artifact.
+
+### Follow one tenant's job: hardware by method
+
+Say a tenant wants to fine-tune the 8B model. Memory decides what hardware the job needs. Training needs about
+16 bytes per trained parameter (weight, gradient, and the optimizer's bookkeeping), and only 2 bytes for a frozen
+one.
+
+| Method | Memory for model state | Hardware | What to say in the interview |
+|---|---|---|---|
+| Full fine-tune | about **128 GB** | at least 2 GPUs; in practice one 8-GPU machine, all GPUs started together | "This is a gang-scheduled job: all 8 GPUs or none." |
+| LoRA (rank 16 on the attention layers) | about **16 GB** frozen + **0.2 GB** trained | one GPU | "Packable. Several can share a machine." |
+| QLoRA | about **4.5 GB** base | one small GPU | "The QLoRA paper fine-tunes a 65B model on one 48 GB GPU." |
+
+The working data for each batch comes on top of these numbers. Measure it per model and sequence length.
+
+Say it like this: "The scheduler has two job shapes: single-GPU LoRA and QLoRA jobs it can pack, and multi-GPU full
+fine-tunes that must be scheduled as a gang."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Training memory by method (model state only)"
+  expr="full: 16 × N bytes   LoRA: 2 × N + 16 × N_adapter   QLoRA: ≈ 0.56 × N + 16 × N_adapter"
+  vars={[
+    { sym: 'N', meaning: 'base parameters' },
+    { sym: 'N_adapter', meaning: 'LoRA parameters, layers × r × Σ(d_in + d_out)' },
+    { sym: '0.56', meaning: '4-bit weights plus scales, about 4.5 bits' },
+  ]}
+  example={[
+    "8B full: 16 × 8.03B = 128 GB → FSDP over 2+ GPUs, in practice one 8-GPU node",
+    "8B LoRA r=16 on q,k,v,o: 16 GB frozen + 16 × 13.6M = 0.2 GB → one GPU",
+    "8B QLoRA: ≈ 4.5 GB base → a small GPU; the QLoRA paper fine-tunes 65B on one 48 GB GPU",
+  ]}
+/>
+
+FSDP (fully sharded data parallel) is PyTorch's way of splitting model state across GPUs. The 13.6M adapter
+parameters: 32 layers × rank 16 × (8,192 + 5,120 + 5,120 + 8,192) for the four attention projections.
+
+</details>
+
+### Jobs that survive failures
+
+Each job runs under a **lease** with a **fencing token**: a number that increases each time the job is handed to a
+new worker. Storage rejects writes carrying an old token, so a worker that lost its lease (and doesn't know it yet)
+can't overwrite the final artifact. The job checkpoints every N steps, including its position in the data. Retries
+resume from the latest checkpoint, and the number of retries is capped.
+
+### Isolation
+
+- One job per container. No GPU sharing across tenants unless the hardware's partitioning is approved for it.
+- No network egress from training containers.
+- Per-tenant encryption keys for datasets, checkpoints and weights. Deletion covers all three.
+- The tenant ID travels with every artifact. The serving router refuses an adapter whose owner doesn't match the
+  caller.
+
+### Quotas and cost
+
+Each tenant gets a GPU-hour budget and a cap on concurrent jobs. Estimate a job's cost before admission: training
+work is about 6 × parameters × tokens operations for a full fine-tune, or about 4 × parameters × tokens for LoRA
+(the frozen base skips part of the backward pass). Divide by the throughput you have measured on your hardware.
+
+### Deploy
+
+LoRA adapters are small, so many can be served on one shared copy of the base model (multi-adapter serving). Full
+fine-tunes need their own replicas, which is the real cost difference between the two methods. Gate every
+deployment on the tenant's eval set beating the base model.
+
+Say it like this: "The training bill is small. The serving bill of a full fine-tune is the product decision: it
+needs its own replicas forever."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Fine-tuning platform"
+  senior={["Sizes GPUs per method, checkpoints and resumes jobs, isolates tenants with containers and per-tenant keys."]}
+  staff={["Separates packable single-GPU jobs from gang-scheduled ones, prices quotas from FLOPs, and treats the serving cost of full fine-tunes as the real product decision."]}
+/>
+
+## Small-team version
+
+At a 50–500 person company you build the internal version: a job spec in git, a queue, one rented GPU machine and an
+eval gate.
+
+Managed fine-tuning is the default to buy. Together lists LoRA fine-tuning of Llama 3.1 8B at $0.34–$0.38 per 1M training tokens
+(fetched 2026-10-12). For 150M training tokens (50M tokens of examples, 3 passes) that is about **$51–$57**.
+
+Keep an exit path. OpenAI's pricing page says it is winding down its fine-tuning platform and no longer accepts new
+users (fetched 2026-10-12). A vendor can remove the method you rely on.
+
+## Pitfalls
+
+- **One hardware shape for every method.** Single-GPU LoRA jobs on 8-GPU machines waste most of the fleet.
+- **Retries that restart from step 0, or two workers writing the same artifact.** Use checkpoints and fencing tokens.
+- **Isolation that stops at the API.** Checkpoints and served adapters carry tenant data too.
+- **No eval gate between "training finished" and "deployed".** A finished run is not a better model.
+
+## Go deeper
+
+- Family walkthrough: [Distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/), especially its small-team cost math.
+- The job queue underneath: [GPU job queue](/system-design-labs/interviews/walkthroughs/gpu-job-queue/). Whether to fine-tune at all: [Adapt models](/system-design-labs/interviews/walkthroughs/adapt-models/).
+- <LabRef lab="lora-finetune" inline /> for the training job, <LabRef lab="dist-lock" inline /> for leases and fencing tokens.

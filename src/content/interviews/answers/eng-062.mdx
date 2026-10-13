@@ -1,0 +1,188 @@
+---
+question: eng-062
+family: multipart-practical-coding
+status: published
+labs: [cicd-engine]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Tasks and their dependencies are a graph, so I'll store the edges in both directions: what each task waits on,
+> and who waits on it. The first direction lets me reject a dependency that would create a loop. The second lets
+> me pass a failure on to every task downstream with one breadth-first walk that visits each task once. Adding a
+> dependency on a task that has already failed fails the new task straight away. Completion, retries and a ready
+> queue come next, and none of them needs the graph code rewritten."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see you model a small dependency system in memory, with clear states and failure that
+spreads correctly, and then extend it as requirements arrive.
+
+You already know the real-world version: a CI pipeline where "deploy" waits on "test", which waits on "build". If
+"build" fails, nothing after it should run. What makes the interview version tricky is that the graph keeps
+changing while you query it. Dependencies are added after failures have already happened, tasks appear that
+nobody created explicitly, and every rule (a failure spreads, a loop is refused) must hold after each single
+operation, not just at the end.
+
+PracHub, a site that collects reported interview questions, lists a Perplexity technical screen titled "Implement Task Dependencies and Failure", marked hard
+(<Cite id="s-ddb2e028ad" />). Only the title is candidate-reported. The requirements on the page are PracHub's
+write-up: tasks start "active", `add_dependency` creates missing tasks, `fail_task` fails every direct and
+transitive dependent, adding a dependency on an already-failed task fails the dependent immediately, and unknown
+tasks report "not_found". Treat that as a likely shape, not the interviewer's script.
+
+## Clarify first
+
+- **States:** only active and failed, or also running, succeeded, cancelled? Assume the first two, and say
+  completion and retries are the likely next parts.
+- **Edges:** may a dependency create a cycle (a loop where a task ends up waiting on itself)? Assume reject it.
+- **Duplicates:** adding the same edge twice does nothing.
+- **Unknown tasks:** created automatically by `add_dependency`; `not_found` on lookup.
+- **Scale:** if a failure spreads to a large part of the graph, is time proportional to the affected tasks fine?
+  Assume yes.
+
+Say it like this: "Two states for now, active and failed. Loops are rejected. I expect you'll add success and
+retries, so I'll keep state changes in one place."
+
+## Answer
+
+### Words you need first
+
+- A **dependency** "B depends on A" means B can't succeed unless A does. A is B's dependency; B is A's
+  **dependent**.
+- A **transitive** dependent is one further down the chain: if C depends on B and B depends on A, C is a transitive
+  dependent of A.
+- **Breadth-first search (BFS)** visits a node's neighbours before their neighbours, using a queue. Here it walks
+  from a failed task out to everything that waits on it.
+
+### The shape of it
+
+```
+            deps (what a task waits on)  ─► used for the loop check
+   fetch ◄──── parse ◄──── summarize ◄──── publish
+     ▲
+     └──────── translate
+            dependents (who waits on a task) ─► used for the failure cascade
+```
+
+**`deps`** points from a task to what it waits on. Before adding "A depends on B", you search `deps` from B: if it
+reaches A, the new edge would close a loop.
+
+**`dependents`** points the other way. When a task fails, a BFS over `dependents` finds everything downstream.
+
+Keeping both costs a second dictionary. Without it, one of the two operations has to scan every task.
+
+### The code
+
+```python
+class TaskManager:
+    def __init__(self):
+        self.status = {}
+        self.dependents = defaultdict(set)
+        self.deps = defaultdict(set)
+
+    def add_task(self, t):
+        self.status.setdefault(t, "active")
+
+    def add_dependency(self, task, dep):
+        self.add_task(task)
+        self.add_task(dep)
+        if task == dep or self._depends_on(dep, task):
+            raise ValueError("cycle")
+        self.deps[task].add(dep)
+        self.dependents[dep].add(task)
+        if self.status[dep] == "failed":
+            self.fail_task(task)
+
+    def fail_task(self, t):
+        q = deque([t])
+        while q:                                  # BFS over dependents, each node once
+            n = q.popleft()
+            if self.status.get(n) == "failed":
+                continue
+            self.status[n] = "failed"
+            q.extend(self.dependents[n])
+
+    def get_status(self, t):
+        return self.status.get(t, "not_found")
+```
+
+`_depends_on(a, b)` is a depth-first search over `deps`. The check `if already failed: continue` does two jobs: a
+task reachable by two paths is processed once, and the walk can never loop.
+
+### One pipeline through it
+
+A small document pipeline: `parse` depends on `fetch`, `summarize` on `parse`, `publish` on `summarize`, and
+`translate` on `fetch`. A separate `billing` task depends on nothing. (These results come from running the class
+above with a simple `_depends_on`.)
+
+| Operation | Result | What to say in the interview |
+|---|---|---|
+| `fail_task("parse")` | parse, summarize, publish → **failed**; fetch, translate, billing stay **active** | "Failure flows down to dependents only, never up to fetch or sideways to translate." |
+| `get_status("nope")` | **not_found** | "Unknown ids are reported, not created, on reads." |
+| `add_dependency("notify", "publish")` | notify is created and **failed at once** | "A new edge onto a failed task fails the new dependent immediately." |
+| `add_dependency("fetch", "translate")` | **rejected** as a cycle | "translate already waits on fetch, so this would make fetch wait on itself." |
+
+Tests: a chain fails transitively, an unrelated task stays active, a new edge onto a failed task fails immediately,
+an unknown id is `not_found`, and a cycle is rejected. They passed when run on 2026-10-12.
+
+### Likely next parts, and the change each needs
+
+- **Completion and a ready queue:** add `succeeded`, and keep a count of each task's unfinished dependencies. A
+  task is ready when its count reaches zero. This is **Kahn's algorithm** (the standard way to process a graph in
+  dependency order), run one step at a time.
+- **Retries:** a per-task attempt counter and a limit; spread the failure only after the last attempt.
+- **Cancel versus fail:** a distinct status, so reports can tell "broke" from "never ran".
+- **Concurrency:** a worker pool pulling from the ready queue, with one lock around state changes.
+
+Say it like this: "A ready queue is an in-degree counter on top of the same edges. The graph code doesn't change."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Task manager"
+  senior={["Both edge directions, a visited-once cascade, cycle rejection, and a test per rule."]}
+  staff={["Separates fail from cancel, adds a ready queue without rewriting the graph code, and asks what an AI workflow needs on failure: retry the model call, fall back, or stop the branch."]}
+/>
+
+## Small-team version
+
+An AI workflow with steps that depend on each other (extract text, call a model, check the output, write the
+result) is common at a small company, and so is the urge to write a custom orchestrator. Don't.
+
+- **Use what you run.** For short chains of a few steps, the job queue you already have (a jobs table in Postgres,
+  or your cloud's queue) is enough.
+- **Move to a durable workflow engine** when a workflow waits on humans, runs for hours, or needs to resume after a
+  crash. Write only the step logic.
+- **Own the failure policy.** Decide which failures are retryable (an HTTP 429 "too many requests" or a timeout)
+  and which are terminal (invalid input). Give failing branches a **dead-letter** path, a place failed items land
+  where someone will see them, instead of failing silently.
+
+Retries cost money, because every attempt is a paid model call. With up to 3 attempts per call and no retry budget,
+a provider incident can **triple** the spend of every step that fails. A retry budget of 20% of calls caps it at
+**1.2×**. And don't retry terminal errors at all: a 3-step pipeline that retries invalid input pays for **9**
+doomed calls per bad document.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **No budget:** cost = base × max attempts = base × 3 when every call fails during an incident.
+- **Retry budget:** retries limited to 20% of calls, so cost ≤ base × (1 + 0.2) = **1.2×**.
+- **Retrying terminal errors:** 3 steps × 3 attempts = **9** paid calls per bad document, none of which can succeed.
+
+</details>
+
+## Pitfalls
+
+- **One edge direction only.** Either the cascade or the cycle check has to scan every task.
+- **Recursion without a visited set.** Diamonds get processed twice, and a loop runs forever.
+- **Failing dependents but leaving a later-added dependent active.** The rule must hold after every operation,
+  including `add_dependency`.
+- **Retries that also retry invalid input.** They multiply cost and never succeed.
+
+## Go deeper
+
+- Family walkthrough: [Multi-part practical coding](/system-design-labs/interviews/walkthroughs/multipart-practical-coding/).
+- Fail-fast stages over a validated dependency graph in Go: <LabRef lab="cicd-engine" inline />.
+- Detecting and breaking cycles as a short screen: [infra-102](/system-design-labs/interviews/questions/infra-102/).

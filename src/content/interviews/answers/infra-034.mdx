@@ -1,0 +1,150 @@
+---
+question: infra-034
+family: ai-coding-in-codebase
+status: published
+labs: [kafka-lite]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll go in four steps. Debug: say the cause, prove it with a failing test, then fix. Naive: write the simplest
+> correct version and keep it as a reference. Benchmark: measure it on every input shape, with repeats, and
+> profile to see where the time goes. Optimize: ask the assistant for two options, check both against the
+> reference, measure both, and keep the one that wins everywhere, saying what it costs."
+>
+> The rest of this page explains each part of that answer.
+
+This is the full engineering loop at a small scale: find the bug, get something correct, measure it, then make
+it fast with evidence.
+
+In a normal coding round, "optimize it" usually means "state a better algorithm". Here you have a real benchmark
+and an assistant: a chat tool backed by a **large language model (LLM)**, a program trained on huge amounts of
+text and code that writes a plausible reply to what you type. Ask it to "make this faster" and it will happily
+produce a change that *sounds* faster. Some of those changes help, some do nothing, and some make another case
+slower. The benchmark step is the giveaway: the round wants an optimization you can prove.
+
+Yuan Meng's account of Meta's AI-assisted round describes a toy codebase with exactly those steps, and says the
+interviewer "cared more about how well I partnered with AI to achieve the goal" than about who wrote the code
+(<Cite id="s-598c128e3b" />).
+
+## Clarify first
+
+- What does the benchmark measure, and is there a target number or only "faster"?
+- Input sizes and shapes for the benchmark. Assume more than one shape exists, and ask which matters.
+- Must the naive version stay as a reference for correctness checks? Assume yes.
+- May I add tests and change the benchmark harness?
+- What can the assistant do: chat only, or edit files?
+
+## Answer
+
+### Words you need first
+
+- **Oracle**: a slow but obviously correct version you keep around, so you can check a fast version by comparing
+  outputs on many random inputs.
+- **Profile**: a record of where a program spends its time, function by function.
+- **Syscall** (system call): a request from your program to the operating system, such as opening or reading a
+  file. Each one has a fixed overhead, so thousands of tiny ones add up.
+- **Input shape**: the kind of workload, for example "read 100 messages in a row" versus "jump to one message".
+
+### The four steps
+
+```text
+ 1. Debug        failing test ──▶ say the cause ──▶ fix ──▶ whole suite passes
+        │
+        ▼
+ 2. Naive        simplest correct version (even O(n²)) ──▶ keep it as the oracle
+        │
+        ▼
+ 3. Benchmark    every input shape, several runs ──▶ profile: where does the time go?
+        │
+        ▼
+ 4. Optimize     two options ──▶ both match the oracle? ──▶ both measured on every shape ──▶ keep one
+```
+
+**Debug.** Run the tests, read the failing one, and state a root-cause hypothesis before prompting. Make the test
+fail for that reason and read the failure line. Prompt with the diagnosis and the constraint, paste, and rerun
+everything.
+
+**Naive solution.** Write the obviously correct version first, even if it is O(n²). Let the assistant draft it
+against your tests. Keep it: it becomes the oracle for the optimized version.
+
+**Benchmark.** Benchmark before optimizing, with repeats, on each input shape. A profile tells you where the time
+goes; guessing usually picks the wrong target.
+
+**Optimize.** Ask the assistant for two candidate changes, not one. Implement both, check both against the
+oracle, and benchmark both on every shape. Keep the one that wins everywhere, or explain the trade-off. Drop
+changes the benchmark can't show.
+
+### The worked example: speeding up reads in a small log broker
+
+The family walkthrough runs this loop on this site's <LabRef lab="kafka-lite" inline /> lab, a small Kafka-like
+**log broker** in Go: a server that appends messages to files and lets readers fetch them by position. It has two
+read shapes, each with its own benchmark: reading 100 messages of 256 bytes from the start, and looking up one
+message at a scattered position.
+
+**What the profile showed.** Roughly 70% of read time was in syscalls: every record cost three unbuffered reads,
+and every lookup opened two files again. Say it like this: "The time isn't in our logic; it's in asking the
+operating system for tiny reads. So the fix is fewer system calls."
+
+**The two options the assistant was asked for:**
+
+- **A: a buffered reader.** Read 64 KiB from the file at once, then serve the small reads from memory.
+- **B: an in-memory index plus a kept file handle.** Keep the lookup table in memory, keep each file open, and read
+  through a smaller buffer.
+
+**What the measurements said** (8 interleaved runs of each, compared with `benchstat`, a Go tool that reports
+whether a difference between runs is real):
+
+| Benchmark | Before | A: buffered reads | B: in-memory index + kept handle |
+|---|---|---|---|
+| Read 100 × 256 B, time per call | 227 µs | 68.5 µs (−70%) | 15.3 µs (−93%) |
+| Look up one message, time per call | 42.4 µs | 48.9 µs (+15%) | 3.5 µs (−92%) |
+
+Option A cut one benchmark by about 70% and made the other about 15% slower, because it fills a 64 KiB buffer to
+read one small record. Option B cut both by more than 90%. If you had measured only the first benchmark, A would
+have looked like a clear win and you would have shipped a regression.
+
+Say it like this: "A wins the benchmark I was given and loses the other one. B wins both, so I'll keep B."
+
+### Say what it costs
+
+Every optimization spends something: memory, open file handles, code complexity. Say it. For option B: the index
+in memory costs about 2 bytes per message, and keeping one file open per segment matters once there are
+thousands of segment files.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Debug, naive, benchmark, optimize"
+  senior={["Keeps the naive version as an oracle, profiles before choosing, and reports before-and-after numbers with repeats."]}
+  staff={["Checks every input shape, rejects an optimization that regresses one, and states the resource cost and the scale at which the choice flips."]}
+/>
+
+## Small-team version
+
+On a small team, the person who owns the AI features is also the performance engineer. The loop is the same at
+work:
+
+- **Benchmark before you ask an agent to "make it faster".** A slow embedding backfill (turning every document
+  into the numeric form a search index needs) or a slow ingestion job gets a benchmark and a profile first.
+- **Keep the benchmark in the repo** so CI runs it on the next agent change, and a regression shows up before
+  release.
+- **Optimize only what users or the bill notice.** A change that saves 40 µs on a nightly job is not worth a
+  reviewer's hour; a change that halves a GPU or API bill is.
+
+## Pitfalls
+
+- **Optimizing before a correct baseline exists.** Without the oracle you can't tell fast from fast-and-wrong.
+- **One benchmark run on a noisy machine, reported as a single number.** Run several times and compare with a
+  tool like `benchstat`.
+- **Measuring only the input shape you were given.** Option A regressed the other one by 15%.
+- **Keeping an "optimization" that made no measurable difference.** It adds code to review and maintain for
+  nothing.
+- **Panicking while debugging.** Say the hypothesis out loud, then test it.
+
+## Go deeper
+
+- Family walkthrough: [phase 3 of the practice drill](/system-design-labs/interviews/walkthroughs/ai-coding-in-codebase/#solution-in-stages), two options measured with benchstat.
+- Run the same loop on <LabRef lab="kafka-lite" inline />.

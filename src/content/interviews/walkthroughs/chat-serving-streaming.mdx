@@ -1,0 +1,876 @@
+---
+title: "Serve a ChatGPT-style assistant with streaming"
+summary: "Design ChatGPT-style serving: stream each reply, budget the wait for the first word and the gap between words separately, limit free users by tokens, share the common prompt, and survive disconnects and spikes."
+track: cross
+format: design
+family: chat-serving-streaming
+smallTeamFocus: "Relay a provider's stream through your backend, stop it when the user leaves, cap tokens per user and plan, and know your provider's spend cap. Run your own GPUs only at hundreds of millions of steady tokens a month."
+rounds: [system-design]
+level: both
+timeboxMin: 45
+order: 125
+status: published
+basedOn: [infra-004, eng-074, eng-075, infra-005, r2a-002]
+askedAt: [openai, anthropic, google]
+labs:
+  - { lab: websocket-gateway, role: proof, note: "Heartbeats, per-client send buffers, signed reconnect tokens and sequence-numbered replay after a reconnect: the same shape as SSE resume." }
+  - { lab: rate-limiter, role: proof, note: "Token buckets and tiered limits in a shared store. It counts requests, so weighting each check by tokens is your exercise." }
+  - { lab: load-balancer, role: proof, note: "Least-connections routing, health checks, circuit breakers and a retry budget in front of replicas; no prefix affinity, and a known v2 retry bug." }
+  - { lab: observability, role: partial, note: "Histograms and tracing you could build TTFT and inter-token latency metrics on; the Go package does not compile yet." }
+  - { lab: llm-inference, role: partial, note: "Prefill and decode paths, a real KV cache and a 16-token page allocator; no token streaming or cancellation yet." }
+gapLabs: [llm-gateway, llm-observability]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+Design the serving system behind a ChatGPT-style assistant. Users send messages in a conversation, and a model
+streams the reply back word by word.
+
+> **If you only remember one thing, say this in the first minute:**
+> "A chat reply is not a quick stateless request. It is a job that runs for many seconds and holds scarce GPU
+> memory the whole time. I'll stream the reply to the browser as it is written, and I'll treat two delays
+> separately: the wait for the first word, and the gap between the words after it, because different parts of
+> the system cause them. The number of users one GPU machine can serve is set by its memory, so I'll share the
+> common system prompt between users and limit the free tier by tokens, not by message count. Then I'll cover what
+> happens when a user disconnects mid-reply, and who gets slowed down first in a traffic spike."
+>
+> The rest of this page explains each part of that answer.
+
+### What makes this different from a normal web service
+
+You already know how to serve a normal web request. A server reads a few rows, builds a response in a few
+milliseconds, and forgets about you. Any server can take your next request. Requests cost roughly the same.
+If load doubles, you add servers.
+
+A chat reply from a large language model (**LLM**, the kind of model behind ChatGPT and Claude) breaks each of
+those habits:
+
+1. **It runs for seconds, not milliseconds.** The model writes the reply one small piece at a time. A
+   reply of a few hundred words takes 10 to 20 seconds to finish, so the user must see it arrive as it is
+   written.
+2. **It holds memory while it runs.** During those seconds the GPU keeps a working memory of the whole
+   conversation. That memory, not the GPU's speed, decides how many users one machine can serve at once.
+3. **Requests differ wildly in cost.** One user sends a short question. Another pastes a long document of about
+   100,000 tokens (a token is a small piece of text, roughly ¾ of a word; more just below). The second one
+   costs about two thousand times more work. A limit of "20 messages a day" treats them as equal.
+4. **Capacity is slow and expensive to add.** One large model fills a machine of 8 GPUs, and a new machine
+   can need over a minute just to load the model before it can serve anyone.
+
+Every part of the design answers one of these four facts.
+
+This exact prompt was reported for an OpenAI software-engineer onsite posted in September 2026, whose title names
+streamed replies, free-tier limits and GPU scheduling (<Cite id="s-86dff7d564" />). On that site only the title
+is candidate-reported. Its write-up adds likely follow-ups: latency targets for the first word and the rest, a
+client that disconnects mid-reply, a long system prompt shared by many users, a model rollout, and who degrades
+first in a spike. The prompt gives no numbers, so you choose them.
+
+<QuestionRow id="infra-004" />
+
+### Words you need first
+
+These terms appear on every line below. Each gets a plain meaning first and then the name interviewers use.
+
+- The model reads and writes text in small pieces of about ¾ of a word each. One piece is a **token**. Prices,
+  limits and memory are all counted in tokens.
+- Before it writes anything, the model reads the whole prompt (the app's instructions, the chat history and the
+  new message) in one big pass. That is **prefill**. It decides how long the user waits for the first word.
+- Then the model writes the reply one token per pass, and each pass handles every user on the machine at once.
+  That is **decode**. It decides how fast the words keep coming.
+- The wait for the first word is the **time to first token (TTFT)**. The gap between words after that is the
+  **inter-token latency (ITL)**. They are two separate budgets with separate causes.
+- So that decode does not re-read the whole conversation for every new token, the GPU keeps a saved summary of
+  every token so far. That summary is the **KV cache** ("key-value cache"). It lives in the GPU's own fast
+  memory, called **HBM** (high-bandwidth memory), which holds 80 GB per GPU on the machine we assume.
+
+One more: a **stream** in this page means one reply being generated and sent to one user.
+
+### The message we follow through this page
+
+Every number below comes from one message. A free-tier user on a phone types *"Explain how DNS works"* in a
+conversation they started a few minutes ago. The prompt the model must read is made of three parts:
+
+| Part | Tokens | What to say in the interview |
+|---|---|---|
+| The app's system prompt (instructions, the same for every user) | 2,000 | "This part is identical for everyone, so we should compute it once and share it." |
+| The earlier turns of this conversation | 1,500 | "This is private to the user and grows every turn." |
+| The new message | 100 | "This is the only part that is new." |
+| **Prompt total** | **3,600** | "This decides the first-word wait." |
+| The reply the model writes | 400 | "This decides how long the stream stays open." |
+| **Held in memory by the end** | **4,000** | "This decides how many users fit on a machine." |
+
+These sizes are assumptions. Say them out loud and switch to the interviewer's numbers if they give different
+ones. We will follow this message through the gateway, the GPU machine, a disconnect on a train, and the bill.
+
+### The same problem in other shapes
+
+The same design appears in four other reported forms:
+
+- **"Design ChatGPT"**, listed in Hello Interview's OpenAI guide among commonly asked design questions and tagged
+  Staff in the bank (<Cite id="s-4d55d9b987" />). It can be about the product (conversations, history, sharing)
+  or about GPUs.
+- **"Design a Claude chat service"**, listed by interviewing.io for Anthropic (<Cite id="s-4edc43db4e" />). It
+  has the same two possible readings.
+- **A GPT-like system in an OpenAI phone screen**: how a request flows, where latency comes from and how GPUs are
+  handled. It was seen only as a summary of a login-gated forum thread, and the same screen reportedly had a
+  key-value-store coding question (<Cite id="s-401c185c20" />).
+- **A scalable LLM inference system at Google**, Senior, early March 2026: load balancing, model optimization and
+  horizontal scaling. It is a user-submitted report whose question text is the site's own
+  (<Cite id="s-db8c0e3034" />).
+
+<QuestionRow id="eng-074" />
+<QuestionRow id="eng-075" />
+<QuestionRow id="infra-005" />
+<QuestionRow id="r2a-002" />
+
+Two neighbouring questions live in other families. The distributed rate limiter for an LLM API is in
+[rate limits, credits and admission control](/system-design-labs/interviews/walkthroughs/rate-limits-admission/).
+The decode loop you would write as code is in
+[continuous batching](/system-design-labs/interviews/walkthroughs/continuous-batching/).
+
+## What is being tested
+
+The interviewer is checking four things. Each is something a strong backend engineer gets wrong at first.
+
+**Two delays, not one.** You should say that the first-word wait and the word-to-word gap are different budgets.
+Prep guides call them "separate SLAs with separate fixes" and warn that GPU utilization is a poor signal for
+autoscaling (<Cite id="s-f440daaea4" />). One serving guide gives a feel for the targets. For the first word:
+"a few hundred milliseconds reads as instant, a couple of seconds reads as broken". For the gaps: "somewhere
+around 50 to 100 milliseconds per token or better" (<Cite id="s-75e82f8882" />). Those are a prep guide's
+targets, not any company's promise.
+
+Say it like this: "TTFT is spent in the queue and in reading the prompt. ITL is spent in the decode loop. I'll
+give each one a number and say which part of the system spends it."
+
+**Knowing what runs out first.** The write-up of the OpenAI item points at GPU memory, mostly the KV cache, as
+the limit on how many replies a server can generate at once (<Cite id="s-86dff7d564" />). If you say "we're
+compute-bound" you have missed the main idea.
+
+**Scoping to the team.** Hello Interview says "The company name alone isn't a reason to spend your preparation
+on model training or GPU infrastructure" (<Cite id="s-4d55d9b987" />). Ask whether you are talking to a product
+team or an inference team, then choose your depth out loud.
+
+**Limits that match the real cost.** Requests differ in cost by three orders of magnitude, so a free tier limited
+by message count is either far too generous or far too strict. That point follows from the arithmetic below. No
+source states it as a grading criterion.
+
+My reading: the strongest answers give each latency budget a number, say which component spends it, and say what
+the user sees when that budget is blown.
+
+## Clarify and scope
+
+Spend two or three minutes here. Each question changes a number later, so write the answers on the board.
+
+| Question | Why it matters | Assumption to write down |
+|---|---|---|
+| Product team or inference team? | Sets how deep you go into GPUs | Inference, so GPU scheduling is in scope. For a product team, spend the time on conversations, streaming and limits |
+| Do we run the model, or call one? | Whether the GPU half exists at all | We run it (the OpenAI and Google variants imply this) |
+| Peak load? | Fleet size | 2,000 new messages ("turns") per second at peak (assumed) |
+| How are tiers limited? | The limiter design | Free: tokens per window, one stream at a time, a cap on prompt length. Paid: higher limits and priority |
+| Latency targets by tier? | Scheduler priorities | First word (TTFT) under 1 s for paid and 2 s for free at p95; word gap (ITL) under 50 ms (assumed, inside the guide's ranges) |
+| Model, hardware, fallback? | Memory math; what to degrade to | Llama-3.1-70B, an open 70-billion-parameter model whose sizes are published, stored at 2 bytes per number (**bf16**), on machines of 8 H100 GPUs. The model is split across all 8 GPUs so they act as one big GPU; this is called **tensor parallelism**, written **TP=8**. A smaller fallback model exists |
+| Conversation shape? | Memory per stream; how much can be shared | The worked message: 2,000-token shared system prompt, 1,500 tokens of history, a 100-token message, a 400-token reply (assumed) |
+| Which clients? | Streaming protocol | Browsers and mobile apps |
+
+Why a published open model? Because its layer counts and sizes are public, so every number below can be checked.
+A company's own model will differ, but the method is the same.
+
+Out of scope: training, retrieval and tools, safety classifiers (name them as one more hop on the request path),
+and billing beyond counting tokens.
+
+## Back-of-envelope
+
+You need four numbers, in this order. Each one answers a question the interviewer will ask:
+
+1. How many replies are being written at the same moment? (That sets the size of everything.)
+2. How many of them fit on one 8-GPU machine? (Memory decides this.)
+3. At that many, are the words still fast enough? (The word-gap budget can set a lower limit.)
+4. How long is the wait for the first word, and what makes it long?
+
+The main text gives each result and what it means. The arithmetic sits in boxes for when an interviewer asks you
+to derive it.
+
+### 1. How many replies are in flight
+
+Use **Little's law**, the queueing rule you may know from capacity planning: items in the system equal arrival
+rate times time in the system. Each reply stays open for about 20 seconds (400 tokens at the 50 ms word-gap budget). At 2,000
+new messages a second, about **40,000 replies are being written at any moment**. That means 40,000 open
+connections to clients and 40,000 conversations in GPU memory.
+
+Say it like this: "Forty thousand open streams is a connection-heavy, CPU-light tier at the edge, and forty
+thousand live conversations in GPU memory behind it."
+
+### 2. How many conversations fit on one machine
+
+Here memory matters, not speed. Each token in a conversation adds a fixed amount to the KV cache. For this model
+that is **327,680 bytes (320 KiB) per token**. Our worked message holds 4,000 tokens by the end of its reply, so
+it occupies **about 1.31 GB** of GPU memory for the whole time it is streaming.
+
+The machine has 8 × 80 GB = 640 GB of HBM. The model's own numbers (its **weights**, the 70 billion learned
+values) take 141.1 GB. We assume another 5 GB per GPU for working space. What is left, **458.9 GB**, is the
+room for KV caches.
+
+- If every conversation keeps its own copy of everything: **350 conversations per machine**.
+- If the 2,000-token system prompt is stored once and shared, each conversation only needs its own 2,000 tokens:
+  **699 conversations per machine**.
+
+So 40,000 streams need **115 machines without sharing and 58 with it. Sharing one system prompt halves the
+fleet.** That is the cost case for the reported follow-up about a shared system prompt.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Little's law:** a 400-token reply at 50 ms per token takes 400 × 0.05 = 20 s. 2,000 turns/s × 20 s =
+  **40,000 concurrent streams**.
+- **Weights:** 70.55 × 10⁹ parameters × 2 bytes = 141.1 GB, using the exact parameter count from the model's
+  config (<Cite id="s-6fdd575dc5" />).
+- **KV cache per token:** 2 (a key and a value) × layers × KV heads × head size × bytes per value. For
+  Llama-3.1-70B: 2 × 80 × 8 × 128 × 2 = 327,680 B = 320 KiB. The model has 64 query heads but only 8 KV heads,
+  because several query heads share one KV head (this is called grouped-query attention). (A head is one of the parallel attention
+  units inside each layer.) Using 64, or the 8,192 hidden size, overstates the cache 8×. Head size is 8,192 hidden ÷ 64 heads = 128.
+- **One stream at the end of its reply:** 4,000 × 327,680 B = 1.31 GB. The shared 2,000-token system prompt
+  alone: 2,000 × 327,680 B = 0.655 GB.
+- **KV room per machine:** 640 GB − 141.1 GB weights − 8 × 5 GB working space (assumed) = 458.9 GB. The weights
+  are stored once across the 8 GPUs, not once per GPU.
+- **Streams per machine:** without sharing, 458.9 ÷ 1.311 = 350. With the system prompt stored once,
+  (458.9 − 0.655) ÷ 0.655 = 699.
+- **Fleet:** 40,000 ÷ 350 = 115 machines; 40,000 ÷ 699 = 58 machines.
+
+</details>
+
+### 3. Are the words still fast at 699 users?
+
+Memory says 699 fit. But every decode pass serves all of them, and the pass has to finish within the 50 ms
+word-gap budget. So check the speed too.
+
+A decode pass is limited by how fast the GPU can read its own memory, not by how fast it can multiply. In each
+pass every GPU reads its share of the model weights once, plus every active conversation's KV cache. Running many
+users together, called **batching**, shares the weight read between them. It does not share the KV reads: each
+user's history must be read every pass.
+
+At 699 users, each pass needs **about 37.7 ms** at the hardware's peak memory speed. That fits a 50 ms budget.
+Turned around, the budget allows up to **963 users per machine at peak memory speed, or 532 if real code reaches
+60% of peak**. The multiplication in the same pass would take only 12.5 ms, which is why we call decode
+**memory-bound**.
+
+The lesson is the important part. The real per-machine limit is **the smaller of the memory limit and the
+word-speed limit**, and only a measurement on your own hardware tells you which one binds.
+
+Say it like this: "Memory gives me 699 per machine. Bandwidth gives me somewhere between 532 and 963 depending on
+how efficient the GPU code is. I'd measure before I trust either."
+
+### 4. The first-word wait, and why long prompts are the risk
+
+Prefill reads the whole prompt in one pass, and it is limited by multiplication speed. For our 3,600-token
+message the hardware cannot do it in less than **about 64 ms**. If the 2,000-token system prompt is already
+cached, only 1,600 new tokens are read, and the floor drops to **28.5 ms**.
+
+For a normal chat turn that is a small slice of a few-hundred-millisecond TTFT. So when TTFT goes over budget,
+the cause is usually one of two things: waiting in a queue for KV memory to free up, or a very long prompt.
+
+Long prompts are the real risk. Reading a prompt costs a fixed amount per token, plus a part called **attention**
+(each token looking back at every earlier token) that grows with the square of the prompt length. For a pasted
+100,000-token document, attention is almost half the work, and prefill takes **about 3.4 seconds** on compute
+alone. That blows the 2 s free-tier budget before any queueing. It is an argument for capping prompt length on
+the free tier.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Hardware peaks.** NVIDIA's H100 page prints Tensor Core figures "with sparsity", which ordinary models can't
+  use, so halve them: 1,979 ÷ 2 ≈ 989.5 TFLOPS of dense bf16 per GPU, and 8 × 989.5 = 7.916 × 10¹⁵ FLOP/s per
+  machine. Memory speed is 3.35 TB/s per GPU.
+- **Decode pass at 699 users:** each GPU reads 141.1 GB ÷ 8 = 17.64 GB of weights, plus 699 users × 3,800
+  tokens (average context: the 3,600-token prompt plus half the reply) × 40,960 B (each GPU holds one of the 8 KV
+  heads, so 327,680 ÷ 8) = 108.8 GB of KV. (17.64 + 108.8) GB ÷ 3.35 TB/s = **37.7 ms**.
+- **Compute for that pass:** 699 × 2 × 70.55 × 10⁹ FLOP ÷ 7.916 × 10¹⁵ FLOP/s = 12.5 ms. Less than 37.7 ms,
+  so the pass is memory-bound.
+- **Users allowed by a 50 ms budget:** N ≤ (0.050 s × 3.35 TB/s − 17.64 GB) ÷ (3,800 × 40,960 B) = 962.8, so
+  about 963. At 60% of peak bandwidth, 532. These are upper limits; real GPU code reaches only a fraction of peak
+  bandwidth, so measure.
+- **Prefill floor:** (2 × parameters × n + 2 × layers × hidden × n²) ÷ machine FLOP/s. The first term is the
+  weight multiplications (one multiply-add per weight per token, counted as 2 FLOPs). The second is causal
+  attention, halved for the mask.
+- **Cold 3,600-token prompt:** 2 × 70.55 × 10⁹ × 3,600 ÷ 7.916 × 10¹⁵ = 64 ms; attention adds about 3%.
+- **System prompt cached, 1,600 new tokens:** 28.5 ms.
+- **Pasted 100,000-token document:** weights 1.411 × 10¹⁶ + attention 2 × 80 × 8,192 × 100,000² = 1.31 × 10¹⁶
+  FLOPs, total ÷ 7.916 × 10¹⁵ ≈ **3.4 s**.
+
+</details>
+
+### 5. Reading a new prompt makes everyone else's words stall
+
+Prefill and decode share the same GPUs. Suppose our 3,600-token message arrives and is read in one go inside a
+decode pass. That pass now takes about 37.7 + 64 ≈ **102 ms**. Every one of the 699 users on the machine sees a
+102 ms gap between two words, twice the budget.
+
+The fix is to read long prompts in slices, a slice per pass, between the decode work. This is called **chunked
+prefill**. The slice size comes straight from the budget: after decode's 37.7 ms, a 50 ms pass has about 12 ms
+left, which is enough to read **about 688 tokens**. Our 3,600-token message is read over 6 passes, which adds
+about **300 ms** to its first-word wait.
+
+That is the whole TTFT-against-ITL trade in one number. Bigger slices give new users their first word sooner
+and make everyone else stutter. Smaller slices protect the users already reading and make new users wait.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Largest slice per pass:** (ITL budget − decode pass) × machine FLOP/s ÷ (2 × parameters) =
+  (0.050 − 0.0377) s × 7.916 × 10¹⁵ ÷ 1.411 × 10¹¹ = **688 tokens**.
+- **Our message:** 3,600 ÷ 688 → 6 passes of about 50 ms ≈ 300 ms of TTFT.
+- This treats the slice's compute as extra time added to the pass, which is conservative.
+
+</details>
+
+## High-level design
+
+Here is the whole system. The request travels down the left side. Tokens come back up through the stream
+gateway as **Server-Sent Events (SSE)**: one long-lived HTTP response that the server keeps writing small events
+to (more on why below). A cancel signal travels back to the GPU machine when the user leaves.
+
+```
+   Browser / mobile app
+        │  1. POST message                         ▲  7. tokens as SSE events
+        ▼                                          │     (each with an offset id)
+   ┌──────────────────────┐                  ┌───────────────────────────┐
+   │ API gateway          │                  │ Stream gateway            │
+   │ login, tier,         │                  │ replay buffer, heartbeats,│
+   │ reserve tokens       │                  │ save reply, settle charge │
+   └──────────┬───────────┘                  └─────────────┬─────────────┘
+              │ 2.                                  ▲      │ cancel
+              ▼                                     │      │ (stop click or
+   ┌──────────────────────┐                         │      │  user gone)
+   │ Conversation service │                         │      │
+   │ history, build prompt│                         │      │
+   └──────────┬───────────┘                         │      │
+              │ 3.                                  │      │
+              ▼                                     │      │
+   ┌──────────────────────┐                         │      │
+   │ Router               │                         │      │
+   │ same-conversation    │                         │      │
+   │ affinity, free KV,   │                         │      │
+   │ queue depth          │                         │      │
+   └──────────┬───────────┘                         │      │
+              │ 4.                                  │      │
+              ▼                                     │ 6.   ▼
+   ┌───────────────────────────────────────────────────────────┐
+   │ Model server: one 8-GPU machine (TP=8)                    │
+   │ queues per tier → admit when KV memory allows →           │
+   │ prefill in slices → decode every user each pass (5.)      │
+   │ shared prefix cache for the system prompt                 │
+   └───────────────────────────────────────────────────────────┘
+```
+
+**API gateway.** It checks who the user is and which tier they are on. It enforces one open stream per free user.
+It reserves tokens against the user's quota before any GPU work starts (the reserve-and-refund scheme is in the
+deep dives).
+
+**Conversation service.** It loads the chat history and builds the prompt: system prompt, then history, then the
+new message, trimmed to the tier's length cap.
+
+**Router.** It picks which GPU machine gets the request. A normal load balancer picks the least busy server. This
+one prefers the machine that served the same conversation last turn, because that machine may still hold the
+conversation's KV cache. Keeping a conversation on one machine is called **affinity**. The router also looks at
+free KV memory and queue length on each machine.
+
+**Model server.** One 8-GPU machine running one copy of the model. It keeps a queue per tier and admits a request
+only when there is KV memory for it. It reads new prompts in slices and decodes every admitted user in each pass.
+Users join and leave this group between passes, which is called **continuous batching**. It keeps the shared
+system prompt's KV cache in memory once, as a **prefix cache**, and pushes each new token to the stream gateway.
+
+**Stream gateway.** It holds the connection to the user. It writes each token as an event, keeps a copy of the
+reply so far in a **replay buffer**, and sends small keep-alive messages (**heartbeats**) so it notices dead
+connections. A stop click or a vanished client becomes a cancel sent back to the model server. When the reply
+finishes it saves the reply and settles the token charge.
+
+### Follow the message through it
+
+Here is our message on a busy machine, with a rough clock. The numbers come from the back-of-envelope above.
+
+| Clock | Where | What happens | What to say in the interview |
+|---|---|---|---|
+| 0 ms | API gateway | Free tier, no other open stream. Reserves 3,600 prompt tokens + 1,000 maximum reply = 4,600 tokens. | "I charge the worst case up front and refund the rest at the end." |
+| a few ms | Conversation service | Loads 1,500 tokens of history, adds the 2,000-token system prompt and the 100-token message. | "This hop is cheap; keep it to a few milliseconds." |
+| a few ms | Router | Sends it to the machine that served this conversation's last turn. | "Affinity makes a cache hit likely, with a limit on how hot one machine may get." |
+| + queue | Model server | Waits until there is KV memory for it. | "Under load, this wait is where TTFT grows." |
+| + ~150 ms | Model server | The system prompt is cached, so only 1,600 tokens are read (a 28.5 ms floor), but in 688-token slices across 3 passes of about 50 ms. | "Chunking costs the new user a little to protect 699 others." |
+| every ~38 ms | Model server | One token per pass, shared with every other user on the machine. | "37.7 ms per pass fits the 50 ms budget." |
+| as produced | Stream gateway | Each token goes out as an SSE event with id `msg:N`. | "The id lets a reconnect resume from token N." |
+| ~15 s | Stream gateway | The reply ends at 400 tokens (400 × ~38 ms). Saves it, refunds 600, charges 4,000. | "Two writes to the limit store per message, not one per token." |
+
+### Why Server-Sent Events for the reply
+
+**Server-Sent Events (SSE)** is a plain HTTP response that the server keeps open and keeps writing small events
+to. The browser has it built in. It passes through ordinary proxies, and it has resume built in: each event can
+carry an id, and a reconnecting browser sends the last id it saw in a `Last-Event-ID` header, so the server can
+replay from that point (see the
+[WHATWG SSE spec](https://html.spec.whatwg.org/multipage/server-sent-events.html), fetched 2026-10-12).
+
+SSE only goes one way, from server to client. That is fine here, because the client has nothing to say mid-reply
+except "stop", and stop can be a separate POST. WebSocket earns its extra cost for two-way realtime use, such as
+voice.
+
+Say it like this: "SSE with the token offset in each event id, stop as a separate POST. WebSocket only if we add
+voice."
+
+## Deep dives
+
+### The scheduler between two latency budgets
+
+The model server runs a loop. In each pass it writes one token for every running user, then spends whatever
+time the pass has left on prompt slices for waiting users. Four rules make that loop behave.
+
+- **Admission is by memory.** A request starts only when free KV memory covers its prompt plus a reserve for its
+  reply. Reserving the full maximum reply length never runs out, but wastes memory on replies that end early.
+  Reserving less fits more users, but sometimes the machine runs out mid-reply and must pause a user, free their
+  memory and recompute it later. That pause is called **preemption**.
+- **Queues are per tier.** Weighted fair queueing between paid and free (say 4:1, a policy choice) stops either
+  class from starving the other.
+- **Preemption picks victims by tier, then by work already done.** A reply that has streamed 390 of its 400
+  tokens is the last to evict. Its prefill is paid for, and someone is watching it.
+- **The pass length comes from the word-gap budget.** The 688-token slice above is what a 50 ms ITL allows.
+  Prefill gets whatever decode leaves.
+
+The coding version of this loop (slots, refill, stop sequences, KV budget, cancellation) is the
+[continuous-batching walkthrough](/system-design-labs/interviews/walkthroughs/continuous-batching/).
+
+### Free-tier limits that count tokens
+
+Start with why message counts fail. A 100-token prompt needs about 1.4 × 10¹³ operations to read. A
+100,000-token prompt needs about 2.7 × 10¹⁶ once attention is counted. Two "messages" differ by **roughly
+2,000×**. Limit three things instead:
+
+1. **Tokens per window**, input plus output. This is the main cost control.
+2. **Open streams per user.** Our message holds about 1.3 GB of KV for 20 seconds. Ten open tabs hold ten times
+   that.
+3. **Requests per minute**, only as abuse protection.
+
+You can't know a reply's length in advance, so you **reserve, then refund**. At admission, reserve the prompt
+tokens plus the tier's maximum reply length. At the end, refund what wasn't used.
+
+For our message: the free tier allows a 1,000-token reply, so the gateway reserves 3,600 + 1,000 = **4,600**. The
+reply stops at 400 tokens, so 600 are refunded and **4,000 are charged**.
+
+Write to the shared counter store twice per message, at admission and at completion. Never write once per
+streamed token: at 40,000 streams producing 20 tokens per second each, that would be **800,000 writes per
+second**. The distributed version (several rules in one atomic check, leases per gateway) is the
+[rate-limits family](/system-design-labs/interviews/walkthroughs/rate-limits-admission/).
+
+Should input and output tokens count the same? Derive the weight from GPU cost. At peak, one machine reads
+prompts at **about 56,100 tokens/s** and writes replies at **about 18,500 tokens/s**. Under these assumptions an
+output token costs about **3×** an input token, and it also holds KV memory while it streams. Provider price
+lists point the same way. Claude Sonnet 5, for example, lists $2 per million input tokens and $10 per million
+output tokens ([Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing), fetched 2026-10-11).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Small prompt:** 2 × 70.55 × 10⁹ × 100 = 1.4 × 10¹³ FLOPs. **Large prompt:** about 2.7 × 10¹⁶ with
+  attention (see the prefill box). Ratio ≈ 2,000.
+- **Reserve:** prompt_tokens + max_tokens = 3,600 + 1,000 = 4,600. **Refund:** max_tokens − actual output =
+  1,000 − 400 = 600. Charged: 4,000.
+- **Per-token writes:** 40,000 streams × 20 tokens/s = 800,000 writes/s.
+- **Prefill rate:** 7.916 × 10¹⁵ ÷ 1.411 × 10¹¹ ≈ 56,100 tokens/s. **Decode rate:** 699 ÷ 0.0377 s ≈ 18,500
+  tokens/s. Ratio ≈ 3.
+
+</details>
+
+### Reusing the system prompt and the conversation
+
+**How it works.** Split each prompt into fixed-size blocks of tokens. Give each block a key: a hash of its tokens
+plus the hash of every block before it, so a block only matches when everything before it matched too. A new
+request walks its chain of blocks, reuses every block already in memory, and computes only the rest. The serving
+guide's wording is that requests sharing a prefix "can point at the same cached pages instead of recomputing
+them" (<Cite id="s-75e82f8882" />). Shared blocks carry a reference count, so they are freed only when no one
+uses them.
+
+**What it buys, from the numbers above.** KV per stream halves, from 1.31 GB to 0.655 GB. A machine holds 699
+streams instead of 350, so the fleet needs 58 machines instead of 115. The first-word floor for our message drops
+from 64 ms to 28.5 ms.
+
+**The global system prompt belongs on every machine.** Load it into the cache at startup, before the machine
+takes traffic.
+
+**History needs affinity, not permanent residence.** Between turns a user reads and types; assume 30 seconds.
+That means about 60,000 idle conversations at any moment, whose private KV would need about **39 TB**. The whole
+fleet has only **26.6 TB** of KV room. Recomputing 1,600 tokens of history costs a 28.5 ms floor. So evict idle
+history (or move it to the machine's ordinary memory) and recompute it when the user returns. Prefix caching
+pays most for the shared system prompt, and for agent loops that resend a large context every turn.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Idle conversations:** 2,000 turns/s × 30 s of thinking time (assumed) = 60,000.
+- **Their private KV:** 60,000 × 0.655 GB = 39 TB.
+- **Fleet KV room:** 58 machines × 458.9 GB = 26.6 TB.
+
+</details>
+
+**Correctness and isolation.** The cache key must include the model version and anything else that changes the
+KV cache: the tokenizer (the code that splits text into tokens), the system-prompt version, and any
+adapter (a small add-on that customizes the model). Decide explicitly whether identical prefixes
+are shared across customers. A cache hit returns the first word faster, and that timing difference can reveal
+that someone else sent the same prefix.
+
+### Disconnects, cancellation and resume
+
+Back to our user. At token 200 the train goes into a tunnel and the phone's connection dies.
+
+- **Noticing.** A dead mobile client is often not noticed until the server's writes fill the socket buffers.
+  SSE heartbeats (comment lines the browser ignores) plus a write timeout make a vanished client show up within
+  seconds.
+- **Grace, then cancel.** Keep generating for a grace window (say 15 s, a policy choice), buffering the reply
+  under the message id. If the phone reconnects with `Last-Event-ID: msg:200`, replay tokens 201 onwards and
+  continue. If it doesn't, set the reply's cancel flag. The scheduler drops it at the next pass and frees its KV
+  memory. The Together AI guide lists passing a disconnect back to the scheduler as its own item, separate from
+  the batching scheduler (<Cite id="s-0457784328" />).
+- **The cost of never cancelling.** Wasted decode = share of replies abandoned × average share of the reply left.
+  With an assumed 5% of replies abandoned halfway, that is **2.5% of decode capacity**. Cancel faster for the
+  free tier.
+- **Save the finished reply** even if nobody was connected, so a returning user sees the whole answer.
+- **Gateway failure.** If the replay buffer lives only in one gateway's memory, a crash loses the resume point.
+  Keep it in a small shared store keyed by message id, or route the reconnect back to the machine generating it.
+- **Slow readers.** Never drop tokens. When a client falls behind, put several tokens into one event. A whole
+  reply is a few kilobytes of text, so buffering it is cheap.
+
+Say it like this: "Heartbeats to notice, a grace window to resume, then cancel so the GPU memory is freed."
+
+Here is the relay at the heart of this, as a small sketch. The event id carries the token offset, so a reconnect
+resumes after it. The upstream is closed on disconnect, so generation stops:
+
+```python
+async def relay(upstream, is_disconnected, msg_id, start_offset=0, buffer=None):
+    buffer = buffer if buffer is not None else []
+    offset = start_offset
+    try:
+        async for delta in upstream:
+            buffer.append(delta)                  # for replay and for persisting the reply
+            offset += 1
+            if await is_disconnected():           # Starlette: request.is_disconnected()
+                return
+            yield f"id: {msg_id}:{offset}\ndata: {json.dumps({'t': delta})}\n\n"
+        yield f"event: done\ndata: {json.dumps({'tokens': offset})}\n\n"
+    finally:
+        await upstream.aclose()                   # stops the upstream stream either way
+```
+
+Read it this way: `upstream` is the model server's token stream, and each `delta` is one token of text. Each
+yielded string is one SSE event. The `finally` block runs whether the reply ends normally or the client leaves,
+so the upstream is always closed. Three tests (a full stream, a disconnect after three frames that must close the
+upstream, and resumed ids that continue from an offset) passed on 2026-10-12 under Python 3.13.7 in the guide's
+scratch environment. They use a fake upstream. A real one needs the grace window, the shared buffer and the
+heartbeat added.
+
+## Failure modes and overload
+
+Each row says what breaks, what the user sees, and what the system does.
+
+| Failure | What the user sees | Response |
+|---|---|---|
+| A GPU machine dies mid-reply | Their reply pauses | The gateway holds the prompt and every token streamed so far. Send prompt + partial reply to another machine as one prefill and keep writing. The pause is one prefill, tens of milliseconds at chat sizes |
+| A stream gateway dies | The connection drops | The browser's SSE reconnects to another gateway with `Last-Event-ID`, which replays from the shared buffer |
+| KV memory runs out | Word gaps grow, then replies get paused | Admit on projected KV memory, not request count. Frequent preemptions mean admission is too optimistic |
+| One machine is hot because of affinity | Slow first words (p99) on that machine | Bounded-load hashing: once a machine is too busy, new conversations spill to the next one |
+| Cold start during a spike | First-word waits climb while capacity loads | 141 GB of weights at an assumed 2 GB/s takes about 71 s, plus cache warm-up. Autoscale early, on queue depth and tokens waiting for a slot, not GPU utilization (<Cite id="s-f440daaea4" />) |
+
+### Who degrades first in a spike
+
+This is the reported follow-up. Answer with a ladder, cheapest harm first:
+
+1. **Protect replies already running.** Their prefill is paid for and a person is watching.
+2. **Background and batch traffic** waits or is rejected before interactive traffic.
+3. **Free tier, new messages:** queue behind a "high demand" notice, cut the maximum reply length and the prompt
+   cap, route to the fallback model if the product allows it, then reject with `Retry-After`.
+4. **Paid tier:** hold the first-word wait, and let the word gap stretch toward its budget (more users per pass,
+   slower words each).
+5. **Last:** reject new paid requests.
+
+Write the ladder down before the spike, and attach a metric and an owner to every step.
+
+<Pitfall title="Counting requests instead of tokens">
+A requests-per-minute limit treats a 100-token question and a 100,000-token document as equal. Their prefill
+costs differ by about 2,000×, and how long they hold KV memory differs too. Limit tokens per window and open
+streams; keep the request-count limit for abuse.
+</Pitfall>
+
+## Evals and observability
+
+You need to know, per tier, whether each budget is being met, and why not when it isn't. Here p50, p95 and p99
+mean the usual percentiles.
+
+- **Time to first token** at p50, p95 and p99 per tier, split by prompt length. Otherwise the long-prompt tail
+  hides in the average.
+- **Word gap** at p50 and p99, and the **largest gap within each stream**. One 400 ms stall is what users notice.
+- **Queue wait per tier**, and rejected requests by reason (tokens, open streams, capacity).
+- **KV memory use, preemptions and recomputes**, and the **prefix-cache hit rate counted in tokens**, not
+  requests.
+- **Cancellations** by cause (stop button, or a disconnect past the grace window), and GPU-seconds spent after a
+  disconnect.
+- **Stream completion rate**, mid-stream errors, and how often a reconnect resumed.
+- **Tokens in and out per user and tier**, reconciled against the limiter's charges.
+
+**Rolling out a new model version.** An **eval set** is a fixed collection of test prompts with known good
+answers or grading rules, used to compare model versions offline. Gate the new version on it first. During the
+canary, compare first-word wait, word gap, errors, reply length, refusal rate and user signals (regenerate clicks,
+thumbs-down). Pin each conversation to one version, so caches stay per version and a user never switches models
+mid-thread. Keep the old pool warm until the canary passes, so rollback is a routing change.
+
+Most of this is LLM-specific telemetry that generic tracing doesn't give you. It is what the planned
+llm-observability lab would cover.
+
+## Trade-offs
+
+| Decision | What you gain | What you give up | Choose differently when |
+|---|---|---|---|
+| SSE for the reply | Plain HTTP, resume via `Last-Event-ID`, passes proxies | Client-to-server messages go in separate requests | Two-way realtime (voice): WebSocket |
+| Grace window before cancelling | Complete replies for flaky connections | About 2.5% of decode at the assumed abandon rate | Under capacity pressure: cancel at once for the free tier |
+| Reserve the full maximum reply of KV at admission | No storms of paused replies | Fewer users per machine | Replies are reliably short: reserve an estimate and allow preemption |
+| Conversation affinity | Cache hits across turns | Uneven load | Short chats: balance freely and share only the system prompt |
+| Small prefill slices | Steady word gaps for running replies | Longer first-word wait for new users | Agent clients nobody watches: bigger slices |
+| One TP=8 copy of the model per machine | 57 GB of KV room per GPU (458.9 ÷ 8) | A GPU failure takes out all 8 | You need smaller failure domains |
+
+<AINative title="Agent clients change the traffic, and you still verify the stream">
+More of this traffic comes from agents than from people reading along. That is an inference from how agent
+loops work, not a reported number. An agent resends a long, mostly identical context every turn, which raises
+the value of prefix caching. Nobody watches its stream, so total time matters more than smooth word gaps: expose
+the prefill slice size per traffic class. On the build side, a coding agent writes the SSE handler and the token
+bucket in minutes. What you check yourself: that a disconnect actually frees KV memory or closes the provider
+stream (a fake engine that counts live replies after the client leaves, like the relay test above); that
+reserve-and-refund never refunds twice when two streams for one user finish together; and that a slow-reader
+load test shows tokens grouped into fewer events, not dropped.
+</AINative>
+
+## Small-team version
+
+At a 50–500 person company the usual setup is different: you call a provider's API (Anthropic, OpenAI and so on)
+and stream its reply to your users through your own backend. The GPU half of this page becomes the provider's
+problem. The product half stays yours: streaming, cancellation, per-user token caps, and staying under your
+provider's limits.
+
+### Build
+
+- **An SSE relay in your backend.** The browser never talks to the provider. Your server holds the API key,
+  builds the prompt, enforces the user's quota, and relays each piece of text as an SSE event with an offset in
+  its id. On disconnect, close the upstream stream; check your provider's documentation for what closing does to
+  generation and billing.
+- **Token quotas per user and plan**, with reserve-and-refund using the usage the provider reports at the end of
+  the stream. Keep the counters in the Postgres or Redis you already run; the load is tiny (below).
+- **Fall back to another model only before the first token.** Assembled reports grouping models by capability
+  tier and falling back to the next model in the same tier "only before any token has streamed", which gave them
+  failover in hundreds of milliseconds
+  ([Assembled, 2025-06-12](https://www.assembled.com/blog/your-llm-provider-will-go-down-but-you-dont-have-to)).
+  Switching models mid-reply produces a stitched answer.
+
+### Size it
+
+Take a feature with 50,000 requests a day, each with 3,000 input tokens (2,000 of them a cached system prompt)
+and 400 output tokens (assumed). At peak you have **about 21 replies open at once**. Any async web server handles that. Connections are not your constraint.
+
+The provider is. Providers limit you per minute in three ways: requests per minute (**RPM**), input tokens per
+minute (**ITPM**) and output tokens per minute (**OTPM**). At peak this feature sends about 139 requests,
+139,000 uncached input tokens and 56,000 output tokens a minute. Anthropic's Start tier lists 1,000 RPM,
+2,000,000 ITPM and 400,000 OTPM for Sonnet 5, and for most models only uncached input counts toward ITPM
+([Anthropic rate limits](https://platform.claude.com/docs/en/api/rate-limits), fetched 2026-10-12). So the
+per-minute limits are fine.
+
+The **monthly spend cap** is not. Start is capped at $500 and Build at $1,000. At the cap the API returns 429 with
+no `retry-after` until the first of the next month. At Sonnet 5 list prices this feature costs **about $0.0064
+per request, or about $9,600 per 30 days**. Know your tier before launch day.
+
+Say it like this: "At this size the connection count is nothing. The thing that stops us on day one is the
+provider's monthly spend cap."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Arrivals:** 50,000 ÷ 86,400 s = 0.58 per second on average. Assume a peak of 4×: 2.3 per second.
+- **Time per stream:** about 1 s to the first token, plus 400 tokens ÷ an assumed 50 tokens/s = 9 s.
+- **Open streams (Little's law):** 2.3 × 9 ≈ 21.
+- **Per minute at peak:** 2.3 × 60 ≈ 139 requests; 139 × 1,000 ≈ 139,000 uncached input tokens;
+  139 × 400 ≈ 56,000 output tokens.
+- **Per request at Sonnet 5 list prices** ($2 per million input, $0.20 per million cached input, $10 per
+  million output; [Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing), fetched
+  2026-10-11): 1,000 × $2/M + 2,000 × $0.20/M + 400 × $10/M = $0.0064.
+- **Per 30 days:** 50,000 × 30 × $0.0064 = $9,600.
+
+</details>
+
+### Free-tier economics
+
+A free user capped at 20 messages a day costs at most **$3.84 a month on Sonnet 5**, or **$0.19 on Claude Haiku
+5.5** (same workload, list prices; quality not compared). With 10,000 free users all at the cap, that is
+$38,400 against $1,920 a month. That gap is the case for a cheaper model on the free tier, gated by your eval
+set. Flat-price plans need per-user caps too: Anthropic added weekly limits to Claude Pro and Max after "extreme
+usage by a small number of customers", expected to affect under 5% of subscribers
+([TechCrunch, 2025-07-28](https://techcrunch.com/2025/07/28/anthropic-unveils-new-rate-limits-to-curb-claude-code-power-users/)).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Sonnet 5: 20 × $0.0064 × 30 = $3.84 per user per month; × 10,000 users = $38,400.
+- Haiku 5.5 ($0.10 per million input, $0.01 per million cached input, $0.50 per million output, same pricing
+  page): 1,000 × $0.10/M + 2,000 × $0.01/M + 400 × $0.50/M = $0.00032 per request. 20 × $0.00032 × 30 = $0.19 per
+  user per month; × 10,000 users = $1,920.
+
+</details>
+
+### Buy or skip
+
+- **Skip** your own GPUs, schedulers, KV management and prefill slicing. Use the provider's prompt caching for
+  the shared system prompt instead. It is the same idea, sold as a discount: cache reads cost 0.1× the base input
+  price on most Claude models, per the pricing page.
+- **Buy or adopt** a gateway (a LiteLLM-style proxy) only when you have several providers and teams. One relay
+  endpoint is a few hundred lines.
+
+### Revisit when
+
+- **Volume** reaches hundreds of millions of steady output tokens a month. One published analysis puts a rented
+  2× H100 machine's break-even at 245M (against Opus 5) to 612M (against Sonnet 5) output tokens a month before
+  labor. It also finds that against the same open model on a serverless endpoint, self-hosting cannot break even
+  at business-hours duty cycles
+  ([Cohorte, 2026-09-20](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even)).
+- **Residency or compliance** rules out the provider.
+- **Latency.** Self-hosting is not automatically faster. The same analysis reports a 24.8 s mean time to first
+  token under load with default settings, against 4.6 s tuned.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Latency and capacity"
+  senior={[
+    "Separates the first-word wait (TTFT) from the word gap (ITL), gives each a number, and says which component spends it.",
+    "Sizes the KV cache with KV heads, not query heads, and gets users per machine from free GPU memory.",
+    "Reads long prompts in slices, keeps a queue per tier, and autoscales on queue depth or TTFT.",
+  ]}
+  staff={[
+    "Shows the per-machine limit is the smaller of the memory limit and the word-speed limit, and asks for a bandwidth measurement to know which binds.",
+    "Turns prefix sharing into fleet size (115 vs 58 machines) and the slice size into a stated TTFT-against-ITL trade.",
+    "Asks first whether the company runs the model at all, and moves the depth to quotas and provider limits if not.",
+  ]}
+/>
+
+<LevelContrast
+  title="Failure, rollout and degradation"
+  senior={[
+    "Notices disconnects with heartbeats, cancels after a grace window, and resumes with Last-Event-ID.",
+    "Canaries a new model on latency and error metrics.",
+    "Sheds the free tier before paid.",
+  ]}
+  staff={[
+    "Recovers a dead machine's replies by re-reading prompt plus partial reply elsewhere, so users see a pause, not an error.",
+    "Pins conversations to a model version, gates on offline evals first, and plans warm capacity for both versions.",
+    "Writes the degradation ladder before the spike, with a metric and an owner for each step.",
+  ]}
+/>
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="(Listed on the PracHub page, OpenAI) The connection drops halfway through a long reply. What happens, and what does the user see on reconnect?">
+    Keep generating for a grace window and buffer the output under the message id. On reconnect with
+    `Last-Event-ID`, replay from that offset and continue, so the user sees the reply pick up where it stopped.
+    After the window, cancel and free the KV memory. Save the finished reply either way
+    (<Cite id="s-86dff7d564" />).
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page, OpenAI) Many users share the same long system prompt. How do you reuse the work?">
+    A prefix cache: split prompts into token blocks keyed by chained hashes, share matching blocks with a
+    reference count, and load the system prompt on every machine at startup. With these numbers it halves KV per
+    stream (350 to 699 streams per machine) and cuts the first-word floor from 64 to 28.5 ms. Put the model
+    version in the key.
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page, OpenAI) How do you roll out a new model version with no drop in quality or latency?">
+    Offline evals first. Warm a separate pool, including its prefix cache. Send a small share of new
+    conversations and pin each to one version. Compare latency, errors, reply length, refusals and user signals.
+    Keep the old pool warm so rollback is a routing change.
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page, OpenAI) During a traffic spike, which users degrade first?">
+    Protect running replies; shed background traffic; then free-tier new messages (shorter replies, shorter
+    prompts, fallback model, then reject); paid keeps its first-word wait and lets the word gap stretch; paid is
+    rejected last.
+  </FollowUp>
+  <FollowUp q="(Reported, Google) How do load balancing and horizontal scaling change for LLM serving compared with a stateless API?">
+    Requests are not equal and machines are not stateless. Route on free KV memory and queue depth rather than
+    connection count, keep conversation affinity for cache hits, and scale on queue wait or TTFT, since a cold
+    machine takes about 71 s just to read 141 GB of weights at an assumed 2 GB/s. The report itself names only
+    the topics (<Cite id="s-db8c0e3034" />).
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) You limit the free tier by tokens, but you don't know the reply length up front. How do you charge?">
+    Reserve prompt tokens plus the maximum reply length, refund the unused part at completion: two store writes
+    per message. Add a cap on open streams, because tokens per window doesn't bound the memory held at one moment.
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) TTFT p99 regressed but ITL is fine. Where do you look?">
+    Queue wait (KV admission is blocking), the prompt-length mix (a client sending long documents), the
+    prefix-cache hit rate (a system-prompt change or a deploy invalidated it), and the prefill slice size.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **One latency number.** The first-word wait and the word gap fail for different reasons and are fixed in
+  different places (<Cite id="s-f440daaea4" />).
+- **Request-count limits.** Requests differ in cost by three orders of magnitude, so count tokens and open
+  streams instead.
+- **The KV formula with hidden size.** It overstates Llama-3.1-70B's cache by 8× (64 query heads ÷ 8 KV heads).
+- **Ignoring disconnects.** Without cancellation, abandoned replies keep burning GPU time or provider tokens
+  (<Cite id="s-0457784328" /> lists disconnect propagation as its own topic).
+- **Dropping tokens under backpressure.** That is right for presence updates and wrong for a reply; group tokens
+  into fewer events instead.
+- **Autoscaling on GPU utilization.** A busy GPU and a drowning one look the same (<Cite id="s-f440daaea4" />).
+- **Going deep on GPUs without asking.** Prepare for the team, not the company name (<Cite id="s-4d55d9b987" />).
+- **Re-arguing the setup.** An Anthropic inference-team candidate says they pushed on assumptions that "didn't
+  feel realistic" too directly and in hindsight should have accepted the setup faster; they got no offer, and
+  don't call this the reason (<Cite id="s-4e04a1689c" />). Write assumptions down and design inside the
+  interviewer's.
+
+## Prove it with a lab
+
+<LabRef lab="websocket-gateway" role="proof" note="Ping every 30 s with a 10 s pong timeout, a 256-message send buffer per client, HMAC-signed reconnect tokens valid for 5 minutes, and a ring buffer that replays missed messages by sequence number." />
+
+Its reconnect-and-replay has the same shape as SSE resume: a sequence number per event and a bounded replay
+buffer. Two honest gaps: it is WebSocket, not SSE, and its send buffer drops messages when full. Dropping suits
+room broadcasts and is wrong for a token stream. Changing it to group messages, or to close slow consumers after
+a grace window, is a good exercise.
+
+<LabRef lab="rate-limiter" role="proof" note="Token bucket, sliding window, and a Redis-backed limit with free, basic and premium tiers." />
+
+Every check consumes one unit. Weighting by tokens (`Allow(key, n)` with reserve and refund) is the change to
+make. Its benchmark rows are estimates; don't quote them.
+
+<LabRef lab="load-balancer" role="proof" note="Least-connections selection, health checks, circuit breakers and a retry budget." />
+
+It balances on connections and knows nothing about prefixes or KV memory. Don't copy its retry path for streams:
+the v2 retry runs after the first 5xx has already been written to the client (a known bug), which is exactly what
+a streaming gateway must avoid.
+
+<LabRef lab="observability" role="partial" note="Histograms and W3C tracing: enough to build TTFT and ITL histograms per tier once it compiles." />
+
+<LabRef lab="llm-inference" role="partial" note="Prefill and decode branches, per-request KV, and a 16-token page allocator." />
+
+Its server returns the whole reply at the end. A per-token callback feeding an SSE response, plus a cancel flag
+the engine checks each pass, turns it into a small version of this design. Its paged allocator is bookkeeping
+only, and its throughput rows are estimates.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-86dff7d564" />: PracHub OpenAI onsite item (streaming, free-tier limits, GPU scheduling; follow-ups in the write-up)
+- <Cite id="s-4d55d9b987" />: Hello Interview OpenAI L5 guide ("Design ChatGPT"; prepare for the team)
+- <Cite id="s-4edc43db4e" />: interviewing.io Anthropic page ("design a Claude chat service")
+- <Cite id="s-401c185c20" />: 1Point3Acres OpenAI phone screen (summary only)
+- <Cite id="s-db8c0e3034" />: Hello Interview community, Google LLM serving system
+- <Cite id="s-f440daaea4" />: Baseten prep guide (TTFT vs ITL, autoscaling signals)
+- <Cite id="s-75e82f8882" />: serving guide (TTFT and ITL targets, shared prefix pages)
+- <Cite id="s-0457784328" />: Together AI guide (scheduler and disconnect propagation as separate items)
+- <Cite id="s-4e04a1689c" />: Anthropic inference-team report (pushing back on the setup)
+- <Cite id="s-6fdd575dc5" />: Llama-3.1-70B config.json (mirror of Meta's gated config)
+- [NVIDIA H100 specifications](https://www.nvidia.com/en-us/data-center/h100/) (official, fetched 2026-10-11): 80 GB, 3.35 TB/s, 1,979 TFLOPS bf16 with sparsity
+- [WHATWG HTML: server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html) (fetched 2026-10-12)
+- [Anthropic API rate limits](https://platform.claude.com/docs/en/api/rate-limits) (official, fetched 2026-10-12): tiers, spend caps, cache-aware ITPM
+- [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) (official, fetched 2026-10-11)
+- [Assembled: your LLM provider will go down](https://www.assembled.com/blog/your-llm-provider-will-go-down-but-you-dont-have-to) (first-hand, 2025-06-12)
+- [Cohorte: self-hosted LLM cost vs API](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even) (secondary, 2026-09-20)
+- [TechCrunch: Anthropic weekly rate limits](https://techcrunch.com/2025/07/28/anthropic-unveils-new-rate-limits-to-curb-claude-code-power-users/) (news, 2025-07-28)

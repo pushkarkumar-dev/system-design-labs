@@ -1,0 +1,156 @@
+---
+question: r2b-015
+family: distributed-training
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "A GRPO step has three phases: generate several answers per prompt, score them against each other, then train.
+> Pipeline parallelism, which splits the model's layers into stages like an assembly line, works well for the
+> training phase if I cut the batch into enough micro-batches: with 4 stages and 16 micro-batches, about 19% of the
+> time is idle. It works badly for generation, because each new token must pass through every stage before the next
+> one can start, so most stages sit idle. So I'd generate with a separate inference engine, copy weights into it
+> after each update, and tag every answer with the model version that wrote it."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you understand how a GRPO training step actually runs on hardware, and why
+one splitting technique suits one half of it and not the other.
+
+### What makes this different from ordinary training
+
+Ordinary training reads a fixed dataset. Every batch has a known size, and the work per batch is predictable.
+
+GRPO (group relative policy optimization) is a kind of **reinforcement learning**: the model is trained on scores
+for its own answers rather than on fixed examples. The model writes its own training data first, and only then trains on it.
+Writing data means generating text one token at a time, which is slow, sequential and uneven in length. Training is
+fast, parallel and regular. One system has to do both, and the two halves want different hardware layouts.
+
+### Words you need first
+
+- **Token**: a piece of a word, about ¾ of a word. Models read and write tokens.
+- **Policy**: the model being trained, in reinforcement-learning language. Each update creates a new **policy
+  version**.
+- **Pipeline parallelism (PP)**: putting different layers on different GPUs, so data flows from stage to stage. The
+  idle time at the start and end of each step is the **bubble**.
+- **Micro-batch**: a slice of the step's batch. Cutting the batch into many micro-batches keeps more stages busy.
+
+Only the title, "Explain Pipeline Parallelism in GRPO Training", is visible. PracHub's description mentions stages,
+micro-batches, rollouts, relative advantages, policy versions, throughput and staleness
+(<Cite id="s-4e3fbcaea8" />, low confidence).
+
+## Clarify first
+
+- **Model size and pipeline depth?** "I'll assume a model that needs 4 pipeline stages."
+- **Group size?** "How many answers per prompt? The GRPO paper samples 64 per question."
+- **Who generates?** "Does the training framework generate the answers, or a separate inference engine?"
+- **Overlap?** "Do we generate, then train, in turns? Or do generation and training overlap?"
+
+## Answer
+
+### GRPO in plain words
+
+GRPO comes from the DeepSeekMath paper ([Shao et al., 2024](https://arxiv.org/abs/2402.03300)). Older methods
+train a second model, a **value model**, to predict how good an answer will be. GRPO "foregoes the value model,
+instead estimating the baseline from group scores".
+
+In practice: for each prompt, sample G answers and score them. Then compare each answer with its own group. Subtract
+the group's average score and divide by the group's spread (standard deviation). The result is the answer's
+**advantage**: how much better or worse it was than its siblings. Training then makes above-average answers more
+likely and below-average ones less likely. A penalty for drifting from a frozen reference copy of the model (a
+distance measure called **KL divergence**) is added to the loss rather than to the reward.
+
+### A step has three phases
+
+1. **Generate** G answers per prompt. This is slow, token-by-token work, and answers vary widely in length.
+2. **Score**: compute rewards, and run forward passes of the current and reference models to get each token's
+   probability.
+3. **Train**: forward and backward passes on the sampled tokens, weighted by the advantages, with clipping that
+   limits how far one update can move the model.
+
+### Pipeline parallelism in the training phase: works as usual
+
+Split the layers into p stages and the batch into m micro-batches. Run the standard **1F1B** schedule (one forward,
+one backward, alternating). The idle share is about (p − 1) ÷ m ([Narayanan et al., 2021](https://arxiv.org/abs/2104.04473)).
+With **4 stages and 16 micro-batches, about 19%** of the time is idle.
+
+Two GRPO details matter here.
+
+- **A group must be complete before it can train.** The advantage needs all G scores in the group. So a micro-batch
+  can start only when all of its groups have been generated and scored.
+- **Answer lengths vary.** If micro-batches are filled by number of answers, one with a very long answer becomes a
+  straggler, and its stage holds up the line. Pack micro-batches by token count instead.
+
+Say it like this: "In the training phase GRPO is ordinary pipeline training, except that groups must be complete and
+micro-batches should be packed by tokens, not by answers."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Bubble = (p − 1) ÷ m = (4 − 1) ÷ 16 = 3 ÷ 16 ≈ 19%. Doubling m to 32 halves it to about 9%; adding stages raises it.
+
+</details>
+
+### Pipeline parallelism in the generation phase: works badly
+
+Follow one answer being generated on a 4-stage pipeline:
+
+| Moment | Stage 1 | Stage 2 | Stage 3 | Stage 4 |
+|---|---|---|---|---|
+| token 1, part 1 | busy | idle | idle | idle |
+| token 1, part 2 | idle | busy | idle | idle |
+| token 1, part 3 | idle | idle | busy | idle |
+| token 1, part 4 | idle | idle | idle | busy |
+| token 2, part 1 | busy | idle | idle | idle |
+
+Each new token depends on the one before it, so it must pass through all 4 stages before the next token can start.
+With one sequence in flight, only one stage works at a time: three-quarters of the GPUs idle. You need at least p
+independent batches of sequences in flight to fill the line. And generation is limited by memory reads, not math,
+anyway.
+
+So most designs generate with a **separate inference engine** that splits each layer's math across GPUs instead
+(**tensor parallelism**). After each training update they copy the new weights into it, rearranging them from the
+training layout to the inference layout (**resharding**).
+
+Say it like this: "Decoding under a pipeline starves the stages, because each token waits for the previous one to
+go all the way through. I generate with a separate engine and copy weights in after each update."
+
+### Policy versions and staleness
+
+If generation overlaps training, answers come from policy version v while the learner is already at v + 1 or later.
+Tag every answer with its version, and store each token's probability as generated. The clipped objective already
+corrects for mild staleness. Drop answers beyond a lag limit.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="PP in GRPO"
+  senior={["Explains GRPO's group baseline, 1F1B for the training phase, and the bubble formula."]}
+  staff={["Explains why decode under PP starves stages, chooses a separate generation engine with weight resharding, and bounds policy lag."]}
+/>
+
+## Small-team version
+
+Small teams rarely run GRPO. If you try reinforcement learning with automatically checkable rewards (for example,
+"did the code pass its tests?") on a small open model:
+
+- Use a library that already separates generation from training.
+- Keep it on one machine.
+- Measure whether it beats ordinary supervised fine-tuning on your own eval before investing further.
+
+## Pitfalls
+
+- **Treating generation like training micro-batches.** Token-by-token decoding leaves most stages idle.
+- **Computing advantages before the whole group finishes.** The group average needs every score.
+- **Ignoring length variance across micro-batches.** One long answer becomes the straggler.
+- **Not tracking which policy produced which answer.** You can't bound or correct staleness without it.
+
+## Go deeper
+
+- Family walkthrough: [Distributed training](/system-design-labs/interviews/walkthroughs/distributed-training/), its parallelism deep dive.
+- The surrounding system: [async RL post-training](/system-design-labs/interviews/questions/infra-092/).
+- See which layers a pipeline would split: <LabRef lab="transformer" inline />.

@@ -1,0 +1,146 @@
+---
+question: eng-029
+family: support-agent
+status: published
+labs: [agent-framework, llm-eval]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "First I'd find the cause in the traces: group the looping conversations by the last tool called and by what the
+> model saw before each repeat. The usual causes are a tool result that never reaches the next prompt, an error
+> message that says 'try again', and a parse failure that silently asks again. I'd fix the cause in code. Then I'd
+> add limits that work even when I don't know the cause: stop on the same call twice, on calls that change nothing,
+> and on a token budget, each ending in a hand-off with a named reason. And I'd keep the looping inputs as tests."
+>
+> The rest of this page explains each part of that answer.
+
+An **agent** is a loop around a **large language model (LLM)**, a program that reads text and writes text. Each
+round, code sends the model the conversation so far. The model replies with an answer, or with a **tool call**: a
+structured request such as "look up invoice 2026-09" that the code runs, adding the result to the conversation
+before asking again.
+
+A loop in normal code is a bug you can read: the exit condition is wrong. An agent loop is different. The model
+decides each step, so the loop "ends" only when the model chooses to answer. If the model never gets what it needs,
+or keeps being told to try again, it keeps asking. Nothing in the code is obviously wrong. That is why you need two
+fixes: find the cause, and add limits in code that stop **any** loop, including ones whose cause you haven't found
+yet.
+
+There is also money involved. Every step re-sends the whole conversation, and you pay for every token (a token is
+roughly ¾ of a word). A loop is a cost incident before it is a quality one.
+
+The wording is an example in an applied-AI prep guide (2026-07-23): "This agent loops forever on some inputs. Find
+out why and fix it." The same guide contrasts candidates who talk about "tracing every step, setting hard limits on
+iterations and cost" with those who "talk about the model being smart" <Cite id="s-7d03a572e0" />.
+
+## Clarify first
+
+- **Do we have traces of the looping conversations?** "I'll assume yes. If not, adding them is step one."
+- **What does 'forever' mean today?** "Until a step limit, a token budget or a timeout? Is there any limit now?"
+- **Which inputs?** "Can I see two or three examples?"
+- **Did anything change?** "Is the model version pinned, or did a model or prompt change recently?"
+
+## Answer
+
+### Words you need first
+
+- **Trace**: the recorded sequence of model calls and tool calls for one conversation, like a distributed trace
+  with one span per step.
+- **Prompt**: everything sent to the model on one call: instructions, conversation so far, tool results.
+- **Hand-off**: passing the conversation to a human support agent.
+- **State**: a small structured record of what the agent knows and has done (identity, ids, actions).
+
+### Find the cause
+
+Group looping traces by the last tool called and by what the model saw before each repeat. The usual causes:
+
+1. **The tool result never reaches the next prompt.** It isn't appended, has the wrong role, or was cut away when
+   the conversation was shortened. The model never sees the answer, so it asks again.
+2. **An error that reads like an invitation**: "temporarily unavailable, try again".
+3. **A parse failure that silently re-prompts.** The model's output didn't match the parser, so the loop asks again,
+   and the model repeats itself.
+4. **Rephrased searches with no new information**: different arguments each time, the same empty result.
+5. **A goal the tools can't satisfy**: the customer wants something no tool does, and there is no hand-off path.
+
+### Follow one looping conversation
+
+A customer asks, *"Why was I charged twice in September?"* The trace shows (illustrative values):
+
+| Step | The model proposes | What it gets back | What to say in the interview |
+|---|---|---|---|
+| 1 | `lookup_invoice`, month 2026-09 | "temporarily unavailable, try again" | "The error message is an instruction to loop." |
+| 2 | `lookup_invoice`, month 2026-09 | same error | "Same tool, same arguments: an identical-call check would stop here." |
+| 3 | `lookup_invoice`, month "September 2026" | same error | "Rephrased arguments: only a no-progress check catches this." |
+| 4–50 | more of the same | same error | "Each step re-sends a longer conversation, so cost grows faster than the steps." |
+
+Root cause: cause 2, an error that invites a retry, with no limits to stop it.
+
+### Fix the cause in code
+
+- Append tool results correctly, with the right role.
+- Return structured errors with `retryable: false` and a suggested next step, for example
+  `{"error": "billing_unavailable", "retryable": false, "say": "offer a callback"}`.
+- Treat a parse failure as an invalid step that ends the turn, not a silent retry.
+
+### Then add limits that don't depend on knowing the cause
+
+- **An identical-call check**: the same tool and arguments twice in one turn, compared by hashing the arguments with
+  sorted keys so reordered JSON doesn't hide a repeat.
+- **A no-progress check**: the state unchanged for two steps in a row. This catches step 3 above.
+- **A tool-error budget per turn**, a **token budget per conversation**, and a **spend cap per customer per day**.
+
+Each ends in a hand-off with a named reason, never an exception the customer sees. A sketch with these exits ran on
+2026-10-12 with nine passing tests, including a "try again" loop and a no-progress loop (in the family
+walkthrough). Say: "Lowering max steps alone doesn't fix this; it still burns every step before stopping."
+
+### Prove it
+
+Add the looping inputs to the test set. Chart stop reasons by prompt version, and alert when `repeated_call` or
+`no_progress` rises.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Infinite loop"
+  senior={["Finds the root cause from traces, fixes it in code, and adds repeated-call and budget limits."]}
+  staff={["Turns stop reasons into a monitored metric with an alert, and adds the class of input to the regression set so the fix can't silently regress."]}
+/>
+
+## Small-team version
+
+Because every step re-sends a growing conversation, tokens grow faster than the number of steps. A 50-step loop
+costs about **$4.20** on Claude Sonnet 5, against about **$0.11** for a normal 6-step turn. That is roughly 40 times
+the cost, for a conversation that helped no one.
+
+So set provider spend caps and per-customer daily caps on day one, before you know why anything loops. Then the
+debugging above happens on a dashboard, not on a bill. Say: "The caps go in before the first customer, because the
+first loop will come from a cause I haven't thought of."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Input tokens over N steps, starting at C0 tokens and adding Δ per step: N × C0 + Δ × N(N + 1) ÷ 2.
+
+With an assumed C0 = 4,000 and Δ = 1,500:
+
+- 50 steps: 200,000 + 1,912,500 ≈ **2.1M input tokens**, about **$4.20** at $2 per million (Claude Sonnet 5 list
+  price, fetched 2026-10-11).
+- 6 steps: 24,000 + 31,500 = **55,500 tokens**, about **$0.11**.
+
+</details>
+
+## Pitfalls
+
+- **Fixing it with a prompt line** ("don't call the same tool twice"). The model may follow it today and ignore it
+  tomorrow; only code is guaranteed to stop.
+- **Only lowering max steps.** It still burns every step before stopping, and the cause remains.
+- **Raising an exception the customer sees instead of handing off.** The customer gets an error, not help.
+- **Not keeping the looping input as a test.** The next prompt change can bring the loop back unnoticed.
+
+## Go deeper
+
+- Family walkthrough: [Customer-facing support agent](/system-design-labs/interviews/walkthroughs/support-agent/), "The turn loop and its stop conditions" and "Debugging the agent against its flow".
+- Labs: <LabRef lab="agent-framework" inline /> has no repeated-call check; add one. <LabRef lab="llm-eval" inline /> for the regression gate.
+- Related: [eng-028](/system-design-labs/interviews/questions/eng-028/).

@@ -1,0 +1,176 @@
+---
+question: r2a-026
+family: kv-cache-memory-math
+status: published
+labs: [llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Every conversation keeps a KV cache on the GPU that grows by one token at a time, and nobody knows in advance
+> how long it will get. If you reserve the maximum for each one, most of the reservation sits empty. Paged
+> attention fixes that the way an operating system does: the cache pool is cut into small fixed-size blocks,
+> each conversation gets a block table that maps its blocks to wherever they sit, and a new block is handed out
+> only when the last one fills. Waste drops to part of one block per conversation, so several times more
+> conversations fit. When blocks run out, the scheduler pauses a conversation instead of crashing."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+This is a memory-management question. The interviewer wants to see that you know why a simple allocator wastes
+most of the cache, how blocks and a block table fix it, and what the server does when blocks run out. Expect
+pushes on block size, sharing and preemption.
+
+A backend engineer already knows this problem from two places. An operating system pages memory so processes
+don't need contiguous RAM. A database allocates rows in fixed-size pages instead of reserving space for a
+table's maximum size. What makes the LLM version different:
+
+1. **Each conversation's memory grows one token at a time**, for seconds or minutes, and its final size is
+   unknown until the model stops writing.
+2. **The memory is GPU memory**, fixed at 80 GB per card and already mostly full of model weights. There is no
+   swap file to fall back on cheaply.
+3. **Every byte reserved and unused is a user you can't serve.** Waste here directly lowers how many
+   conversations one expensive machine can hold.
+
+(CentML's technical rounds were reported to start from paged attention and cache management, then move to
+system design; the source is a short Glassdoor snippet, so low confidence <Cite id="s-fdc0969e32" />.)
+
+## Clarify first
+
+- **Which engine?** "I'll assume a design like vLLM, a popular open-source serving engine. Block size varies by
+  engine, so I'd check it."
+- **How long are conversations?** "I'll assume a maximum of 8,192 tokens and an average of 1,800." (Both assumed.)
+- **Which model and hardware?** "Llama-3.1-70B in bf16, split across four A100 80 GB GPUs, with 5 GB per GPU of
+  overhead assumed."
+
+## Answer
+
+### Words you need first
+
+- **Token**: the unit the model reads and writes, roughly ¾ of a word.
+- **KV cache**: the saved keys and values of every earlier token, at every layer of the model, which let it write
+  each new token without re-reading the whole conversation. It costs **320 KiB per token** for Llama-3.1-70B.
+- **Sequence**: one conversation's tokens being generated. Engines say "sequence" where you would say "request".
+- **Tensor parallelism (TP)**: splitting the model across several GPUs in one server, so each GPU holds a slice of
+  every layer, including a slice of the cache.
+
+### The problem: reserving the maximum
+
+A simple ("contiguous") allocator gives each new sequence one continuous region big enough for the maximum
+length, because it can't know when the model will stop. With an 8,192-token maximum and an 1,800-token average,
+**78%** of each reservation sits empty. The vLLM authors reported that systems before theirs "waste 60% – 80% of
+memory due to fragmentation and over-reservation" ([vLLM blog](https://vllm.ai/blog/2023-06-20-vllm), 2023-06-20).
+
+### The fix: blocks and a block table
+
+Split the cache pool into **blocks** that each hold the keys and values for a fixed number of tokens (16 here,
+as in the llm-inference lab). Give each sequence a **block table**: a list mapping its logical blocks (block 0,
+1, 2 of this conversation) to physical blocks anywhere in GPU memory.
+
+```
+Sequence A's block table          GPU cache pool (16 tokens per block)
+  logical 0 ────────────────────▶ [ block 7  ]
+  logical 1 ────────────────────▶ [ block 2  ]
+  logical 2 (partly full) ──────▶ [ block 11 ]
+Sequence B's block table
+  logical 0 ────────────────────▶ [ block 4  ]
+                                  [ free list: 0, 1, 3, 5, 6, 8, ... ]
+```
+
+The **block table** is the indirection, exactly like a page table. The **pool** is one big region carved into
+equal blocks. The **free list** holds blocks no one is using. A new block is taken only when a sequence's last
+block fills up, and all its blocks go back to the free list when it ends. The most a sequence can waste is the
+unfilled part of its last block; vLLM reported "under 4%".
+
+### Follow the example box
+
+| Step | What happens | Result | What to say in the interview |
+|---|---|---|---|
+| 1. Size a block | 16 tokens × 320 KiB | **5 MiB** (1.25 MiB per GPU at TP = 4) | "A block is small enough that waste is negligible." |
+| 2. Free memory | 320 GB − 141.1 GB weights − 20 GB overhead | **158.9 GB**, about 485,000 tokens | "That's the pool." |
+| 3. Reserve the max | 485,000 ÷ 8,192 | **59** sequences | "That's the worst case." |
+| 4. Page instead | 485,000 ÷ about 1,808 | about **268** sequences | "About 4.5× more, at the average length." |
+| 5. Check the next limit | compute and latency | the batch is now limited by them | "Paging moves the limit off memory, which is where you want it." |
+
+Say it like this: "Paging doesn't compress anything. It removes reservation waste, so the pool holds sequences
+at their real length instead of their maximum."
+
+### What else the block table buys
+
+**Sharing.** Two block tables can point at the same physical block. Reference counts and copy-on-write (copy a
+block only when one sharer writes to it) let several sampled replies to the same prompt share the prompt's cache.
+The same trick, **prefix caching**, stores a common system prompt once for every request that starts with it.
+
+### When blocks run out
+
+The scheduler **preempts** a sequence: it pauses it and frees its blocks so others can continue. vLLM's tuning
+docs say the V1 default is to recompute preempted requests later rather than swap them to CPU memory, and
+suggest raising the memory fraction or lowering max sequences or max batched tokens when preemption is frequent
+([docs](https://docs.vllm.ai/en/latest/configuration/optimization.html), fetched 2026-10-12). Preemption is
+expected under load; a high rate means your limits are set too high for your traffic.
+
+### The cost
+
+Attention now reads keys and values through the block table, so the GPU code has to gather blocks that aren't
+next to each other. Block size trades that gather overhead (smaller blocks, more lookups) against last-block
+waste (bigger blocks, more empty space).
+
+The PagedAttention paper reports 2–4× throughput over FasterTransformer and Orca at the same latency
+([arXiv 2309.06180](https://arxiv.org/abs/2309.06180)). That is their measured setup. For yours, derive the gain
+from the batch your memory now allows and the point where compute becomes the limit.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **KV bytes per token**: 2 × 80 layers × 8 KV heads × 128 × 2 bytes = **327,680 B** (320 KiB).
+- **Block**: 16 × 327,680 B = **5 MiB** across 80 layers (64 KiB per layer); ÷ 4 GPUs = **1.25 MiB per GPU**.
+- **Contiguous waste**: (8,192 − 1,800) ÷ 8,192 = **78%** unused.
+- **Paged waste**: about half a block, 8 tokens, per sequence: 8 ÷ 1,800 = **0.4%**.
+- **Free memory**: 4 × 80 − 141.1 − 4 × 5 = **158.9 GB** = 158.9 × 10⁹ ÷ 327,680 = **484,910 tokens**.
+- **Reserved**: 484,910 ÷ 8,192 = 59.2 → **59**. **Paged**: 484,910 ÷ 1,808 ≈ **268**.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Paged attention"
+  senior={["Explains blocks, block tables, allocation on demand and the waste arithmetic, and what preemption does."]}
+  staff={["Shows that paging moves the binding limit from memory to compute or latency, and sets batch limits and alerts on preemption accordingly."]}
+/>
+
+## Small-team version
+
+You won't write a paged allocator. You'll pick an engine that has one, such as vLLM, and configure it. What you
+own:
+
+- **Limits from real data.** Set max context and max sequences from your real length distribution, not the model
+  card's maximum.
+- **Prefix caching** for a long shared system prompt.
+- **An alert on the preemption counter**, so you hear when the pool is too small for your traffic.
+- **A re-check** of the arithmetic whenever you change the model, its quantization or the context limit.
+
+Paging is worth real money. On the family walkthrough's 4×A100 box, which costs **$4,059–$4,643 a month** at
+RunPod list prices (fetched 2026-10-11):
+
+- 59 sequences reserved at 8K cost about **$69–$79 each per month**.
+- About 268 at the assumed 1,800-token average cost about **$15–$17 each**, until compute or the latency budget
+  limits the batch first.
+
+Default: an engine with paging and prefix caching (vLLM or similar), never your own allocator.
+
+## Pitfalls
+
+- **Calling paging "compression".** It removes reservation waste; it doesn't shrink the bytes per token.
+- **Quoting 2–4× as a law.** It is one paper's measured result; derive your own gain from headroom.
+- **Sizing at the worst case after adopting paging, or at the average with no plan for preemption.** The first
+  wastes the gain; the second surprises you under load.
+- **Forgetting block memory is per layer and per GPU.** Under tensor parallelism each GPU holds a quarter of each
+  block at TP = 4.
+
+## Go deeper
+
+- Family walkthrough: [KV cache and GPU memory math](/system-design-labs/interviews/walkthroughs/kv-cache-memory-math/#derivations), section 7.
+- The scheduler on top of the pool: [batcher to fleet](/system-design-labs/interviews/walkthroughs/batcher-to-fleet/) and [continuous batching](/system-design-labs/interviews/walkthroughs/continuous-batching/).
+- Read `PagedKVCache` in <LabRef lab="llm-inference" inline />; its pages are bookkeeping only.

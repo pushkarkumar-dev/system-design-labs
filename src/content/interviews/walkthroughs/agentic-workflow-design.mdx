@@ -1,0 +1,843 @@
+---
+title: "Agent or workflow? Designing multi-step LLM automation"
+summary: "Automate an internal process with LLMs: put each step in plain code, one model call or a capped agent loop, check what the model produces, run it so it survives restarts, and add more agents only when it pays."
+track: ai-engineer
+format: design
+family: agentic-workflow-design
+smallTeamFocus: "Write the orchestrator in plain code on the job runner you already have. Buy the model API and tracing. Skip multi-agent setups and frameworks until an eval shows one capped loop falls short."
+rounds: [ml-system-design, system-design]
+level: both
+timeboxMin: 45
+order: 107
+status: published
+basedOn: [r2a-014, r2a-015, r2a-013, eng-019, eng-024, eng-025, eng-018]
+askedAt: [apple, harvey, promptlayer, perplexity]
+labs:
+  - { lab: agent-framework, role: partial, note: "A ReAct loop, JSON function calling with a token budget guard, and parallel sandboxed tools around a mock LLM. 3 of its 15 tests fail (2026-10-11): its parser can't read the nested tool-call JSON its own prompt asks for, so fix that first." }
+  - { lab: llm-eval, role: proof, note: "Bootstrap confidence intervals and a paired test: the statistics behind 'did this prompt or model change make the automation worse?'. The bundled server answers with a mock LLM." }
+  - { lab: distributed-cron, role: proof, note: "A scheduler with a CAS lease so exactly one node runs each job, plus job history and backfill: the deterministic trigger most of these systems start from." }
+  - { lab: dist-lock, role: proof, note: "Leases and fencing tokens that reject a stale holder's writes: the mechanism that keeps two agents from both editing the same file." }
+  - { lab: saga, role: partial, note: "Forward steps with compensations and a persistent event log, the shape of a resumable multi-step run. Its module fails to set up as of 2026-10-11, so read it rather than run it." }
+  - { lab: message-queue, role: partial, note: "Visibility timeouts and dead-letter queues for work items that keep failing. Its delayed-message test panics as of 2026-10-11." }
+  - { lab: mcp-server, role: background, note: "Tools with input schemas behind one bearer token for the whole server; per-tool permission tiers are what you design on top." }
+  - { lab: observability, role: partial, note: "Spans and trace-context propagation, the shape of one trace per agent run. Its Go package does not compile as of 2026-10-11." }
+gapLabs: [llm-observability, llm-judge-evals, guardrails]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'd build this as a workflow that my own code controls, not as one big agent. For each step I pick the
+> cheapest thing that works: a plain rule, then a single model call with a fixed answer format, and only for
+> open-ended steps an agent loop with a cap on steps and dollars. Everything the model produces goes through a
+> check in code before it can change anything, and risky actions wait for a person. The run is saved after every
+> step, so a restart resumes instead of starting over. I'd only add more agents if a test on real past cases
+> shows one loop isn't enough."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer asks you to design an AI system that automates some internal process. The versions differ on
+the surface: raise a service's test coverage with AI, send engineering questions that land with the wrong team
+to the right one, score a document against a set of rules and suggest fixes, write a research report with
+citations, run a long research query, order lunch for employees. Underneath, they all ask the same thing.
+
+### What makes this different from normal automation
+
+You have built automation before: a cron job, a queue consumer, a workflow engine. Each step in those systems
+runs code you wrote. Given the same input, it does the same thing every time. If it is wrong, it is wrong the
+same way every time, and a test catches it.
+
+A step that calls a large language model (LLM) is different in three ways:
+
+1. **It can be confidently wrong.** The model may return a team that doesn't exist, a function that was never
+   written, or a quote that isn't in the source. It looks just as sure when it is wrong as when it is right.
+   This is called **hallucination**. Your design needs a way to catch it.
+2. **It is not repeatable and not free.** The same input can give a different answer on a second try. Each call
+   costs money and takes seconds, not milliseconds.
+3. **It can choose its own next step.** If you let it, the model decides what to do next: read a log, then a
+   dashboard, then a deploy history. That flexibility is useful for open-ended work, and dangerous for
+   everything else, because each extra step is another chance to be wrong and another charge on the bill.
+
+So the real question in every version of this round is: **which steps should be plain code, which a single model
+call, and which an agent that picks its own tools**, and how you check, run and operate the parts that are not
+plain code. The follow-ups go to the same places every time: what if the AI is wrong, which checks stay human,
+what happens to a long run when a server restarts, when several agents are worth it and how they avoid
+conflicting edits, and how you find out it failed.
+
+### Words you need first
+
+- **Token**: the unit models read and write, roughly ¾ of a word. Providers charge per token, with separate
+  prices for **input tokens** (what you send) and **output tokens** (what the model writes back). For the
+  model priced on this page, output costs five times more per token.
+- **Prompt**: the text you send in one model call. It usually starts with a **system prompt**, fixed
+  instructions for the job ("You route engineering questions to teams…"), followed by the actual input.
+- **Tool**: a function your code offers the model, described by a name and a JSON input schema. The model can
+  answer "please call `search_logs` with these arguments" instead of plain text. That reply is a **tool call**
+  (also called *function calling*). Your code runs the function and sends the result back in the next call.
+- **Workflow**: your code decides the order of steps. Model calls are steps inside it, like any other function.
+- **Agent**: a loop in which the model decides the next tool call each turn, until it says it is done or a
+  limit stops it. The model, not your code, chooses the path.
+- **Structured output**: asking the model to answer in a fixed JSON shape (for example, one team id from a list
+  of 40) so code can check the answer.
+- **Eval set** (or just **eval**): a fixed list of example inputs with known right answers. You run the system
+  on it before every prompt or model change, like a regression suite, and read the result as a percentage.
+
+Anthropic's guide to building agents draws the same line: "Workflows are systems where LLMs and tools are
+orchestrated through predefined code paths", while agents "dynamically direct their own processes and tool
+usage" ([Anthropic, Building effective agents, 2024-12-19](https://www.anthropic.com/engineering/building-effective-agents)).
+
+### The reported versions
+
+<QuestionRow id="r2a-014" />
+<QuestionRow id="r2a-015" />
+<QuestionRow id="r2a-013" />
+<QuestionRow id="eng-019" />
+<QuestionRow id="eng-024" />
+<QuestionRow id="eng-025" />
+<QuestionRow id="eng-018" />
+
+Two Perplexity items are titles only on a login-gated aggregator (<Cite id="s-bebe1e8956" />), and the Apple
+routing question was seen only through search snippets (<Cite id="s-d3df675c97" />).
+
+### The example this page follows
+
+One case runs through the whole page: **routing engineering pings at a 500-person company**. A *ping* is a
+Slack message or ticket asking for help, like "builds keep failing, who owns this?". Many land with the wrong
+team, and someone has to forward them. The Apple version of the question asks you to automate this and, for
+"deep infrastructure bugs", to investigate. It is a good teaching case because it needs all three kinds of step:
+rules, one model call, and an agent. The other versions (tests, lunch, file scoring, research reports, long
+queries) appear in the deep dives.
+
+## What is being tested
+
+The reports agree on what interviewers look for. In plain words:
+
+- **Breaking the problem into steps, not going deep on one.** PromptLayer's interviewer-side post on its
+  multi-agent research-report exercise lists what it looks for: "Clear problem decomposition into sub-tasks",
+  "Logical flow between agent steps", "Consideration of error handling and edge cases" and "How they'd structure
+  prompts for each component". It tells interviewers "Don't go too in the weeds", and names "Boring textbook
+  answers" as a red flag (<Cite id="s-1205b0cc50" />).
+- **Understanding agents from end to end.** A mid-level Apple candidate asked how they would use AI to improve
+  a service's test coverage felt the interviewer was "mainly checking whether I understood AI agents end to
+  end". The follow-ups were hallucination, minimizing human oversight and getting notified about failures
+  (<Cite id="s-fdb7a967ba" />).
+- **Talking at the right level.** In an Apple cloud-infrastructure loop, a principal engineer asked for a
+  lunch-ordering bot. The candidate reports the discussion was about workflow, prompt behavior and how the pieces
+  fit, not eval metrics, and that they started at the wrong level of abstraction before recovering
+  (<Cite id="s-af94ba2c51" />).
+- **Restraint with multiple agents.** A Harvey candidate spent "a long time discussing how to avoid conflicts
+  when multiple agents were involved" and wrote afterwards: "I may have short-circuited here. In the end, it
+  would have been enough to let one person make the changes." That is the candidate's hindsight, not relayed
+  interviewer feedback; the listing is tagged rejected (<Cite id="s-74265be7ec" />).
+- **Keeping control in code.** A research repo's list of common AI-system-design mistakes, relaying a TechEon
+  guide, includes "Putting control flow in prompts instead of the orchestrator" and "Choosing agents because
+  they're exciting, not because the problem requires autonomy"
+  ([AI Engineering Field Guide, AI system design questions](https://github.com/alexeygrigorev/ai-engineering-field-guide/blob/main/interview/questions/04-ai-system-design.md), accessed 2026-10-12).
+  The **orchestrator** there is the plain code that runs the steps; the design below is built around it.
+
+My reading: the round is decided on three things. Where you draw the line between code and model. How the system
+catches a confident wrong answer. And whether you can run it in production: saved state, retries, cost limits
+and alerts.
+
+Say it like this: "Before I draw boxes, I want to decide which steps even need a model. Then I'll show how I
+check what the model does, and how I'd run and monitor it."
+
+## Clarify and scope
+
+Ask these first. For each one the interviewer leaves open, say an assumption out loud and write it down.
+
+1. **What starts a run?** An event (a ping, a merged pull request, an uploaded file), a schedule, or a person
+   asking. Assume event-triggered, with a nightly batch for anything slow.
+2. **What can it change?** Read-only; drafts a person applies; changes that can be undone; or changes that
+   can't, such as payments. Assume drafts and pull requests only, no direct production writes.
+3. **Is there a cheap, trustworthy check?** Tests, a compiler, a schema, a rule engine, a citation you can look
+   up, or only human judgment. This decides how much freedom is safe to give the model.
+4. **Volume and latency.** Assume 2,000 pings a day, each routed within a minute; tests generated overnight.
+5. **Who receives the output, and what do they do when it is wrong?** An on-call engineer who can reassign a
+   ping in one click tolerates more error than an employee whose allergy was ignored.
+6. **What exists already?** CODEOWNERS files, a service catalog, an on-call rota, CI. Rules you can read from
+   these are cheaper and easier to audit than anything a model infers.
+
+Out of scope unless asked: training or fine-tuning a model, a company-wide agent platform, and the UI.
+
+Say it like this: "I'll assume it can only draft things a person approves. If it can make changes that can't be
+undone, the design gets much stricter, so tell me if that's the case."
+
+## Back-of-envelope
+
+Three numbers decide most of these designs: what a run costs, how likely a multi-step run is to finish
+correctly, and how much human review it needs. Each one has a simple idea behind it. Learn the idea first; the
+exact arithmetic is in the boxes.
+
+### Cost: an agent re-reads its whole history at every step
+
+A model does not remember earlier calls. To continue a conversation, you send everything again: the system
+prompt, the tool descriptions, the task, and every tool result and model message so far. In an agent loop, each
+step therefore sends a longer prompt than the last one.
+
+That has a surprising effect. If each step adds about the same amount of text, the total input grows with the
+**square** of the number of steps. Double the steps and you roughly quadruple the input bill.
+
+The formula, with four inputs you can estimate:
+
+- `N`: model calls (steps) in the run
+- `C0`: the fixed start of every call (system prompt, tool schemas, task)
+- `Δ`: tokens added per step (the tool result plus the model's own reasoning)
+- `o`: output tokens per step
+
+**input tokens = N × C0 + Δ × N × (N + 1) ÷ 2**, and **output tokens = N × o**.
+
+For our ping investigator, assume 8 steps, a 4,000-token start, 1,500 tokens added per step and 300 written per
+step. One run costs about **$0.196** at Claude Sonnet 5 list prices ($2 per million input tokens, $10 per million
+output tokens, fetched 2026-10-11).
+
+There is one big discount. **Prompt caching** means the provider keeps the start of a prompt it has seen
+recently, and charges much less (here $0.20 per million instead of $2) to read it again. Since each agent step
+resends the previous step's prompt plus a little more, most of the input becomes cheap cache reads. With caching
+the same run costs about **$0.069**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Input tokens, no caching:** N × C0 = 8 × 4,000 = 32,000. Δ × N × (N + 1) ÷ 2 = 1,500 × 8 × 9 ÷ 2 = 54,000.
+  Total 86,000 input tokens. Output: 8 × 300 = 2,400 tokens.
+- **Cost, no caching:** 86,000 × $2 ÷ 1M = $0.172; 2,400 × $10 ÷ 1M = $0.024. Total **$0.196** per run.
+- **Cost, with caching:** the 4,000-token start is the same for every run, so it is already cached. Each step
+  adds 1,500 new tokens: 8 × 1,500 = 12,000 new tokens, written to the cache at an assumed 1.25× premium
+  (12,000 × $2.50 ÷ 1M = $0.030). The other 74,000 input tokens are cache reads at $0.20 per million ($0.015).
+  Output stays $0.024. Total ≈ **$0.069** per run.
+
+</details>
+
+### The cost ladder for the ping router
+
+Now compare the ways to route one ping, at an assumed 2,000 pings a day:
+
+| Path | Tokens per ping | Cost per ping | Per 30 days |
+|---|---|---|---|
+| Rules only (CODEOWNERS, service catalog) | 0 | $0 | $0 |
+| One classification call, Sonnet 5 (2,500 in, 150 out) | 2,650 | $0.0065 | $390 |
+| Same call on gpt-5-mini ($0.25 / $2.00 per 1M) | 2,650 | $0.000925 | $56 |
+| Agent on every ping, no caching | 88,400 | $0.196 | $11,760 |
+| Rules first, one call for the 40% they miss, agent for 5% | — | $0.0124 | $744 |
+
+Prices are list prices fetched on 2026-10-11 (see Sources); the 2,000 pings a day and the 40% and 5% splits are assumptions. The
+agent costs about **30 times** the single call for the same ping. Most of that money buys nothing when the answer
+is one team name from a closed list.
+
+Say it like this: "An agent re-reads its history at every step, so its cost grows with the square of the steps.
+For routing, one call costs under a cent and an agent costs about 20 cents. I only want the agent where the
+answer can't be looked up."
+
+<details>
+<summary>The arithmetic behind the ladder</summary>
+
+- **One Sonnet 5 call:** 2,500 × $2 ÷ 1M = $0.005, plus 150 × $10 ÷ 1M = $0.0015. Total $0.0065.
+  × 2,000 pings × 30 days = **$390**.
+- **One gpt-5-mini call:** 2,500 × $0.25 ÷ 1M = $0.000625, plus 150 × $2 ÷ 1M = $0.0003. Total $0.000925.
+  × 60,000 pings ≈ **$56**.
+- **Agent on every ping:** $0.196 × 60,000 = **$11,760**. Tokens: 86,000 + 2,400 = 88,400.
+- **The mix:** 0.40 × $0.0065 + 0.05 × $0.196 = $0.0026 + $0.0098 = $0.0124 per ping. × 60,000 = **$744**.
+- **Ratio:** $0.196 ÷ $0.0065 ≈ 30.
+
+</details>
+
+### Reliability: every step is another chance to be wrong
+
+Suppose each step of a run is right 95% of the time. A run is right only if every step is right. With 8 steps,
+that is 0.95 multiplied by itself 8 times: about **66%**. Make the steps a bit better (99%) and 8 steps give
+about **92%**. Make the run longer (20 steps at 95%) and it drops to about **36%**.
+
+The formula is **P(run correct) ≈ p^N**, where `p` is the chance one step is right and `N` is the number of steps.
+Real steps are not fully independent, so treat this as an order of magnitude, not a prediction.
+
+The same idea explains a metric you will hear about. **pass^k** is the chance an agent succeeds on *all* of `k`
+tries at the same task, which measures consistency. Anthropic's agent-evals guide separates it from **pass@k**,
+the chance it succeeds on *at least one* of `k` tries. At a 75% success rate per try, passing all three tries is
+0.75³ ≈ **42%**.
+
+Anthropic's agent guide says the same thing in words: agentic systems "trade latency and cost for better task
+performance" and carry "the potential for compounding errors"
+([Building effective agents, 2024-12-19](https://www.anthropic.com/engineering/building-effective-agents)).
+
+Say it like this: "Every step I turn into plain code removes one factor from that product. That's the
+reliability argument for a workflow, on top of the cost argument."
+
+### Review: the person checking the output is the real bottleneck
+
+Most of these systems end with a person reviewing what the AI produced. That review is usually the biggest cost,
+bigger than the tokens.
+
+Take a test-writing agent. Assume it attempts 40 modules a night and each review takes 5 minutes. If a person
+reviews every attempt, that is about **3.3 hours of engineer time a day**. If checks in code throw away the bad
+attempts first, and an assumed 25% survive, it drops to about **0.8 hours**.
+
+Now put prices on both sides. One attempt of a test-writing agent (a 20-step loop) costs about **$1.18** in
+tokens, or about **$0.30** with caching. Five minutes of an engineer's time costs about **$7.80**. **The review
+costs more than the tokens.** If a person had to look at every attempt, review would cost about **$31** per
+useful test. Automated filters before the human are the cost lever, not the choice of model.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Review hours per day** = items reaching a person × minutes each ÷ 60. All attempts: 40 × 5 ÷ 60 ≈ 3.3
+  hours. After filters (assumed 25% pass): 10 × 5 ÷ 60 ≈ 0.8 hours.
+- **One attempt** (assumed N = 20, C0 = 6,000, Δ = 2,000, o = 500): 20 × 6,000 + 2,000 × 20 × 21 ÷ 2 =
+  120,000 + 420,000 = 540,000 input tokens; 20 × 500 = 10,000 output tokens. At Sonnet 5 list price:
+  $1.08 + $0.10 = **$1.18**. With caching, about **$0.30**.
+- **Per useful test** at a 25% yield: $1.18 ÷ 0.25 = $4.72 (or $0.30 ÷ 0.25 = $1.20 cached).
+- **Engineer time:** a loaded cost of about $194K a year (the US Bureau of Labor Statistics median software-developer wage of $135,980
+  for May 2025 ([BLS](https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm), fetched
+  2026-10-12), divided by an assumed 0.70 for benefits and overhead) over 2,080 hours is about $93 an hour, so 5 minutes ≈ **$7.80**.
+- **Reviewing every attempt:** four attempts per useful test × $7.80 ≈ **$31**.
+
+</details>
+
+## High-level design
+
+Here is the whole system for the ping router. The same shape fits every version of the question.
+
+```
+Trigger (Slack event, webhook, cron, a person asking)
+   │
+   ▼
+Intake ── plain code: drop duplicates, check the input, create a run record
+   │
+   ▼
+Orchestrator ── plain code that owns the run: calls each step, enforces budgets,
+   │             saves progress after every step, decides when the run is over
+   │
+   ├──► Rules / plain code      (CODEOWNERS lookup, service catalog)
+   ├──► One LLM call            (fixed answer format, e.g. a team id from a list)
+   └──► Capped agent loop       (tools, step cap, dollar cap; only for open-ended work)
+   │
+   ▼
+Verifier ── plain code that checks every model output it can
+   │
+   ▼
+Action gateway ── the only path to side effects: permission tiers, idempotency keys, audit log
+   │
+   ▼
+Person ── only for risky actions, or to accept / reassign
+
+Underneath everything: run store (state, step log, checkpoints) · traces · cost meter · alerts
+```
+
+**Trigger and intake.** Something starts a run: a new Slack message, a GitHub webhook, a nightly cron. Intake
+is ordinary code. It drops duplicates (five people pinging about the same outage should become one run), checks
+the input is well formed, and writes a run record.
+
+**Orchestrator.** This is the most important box, and it is plain code. It calls each step in order, keeps the
+budgets, writes the step log and decides when the run is over. The model never decides whether the run
+continues; it only proposes. Say it like this: "The model proposes. My code decides."
+
+**Step router.** Each step sits on the lowest rung that works. The rungs are: a rule, one model call with a
+structured output, or a capped agent with tools. We call this *the ladder*.
+
+**Verifier.** Code that checks outputs wherever a check exists. The team id exists in the catalog. The tests
+run. The JSON matches the schema. A quoted passage appears in its source.
+
+**Action gateway.** The only way the system changes anything. It holds **permission tiers**: read, draft,
+reversible write, irreversible write. It attaches an **idempotency key** to every write, so a retried step can't
+do the same thing twice. It writes the audit log.
+
+**Person.** Only where a wrong action is costly. For pings, the on-call engineer simply accepts or reassigns.
+
+**Run store.** One row per run (status, input, budget, why it stopped) and an append-only step log with a
+saved checkpoint after every step. Traces, a cost meter and alerts read from it.
+
+### Follow one ping through it
+
+Say this message arrives in #help-infra at 09:12: *"Since about 8:40 the nightly export jobs fail with
+'connection reset by peer' when they write to the reports bucket. Who owns this?"* No service name from the
+catalog appears in it, so the rules alone can't place it. Here is what happens (illustrative timings and the
+costs worked out above):
+
+| Clock | Step | What happens | Running cost | What to say in the interview |
+|---|---|---|---|---|
+| 09:12:00 | **1. Intake** | The Slack event creates run #4812. No open run about the same bucket, so no duplicate. | $0 | "Dedupe first; one outage can produce twenty pings." |
+| +50 ms | **2. Rules** | Look for a service name, file path or alert id that maps to an owner. None found. | $0 | "Rules handle the easy majority for free, and they are auditable." |
+| +2 s | **3. One model call** | Classify into one of 40 team ids, or "unknown", with a one-line reason. It returns `storage-platform`. | $0.0065 | "The answer is one item from a closed list, so one call with a schema is enough." |
+| +2 s | **4. Verifier** | `storage-platform` exists in the catalog and has an on-call. If it didn't, the ping would go to a triage queue. | $0.0065 | "A made-up team id fails this check and falls back to triage." |
+| +3 s | **5. Gateway** | Post to the storage-platform on-call with the reason and a reassign button. Idempotency key `run-4812-step-5`. | $0.0065 | "If this step is retried, the key stops a second post." |
+| 09:14 | **6. Person** | The on-call accepts the ping and clicks "investigate". | $0.0065 | "Every accept or reassign is a free label for my eval set." |
+| 09:14 → 09:16 | **7. Capped agent** | Read-only tools: search logs, read metrics, list recent deploys, read runbooks. 8 steps. It finds a proxy config change deployed at 08:35. | about $0.07 cached ($0.20 uncached) | "Read-only tools, a step cap and a dollar cap. Its output is a draft, never a change." |
+| 09:16 | **8. Stop** | The agent writes a summary with links to the log lines and the deploy. Stop reason: `answered`. | about $0.08 | "Every run ends with a recorded stop reason." |
+
+Notice where the model was used. One call chose from a list. One capped agent investigated, and only because a
+person asked for it. Everything that could change anything went through code.
+
+### How the other versions land on the ladder
+
+| Variant | Plain code | One LLM call | Capped agent | Person |
+|---|---|---|---|---|
+| Route pings (r2a-015) | CODEOWNERS and service-catalog lookup, dedupe | Classify unmatched pings to a team from a closed list | Investigate a "deep infra bug": read logs, metrics, recent deploys, read-only | On-call accepts or reassigns |
+| Test coverage (r2a-014) | Coverage diff, repeated test runs, mutation check | None | Write tests in a sandbox, run them, iterate | Reviews PRs that pass the filters |
+| Lunch bot (r2a-013) | Schedule, budget, vendor API, payment cap | Turn "something vegetarian, no nuts" into a structured order matched to the menu | Not needed | Employee confirms; office manager handles exceptions |
+| Score a file (eng-019) | Combine per-rule verdicts into qualified, acceptable, unqualified | One call per rule, in parallel, with quoted evidence | Optional editor that drafts patches | Applies or rejects patches |
+| Research report (eng-024) | Fetch, dedupe sources, check citations | Outline, section drafts | Lead plus parallel search workers | Spot-checks citations |
+| Long-running query (eng-025) | Job record, checkpoints, timeouts | Plan | Worker loop | Cancels or steers |
+| Discover-style feed (eng-018) | Ingest, cluster, rank, schedule | Summarize a story cluster with citations | Not needed | Editorial rules |
+
+## Deep dives
+
+### Placing each step on the ladder
+
+Anthropic's guide gives the advice to say out loud: start by "finding the simplest solution possible, and only
+increasing complexity when needed". It also notes that "optimizing single LLM calls with retrieval and
+in-context examples is usually enough"
+([Anthropic, 2024-12-19](https://www.anthropic.com/engineering/building-effective-agents)). Turn that into four
+questions you ask about each step:
+
+1. **Can you draw the path in advance?** If yes, it is a workflow. Agents earn their cost when the next action
+   depends on what the last one found, as in debugging an incident.
+2. **Is the answer from a closed set?** If the answer is one of 40 team ids, one call with a schema that lists
+   the 40 ids (an *enum*) beats an agent.
+3. **Is there a cheap check?** Freedom is safe where results can be checked. A test-writing agent can try
+   again and again because the test runner tells it the truth. A policy-writing agent has no such judge.
+4. **What does a wrong action cost?** A misrouted ping costs a reassignment. A wrong lunch order for someone with
+   an allergy is a safety issue, so that bot must ask instead of guess and must never order without a
+   confirmation.
+
+This also answers the Apple follow-up "when is deterministic code better than an agent?". Code wins when the
+rules are stable and must be auditable. It wins when the input is already structured: a stack trace naming a
+service maps to an owner through CODEOWNERS. It wins when volume and latency matter. And it wins when a regulator
+or an incident review will later ask exactly why a decision was made. Use the model for the messy long tail:
+free-text pings, vague bug reports. In practice the rules handle the common cases and the model handles the rest.
+
+Say it like this: "Rules for the head of the distribution, one model call for the tail, and an agent only where
+the path can't be drawn in advance."
+
+### Where the prompts fit: the lunch bot
+
+The lunch-bot interviewer asked where "prompt behavior" fits. The concrete answer: each model step has its own
+short system prompt with one job, and an output schema.
+
+Follow one order. An employee types *"something vegetarian, no nuts, under 15"*. The parsing step returns
+`{items, dietary_flags, missing_fields}`. If `missing_fields` is not empty (say, no delivery location), the
+workflow asks the employee a question instead of guessing. Budgets, vendor cut-off times and payment caps live in
+code, where a prompt can't talk its way past them. Code filters the menu; the model only phrases the options. The
+order is placed only after the employee taps confirm.
+
+Say it like this: "Anything that must always hold, like the budget or an allergy, lives in code. The prompt only
+handles the fuzzy part: understanding what the person asked for."
+
+### Checking what the agent produces: the test-coverage agent
+
+The test-coverage question is the checking question in its plainest form. A test-writing agent is a good use of
+an agent, because the test runner gives honest feedback. A reasonable pipeline has three parts.
+
+1. **Generate in a sandbox.** A *sandbox* is an isolated environment, such as a container, where the agent can
+   only touch what you allow. Here it can read the repository, write only under test directories, and run the
+   test command. No network, no production credentials.
+2. **Filter in code, cheapest check first.** The test builds. It passes several runs in a row (a flaky test is
+   worse than none). It raises coverage of the target lines. It fails when the code under test is deliberately
+   broken; this is a **mutation check**, and it proves the test actually checks something. It doesn't edit, skip
+   or weaken existing tests.
+3. **Show a person only what survives,** with the coverage diff and the broken version it caught attached.
+
+There is published evidence for this shape. Meta's TestGen-LLM paper reports that "75% of TestGen-LLM's test
+cases built correctly, 57% passed reliably, and 25% increased coverage", and that 73% of its recommendations
+were accepted for production by Meta engineers ([arXiv 2402.09171, 2024-02-14](https://arxiv.org/abs/2402.09171)).
+Its successor, ACH, first generates faults the current tests miss and then writes tests that catch them;
+engineers in Messenger and WhatsApp test-a-thons "accepted 73% of its tests"
+([arXiv 2501.12862, 2025-01-22](https://arxiv.org/abs/2501.12862)). The filters did most of the work: only a
+quarter of raw test cases were worth showing anyone. That matches the 25% yield assumed in the review numbers
+above.
+
+**"What if the AI hallucinates?"** Two kinds matter. Invented functions and APIs fail the build filter, which is
+cheap. The dangerous kind is a test that passes because it asserts the current behavior, *including a bug*, and
+so locks the bug in. Mutation checks don't catch that. A person does, which is why reviewers read the assertions,
+not just the green checkmarks. Flag tests whose expected values look surprising (an empty result, a negative
+total) for a closer look.
+
+**"How would you minimize human oversight?"** The Apple candidate's own answer was to reduce review without
+removing it (<Cite id="s-fdb7a967ba" />). Make that concrete. Decide what the agent may do alone: add tests that
+pass every filter and open a pull request. Decide what it may never do: change production code, delete or weaken
+tests, touch CI configuration. Decide where a person stays: merging, and any assertion about behavior that looks
+wrong. Then make each review cheaper instead of removing the person: small pull requests, the evidence attached,
+and a weekly sample of merged agent tests checked against later reverts.
+
+Say it like this: "I don't remove the reviewer. I make each review cheaper and send fewer items to them."
+
+### Several agents: when they pay, and how they avoid conflicting edits
+
+A **multi-agent system** splits one job across several model loops: often a *lead* agent that plans and
+*subagents* that each do a part. The best public case for it is Anthropic's research system. A lead agent with
+parallel subagents "outperformed single-agent Claude Opus 4 by 90.2%" on its internal research eval. The cost:
+"multi-agent systems use about 15× more tokens than chats", and on BrowseComp (a benchmark of hard web-browsing
+questions) token usage alone "explains 80% of the variance". The same post says the pattern suits "heavy
+parallelization" and fits poorly where agents must "share the same context" or have "many dependencies between
+agents", and that coding has "fewer truly parallelizable tasks than research"
+([Anthropic, 2025-06-13](https://www.anthropic.com/engineering/multi-agent-research-system)).
+
+Cognition makes the counter-argument and names the conflict problem: "Actions carry implicit decisions, and
+conflicting decisions carry bad results", and "The simplest way to follow the principles is to just use a
+single-threaded linear agent" ([Cognition, Walden Yan, 2025-06-12](https://cognition.com/blog/dont-build-multi-agents)).
+
+The two posts agree once you separate reading from writing. **Parallel readers are cheap to coordinate; parallel
+writers are not.** This is the same rule you know from databases: many readers are easy, concurrent writers need
+locks or versions.
+
+Apply it to the Harvey question: score a long document against 30 rules and suggest fixes.
+
+- **Scoring only reads, so run it in parallel.** One call per rule, each returning a verdict and the quoted text
+  it relied on. Code combines the verdicts into qualified, acceptable or unqualified, so the label is
+  reproducible.
+- **Edits are proposals, not writes.** Each suggestion is a patch against a base version hash.
+- **One writer applies them,** in rule-priority order. If a patch no longer applies because the base changed, it
+  is regenerated against the new version. This is *optimistic concurrency*, the same idea as a version column in
+  a database row. It is also the candidate's hindsight, "let one person make the changes", stated as a design.
+- **If you must have parallel writers,** split the file by section, give each writer a **lease** (a lock that
+  expires unless renewed), and have the store reject writes that carry an old **fencing token** (a number that
+  goes up each time the lease changes hands). A lease alone isn't enough: a paused writer can wake after its
+  lease expired and still write.
+- **Re-score after merging.** Two edits can merge cleanly as text and still contradict each other in meaning.
+  That is why a text-merging data structure (a CRDT) doesn't solve this. The scorer is the check that closes the
+  loop.
+
+For the research report, use the **orchestrator-workers** pattern: a lead plans the sections, read-only workers
+search in parallel, and each claim carries a source id plus the quoted passage it rests on. Anthropic's system
+passes findings to a separate CitationAgent to place citations. A cheaper check in code catches most made-up
+citations: the quoted passage must appear in the fetched document.
+
+Say it like this: "Many agents reading in parallel is fine. Many agents writing to the same thing is a
+concurrency problem, and I'd rather have one writer."
+
+### Long-running runs: state, resuming and timeouts
+
+A run that takes 40 minutes will meet a deploy, a worker restart or a provider outage. You already know the tools
+for this from job systems. Apply them:
+
+- **A run record and an append-only step log,** with a saved checkpoint after every step: messages so far, tool
+  results, budget spent. A restarted worker resumes from the last checkpoint instead of starting over. Anthropic
+  built its research agents to "resume from where the agent was when the errors occurred", with "regular
+  checkpoints" ([Anthropic, 2025-06-13](https://www.anthropic.com/engineering/multi-agent-research-system)).
+- **Idempotent side effects.** Every tool call that writes carries a key made from the run id and step number,
+  so a replayed step doesn't open a second pull request or place a second order.
+- **Leases with heartbeats.** A worker holds the run while it keeps sending heartbeats. If it dies, another
+  worker takes the run after the lease expires, and fencing tokens stop the old one from writing.
+- **Three budgets:** a timeout per tool call, a cap on steps and tokens per run, and a wall-clock deadline.
+  Every exit records a **stop reason** (answered, step cap, budget, error, handed off).
+- **Progress, cancel and steer.** The caller gets a run id at once and polls or subscribes to status events. A
+  person can cancel or add an instruction mid-run.
+- **Deploys don't break running work.** Keep in-flight runs on the version that started them; Anthropic calls
+  its approach "rainbow deployments".
+
+You can rent this layer. *Durable-execution engines* (workflow engines that save each step and resume after
+crashes) exist, and providers now host agent harnesses: the loop, tools and state run on their servers.
+Anthropic's Claude Managed Agents, for example, is a beta "pre-built, configurable agent harness that runs in
+managed infrastructure", aimed at "long-running tasks and asynchronous work", with session history stored on
+their side. Its docs also say it is not currently eligible for Zero Data Retention or HIPAA BAA coverage
+([Claude Managed Agents overview](https://platform.claude.com/docs/en/managed-agents/overview), fetched
+2026-10-12). Check those terms before you put customer data through any hosted harness.
+
+Say it like this: "This is a job system problem I already know: checkpoints, idempotency keys, leases with
+fencing, and timeouts. The model is just a slow, expensive step inside it."
+
+## Failure modes and overload
+
+| What breaks | How you notice | What the system does |
+|---|---|---|
+| Agent loops or makes no progress | the same tool call with the same arguments twice; steps that add no new information | stop with a reason, hand to the fallback path |
+| Cost runs away | per-run token and dollar meter; daily spend against budget | hard cap per run; alert at 50% and 80% of the daily budget |
+| A bad write | revert rate; changes outside allowed paths | gateway tiers; agent credentials can't reach production |
+| Instructions hidden in the input (a ping or document that says "ignore your rules") | tool calls the task didn't need | read-only tools; no way to send data out without approval |
+| Provider outage or 429s (rate-limit errors) | error rate per model | retry with backoff, then fall back to rules-only routing |
+| Quality slowly gets worse | acceptance and reassignment rates fall | alert on outcome metrics, not only on errors |
+| Backlog | queue age | shed the agent path first; rules and single calls keep running |
+
+The fourth row has a name: **prompt injection**. The model reads text written by someone else, and that text
+can contain instructions. The model may follow them, because to the model, instructions and data are the same
+kind of text.
+
+Two incidents make these rows concrete. Replit's agent deleted a production database during a code freeze, and
+the CEO pledged to separate development and production databases automatically
+([TechTarget, 2025-07-22](https://www.techtarget.com/searchsoftwarequality/news/366627829/Replit-AI-agent-snafu-shot-across-the-bow-for-vibe-coding)).
+And a support ticket containing instructions made a coding agent, connected with a database role that bypasses
+row-level security, copy secrets into the ticket. Simon Willison calls that combination the lethal trifecta:
+private data, untrusted input, and a way to send data out
+([Willison, 2025-07-06](https://simonwillison.net/2025/Jul/6/supabase-mcp-lethal-trifecta/)). A ping router reads
+untrusted text all day, so keep its tools read-only and its only output a team id.
+
+Say it like this: "Every ping is untrusted input. So the router can only read, and the only thing it can output
+is a team id from a list."
+
+### Getting told when it fails
+
+This is the third Apple follow-up. Split the signals by who has to act:
+
+- **Page someone:** the run failure rate goes above a threshold, runs are stuck without a heartbeat, the daily
+  budget is used up, or the dead-letter queue (where items go after too many failed retries) is growing.
+- **Open a ticket or post to a channel:** the acceptance rate is falling, the reassignment or revert rate is
+  rising, or one stop reason suddenly dominates.
+- **Never page on a single failed run.** Agents fail individual runs routinely; the fallback path absorbs those.
+
+Counting stop reasons per day (answered, step cap, budget, error, handed off) is the cheapest dashboard you will
+build, and often the most useful.
+
+## Evals and observability
+
+The eval set from the top of the page is your regression suite. The difference from unit tests is that results
+are percentages, not pass or fail, because the model is not fully predictable.
+
+- **Build the set from history.** Internal processes come with labels already. For pings, the team that finally
+  fixed each past issue is the right answer. Take 200 historical pings and measure rules alone, then rules plus
+  one call. For tests, the label is the filter result. Anthropic's agent-evals guide suggests "20-50 simple tasks
+  drawn from real failures" to start, and grading "what the agent produced, not the path it took"
+  ([Anthropic, 2026-01-09](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents)).
+- **Measure consistency, not just accuracy.** Run each case three times and report pass^3. A router that is
+  right on average but flips between teams on reruns loses people's trust.
+- **Know what your set can detect.** Two prompt versions run on the same cases can be compared case by case;
+  this is a *paired test*. With 500 paired cases and versions disagreeing on 20% of them, the smallest drop it
+  reliably catches is <LabNumber lab="llm-eval" metric="Smallest true gap with 80% power, paired test, n=500" />.
+  A 50-case set catches only large breaks, so pair it with live metrics.
+- **Live metrics per version:** ping reassignment rate and time to the right team; revert and flake rates for
+  agent-written tests; citation validity for reports; cost and latency per run.
+- **One trace per run,** with a span per step recording tokens, cost, tool, result size and stop reason.
+  Launch in **shadow mode** first: the system suggests, people act as usual, and you compare the two.
+
+Say it like this: "My eval set comes free from history: every past ping already has the team that fixed it."
+
+## Trade-offs
+
+| Decision | Choice here | What it costs | When to choose differently |
+|---|---|---|---|
+| Workflow or agent | Workflow by default, agent for open-ended steps | Less flexible on new kinds of cases | The path really can't be drawn in advance, and a check exists |
+| Plain code or framework | Plain code around the provider's SDK | You write retries, state and tracing | A framework gives you durable execution or tracing you would otherwise build, and you understand it |
+| One agent or several | One writer, parallel read-only helpers | Slower on broad research | Searching many independent sources, and the 15× token bill is acceptable |
+| One strong model or one per step | Small model for classification, strong model for the agent | Two models to evaluate | Volume is low enough that one model is simpler |
+| Human gate everywhere or tiered | Tiered by how risky the action is | Some bad drafts reach a person | Regulated actions: keep a person on every one |
+| Synchronous or async | Async run with status events | More moving parts | Runs finish in a few seconds |
+
+<AINative title="Who verifies the test-writing agent?">
+A coding agent will write most of this system for you: the orchestrator, the step log, the filters, even the
+first eval set. That is the easy part to delegate, because it is easy to check. What stays yours is the part
+the agent is worst placed to judge: the stop conditions and budgets, the permission tiers, which labels in the
+eval set are right, and whether a generated test asserts the right behavior. Read 20 run transcripts a week.
+Mitchell Hashimoto describes turning each agent mistake into a rule file entry or a tool
+([2026-02-05](https://mitchellh.com/writing/my-ai-adoption-journey)); do the same with the automation you
+ship, so each failure becomes a test or a filter rather than a prompt tweak.
+</AINative>
+
+## Small-team version
+
+You own AI at a 50–500 person company. Someone asks you to "add an agent" to on-call routing, test coverage or
+contract review. This is the family where the small-team answer differs most from a big-lab answer, because most
+of the value comes from rules, one model call and a good fallback.
+
+### Build, buy, skip
+
+- **Build:** the orchestrator, in plain code. Anthropic suggests developers "start by using LLM APIs directly",
+  warning that frameworks "can obscure the underlying prompts"
+  ([2024-12-19](https://www.anthropic.com/engineering/building-effective-agents)). Chip Huyen gives the same
+  advice for orchestration tools: "start building your application without one first"
+  ([2024-07-25](https://huyenchip.com/2024/07/25/genai-platform.html)). The run store is a `runs` table and a
+  `steps` table in the Postgres you already have. Build the checks and the permission tiers yourself; nobody
+  sells your filters.
+- **Buy:** the model API, with a second provider wired up as a fallback. Tracing (a self-hosted open-source tool
+  or a vendor). A durable-execution engine or a hosted agent harness only when runs last minutes or more and you
+  are rebuilding checkpointing for the third time; read its data-retention terms first.
+- **Skip:** multi-agent designs, a general agent platform, fine-tuning, and a vector database for this problem.
+
+The job postings show what the role asks for. Supabase advertised an AI Platform Engineer to build the execution
+layer for internal agents (event-triggered queue, durable state, human review gate, rollback, full run logging,
+golden test suites with CI gating, least-privilege credentials) and said: "You will be the only engineer on this
+platform." Onit's AI Engineer posting sets a 90-day goal of one production agent workflow with tracing, an
+offline eval suite with regression gates, cost and latency targets, and documented fallbacks ([Supabase, 2026-07-31](https://api.ashbyhq.com/posting-api/job-board/supabase),
+[Onit, undated](https://jobs.lever.co/onit/983d3c5d-55d7-4802-9865-80bf58c68bd4)).
+
+### Default stack, and when to change it
+
+- Triggers: the cron or queue you run today (Slack events, GitHub webhooks, a nightly job).
+- Run store: Postgres; one `runs` table and one `steps` table, with leases on the run row.
+- Models: one managed API; a small model for classification and extraction, a stronger one for agent steps.
+- Structured outputs for every single-call step, with the JSON checked in code.
+- Evals: a few hundred historical cases in the repo, run in CI on every prompt or model change.
+- Alerts: stop-reason counts and budget alarms posted to the team channel; paging only for stuck runs.
+
+Move to a durable-execution engine when runs routinely outlive a deploy. Move to a hosted harness when you need
+sandboxed code execution and its retention terms fit. Move to several agents only when an eval shows the single
+loop failing on breadth, not on correctness.
+
+### What it costs (prices fetched 2026-10-11)
+
+From the back-of-envelope: routing 2,000 pings a day costs about **$390 per 30 days** with one Sonnet 5 call per
+ping, **$56** with gpt-5-mini, **$744** with rules first and an agent for 5%, and **$11,760** with an agent on
+every ping. A test-writing agent costs about $1.18 per attempt uncached and $0.30 cached, while the engineer
+reviewing the result costs about $7.80 per review.
+
+Set spend limits before launch. Anthropic's docs say that once an organization reaches its tier's monthly spend
+cap, requests return HTTP 429 with no `retry-after` header until the first day of the next month
+([Anthropic rate limits](https://platform.claude.com/docs/en/api/rate-limits), fetched 2026-10-12). The cap is per
+organization, so a runaway agent can stop every other feature too. Put the automation in its own workspace with its
+own, lower spend limit, so it hits that limit first.
+
+### A realistic delivery plan
+
+1. **Week 1:** pull 200–500 historical cases with their real outcomes. Measure rules alone. Often this already
+   handles most of the volume.
+2. **Week 2:** add one model call for what the rules miss, with a schema, and an eval in CI. Compare against the
+   rules-only baseline.
+3. **Weeks 3–4:** shadow mode. The system suggests; people act; you log disagreements and read them.
+4. **Week 5:** act automatically on high-confidence cases in the low-risk tier; everything else stays a
+   suggestion.
+5. **Later, only if what's left is worth it:** a capped agent for the open-ended cases, read-only first.
+
+One engineer directing coding agents can ship steps 1–4 in about a month (a planning assumption, not a measured
+figure).
+
+### What you still check yourself
+
+Stop conditions and budgets: kill a worker mid-run and replay a step. Permission tiers: try to make the agent
+write outside its allowed paths. The eval labels. The alert routing: fire each alert once. And a weekly sample of
+agent outputs that nobody complained about.
+
+### What small-company interviewers probe
+
+Elicit's hiring manager describes a loop with no ML-specific round for AI engineers. It probes error handling,
+retries, fallbacks and timeouts rather than the happy path
+([Latent Space, 2024-06-21](https://www.latent.space/p/hiring)). Expect "would you build this at all?", "what
+does it cost per ping?", "what happens when the provider is down?" and "how would you know it works in week
+two?". A product manager or founder in the loop will ask what the user sees when the automation is wrong.
+
+### Revisit when
+
+Volume grows tenfold, so the cost and latency of the single call start to matter. A second team wants its own
+automation, so a shared run store and gateway become a platform. An action becomes irreversible or regulated,
+so a person approves every one. Or the eval shows the leftover cases are where the business value is.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Agent or workflow"
+  senior={[
+    "Places each step on the rules, one-call or agent rung with a reason, and caps steps, tokens and dollars per run.",
+    "Builds the verifier: filters in code, a human gate on risky actions, stop reasons on every exit.",
+    "Makes runs resumable with checkpoints and idempotent side effects, and alerts on stuck runs and budgets.",
+  ]}
+  staff={[
+    "Starts from the outcome metric and the cost of a wrong action, and shows that rules plus one call may solve most of it before any agent.",
+    "Prices the human review, not just the tokens, and designs the filters to cut review load.",
+    "Says who owns the permission tiers, the eval labels and the budget, and which metric would show the automation should be switched off.",
+  ]}
+/>
+
+In plain words: a Senior answer builds the system correctly, with caps, checks and resumable runs. A Staff answer
+also asks whether the system should exist in this form, puts a price on the people involved, and says who owns
+the decisions after launch.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="What would you do if the AI hallucinates? (Reported, Apple)">
+Separate the cheap kind from the dangerous kind. Invented functions and APIs fail the build or the schema check.
+A test that passes because it asserts current buggy behavior survives every automated filter, so reviewers read
+assertions, and tests whose expected values look surprising get flagged. For routing, a made-up team id fails
+the closed-list check and falls back to the default queue.
+  </FollowUp>
+  <FollowUp q="How would you minimize human oversight? (Reported, Apple)">
+Make each review cheaper rather than remove the reviewer. Define what the agent may do alone, what it may never
+do, and where a person stays. Use filters so fewer items reach a person, attach the evidence (coverage diff, the
+broken version the test caught) to each one, and check a weekly sample of auto-accepted outputs against later
+reverts.
+  </FollowUp>
+  <FollowUp q="How do you make sure you're notified about failures? (Reported, Apple)">
+Every run ends with a stop reason. Page on stuck runs, an exhausted budget, a growing dead-letter queue and a run
+failure rate above a threshold. Send quality signals (acceptance falling, reverts rising) to a channel or ticket.
+Never page on one failed run; the fallback path handles it.
+  </FollowUp>
+  <FollowUp q="How do you avoid conflicts when several agents edit the same file? (Reported, Harvey)">
+Make edits proposals: patches against a base version hash. One writer applies them in priority order and
+regenerates any patch whose base changed. If parallel writers are unavoidable, split the file, use leases with
+fencing tokens, then re-run the scorer on the merged result, because a clean text merge can still contradict
+itself.
+  </FollowUp>
+  <FollowUp q="When is deterministic code a better choice than an agent? (Reported, Apple, via a snippet)">
+When the rules are stable and auditable, the input is already structured, volume or latency matters, or someone
+will later ask exactly why. Use the model for the messy long tail. The cost table shows a 30× gap per ping
+between one call and an agent, before counting the reliability loss from more steps.
+  </FollowUp>
+  <FollowUp q="How would you structure the prompts for each component? (PromptLayer interviewer post)">
+One short system prompt per step with a single job and an output schema, rather than one prompt that runs the
+whole process. Rules that must hold (budgets, cut-offs, who can approve) live in code. Version prompts with the
+code and evaluate each step on its own cases.
+  </FollowUp>
+  <FollowUp q="The run takes 40 minutes and the worker restarts at minute 30. What happens? (Not reported; a natural next push)">
+Another worker takes the run after the lease expires, loads the last checkpoint and continues from the next step.
+Writes carry idempotency keys, so a replayed step doesn't repeat a side effect, and the old worker's fencing
+token is rejected if it wakes up.
+  </FollowUp>
+  <FollowUp q="The bill doubled last week. Find out why. (Not reported; a natural next push)">
+Group cost by stop reason and by step count. A doubled bill with the same number of runs usually means longer
+runs: a new tool returning bigger results, a loop the cap allows, or a broken cache prefix (for example, a
+timestamp at the top of the system prompt, which changes every call so nothing is reused). Because cost grows
+with the square of the steps, a few runs hitting the step cap can dominate the total.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **An agent where a lookup works.** Routing a ping that names its service through an agent is paying 30× for a
+  table lookup. The field guide's list of mistakes includes choosing agents "because they're exciting"
+  ([AI Engineering Field Guide](https://github.com/alexeygrigorev/ai-engineering-field-guide/blob/main/interview/questions/04-ai-system-design.md)).
+- **Control flow in the prompt.** "Retry until the tests pass" written as an instruction to the model, instead of
+  a loop in code with a cap, means nothing enforces the limit.
+- **Several writers by default.** Parallel writers create the conflict problem you then have to solve; the Harvey
+  candidate's hindsight is that one writer would have been enough (<Cite id="s-74265be7ec" />).
+- **Starting at the wrong level.** Diving into model internals or infrastructure when the interviewer wants the
+  workflow and the prompt behavior wastes the round (<Cite id="s-af94ba2c51" />).
+- **A textbook tour.** Listing patterns without placing them on this process shows memory, not judgment;
+  PromptLayer names "Boring textbook answers" as a red flag (<Cite id="s-1205b0cc50" />).
+- **No check, or a person on everything.** Without a check, wrong output reaches people; with a person on
+  everything, review costs more than the automation saves. And without a step or dollar cap, one bad run can eat
+  the budget.
+
+## Prove it with a lab
+
+<LabRef lab="agent-framework" role="partial" note="Fix the parser first (json.JSONDecoder.raw_decode reads the nested tool-call JSON), then add a stop reason to every exit, a per-run dollar cap next to its token guard, and a test that the same tool call twice ends the run." />
+
+<LabRef lab="llm-eval" role="proof" note="Run a paired comparison of two prompt versions on the same cases and read the interval before you call one better." />
+
+<LabRef lab="distributed-cron" role="proof" note="The scheduled trigger with a CAS lease so exactly one node starts each run; add a run-store write to its job hook." />
+
+<LabRef lab="dist-lock" role="proof" note="Leases plus fencing tokens: write a test where a paused writer wakes after its lease expired and its write is rejected." />
+
+<LabRef lab="saga" role="partial" note="Forward steps, compensations and a persistent event log: the shape of a resumable run. Read it; its module fails to set up as of 2026-10-11." />
+
+<LabRef lab="message-queue" role="partial" note="Visibility timeouts and a dead-letter queue for runs that keep failing." />
+
+<LabRef lab="mcp-server" role="background" note="Tools with input schemas behind one server-wide token; sketch per-tool tiers on top." />
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-fdb7a967ba" />
+- <Cite id="s-af94ba2c51" />
+- <Cite id="s-d3df675c97" />
+- <Cite id="s-74265be7ec" />
+- <Cite id="s-1205b0cc50" />
+- <Cite id="s-bebe1e8956" />
+- Anthropic, "Building effective agents", 2024-12-19: https://www.anthropic.com/engineering/building-effective-agents
+- Anthropic, "How we built our multi-agent research system", 2025-06-13: https://www.anthropic.com/engineering/multi-agent-research-system
+- Anthropic, "Demystifying evals for AI agents", 2026-01-09: https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
+- Anthropic, Claude Managed Agents overview (docs, beta), fetched 2026-10-12: https://platform.claude.com/docs/en/managed-agents/overview
+- Cognition (Walden Yan), "Don't Build Multi-Agents", 2025-06-12: https://cognition.com/blog/dont-build-multi-agents
+- Alshahwan et al., "Automated Unit Test Improvement using Large Language Models at Meta", 2024-02-14: https://arxiv.org/abs/2402.09171
+- Foster et al., "Mutation-Guided LLM-based Test Generation at Meta", 2025-01-22: https://arxiv.org/abs/2501.12862
+- AI Engineering Field Guide, AI system design questions (relaying TechEon), accessed 2026-10-12: https://github.com/alexeygrigorev/ai-engineering-field-guide/blob/main/interview/questions/04-ai-system-design.md
+- TechTarget, Replit agent incident, 2025-07-22: https://www.techtarget.com/searchsoftwarequality/news/366627829/Replit-AI-agent-snafu-shot-across-the-bow-for-vibe-coding
+- Simon Willison, "Supabase MCP can leak your entire SQL database", 2025-07-06: https://simonwillison.net/2025/Jul/6/supabase-mcp-lethal-trifecta/
+- Chip Huyen, "Building a generative AI platform", 2024-07-25: https://huyenchip.com/2024/07/25/genai-platform.html
+- Mitchell Hashimoto, "My AI adoption journey", 2026-02-05: https://mitchellh.com/writing/my-ai-adoption-journey
+- Latent Space, Elicit on hiring AI engineers, 2024-06-21: https://www.latent.space/p/hiring
+- Supabase AI Platform Engineer posting, 2026-07-31: https://api.ashbyhq.com/posting-api/job-board/supabase
+- Anthropic, Rate limits (spend caps), fetched 2026-10-12: https://platform.claude.com/docs/en/api/rate-limits
+- US Bureau of Labor Statistics, Software developers (median wage, May 2025), fetched 2026-10-12: https://www.bls.gov/ooh/computer-and-information-technology/software-developers.htm
+- Onit AI Engineer posting (undated): https://jobs.lever.co/onit/983d3c5d-55d7-4802-9865-80bf58c68bd4
+- Model prices: Anthropic and OpenAI pricing pages, fetched 2026-10-11: https://platform.claude.com/docs/en/about-claude/pricing and https://developers.openai.com/api/docs/pricing

@@ -1,0 +1,183 @@
+---
+question: r2a-024
+family: enterprise-rag-acl
+status: published
+labs: [rag, vector-index, agent-framework]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Let me lay out the components first. Internal search that only returns what this user may read; web search as
+> a tool, with fetched pages treated as untrusted; a planner loop where the model breaks the question into
+> sub-questions and calls those tools, with a cap on steps and cost; a writer that ties every claim to a source
+> id; and a checker in code that verifies each citation. Caching is safe only when the key includes who is asking
+> and the permission version. And because I store which passages each report used, when someone loses access I
+> can find and fix the reports that already quoted that data."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see two things: that you can lay out an agent-style research system in a few minutes,
+and that you notice the ways it can leak data.
+
+A normal search returns links, and the user opens what they are allowed to open. A research assistant does more.
+It reads internal documents and web pages, then writes a new document, the report, that quotes them. That report
+is a copy of the data. If a passage the user shouldn't see gets into the model's input, it can end up in the
+report. And if access is revoked tomorrow, the report from yesterday still contains it.
+
+This comes from a first-hand account by a Cohere agent-platform SWE candidate (interview April 2026, cut after
+this round). The prompt was to design "a system like Glean", enterprise-grade, that retrieves internal and
+external information, synthesizes it, cites it and outputs a report. The interviewer asked about caching by
+question similarity, how citations work, and "what happens if a downstream party changes their mind and
+shouldn't have access to certain data anymore" (<Cite id="s-d5d3016775" />). In hindsight the candidate thought
+it better to lay out the general components first, and to let the model plan with function calling rather than
+splitting the work into many fine-grained parts. The post doesn't say what the interviewers cited.
+
+## Clarify first
+
+- **Who reads the report?** "May it include internal content the reader can't open? I'll assume the report
+  inherits the permissions of the user who asked."
+- **External sources.** "Open web, or paid databases too? I'll assume web search through a tool."
+- **How long may a report take?** "I'll assume minutes, run in the background, with progress shown."
+- **Who is the 'downstream party'?** "A user, a team, or a partner organization with delegated access?"
+
+## Answer
+
+### Words you need first
+
+- **RAG** (retrieval-augmented generation): search documents first, then give the best passages to a large
+  language model (LLM) to answer from, with citations.
+- **Chunk**: a passage of a few hundred words cut from a document; the unit you search and cite.
+- **Embedding**: a list of numbers computed from text so that similar meanings get similar vectors. It lets you
+  find "similar questions" as well as similar passages.
+- **ACL** (access control list): the users and groups (**principals**) allowed to read a document. A user's
+  **principal set** is their id plus all their groups.
+- **Tool call** (function calling): the model asks your code to run a function, such as "search internal docs for
+  X", and reads the result. A loop of such calls is what people mean by an agent.
+
+### Components first
+
+Spend two minutes on this, then go deep where the interviewer points:
+
+```
+Question
+   ▼
+Planner loop (LLM) ── cap: N steps, $ budget
+   │  calls tools
+   ├──► Internal search ── hybrid, reranked, filtered by the user's principals
+   └──► Web search ── fetched pages = untrusted text, never instructions
+   ▼
+Evidence store ── every item gets an id (chunk id + document version, or URL + fetch time)
+   ▼
+Writer (LLM) ── each claim cites evidence ids
+   ▼
+Citation verifier (code) ── id collected in this run? permitted for this user? quote matches?
+   ▼
+Report + record of which chunks it used
+```
+
+1. **Internal search** combines keyword and vector search, reranks, and applies the user's permission filter
+   inside the search, so forbidden chunks are never even scored.
+2. **Web search** is a tool. Fetched pages may contain text like "ignore your instructions"; treat them as data.
+3. **The planner loop** lets the model break the question into sub-questions and call the tools. Cap the steps
+   and the spend, so one hard question can't run for an hour.
+4. **The writer** drafts sections from the collected evidence, each claim tied to an evidence id.
+5. **The verifier** is code, not a model. It also stores which chunks the report used.
+
+### Follow one report
+
+Say a product manager at an invented company, Northwind, asks: *"How do our enterprise discounts compare with
+competitors' published pricing?"*
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| Plan | The model splits it into "our discount policy", "recent exceptions", "competitors' list prices". | "The model plans; my code enforces the step and cost caps." |
+| Internal search | Finds the pricing policy and an exception document for the Kestrel account. Both are readable by her groups. | "The permission filter runs inside the search, not after it." |
+| Web search | Fetches two competitors' pricing pages. | "Web pages are evidence, never instructions." |
+| Write | Each sentence cites ids, for example `chunk:4417@v12` or a URL with fetch time. | "No claim without an id." |
+| Verify | Code checks each id was collected in this run and is permitted for her; quoted spans must match word for word. | "Unsupported sentences are removed or marked." |
+| Store | The report is saved with the list of chunk ids it used. | "This is what makes revocation possible later." |
+
+### Citations
+
+Every evidence item gets an id: an internal chunk id with its document version, or a URL with its fetch time. The
+writer must cite ids. Code then checks three things for each citation: the id was collected in this run, it is
+permitted for this user, and any quoted text appears word for word in the source. Sentences that fail are removed
+or marked as unsupported.
+
+### Caching by similarity
+
+A **semantic cache** embeds a new question and, if a stored question is close enough in meaning, returns the
+stored answer. Keyed by the question alone, it hands user A's report, built from A's documents, to user B. Use it
+only inside a safe key: tenant (the customer company), a fingerprint of the principal set, and the ACL version.
+Cheaper and safer layers come first:
+
+1. Cache question embeddings and external search results. They hold no internal content.
+2. Cache retrieval results for content the whole company can read.
+3. Cache whole reports only per principal set and ACL version.
+
+Set the similarity threshold from labelled pairs of "same" and "different" questions. Two questions that differ
+by one name ("Kestrel's discount" and "Falcon's discount") can be very close in embedding space and need different
+answers.
+
+### Revocation downstream
+
+Back to the Kestrel exception. Tomorrow a partner team loses access to it. What happens?
+
+- **New queries.** A separate fast lane updates the ACL store and re-tags the chunks, without re-embedding
+  anything. Searches filter on the new principals. A final re-check against the live ACL store catches an index
+  that lags. Caches keyed by ACL version miss.
+- **Reports already delivered.** This is the research-report twist. Because each report stores the chunk ids it
+  used, a revocation can find every report that quoted the Kestrel chunk and flag, redact or regenerate it.
+
+State the remaining window as a bound: how long until you hear about the change plus how long to apply it, or the
+lifetime of any login token that carries the user's groups, plus any cache that ignores permissions. The family
+walkthrough writes this as max(t_detect + t_apply, t_claims) + t_cache. With change events and groups looked up
+per request it comes to about **3 minutes**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Change events arrive in about 1 minute (t_detect), applying the new ACL takes about 2 (t_apply), groups are
+  looked up per request with a 1-minute cache (t_claims ≈ 1), and caches are keyed by ACL version (t_cache = 0):
+  max(1 + 2, 1) + 0 = **3 minutes**.
+- For contrast: if groups ride in a one-hour login token and the connector polls every 15 minutes with a
+  10-minute answer cache, max(15 + 2, 60) + 10 = **70 minutes**.
+
+</details>
+
+Say it like this: "A delivered report is a copy of the data, so revocation has to reach it. I store each report's
+chunk ids so I can find it."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Research assistant with citations"
+  senior={["Lays out retrieval, planner, writer and verifier; keys caches by principals; filters inside retrieval."]}
+  staff={["Treats delivered reports as derived copies that revocation must reach, and bounds the planner's cost and steps."]}
+/>
+
+In plain words: a Senior answer draws the right parts and keeps permissions inside them. A Staff answer also
+follows the data into the reports it produced, and puts limits on what the planner can spend.
+
+## Small-team version
+
+Build the single-pass version first: search, write a cited answer, verify the citations in code. Add the planner
+loop only for questions your evaluation shows need several searches, and give it a step cap and a dollar cap.
+Skip similarity caching of answers until traffic shows real repeats; caching question embeddings is free of leak
+risk. Store each answer's chunk ids from day one, because adding that later means you can't find old reports.
+
+## Pitfalls
+
+- **Going deep on one component before naming them all.** That is the candidate's own hindsight, not a reason the
+  interviewers gave.
+- **A similarity cache keyed only by the question.** It serves one user's report to another.
+- **Forgetting that generated reports are copies of the data.** Revocation then misses them.
+- **Trusting web pages as instructions.** A fetched page can try to steer the model.
+- **A planner with no caps.** One hard question can loop and run up cost.
+
+## Go deeper
+
+- Family walkthrough: [Permission-aware enterprise RAG](/system-design-labs/interviews/walkthroughs/enterprise-rag-acl/#citations-and-caching-frequent-questions).
+- Retrieval stages: <LabRef lab="rag" inline />; agent loop mechanics: <LabRef lab="agent-framework" inline />.

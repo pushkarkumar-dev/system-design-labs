@@ -1,0 +1,179 @@
+---
+question: infra-020
+family: concurrent-io-workers
+status: published
+labs: [embedding-pipeline]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Duplicates means identical bytes. I won't read every file in full. I'll group files by size first, which
+> costs no reads at all, then hash just the first 4 KiB of files that share a size, and only hash whole files
+> that still match. I'll skip symlinks so a loop can't hang the walk, treat hard links as one file, and skip
+> files I can't read. And I'll write a test that creates every one of those cases itself."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you can write code that touches a real filesystem correctly, and prove
+it with a test that builds its own fixtures.
+
+Finding duplicates sounds like a one-liner: hash every file, group by hash. What makes it a real question is
+that a filesystem is messier than a list. Some "files" point at other files. Some are the same file under two
+names. Some vanish or become unreadable while you scan. And reading every byte of a large tree is slow. The
+base question is easy; the follow-ups test how your design holds up as the interviewer adds those cases, and
+whether your test would catch each one.
+
+The candidate who reported it for Anthropic (Senior/Staff) called the base question straightforward and said
+"the real signal was in the follow-ups" (<Cite id="s-4e04a1689c" />).
+
+## Clarify first
+
+Say your assumptions out loud:
+
+- **What is a duplicate?** "Identical bytes, not the same name."
+- **Follow symlinks?** "No. A symlink loop would otherwise hang the walk."
+- **Hard links?** "Two hard links to one file are one file, not duplicates."
+- **How many files, how big?** "Assume many, and some large, so I won't read every file in full."
+- **Output?** "Groups of paths, each group of size two or more."
+
+## Answer
+
+### Words you need first
+
+- **`stat`**: the system call that returns a file's metadata (size, owner, times, identity) without reading
+  its contents. It is cheap.
+- **Hash**: a short fingerprint of a file's bytes. **SHA-256** is the usual choice; two different files
+  practically never share one.
+- **Symlink** (symbolic link): a small file that points at another path. Following one can lead back to a
+  parent directory and loop forever.
+- **Hard link**: a second name for the same file on disk. Both names share one **inode**, the file's
+  identity number. A pair `(st_dev, st_ino)` (device and inode) identifies a file uniquely.
+
+### Narrow cheaply, read late
+
+The idea is a funnel. Each step is more expensive than the last, and each removes most of the remaining
+candidates:
+
+```
+Walk the tree (os.scandir) ── skip symlinks and unreadable directories; stat each file
+   │
+   ▼
+Drop repeat inodes ── a hard link is not a copy
+   │
+   ▼
+Group by size ── free: no file contents read; unique sizes leave here
+   │
+   ▼
+Hash the first 4 KiB ── one small read per remaining file
+   │
+   ▼
+Hash the whole file ── SHA-256 in 1 MiB blocks, only for files that still match
+   │
+   ▼
+Groups of two or more identical files
+```
+
+**The walk** uses `os.scandir`, which returns `stat` information cheaply. It skips symlinks and directories it
+can't open.
+
+**Dropping repeat inodes** keeps a set of `(st_dev, st_ino)`. A file whose pair was already seen is a hard
+link to a file you already have.
+
+**Grouping by size** is the big win. Two files of different sizes can't be identical, and this step reads no
+contents at all.
+
+**The partial hash** reads only 4 KiB of each file that shares a size with another.
+
+**The full hash** reads in 1 MiB blocks, never with one `read()` of the whole file, so a 50 GB file doesn't
+need 50 GB of memory.
+
+Catch `OSError` per file. A file deleted or made unreadable during the scan is skipped, not fatal. Say it like
+this: "Most files leave at the size step, so I only read in full the files that are probably duplicates."
+
+### The test is half the answer
+
+Create everything under pytest's `tmp_path`, a fresh temporary directory for each test. Each fixture is there
+to break one specific wrong design:
+
+| Fixture | What it catches |
+|---|---|
+| Two identical files in different directories | The basic case |
+| Same size, same first 4 KiB, different last byte | A design that stops at the partial hash |
+| A same-size random file | Grouping by size alone |
+| Two empty files | The zero-length edge case |
+| A hard link | Reporting one file as two |
+| A symlink, and a symlink loop to the root | Following links, and hanging |
+| A file with mode 000 (unreadable) | Crashing on a permission error |
+
+Assert exactly two groups.
+
+Run on 2026-10-12, the first version of this test failed, and the bug was in the test. It expected `a.bin`,
+but the finder reported `a_hardlink.bin`, because which hard-link name is seen first depends on directory
+order. Comparing groups by inode fixed it, and the test then passed five runs out of five. Saying that kind of
+thing out loud is what the follow-ups probe. Say it like this: "My test assumed an order the filesystem
+doesn't promise, so I compare by inode instead of by name."
+
+### Scale follow-ups
+
+- **Millions of files.** Stream the walk instead of building a list of every path up front, and keep only
+  the size map in memory.
+- **Large files.** The partial hash saves most of the reads.
+- **Parallelism.** Hashing is disk-bound: the time goes to reading, not computing. A small thread pool over
+  the full-hash step can help on an SSD and hurt on a single spinning disk, whose head must jump between
+  files. Measure before you parallelize.
+- **Files changing during the scan.** Re-`stat` before reporting, and drop any file whose size or modified
+  time changed.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Duplicate files"
+  senior={["Size, then partial hash, then full hash; handles symlinks, hard links and unreadable files; a test that creates every edge case."]}
+  staff={["Explains the cost model (stat vs partial vs full reads), when parallel hashing helps or hurts on the device, and how to make the scan restartable on a huge tree."]}
+/>
+
+In plain words: a Senior answer gets the funnel and the edge cases right. A Staff answer also explains what
+each step costs on the actual disk, and how a scan of a huge tree survives a restart.
+
+## Small-team version
+
+The same pattern removes duplicate documents before you **embed** them (turn each piece of text into a list
+of numbers used for search). Without it you pay to embed the same text twice, and search returns the same
+passage five times. The actions:
+
+- **Hash the normalized content** (after stripping whitespace and boilerplate), and key each stored
+  embedding by that hash.
+- **Skip known hashes on re-ingest**, so a nightly re-run only embeds what changed.
+- **Leave near-duplicates for later.** Exact-hash dedup is cheap. Finding *similar* documents (MinHash or
+  embedding similarity) is a separate decision, worth making only when search quality shows duplicates
+  crowding the results.
+
+The saving is mostly quality and time, not money. Embedding 1M chunks of 500 tokens (a **token** is roughly ¾
+of a word) costs about **$10** at $0.02 per million tokens (OpenAI text-embedding-3-small, fetched
+2026-10-11). Embedding them locally at the embedding-pipeline lab's measured 112 chunk-length texts a second
+on one CPU process takes about **2.5 hours**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Cost:** 1,000,000 chunks × 500 tokens = 500 million tokens; 500 × $0.02 = **$10**.
+- **Time:** 1,000,000 ÷ 112 per second ≈ 8,900 s ≈ **2.5 hours**.
+
+</details>
+
+## Pitfalls
+
+- **Hashing every file in full before grouping by size.** It reads the whole tree when a free size check
+  would rule out most files.
+- **Following symlinks.** A link back to a parent directory turns the walk into an infinite loop.
+- **Reporting hard links as duplicates.** They are one file with two names; deleting "the copy" deletes
+  nothing.
+- **A happy-path-only test.** Without the same-prefix, different-last-byte fixture, a design that trusts the
+  partial hash passes.
+
+## Go deeper
+
+- Family walkthrough: [Concurrent I/O workers](/system-design-labs/interviews/walkthroughs/concurrent-io-workers/), "The same shape, four more times".
+- Content hashing as an ingestion key: <LabRef lab="embedding-pipeline" inline />.

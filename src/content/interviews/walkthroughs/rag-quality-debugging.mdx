@@ -1,0 +1,811 @@
+---
+title: "Measure retrieval and debug confident wrong answers"
+summary: "Find the stage that produced a confident wrong answer: trace it, sort failures by stage, give retrieval a number on a labeled query set, check answers against their sources, and prove each fix. High-risk answers add abstention and review."
+track: ai-engineer
+format: deep-dive
+family: rag-quality-debugging
+smallTeamFocus: "Turn on traces, triage 40 flagged answers into stages, label 50–200 queries, and gate fixes on a paired metric. Buy tracing and a judge model; build the labeled set yourself; skip metric dashboards you haven't calibrated."
+rounds: [domain-deep-dive]
+level: both
+timeboxMin: 45
+order: 239
+status: published
+basedOn: [eng-009, eng-016, eng-041, eng-045]
+askedAt: [anthropic, applied-ai-generic, mistral, openai]
+labs:
+  - { lab: rag, role: proof, note: "Dense, hybrid and reranked retrieval measured with paired intervals on two BEIR datasets, including a tokenizer bug that made one stage look useless." }
+  - { lab: llm-eval, role: proof, note: "Bootstrap intervals, a paired test and a measured power curve: how big a fix has to be before your query set can see it." }
+  - { lab: embedding-pipeline, role: proof, note: "Model versioning with a neighbour-overlap check, for the 'we swapped the embedding model and answers got worse' case." }
+  - { lab: vector-index, role: proof, note: "Approximate indexes trade recall for speed, a silent retrieval failure you measure against flat search. Its benchmark rows are estimates." }
+  - { lab: search-engine, role: background, note: "BM25 over an inverted index, the lexical half of a hybrid retriever." }
+gapLabs: [llm-judge-evals]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "A bot that answers from our documents can go wrong in five different places, and the fix depends on which
+> one. First I'd make sure every answer is traced, so I can see what search returned and what the model was
+> given. Then I'd sort the bad answers by the first stage that failed: the answer wasn't in our documents,
+> search didn't find it, search found it but ranked it too low, the model had it and ignored it, or the model
+> faithfully repeated an outdated document. I'd label a small set of real questions so search quality becomes
+> a number, and I'd only call a fix real if that number moves on the same questions. For high-risk answers I
+> wouldn't trust the prompt: the bot may say 'I don't know', it shows its sources, and the riskiest questions go
+> to a human."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+### Why this is not a normal bug hunt
+
+When a normal backend service returns a wrong result, you have a lot to work with. The same input gives the
+same wrong output. A test fails, or a stack trace points at a line. You reproduce it, bisect, fix the line, and
+the bug is gone for every user.
+
+A chatbot built on a large language model (LLM) breaks almost every one of those habits:
+
+1. **There is no error.** The wrong answer comes back with status 200, in fluent, confident sentences. Nothing
+   in the logs says "failed". You only know it is wrong because a person checked it against the truth.
+2. **Quality is a rate, not a yes or no.** The bot is right on most questions and wrong on some. A change that
+   fixes the one reported question can quietly break five others. So you measure a percentage over a set of
+   questions, and you compare percentages.
+3. **Several stages can fail, and they all look the same from outside.** A wrong answer can come from missing
+   documents, from bad search, or from the model misreading good search results. The text of the answer does
+   not tell you which.
+
+If you explain those three points and then show a method that turns each one into something you can measure,
+you have the core of this round.
+
+### Words you need first
+
+- An **LLM** reads text and writes text. It knows only what it saw in training, which is old and general. It
+  does not know your company's refund policy.
+- **RAG** (retrieval-augmented generation) fixes that. Before the model answers, the system searches your own
+  documents, pastes the best passages into the prompt, and tells the model to answer from them. Finding the
+  passages is called **retrieval**. Writing the answer is called **generation**.
+- Documents are split into passages of a few hundred words before they are searched. Each passage is a
+  **chunk**. Search returns chunks, not whole documents.
+- The search returns its best-scoring chunks in order. The best k of them are the **top k**, and "k" is how
+  many chunks you send to the model.
+- Models count text in **tokens**, pieces of roughly ¾ of a word. Context limits, speed and prices are all in
+  tokens.
+
+### The question as it is asked
+
+A RAG chatbot gives answers that sound certain and are wrong, some of them where a wrong answer is costly. You
+are asked how you would find out why, how you would measure whether retrieval is fetching the right context,
+what the standard retrieval metrics (recall@k, MRR and nDCG, defined below) measure and when to use each, and
+how you would reduce the damage in a high-risk setting.
+
+Four reported questions make up this family. All four are low-confidence reports, so treat them as the shape
+of the round rather than exact wording:
+
+- **OpenAI forward-deployed engineer.** A prep guide lists "How do you measure whether a retrieval system is
+  fetching the right context?" under the technical deep dive (<Cite id="s-26f0cae3fe" />, reviewed July 2026).
+  The guide cites a candidate account for the loop's shape, but not for this question.
+- **Mistral.** A machine-learning-engineer prep page lists debugging a RAG chatbot that gives confident wrong
+  answers. The page refused every fetch on 2026-10-11 and 2026-10-12 (HTTP 429), so we know it only through a
+  research repository (<Cite id="s-7552ed2bee" />).
+- **Applied-AI loops.** A prep guide says retrieval is scored with recall@k and precision@k, "and ranking quality
+  with MRR or NDCG when the order of results matters" (<Cite id="s-7d03a572e0" />). It names the metrics; it does
+  not report a candidate being asked to define them.
+- **Anthropic.** An aggregator tags this to Anthropic (ML engineer): "A deployed conversational model gives
+  confident but factually wrong answers in high-risk contexts", followed by how you would investigate and
+  mitigate it (<Cite id="s-d7a8e88bf0" />).
+
+<QuestionRow id="eng-009" />
+<QuestionRow id="eng-016" />
+<QuestionRow id="eng-041" />
+<QuestionRow id="eng-045" />
+
+The canonical answer, in one line: separate retrieval failures from generation failures; build a labeled set of
+questions; measure retrieval with the metric that fits how the results are used; check whether answers stick to
+what was retrieved; fix the stage that is failing; and show that the number moved.
+
+## What is being tested
+
+**A method instead of a guess.** The weak answer is "I'd improve the prompt". The strong answer finds the failing
+stage first, from logs and labeled examples, and then fixes that stage. Say: "Before I change anything, I want to
+know which stage is failing, and how often."
+
+**A number for retrieval.** The OpenAI prep guide puts it as "The reliable differentiator is a concrete answer to
+how you know the system works" (<Cite id="s-26f0cae3fe" />). The applied-AI guide is blunter: "If you can't name
+what 'good retrieval' means as a number, the interviewer assumes you tuned yours by feel"
+(<Cite id="s-7d03a572e0" />). It calls evaluation "the widest skill gap in the field".
+
+**Picking the right metric.** Several retrieval metrics exist, and they answer different questions. The
+interviewer wants to hear which one matches the way your model actually uses the search results.
+
+**Knowing that "faithful" is not the same as "correct".** An answer is **faithful** when every claim in it is
+supported by the chunks the model was given. It can be faithful and still wrong, if the chunk itself is out of
+date. The applied-AI guide notes that retrieval over a stale index "will hand back confident, wrong answers".
+
+**Judgment about automatic grading.** A common way to check answers at scale is to ask a second model to grade
+them. That second model is called an **LLM judge**. If you propose one, expect "how do you know it's any good?"
+The guide's own answer to whether you'd trust it before testing it against humans: "The right answer is no."
+
+**Mitigation that doesn't depend on the model behaving** (the Anthropic variant). In a high-risk setting you
+need protections that still work when the model is wrong: letting it decline, showing sources, limiting what it
+may answer, and human review.
+
+A DEV playbook asks the most common follow-up this way: why does a RAG that "returns good documents" still make
+things up? Its answer is "The generation step, not retrieval" (<Cite id="s-3e400c7e21" />). Being able to show
+which of the two it is, with evidence, is the round.
+
+## Clarify and scope
+
+Spend a minute on questions. Each one changes what you do next.
+
+- **What does "wrong" mean here?** Ask: "Does the answer contradict our documents, say something that isn't in
+  them at all, repeat something outdated, or come from the wrong document, like another product or region?"
+- **How was it found, and how often?** One escalated ticket, a pattern of thumbs-down feedback, or an audit?
+  "Without a rate I can't tell later whether a fix helped."
+- **What is logged?** You want a **trace** for each request: a log record of every step, like a distributed
+  trace across your services. Per request it should hold the question (and any rewritten version), the IDs of
+  the chunks retrieved with their scores and ranks, the exact prompt sent, the answer and its citations, and the
+  model and index versions. Say: "If none of this is logged, step one is to log it."
+- **Is there a labeled set?** That is, a list of questions where someone has marked which documents answer
+  each one. *Assume not.*
+- **What is the risk?** Who acts on the answer: a customer deciding about a refund, a clinician, an automated
+  agent calling a tool? This decides how often you will accept "I don't know".
+- **Must the bot answer everything?** "If saying 'I don't know' and handing off to a person is allowed, many
+  failures become cheap."
+
+Then write your assumptions down where the interviewer can see them: no labeled set yet, traces available for
+the last two weeks, a mix of fact lookups and policy questions, and a stated tolerance for declining on
+high-risk questions.
+
+## Core concepts
+
+### The system, drawn
+
+Draw the pipeline first. Every failure you discuss later sits in one of these boxes.
+
+```
+ OFFLINE (runs when documents change)
+ Documents ──► Chunker ──► Embedder ──► Index (vectors + keyword index)
+
+ ONLINE (runs for every question)
+ User question
+    │
+    ▼
+ Query rewrite (optional) ── turns a chatty question into a search query
+    │
+    ▼
+ Retriever ── vector search + keyword search over the index → top 50 candidates
+    │
+    ▼
+ Reranker ── rescores the 50 candidates, keeps the top k (say 5)
+    │
+    ▼
+ Prompt builder ── instructions + k chunks + the question
+    │
+    ▼
+ LLM ── writes the answer, citing chunk IDs
+    │
+    ▼
+ Answer to the user          (every box writes into the trace)
+```
+
+**Chunker.** Splits each document into chunks. A chunk that cuts a sentence or a table in half can lose the
+fact a question needs.
+
+**Embedder.** A small model that turns a piece of text into a list of numbers, called an **embedding** or a
+vector, so that texts with similar meaning get nearby vectors. Each embedder reads only a fixed number of tokens,
+its **window**. The common all-MiniLM-L6-v2 embedder reads 256 word pieces. Any text past the window is dropped
+without an error, so the end of a long chunk is never searchable.
+
+**Index.** Stores every chunk's vector, plus a keyword index of the same chunks.
+
+**Retriever.** Finds candidates in two ways. **Vector search** (also called dense retrieval) embeds the question
+and returns the chunks with the nearest vectors; it is good at paraphrases. **Keyword search** with **BM25**, the
+classic scoring formula behind search engines, matches exact words; it is good at product names, error codes and
+IDs that vector search blurs. Doing both and merging the lists is called **hybrid search**.
+
+**Reranker.** A slower, more accurate model that reads the question and each candidate together and gives each
+pair a score. It reorders the 50 candidates and keeps the best k. It can only reorder what the retriever found.
+
+**Prompt builder and LLM.** The k chunks go into the prompt with instructions such as "answer only from these
+sources and cite them". The model then writes the answer.
+
+### Five failure stages, and the evidence for each
+
+Every confident wrong answer comes from one of five stages. You find the stage by opening the trace and looking
+for the first place where things went wrong.
+
+| Stage | What happened | Evidence in the trace | Typical fix |
+|---|---|---|---|
+| Coverage gap | The answer isn't in the documents at all | No document contains it, even when you search by hand | Decline; add the content; add "can't answer" questions to the test set |
+| Retrieval miss | The right chunk exists but isn't among the candidates | Not in the top 50 | Chunking, the embedder's window, hybrid search, query rewriting |
+| Ranking miss | It is a candidate but isn't in the top k sent to the model | Rank 6–50 | Reranker, a larger k, merging rankings |
+| Generation failure | The right chunk was in the prompt and the answer ignores or contradicts it | The supporting text is in the prompt | Prompt rules, required citations, fewer distracting chunks, chunk order, a stronger model |
+| Stale or wrong source | The answer faithfully follows a document that is outdated or out of scope | The cited chunk says what the answer says | Re-index, remove old versions, date and scope labels, filters |
+
+"Confident" is not a sixth stage. It is a property of all of them. A language model writes fluent text that
+sounds certain whatever its evidence, so the tone of an answer tells you nothing about whether it is right. Say
+it plainly: "Confidence in the wording carries no information. That's why the high-risk fix is structural, not
+'tell the model to be careful'."
+
+### The labeled query set
+
+You cannot put a number on retrieval without knowing, for each question, which chunks or documents are the
+right ones. A list of questions with those answers marked is a **labeled query set** (people also call it an
+eval set or a golden set). It plays the role your test suite plays for code.
+
+- **Where questions come from.** Real user questions sampled from the logs, every reported bad answer, and a
+  handful written by hand to cover product codes, paraphrases and multi-part questions. Include questions your
+  documents cannot answer, and label them "should decline".
+- **What a label is.** The IDs of the relevant documents or chunks, graded if you can: 2 means "answers it", 1
+  means "partly". If chunk IDs change every time you re-chunk, label whole documents instead, and turn the chunk
+  ranking into a document ranking before scoring.
+- **Who labels.** Someone who knows the domain. Hamel Husain's evals FAQ recommends starting with error
+  analysis on 20–50 real outputs with one domain expert deciding quality
+  ([evals FAQ, modified 2026-09-21](https://hamel.dev/blog/posts/evals-faq/)).
+- **How many.** Enough that the number is precise enough to see the change you care about.
+
+That last point needs a moment. Any rate measured on a sample has an uncertainty, written as a 95% **interval**:
+the range the true value very likely sits in. With few questions the range is wide. At a measured rate of 80%,
+**20 questions give about ±17.5 points** (so the truth could be anywhere from about 63% to 97%), and **200
+questions give about ±5.5 points**.
+
+There is a cheaper way to get precision. When you compare two versions of the pipeline, run both on the *same*
+questions and look at the difference question by question. This is a **paired comparison**. Most questions get
+the same result under both versions, so only the questions where they disagree add noise. With 300 questions, a
+2-point drop measured this way has an interval of about **±3.2 points**, against about **±5.7 points** when the
+two versions are measured on separate samples. Say: "I compare versions on the same questions. That roughly
+halves the noise for free."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="95% interval for a rate measured on n queries"
+  expr="± 1.96 × √( p × (1 − p) ÷ n )"
+  vars={[
+    { sym: 'p', meaning: 'the measured rate, e.g. the share of questions where a right chunk was found' },
+    { sym: 'n', meaning: 'number of labeled queries' },
+  ]}
+  example={["p = 0.8, n = 20: ±17.5 points", "p = 0.8, n = 200: ±5.5 points"]}
+/>
+
+- **Paired difference:** the standard error is about √((d − Δ²) ÷ n), where d is the share of questions on which
+  the two versions disagree and Δ is the true difference. With n = 300, d = 0.08 and Δ = −0.02:
+  √((0.08 − 0.0004) ÷ 300) ≈ 0.0163, and 1.96 × 0.0163 ≈ **±3.2 points**.
+- **Unpaired, for comparison:** two separate measurements at p = 0.85 and n = 300 each give
+  1.96 × √(2 × 0.85 × 0.15 ÷ 300) ≈ **±5.7 points** on the difference.
+
+</details>
+
+One warning about shortcuts. You can ask an LLM to write a question for each chunk, which gives you **synthetic
+questions** for free. They are a fine supplement, but they reuse the chunk's own wording, so both keyword and
+vector search look better on them than on real users.
+
+### Retrieval metrics, and when each one fits
+
+Now you can define the metrics. Each one scores a single question's ranked list of results, and then you
+average over all the questions in the set. Use one running example.
+
+**The example question** (invented for illustration): a customer of a software company asks the support bot,
+*"Can I get a refund on the annual plan 45 days after I paid?"* Two chunks in the index are relevant:
+
+- **A**, the current refund policy: "Annual plans can be refunded within 30 days of payment." It fully answers
+  the question, so its grade is 2.
+- **B**, a billing FAQ entry that mentions the 30-day window in passing. Grade 1.
+
+The retriever returns this ranking: **C, A, D, B, E**. C is the *2024* refund policy, which said 60 days; it is
+outdated, so it is not labeled relevant. D and E are unrelated chunks. The pipeline sends the top 3 to the model.
+
+Here are the metrics, each in plain words, with its value for this question:
+
+- **hit@k**: did *any* relevant chunk appear in the top k? Yes or no. A is at rank 2, so **hit@3 = 1**. Averaged
+  over questions it is called the hit rate (or success@k). Many pieces of code labelled "recall" actually
+  compute this.
+- **recall@k**: what *share* of all the relevant chunks appeared in the top k? Formally |R ∩ top k| ÷ |R|, where
+  R is the set of relevant chunks. Only A of \{A, B\} is in the top 3, so **recall@3 = 0.5**. Both are in the top
+  5, so recall@5 = 1.0.
+- **precision@k**: what share of the top k is relevant? Formally |R ∩ top k| ÷ k. In the top 5, two of five are
+  relevant: **precision@5 = 0.4**. Low precision means you are paying tokens to send the model noise.
+- **MRR** (mean reciprocal rank): take 1 ÷ the rank of the *first* relevant result, or 0 if none appears, and
+  average over questions. The first relevant result is A at rank 2, so this question scores **0.5**. MRR rewards
+  putting a right answer in slot 1 and ignores everything after it.
+- **nDCG@k** (normalized discounted cumulative gain): add up the grades of the results in the top k, counting
+  each one less the lower it sits, then divide by the best score any ordering could get. It is the only one of
+  these that uses grades and cares about the whole order. Here **nDCG@5 = 0.643**: decent, but marked down
+  because an irrelevant chunk took rank 1.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="nDCG@k"
+  expr="DCG@k = Σ_(i=1..k) gain_i ÷ log₂(i + 1);   nDCG@k = DCG@k ÷ DCG@k of the ideal ordering"
+  vars={[
+    { sym: 'gain_i', meaning: 'graded relevance of the item at rank i (0 if irrelevant); some libraries use 2^gain − 1 instead' },
+    { sym: 'log₂(i + 1)', meaning: 'position discount: rank 1 counts fully, rank 3 counts half' },
+  ]}
+  example="Ranking [C, A, D, B, E], gains A = 2, B = 1: DCG = 2/log₂3 + 1/log₂5 = 1.6925; ideal = 2/1 + 1/log₂3 = 2.6309; nDCG@5 = 0.643"
+/>
+
+The ideal ordering puts A first and B second. Say which gain you use: linear gains (as here) and
+exponential gains (2^gain − 1) give different numbers for the same ranking.
+
+</details>
+
+Which metric you report depends on how the results are used:
+
+| Situation | Metric | Why |
+|---|---|---|
+| The model reads all k chunks and the answer needs several of them | **recall@k** at the k you actually send | Whether the pieces are there matters more than their order inside the prompt |
+| A single passage answers the question | **hit@k** | Finding any one is success; this is what most "recall" code computes |
+| One right result, and the first slot is what the user or a tool sees | **MRR** | Rewards rank 1, ignores everything after the first hit |
+| Graded relevance and order both matter: a results page, product search, judging a reranker | **nDCG@k** | Credits better items higher; BEIR, the standard public search benchmark, uses nDCG@10 as its headline ([Thakur et al., 2021](https://arxiv.org/abs/2104.08663)) |
+| Context is expensive or distracting chunks hurt | **precision@k** | Tells you what a bigger k costs |
+
+For the refund question, the honest number is **recall@3 = 0.5**, because the pipeline sends three chunks.
+Saying "hit@5 is perfect" would hide the fact that the model never saw B.
+
+Two more habits separate a strong answer.
+
+**Measure at two depths.** Measure recall at the **candidate depth** (say the top 50, before the reranker) as
+well as at the final k. The reranker can only reorder what retrieval found, so recall at 50 is the ceiling on
+what reranking can fix. In the rag lab (this site's hands-on retrieval lab, covered in example 4), reranking raised hit@3 but left hit@20 unchanged. Anthropic's
+contextual-retrieval post reports its results as "1 minus recall@20", the share of queries whose relevant chunks
+are missing from the top 20 ([Anthropic, 2024-09-19](https://www.anthropic.com/news/contextual-retrieval)).
+
+**Order still matters a little inside the prompt.** Liu et al. found that "performance is often highest when
+relevant information occurs at the beginning or end of the input context"
+([Lost in the Middle, 2023](https://arxiv.org/abs/2307.03172)). And the applied-AI guide warns that past a point a
+bigger k feeds the model "more distractors than signal" (<Cite id="s-7d03a572e0" />).
+
+### Faithfulness, correctness and the judge
+
+Retrieval metrics tell you whether the right chunks reached the model. They say nothing about what the model
+did with them. For that you need two different checks.
+
+- **Faithfulness** (also called groundedness) asks: is every claim in the answer supported by the chunks the
+  model was given? It needs no reference answer, which is why the Ragas evaluation framework proposes such
+  metrics "without having to rely on ground truth human annotations"
+  ([Es et al., 2023](https://arxiv.org/abs/2309.15217)).
+- **Correctness** asks: does the answer match the true answer? That needs a labeled reference answer.
+
+When the two disagree, they tell you something. **Faithful but wrong** means the source was stale or the wrong
+one. **Unfaithful but right** means the model answered from its own training data, and it will fail on the
+next question it doesn't happen to know.
+
+Check the cheap things first, with plain code: every sentence has a citation, every citation points at a chunk
+that was actually in the prompt, and every number and name quoted in the answer appears in the cited chunk (a
+string match). Only then use an LLM judge for what is left. Give it one claim at a time and ask for a yes/no
+verdict, because yes/no verdicts are easier to check than scores out of ten.
+
+Before you report the judge's numbers, check it against people. Label 30 answers yourself and measure how often
+the judge agrees with you. Raw agreement is misleading, because a judge that always says "supported" agrees
+with you whenever the answer happens to be supported. So use **Cohen's kappa**, which measures agreement beyond
+what chance would give: 1 is perfect, 0 is no better than guessing. In the example worked in the box below, **26 of 30 agreeing gives κ = 0.68**, while a judge that always says "supported" can agree 70% of the time and still score **κ = 0**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Kappa:** κ = (p_o − p_e) ÷ (1 − p_e). Observed agreement p_o = 26 ÷ 30 = 0.867. If both you and the judge say
+  "supported" 70% of the time, chance agreement is p_e = 0.7 × 0.7 + 0.3 × 0.3 = 0.58. So
+  κ = (0.867 − 0.58) ÷ (1 − 0.58) = **0.68**.
+- **Correcting the judge's rate:** if you know the judge's true-positive rate (TPR, how often it catches a real
+  failure) and true-negative rate (TNR, how often it passes a good answer), you can correct its measured failure
+  rate: f_true ≈ (f_judge + TNR − 1) ÷ (TPR + TNR − 1). A judge that flags 12% of answers, with TPR 0.85 and
+  TNR 0.95, implies (0.12 + 0.95 − 1) ÷ (0.85 + 0.95 − 1) = 0.07 ÷ 0.8 ≈ **8.75%** (the correction is from the
+  evals FAQ above).
+
+</details>
+
+## Worked examples
+
+### 1. Follow one wrong answer through its trace
+
+Take the refund question from above. The bot replied: *"Yes. Annual plans can be refunded within 60 days of
+payment, so you are still eligible."* The customer asked for a refund, and support had to refuse it. Here is how
+you would read the trace, step by step (the case is invented for illustration):
+
+| Step | What the trace shows | What it tells you | What to say in the interview |
+|---|---|---|---|
+| 1. Is the answer in our documents? | Chunk A (current policy, 30 days) exists | Not a coverage gap | "First I check the truth exists in the corpus. It does." |
+| 2. Was it a candidate? | A is at rank 2 of 50 | Not a retrieval miss | "Search found it." |
+| 3. Did it reach the model? | Top 3 sent: C, A, D | Not a ranking miss | "The right chunk was in the prompt." |
+| 4. Did the answer follow the prompt's evidence? | The answer quotes C's "60 days" and cites C | Faithful, but to the wrong chunk | "A faithfulness check would pass this answer. That's the trap." |
+| 5. What is C? | The 2024 policy, never removed from the index | **Stale source** | "Two versions of the policy are both searchable, and the model picked the old one." |
+
+The first failing stage is the index, not the model. The fix is to remove or down-rank superseded documents
+and attach dates to chunks, so the old policy cannot be retrieved for current questions. A reranker would not
+have helped: C is a perfectly relevant-looking chunk. A stricter prompt might have helped by luck, but the same
+conflict would come back with the next policy change.
+
+Say: "This is a data problem that looks like a model problem. The model did exactly what we asked: it answered
+from the context. The context was wrong."
+
+### 2. Three queries, every metric by hand
+
+One question is not a measurement. Here is the refund question (q1) plus two more, with each metric averaged
+over the three:
+
+| Query | Relevant (grade) | Ranking | hit@5 | recall@5 | recall@3 | RR | nDCG@5 |
+|---|---|---|---|---|---|---|---|
+| q1 | A (2), B (1) | C, A, D, B, E | 1 | 1.0 | 0.5 | 0.5 | 0.643 |
+| q2 | F (1) | G, H, I, J, K | 0 | 0 | 0 | 0 | 0 |
+| q3 | L (1) | L, M, N, O, P | 1 | 1.0 | 1.0 | 1.0 | 1.0 |
+| Mean | | | 0.667 | 0.667 | 0.5 | **MRR 0.5** | 0.548 |
+
+(RR is the reciprocal rank of one query; its mean is MRR.)
+
+q1 shows why the metrics disagree. hit@5 and recall@5 are perfect. recall@3 is half. MRR is pulled down because
+rank 1 was wrong. nDCG@5 lands in between, crediting A more than B. If your pipeline sends the top 3 chunks to the
+model, recall@3 is the honest number for q1. These values are the ones the tests in the
+[coding walkthrough](/system-design-labs/interviews/walkthroughs/rag-in-code/) assert.
+
+### 3. Triage a pile of bad answers
+
+Now scale up from one case to a pile. This is the debugging procedure; the counts are invented to show the
+arithmetic.
+
+Suppose 40 answers were flagged in two weeks. For each one, open the trace and assign the first failing stage,
+exactly as in example 1. Say the result is:
+
+| Stage | Count |
+|---|---|
+| Coverage gap | 6 |
+| Retrieval miss (not in the top 50) | 9 |
+| Ranking miss (in the top 50, not the top 5) | 8 |
+| Generation failure (supporting text was in the prompt) | 12 |
+| Stale source | 3 |
+| Ambiguous question | 2 |
+
+Retrieval and ranking together are 17 of the 40; generation is 12. Now the plan writes itself:
+
+1. Add the 40 questions to the labeled set, with their relevant documents.
+2. For the 8 ranking misses: measure recall@50 against recall@5 on the whole set. A large gap is the case for
+   a reranker or for merging rankings.
+3. For the 9 retrieval misses: look for a shared cause. Product codes that vector search blurs (add BM25),
+   chunks longer than the embedder's window, or questions phrased unlike the documents (rewrite the query).
+4. For the 12 generation failures: run a faithfulness check before and after a prompt change, require
+   citations, and try sending fewer chunks.
+5. For the 6 coverage gaps: they should have been "I don't know". Add "should decline" questions to the set and
+   measure how often the bot declines.
+6. For the 3 stale sources: remove superseded versions and add dates, as in example 1.
+
+The point of counting is that a prompt change could fix at most 12 of the 40. "Improve the prompt", the default
+answer, addresses less than a third of this pile. Say: "A prompt change has a ceiling, and the triage tells me
+what it is."
+
+### 4. What the rag lab measured, and what it teaches
+
+The rag lab built three versions of retrieval: vector search alone ("dense"), hybrid search, and hybrid plus a
+reranker. It measured each on two public datasets from **BEIR**: SciFact (scientific claims) and NFCorpus
+(nutrition and medical questions). The metric was hit@3, compared paired on the same questions.
+
+Hit@3 on SciFact was <LabNumber lab="rag" metric="hit@3 on BEIR SciFact" /> for dense, hybrid and rerank; on
+NFCorpus <LabNumber lab="rag" metric="hit@3 on BEIR NFCorpus" />. With about 300 queries, gaps under about 4
+points are noise: on SciFact only reranking cleared its interval, and on NFCorpus no step did. Four debugging
+lessons come out of it:
+
+- **A stage that adds nothing may be broken.** Hybrid added nothing over dense. The cause was the BM25
+  **tokenizer**, the code that splits text into words: it split on spaces only, so "limit," and "limit" counted
+  as different words. With a `\w+` tokenizer (split on anything that isn't a letter or digit), hybrid reached
+  <LabNumber lab="rag" metric="BM25 tokenizer (SciFact)" />. Test each component alone before concluding a
+  technique doesn't work.
+- **Reranking only reorders.** Hit@20 did not move when the reranker was added; only the top of the list
+  improved. Recall at the candidate depth caps what reranking can fix.
+- **Truncation is silent.** Most of the lab's chunks were longer than MiniLM's 256-token window, so a large
+  share of the chunk text was never embedded (the counts are in the lab's benchmark file). No error was raised.
+  Count it.
+- **Conclusions depend on the baseline.** A run of the coding walkthrough's code on 2026-10-12, with a `\w+`
+  tokenizer, found hybrid beat dense by +3.7 points of hit@5 (paired 95% interval +0.3 to +7.0), while a
+  reranker on top added nothing measurable. The lab found the opposite order of usefulness because its BM25
+  was weaker.
+
+Say: "Before I conclude a technique doesn't help, I test the component on its own. In one lab, hybrid search
+looked useless because of a one-line tokenizer bug."
+
+### 5. Is the fix real?
+
+You changed the chunker, and hit@5 went from 0.78 to 0.81 on 200 questions. Is that an improvement?
+
+Not from those two numbers alone. Each measurement on 200 questions is uncertain by about ±5.5 points, so two
+separate numbers 3 points apart prove nothing. Instead, compute the difference question by question (the paired
+comparison from above) and put an interval on it, either by **bootstrapping** (resampling the questions many
+times and recomputing the difference) or with a standard paired test.
+
+Even paired, small gains are hard to see. The llm-eval lab measured how large a true difference has to be for a
+paired test to catch it 80% of the time with 500 questions:
+<LabNumber lab="llm-eval" metric="Smallest true gap with 80% power, paired test, n=500" /> (for two versions
+that disagree on 20% / 40% of questions, one-sided test). A 2-point improvement on a few hundred questions
+usually goes unseen.
+
+So you have two honest options: collect more questions, or ship on direction and say so. Say: "With 200
+questions I can't see a 3-point gain. I'd either grow the set or ship it as 'probably not worse' and keep
+watching."
+
+## Common follow-ups in depth
+
+### "Retrieval returns the right documents but the answer is still wrong"
+
+That is a generation failure, and the playbook's answer is "The generation step, not retrieval"
+(<Cite id="s-3e400c7e21" />). First confirm it: the supporting sentence is in the prompt. Then check, in order:
+
+1. **Conflicting chunks**, such as two versions of a policy both retrieved (example 1 is this case).
+2. **The supporting chunk buried** among ten distracting ones.
+3. **A prompt that doesn't require citations** or doesn't permit "I don't know".
+4. **A model too weak** for the reasoning the question needs.
+
+Measure faithfulness before and after each change, on the same items.
+
+### "How do you measure this in production, without labels?"
+
+You can't compute recall without labels, so you watch signals that move with quality and you sample. Track the
+share of answers with valid citations, how often the bot declines, the thumbs-down and escalation rates, and the
+spread of the top retrieval scores (a drop often means new kinds of questions, or a broken index). Run the
+calibrated judge on a daily sample. Then read flagged traces every week and move each new failure into the
+labeled set.
+
+Ordinary health checks are not enough here. Anthropic's postmortem of three 2025 infrastructure bugs is a
+reminder that standard evals and canaries can miss quality regressions, which is why output quality needs its
+own monitoring ([Anthropic, 2025-09-17](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues)).
+
+### "This is a high-risk context. What changes?"
+
+This is the Anthropic variant (<Cite id="s-d7a8e88bf0" />). The cost of a confident wrong answer is now larger
+than the cost of not answering. A company also owns what its bot says: in Moffatt v. Air Canada (2024) a
+tribunal held the airline responsible for its chatbot's wrong advice on bereavement fares
+([Law360 Canada](https://www.law360.ca/ca/articles/1804075)). In April 2025, Cursor's AI support agent invented a
+login policy and a co-founder apologized publicly
+([Fortune](https://fortune.com/article/customer-support-ai-cursor-went-rogue)).
+
+Mitigations, from the most structural to the least:
+
+1. **Scope.** Classify each question's intent, and route the high-risk ones (dosage, legal advice, refunds over a
+   limit) to a human or a fixed, pre-approved answer.
+2. **Decline below a threshold.** If no retrieved chunk clears a relevance score, or the judge can't find
+   support for a claim, answer "I don't know" and hand off. Declining on purpose is called **abstention**.
+3. **Cite and quote.** Show the source passage next to the answer, so the user can check it.
+4. **Human review** for a sample, or for every answer in the highest-risk category, before it is sent.
+5. **Kill switch and logging**, for when a new failure shows up.
+
+Choose the abstention threshold with numbers, not by feel. Two numbers describe it. **Coverage** is the share
+of questions the bot answers. **Risk** is the share of its answers that are wrong. Raising the threshold lowers
+both. In a hypothetical set of 200 high-risk questions, one threshold might answer 90% of them with 6.7% wrong,
+and a stricter one 70% with 2.1% wrong.
+
+Say: "I'd show the product owner this curve and let them pick the point. Choosing how many customers get 'I
+don't know' is a product decision, not only an engineering one."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Selective answering: coverage and risk"
+  expr="coverage = answered ÷ total;   risk = wrong answers ÷ answered"
+  vars={[
+    { sym: 'answered', meaning: 'queries where the system did not abstain' },
+    { sym: 'wrong answers', meaning: 'answered queries judged incorrect or unsupported' },
+  ]}
+  example={["Hypothetical, 200 labeled high-risk queries. Threshold A answers 180 with 12 wrong: coverage 90%, risk 6.7%", "Threshold B answers 140 with 3 wrong: coverage 70%, risk 2.1%. The product owner picks the point on this curve, not the engineer alone"]}
+/>
+
+</details>
+
+### "How do you pick k and the chunk size?"
+
+Sweep them on the labeled set. For k, plot recall@k against the number of prompt tokens, and pick the smallest
+k where recall stops rising; precision falls as k grows, and every extra chunk costs tokens. For chunk size,
+stay inside the embedder's window and split on the document's structure (headings, paragraphs) rather than at a
+fixed length. The applied-AI guide calls fixed 512-token windows "the lazy default" because "they cut sentences
+in half" (<Cite id="s-7d03a572e0" />). Chunks are often made to overlap a little, so a sentence cut at one edge
+appears whole in the next. In the rag lab, 200 characters of overlap made no measurable difference, so don't
+spend time there before you've measured.
+
+### "You switched embedding models and answers got worse"
+
+Vectors from two embedding models live in different spaces. You cannot mix them, so a switch means re-embedding
+every chunk. Before switching, compare retrieval on the labeled set. The embedding-pipeline lab compared two
+closely related models, MiniLM-L6 and MiniLM-L12, and found that the 10 nearest neighbours of a query overlap by
+only <LabNumber lab="embedding-pipeline" metric="Neighbour overlap@10" />. About a third of each query's
+neighbours change, even between siblings. Say: "A new embedder is a new search engine. I'd re-run the labeled set
+before switching, not after."
+
+## Small-team version
+
+At a 50–500 person company the "the bot made this up" ticket lands on the one engineer who owns the AI feature,
+often with a screenshot and no trace. The goal is a repeatable way to find the failing stage, instead of editing
+the prompt and hoping.
+
+### Build
+
+- **Tracing from day one.** The question, the retrieved chunk IDs with scores and ranks, the prompt, the answer,
+  the citations and every version number. Without this, every ticket starts with trying to reproduce it.
+- **The labeled set.** 50 questions to start, 200 within a month, every flagged answer added with its relevant
+  documents, and a few "should decline" items. This is the asset that outlives every pipeline change.
+- **A small eval script.** hit@k and recall@k at the k you send, recall at candidate depth, MRR or nDCG where
+  order matters, a faithfulness rate from a calibrated yes/no judge, and a paired comparison against the last
+  release. Run it on every change to chunking, prompts or models.
+- **Abstention and citation checks.** They cost nothing to run and do the most for high-risk answers.
+
+### Buy or call as a service
+
+- **A tracing tool.** Open-source and self-hostable (Langfuse is one example) or a vendor. Pick one and move
+  on; what you log matters more than which tool stores it.
+- **The judge model**, from the provider you already use.
+
+### Skip
+
+- **A dashboard of generic metrics before you've read traces.** The evals FAQ's warning about generic metrics:
+  "Good scores on them don't mean your system works."
+- **A new vector database as the fix.** The failure is usually chunking, tokenization, ranking or the prompt,
+  and the triage tells you which.
+- **Fine-tuning the model**, until the labeled set shows retrieval and prompting have run out of room.
+
+### What it costs
+
+The model bill is tiny. Judging 200 answers once costs about **$0.19** on gpt-5-mini or **$1.30** on Claude
+Sonnet 5, so a daily run on Sonnet 5 is about **$39 a month** (list prices fetched 2026-10-11; check them again
+before relying on them).
+
+People's time is the real cost. Labeling 200 questions at an assumed 3 minutes each is about **10 hours of a
+domain expert**, and checking the judge takes another 30 labels. Budget that time explicitly, because it is the
+step that gets skipped.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Judge cost per eval run"
+  expr="cost = items × (input_tokens × p_in + output_tokens × p_out)"
+  vars={[
+    { sym: 'items', meaning: '200 labeled answers (assumed)' },
+    { sym: 'input_tokens', meaning: '2,500: retrieved context, answer and judge instructions (assumed)' },
+    { sym: 'output_tokens', meaning: '150 per verdict (assumed)' },
+  ]}
+  example={["gpt-5-mini at $0.25 / $2.00 per 1M: 200 × (0.000625 + 0.0003) = $0.19 per run", "Claude Sonnet 5 at $2 / $10 per 1M: 200 × (0.005 + 0.0015) = $1.30 per run, about $39 a month run daily"]}
+/>
+
+Labeling: 200 questions × 3 minutes (assumed) = 600 minutes = 10 hours.
+
+</details>
+
+### A realistic delivery plan
+
+1. **Days 1–2.** Turn on tracing if it's missing. Pull the flagged answers and reproduce three of them.
+2. **Week 1.** Triage 40 flagged answers into stages; label 50 questions, including those 40; compute the
+   baseline numbers.
+3. **Week 2.** Fix the largest bucket; show the paired difference; add abstention for high-risk intents.
+4. **Week 3.** Put the eval in CI as a gate; set up a weekly 30-minute review of 20 sampled traces.
+
+### What you verify yourself
+
+- The judge's agreement with your own labels.
+- That the metric code matches a hand-worked example, like the three-query table above.
+- That the labeled set wasn't generated from the same chunks being retrieved.
+- A sample of the declined questions, because declining everything also scores zero wrong answers.
+- That each fix moved the paired metric.
+
+### What small-company interviewers probe
+
+A recruiting vendor's playbook for startup AI-engineer interviews suggests scenario questions such as a chatbot
+giving outdated facts ([Dover, updated 2026-08-24](https://www.dover.com/blog/how-to-hire-ai-engineer-startups)).
+Expect "what do you do on day one with this ticket?", "how would you know it's fixed?" and "what does this cost
+us?"
+
+### Revisit when
+
+Volume makes weekly trace reading impossible (then sample, and run the judge online); the domain becomes
+regulated (human review and legal sign-off become requirements, not options); or a second team ships a RAG
+feature (share the eval harness and the labeling process, not just the code).
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Confident wrong answers"
+  senior={[
+    "Triages failures into retrieval, ranking, generation, coverage and staleness from traces, and fixes the largest bucket first.",
+    "Defines hit@k, recall@k, MRR and nDCG correctly, picks the one that matches how results are consumed, and reports it with a paired interval.",
+    "Calibrates the faithfulness judge against human labels before trusting it.",
+  ]}
+  staff={[
+    "Makes the labeled set and trace logging an owned product asset with a process for growing it from production failures.",
+    "Sets the abstention threshold with the product owner from a coverage-risk curve, and puts human review where the risk is highest.",
+    "Asks what metric would show the fix was wrong, and monitors output quality in production, not only error rates.",
+  ]}
+/>
+
+In plain words: a Senior candidate finds the failing stage and proves the fix with the right number. A Staff
+candidate also makes the measurement last: the labeled set keeps growing from real failures, the threshold for
+declining is a product decision with an owner, and someone would notice if quality slipped next month.
+
+<AINative title="Agents can triage a thousand traces; you calibrate them on thirty">
+An AI coding agent can read every flagged trace, assign a failure stage, draft the labeled questions and write
+the judge prompt in an afternoon. That changes the economics of this whole method: the bottleneck moves from
+reading to checking. Hand-label 30–50 of the same traces yourself and compute agreement before you trust the
+agent's buckets or its judge. Keep the labeled set out of the agent's reach when it is tuning the pipeline, so
+it can't fit the prompt to the test. And never let the same agent propose the fix and grade it: the paired metric
+on a held-out set is the arbiter.
+</AINative>
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="How do you measure whether retrieval is fetching the right context? (Prep guide, OpenAI FDE)">
+    A labeled set of questions with the relevant documents marked, then hit@k or recall@k at the k you send to
+    the model, recall at candidate depth before reranking, and MRR or nDCG where order matters, each with an
+    interval.
+  </FollowUp>
+  <FollowUp q="Your RAG returns good documents but still hallucinates. What's wrong? (DEV playbook)">
+    Generation. Confirm the supporting text was in the prompt, then look for conflicting chunks, distracting
+    chunks, a prompt that doesn't require citations or allow "I don't know", and the model's capability. Measure
+    faithfulness before and after.
+  </FollowUp>
+  <FollowUp q="When would you use MRR instead of recall@k? (Prep guide: metrics by use)">
+    When only the first relevant result matters, such as a search box or a tool that returns one item. When the
+    model reads all k chunks, recall@k is closer to what matters.
+  </FollowUp>
+  <FollowUp q="How do you know your LLM judge is reliable? (Prep guide, techinterview.org)">
+    Label 30 answers yourself and compute Cohen's kappa, not raw agreement, because a judge that always says
+    "supported" can agree often by chance. Re-check whenever the judge model or its prompt changes.
+  </FollowUp>
+  <FollowUp q="The wrong answers are in a high-risk context. What do you ship this week, before the root fix? (Reported topic, Anthropic)">
+    Route high-risk intents to a human or a fixed answer, raise the abstention threshold, show cited passages,
+    and add a kill switch. Then fix the stage the triage points to.
+  </FollowUp>
+  <FollowUp q="How many labeled queries do you need? (Not reported; a natural next push)">
+    Enough that the interval is smaller than the change you care about: 20 questions give about ±17.5 points at
+    a rate of 0.8, 200 give about ±5.5, and a paired comparison does much better than either.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Editing the prompt first.** In most triages a prompt change can fix only the generation bucket.
+- **No labeled set.** Then neither the problem nor the fix has a number.
+- **Mixing up hit@k and recall@k.** "Any relevant chunk found" and "share of relevant chunks found" are
+  different numbers, and reporting either at a k you don't send to the model misleads.
+- **One metric for everything.** The right metric depends on how the results are used.
+- **Treating faithfulness as correctness.** A faithful answer to a stale document is still wrong, as the refund
+  example shows.
+- **Trusting an uncalibrated judge.** The guide's answer to whether you should is "no".
+- **Declaring a fix from unpaired numbers on a small set.** A 3-point gain on 200 questions is inside the noise.
+- **"Tell the model to be careful" as the high-risk mitigation.** It depends on the model behaving; abstention,
+  scope limits and review do not.
+
+## Prove it with a lab
+
+<LabRef lab="rag" role="proof" note="Rebuild the three stages and reproduce the tokenizer finding: test each retriever alone before blaming the technique." />
+
+<LabRef lab="llm-eval" role="proof" note="Use paired_bootstrap_test on two retrieval configurations over the same queries, and read its power simulation before trusting a small gain." />
+
+The llm-eval lab's bootstrap is also slow enough to notice in a CI gate:
+<LabNumber lab="llm-eval" metric="paired_bootstrap_test" /> in the lab's loop.
+
+<LabRef lab="embedding-pipeline" role="proof" note="The neighbour-overlap check before swapping embedding models." />
+
+<LabRef lab="vector-index" role="proof" note="Measure an approximate index's recall against flat search; a recall drop there is a retrieval failure nobody sees in the answer text." />
+
+<LabRef lab="search-engine" role="background" note="BM25 and an inverted index, the lexical half of hybrid search." />
+
+The faithfulness judge has no lab yet (planned: `llm-judge-evals`).
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-26f0cae3fe" />
+- <Cite id="s-7552ed2bee" />
+- <Cite id="s-7d03a572e0" />
+- <Cite id="s-d7a8e88bf0" />
+- <Cite id="s-3e400c7e21" />
+- Thakur et al., "BEIR", 2021: [arxiv.org/abs/2104.08663](https://arxiv.org/abs/2104.08663)
+- Liu et al., "Lost in the Middle: How Language Models Use Long Contexts", 2023: [arxiv.org/abs/2307.03172](https://arxiv.org/abs/2307.03172)
+- Es et al., "Ragas: Automated Evaluation of Retrieval Augmented Generation", 2023: [arxiv.org/abs/2309.15217](https://arxiv.org/abs/2309.15217)
+- Anthropic, "Introducing Contextual Retrieval", 2024-09-19: [anthropic.com/news/contextual-retrieval](https://www.anthropic.com/news/contextual-retrieval)
+- Anthropic, "A postmortem of three recent issues", 2025-09-17: [anthropic.com/engineering](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues)
+- Hamel Husain and Shreya Shankar, evals FAQ, modified 2026-09-21: [hamel.dev/blog/posts/evals-faq](https://hamel.dev/blog/posts/evals-faq/)
+- Moffatt v. Air Canada, 2024-02-14, via Law360 Canada: [law360.ca](https://www.law360.ca/ca/articles/1804075)
+- Fortune on Cursor's support agent, April 2025: [fortune.com](https://fortune.com/article/customer-support-ai-cursor-went-rogue)
+- Dover blog post on hiring AI engineers at startups (vendor), updated 2026-08-24: [dover.com](https://www.dover.com/blog/how-to-hire-ai-engineer-startups)
+- OpenAI and Anthropic pricing pages, fetched 2026-10-11: [OpenAI](https://developers.openai.com/api/docs/pricing), [Anthropic](https://platform.claude.com/docs/en/about-claude/pricing)

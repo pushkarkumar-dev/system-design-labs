@@ -1,0 +1,161 @@
+---
+question: infra-069
+family: llm-from-scratch
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll write attention so it works for a real server, not just one clean example. That means three things.
+> The softmax subtracts each row's maximum first, so large scores can't overflow into nan. The causal mask is
+> lined up with the newest token, so it is still right when the model generates one token at a time against a
+> cache. And when a batch mixes prompts of different lengths, I combine the causal mask with a padding mask so
+> padding is never attended to, and I make sure a fully padded row doesn't produce nan. Then I test against
+> PyTorch's built-in attention."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer is looking for attention written with a serving system in mind. The maths is the same as in
+any attention question. What changes is the set of cases the code must survive.
+
+A backend comparison helps. A function that handles one request is easy. A function that handles a batch of
+requests of different sizes, some of them half-finished, needs care with the edges. Attention in a model
+server is the same: it runs on batches of prompts of different lengths, and it runs again for every new token
+the model writes. Each of those cases has its own way to go silently wrong, and floating-point overflow adds a
+third.
+
+(This row comes from a prep guide, not a candidate: techinterview.org's Together AI guide lists "Implement
+attention from scratch with appropriate batching considerations" as a typical problem and says interviewers
+"watch for scaled dot-product mechanics, causal masking, and numerical stability in the softmax"
+<Cite id="s-0457784328" />.) Treat it as a likely shape of the round, not a confirmed question.
+
+## Clarify first
+
+- **Ragged batches?** "Will prompts in one batch have different lengths? Then I need a padding mask too. I'll
+  assume yes."
+- **Prefill only, or decode too?** "Do I only process whole prompts, or also one new token at a time against
+  stored keys? That decides how the mask lines up."
+- **Number format.** "fp32 or fp16? In 16-bit floats, overflow comes much sooner, so the max subtraction
+  matters more."
+- **Library.** "NumPy for the softmax, and either for the rest? I'll assume NumPy."
+
+## Answer
+
+### Words you need first
+
+- **Attention**: each token scores itself and the earlier tokens (its **query** against their **keys**), a
+  **softmax** turns the scores into weights that add up to 1, and the output is the weighted mix of their
+  **values**.
+- **Causal mask**: hides later tokens, so a token sees only itself and the past.
+- **Padding**: filler tokens added to short prompts so a batch forms a rectangle. A **padding mask** hides them.
+- **Prefill and decode**: the model reads the whole prompt in one pass (**prefill**), then writes one token per
+  pass (**decode**). In decode, the past tokens' keys and values come from a **KV cache**.
+
+### Follow one batch through it
+
+Take a batch of two prompts. Prompt A has 4 tokens. Prompt B has 2 tokens, so it gets 2 padding tokens. This
+example left-pads (puts the padding first), which keeps both rows' next token at the same index:
+
+| Case | Query × key shape | Mask | What to say in the interview |
+|---|---|---|---|
+| Prefill, row A | 4 × 4 | lower triangle | "The usual causal triangle." |
+| Prefill, row B | 4 × 4 | lower triangle AND keys 3–4 only | "Padding keys are hidden in every row." |
+| Row B, padding query 1 | 1 × 4 | nothing allowed | "Every key is masked, so softmax gives nan. Skip or zero this row." |
+| Decode, either row | 1 × 5 | all real keys allowed | "One new query at the last position sees every earlier key." |
+
+### Stable softmax
+
+Subtract the row maximum before exponentiating. `exp(1000)` overflows to infinity, and infinity divided by
+infinity is nan. Subtracting the same number from every score leaves the softmax unchanged, so you pick the one
+that makes the biggest exponent zero. The guide calls this "the step people skip under pressure".
+
+```python
+def softmax(x, axis=-1):
+    m = np.max(x, axis=axis, keepdims=True)        # exp(1000) overflows; exp(0) doesn't
+    e = np.exp(x - m)
+    return e / np.sum(e, axis=axis, keepdims=True)
+
+def causal_mask(t_q, t_k):                         # True = may attend, aligned bottom-right
+    i, j = np.arange(t_q)[:, None], np.arange(t_k)[None, :]
+    return j <= i + (t_k - t_q)
+
+def attention(q, k, v, mask=None, pad=None):       # q (B,h,Tq,d), k/v (B,h,Tk,d), pad (B,Tk) True = real
+    scores = q @ np.swapaxes(k, -1, -2) / np.sqrt(q.shape[-1])
+    keep = causal_mask(q.shape[-2], k.shape[-2]) if mask is None else mask
+    if pad is not None:
+        keep = keep & pad[:, None, None, :]        # AND the padding mask with the causal mask
+    scores = np.where(keep, scores, -np.inf)
+    return softmax(scores) @ v
+```
+
+### Serving considerations to say aloud
+
+- **Mask alignment.** In a decode step there is one query and `T_k` cached keys. The mask must be aligned to
+  the bottom-right corner, so the new token sees every key. PyTorch's `is_causal=True` aligns non-square masks
+  to the top-left, which is wrong here (PyTorch 2.14 docs, read 2026-10-12). Say: "With one query, the correct
+  causal mask allows everything."
+- **Fully masked rows.** A padding query with every key masked gives nan. Skip those rows or zero their
+  output, or the nan spreads through the next layer.
+- **Padding side.** Left-padding for generation keeps every row's next token at the same index.
+- **Memory.** The `(T_q, T_k)` score matrix grows with the square of the length. Fused kernels such as
+  FlashAttention compute the same result in small tiles without storing it.
+
+### Test it
+
+Compare against `F.scaled_dot_product_attention` on square inputs. Then feed scores of 1,000 to show that the
+naive softmax returns nan and the stable one doesn't. Then check that row B's outputs don't change when you
+change the values in its padding positions.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Attention for serving"
+  senior={["Stable softmax, a correct causal mask and a padding mask, with tests."]}
+  staff={["Covers the decode-step mask alignment, nan rows, fp16 overflow and T² memory, and says which of these the fused kernel handles for you."]}
+/>
+
+## Small-team version
+
+If you host a model yourself, the serving engine's fused attention handles all of this. You still meet the
+ideas indirectly.
+
+**Latency.** The wait for the first word grows with the prompt, because the prompt is read before anything is
+written. After that, every output token costs one decode step. So `max_tokens`, the cap on output length, is
+your biggest latency lever.
+
+**Cost.** Behind an API, the provider can reuse the work for the start of your prompt (prompt caching), but only
+if that start is byte-for-byte identical, because attention only looks backward. On the family walkthrough's
+assumed workload (50,000 requests a day, a 2,000-token stable prefix in a 3,000-token prompt, 400 output
+tokens, Claude Sonnet 5 list prices), a working prefix cache takes the bill from **about $15,000 to about
+$9,600 per 30 days**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- No cache: 3,000 × $2/M + 400 × $10/M = $0.0100 per request; × 50,000 × 30 = $15,000.
+- Cached prefix: 1,000 × $2/M + 2,000 × $0.20/M + 400 × $10/M = $0.0064; × 50,000 × 30 = $9,600.
+
+</details>
+
+Default: a managed API; self-host only under the conditions in the walkthrough's small-team section.
+
+## Pitfalls
+
+- **Skipping the max subtraction.** Large scores overflow to nan, which is the exact thing the guide says
+  interviewers watch for.
+- **Subtracting the global max instead of the row max.** It works, but it hides that you know why the
+  subtraction is safe per row.
+- **Using `is_causal=True` for decode steps.** PyTorch aligns that mask top-left, so the new token sees only
+  the first key.
+- **Applying the padding mask inconsistently.** Hiding padding keys in some rows but not others lets filler
+  tokens leak into real outputs.
+- **Calling a prep guide's example a reported question.** It tells you a likely shape, not what a candidate
+  was asked.
+
+## Go deeper
+
+- Family walkthrough: [Stage 1: softmax and attention](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#stage-1-softmax-and-attention) and [Common mistakes](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#common-mistakes).
+- Lab: <LabRef lab="transformer" inline />.

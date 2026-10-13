@@ -1,0 +1,168 @@
+---
+question: r2b-005
+family: llm-from-scratch
+status: published
+labs: [llm-inference, transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Greedy decoding takes the single most likely token at each step. Beam search keeps the k best partial
+> sentences instead of one, extends each by every possible token, and keeps the k best of those. I'll score
+> everything in log-probabilities and add them, because multiplying hundreds of probabilities rounds to zero.
+> The sentence probability is the exponent of that sum. I'll prove it right with brute force on a tiny
+> vocabulary: a beam wide enough to keep everything must find the same answer as trying every sequence, and a
+> beam of width 1 must equal greedy."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants two search strategies over the model's next-token predictions, and a sentence
+probability that is actually correct.
+
+For a backend engineer, beam search is a bounded best-first search. Think of exploring paths through a graph
+where each step has thousands of branches. You can't explore them all, so you keep a fixed-size frontier of
+the best partial paths. What makes it tricky is the bookkeeping: each surviving candidate must remember which
+parent it came from, and the scores must be added in log space or they vanish. Bugs here still return a
+sentence. Only a test against exhaustive search tells you it's the right one.
+
+(The evidence is one question title, "Greedy and Top-k Beam Search Decoding That Returns the Sentence
+Probability", Microsoft, Sep 2026, with no body <Cite id="s-d302bba651" />.) "Top-k" here most likely means a
+beam width of k, not top-k sampling, so ask.
+
+## Clarify first
+
+- **Model interface.** "I'll assume a function `step(seqs)` that returns next-token log-probs, shape `(n, V)`."
+- **Meaning of top-k.** "Does 'top-k' mean beam width k? I'll assume yes."
+- **Stopping.** "Is there an end-of-sequence (EOS) token and a maximum length? I'll assume an optional EOS and
+  a cap."
+- **What to return.** "Probability or log-probability? Does it include EOS, and the prompt? I'll return a
+  probability that includes EOS and excludes the prompt."
+- **Length.** "Should I adjust for length? I'll assume no, and mention why you might."
+
+## Answer
+
+### Words you need first
+
+- **Token**: one small piece of text, as an integer id. The **vocabulary** has `V` of them.
+- **Next-token distribution**: for a given prefix, the model's probability for every possible next token.
+- **Log-probability (log-prob)**: the natural log of a probability. It is always 0 or negative. Probabilities
+  multiply along a sentence; log-probs add.
+- **Greedy decoding**: at each step, take the most likely token.
+- **Beam search**: keep the k best partial sentences (the **beams**) by total log-prob, and extend all of them
+  each step. k is the **beam width**.
+- **EOS**: the end-of-sequence token; a beam that emits it is finished.
+
+### Follow one search by hand
+
+Take a 3-token vocabulary (A, B and EOS) and beam width 2. The log-probs are made up for the example; each step's numbers are totals, the parent's score plus the new token's log-prob:
+
+| Step | Candidates (total log-prob) | Kept | What to say in the interview |
+|---|---|---|---|
+| 1 | A −0.4, B −1.3, EOS −2.9 | A, B | "Two beams survive." |
+| 2 | from A: AB −0.9, AA −1.5, A·EOS −3.2; from B: BA −1.9, BB −2.5, B·EOS −3.2 | AB, AA | "Six candidates, one table, keep the best two." |
+| 3 | from AB: AB·EOS −1.0, others below −3; from AA: AA·EOS −2.0, others lower | AB·EOS, AA·EOS | "Both finish and leave the alive set, so the search stops." |
+
+The best finished beam is "A B EOS" with log-prob −1.0, so its probability is e^−1.0 ≈ **0.37**. Greedy would also have taken
+A then B here. Beam search wins when the best first token leads to a worse sentence than the second-best
+one.
+
+### The code
+
+Greedy is beam search with width 1: pick the argmax at each step and add its log-prob.
+
+```python
+def beam_search(step, prompt, beam, max_len, eos=None, alpha=0.0):
+    alive, done = [(list(prompt), 0.0)], []
+    for _ in range(max_len):
+        logp = step([s for s, _ in alive])                          # (n_alive, V)
+        V = logp.shape[-1]
+        total = torch.tensor([sc for _, sc in alive])[:, None] + logp
+        top = torch.topk(total.flatten(), min(beam, total.numel()))
+        nxt = []
+        for score, flat in zip(top.values.tolist(), top.indices.tolist()):
+            parent, tok = divmod(flat, V)                          # flat index -> (beam, token)
+            seq = alive[parent][0] + [tok]
+            (done if tok == eos else nxt).append((seq, score))
+        alive = nxt
+        if not alive:
+            break
+    done += alive
+    n0 = len(prompt)
+    seq, score = max(done, key=lambda c: c[1] / (len(c[0]) - n0) ** alpha)
+    return seq[n0:], math.exp(score)                               # probability of the continuation
+```
+
+How the bookkeeping works: `total` is a `(beams, V)` table of every beam extended by every token. Flattening
+it and taking the top `beam` entries picks the winners in one call. `divmod(flat, V)` turns each flat index
+back into a parent beam and a token. That one line is where people lose track of parents.
+
+### Three things to say
+
+- **Sum log-probs.** A product of a few hundred probabilities underflows to 0.0 in floating point. A sum of
+  their logs stays finite.
+- **Length bias.** Each token adds a negative log-prob, so raw scores favour short outputs. Google's NMT beam
+  search added "a length-normalization procedure" for this
+  ([Wu et al., 2016](https://arxiv.org/abs/1609.08144), read 2026-10-12). `alpha` above divides the score by
+  `length^alpha`.
+- **Finished beams.** This version moves EOS hypotheses out, so the beam narrows as sentences finish.
+  Production versions take the top `2k` candidates so they can refill it.
+
+### Test it with brute force
+
+With a 4-token vocabulary and length 4, there are only **256 sequences**, so you can try every one. A beam of
+width 256 must find the same best sequence and probability. Width 1 must equal greedy. Then recompute the
+returned probability step by step and compare. All three checks are in the family walkthrough's suite. Say:
+"Brute force is my oracle, because on a tiny vocabulary it is cheap and certainly right."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Worked example: AB·EOS total = −1.0; e^−1.0 ≈ 0.368.
+- Brute-force size: 4 tokens, length 4: 4⁴ = 256 sequences.
+- Cost: each step runs the model on k rows, so beam search does about k times greedy's work and keeps k rows
+  of KV cache (the stored keys and values of past tokens).
+
+</details>
+
+If the interviewer asks about speed, add the cache: keep one cache row per beam, and after each step reorder
+the rows so each survivor gets its parent's stored keys and values.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Greedy and beam search"
+  senior={["Correct beams in log space, EOS handling, and a brute-force test."]}
+  staff={["Adds length normalization with a reason, keeps one KV-cache row per beam and reorders rows by parent, and knows beam search isn't used for open-ended chat."]}
+/>
+
+## Small-team version
+
+You won't run beam search against an API. Chat models sample their output at random from the filtered
+probabilities. The nucleus-sampling paper argues that likelihood-maximizing decoding gives "bland and strangely
+repetitive" text ([Holtzman et al., 2019](https://arxiv.org/abs/1904.09751)).
+
+The probability half is useful, though. Some providers return each output token's log-prob. Summing them gives
+a confidence score for classification-style prompts ("is this ticket about billing: yes or no?"), which you can
+threshold and evaluate. Check that your provider exposes log-probs before you design around them.
+
+The cost is close to zero. A one-token classification answer adds one output token per request: **$0.50 per
+million requests** at $0.50 per 1M output tokens (gpt-6-luna list price, fetched 2026-10-11).
+
+Default: sampled chat output, plus log-prob confidence only on classification prompts, thresholded against your
+eval.
+
+## Pitfalls
+
+- **Multiplying probabilities.** The product underflows to zero on long outputs, and every beam ties.
+- **Losing track of parents.** Without `divmod` on the flat index, a token gets attached to the wrong beam.
+- **Counting the prompt's tokens in the returned probability.** The question asks for the sentence the model
+  produced, not the prompt it was given.
+- **Comparing beams of different lengths without saying how.** Raw sums favour the shortest finished beam.
+
+## Go deeper
+
+- Family walkthrough: [Stage 6: decoding](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#stage-6-decoding), including the cached beam step.
+- Sibling question: [eng-061](/system-design-labs/interviews/questions/eng-061/).
+- Labs: <LabRef lab="llm-inference" inline />, <LabRef lab="transformer" inline />.

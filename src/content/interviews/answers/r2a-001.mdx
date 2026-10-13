@@ -1,0 +1,178 @@
+---
+question: r2a-001
+family: rag-system-design
+status: published
+labs: [rag, embedding-pipeline, vector-index, llm-eval]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Enterprise RAG is a pipeline from many sources into permission-aware search indexes, and a query path that
+> searches only what this user may see, ranks it, and has the model answer with citations that code checks. I'd
+> design the tracing first: for every answer, log the rewritten question, which passages were found and which
+> were sent, with scores, and the citation check. Then 'the bot is wrong' becomes a lookup: was the evidence
+> found, was it sent, and did the model follow it? Each 'no' names the stage to fix."
+>
+> The rest of this page explains each part of that answer.
+
+The round has two halves: design the system, then debug it. The second half is the one to rehearse.
+
+Some background. **RAG** (retrieval-augmented generation) means searching your documents for passages that answer
+a question, then handing them to a large language model (**LLM**, such as Claude or GPT) to write the answer.
+"Enterprise" adds many sources, millions of documents, thousands of users, and permissions. Debugging it is
+different from debugging a normal service:
+
+1. **Nothing crashes.** A wrong answer is a fluent paragraph with a 200 status code. You need traces that record
+   *what the model saw*, not just latency and errors.
+2. **Failures stack.** A bad parse, a missed search, a poor ranking and a model that ignores its evidence all look
+   the same to the user. You have to walk the stages in order.
+3. **Permissions can hide the answer.** If the filter for "what may this user see" runs after ranking, some users
+   get empty answers for reasons no log shows.
+
+The source is a first-hand 2026 account from an AI Infrastructure Engineer candidate in Germany, on a team doing
+internal AI infrastructure for Gemini: one technical round, "Design an enterprise-level RAG system", with questions
+during the walk-through, then "some troubleshooting questions". The candidate was rejected with no reason given and
+didn't describe the troubleshooting questions (<Cite id="s-3da5e3fd6a" />). An infra title still gets RAG design.
+
+## Clarify first
+
+- **What does "enterprise-level" mean here?** How many documents, users and sources; do permissions apply? "Assume
+  millions of documents, thousands of users, and per-user **ACLs** (access-control lists: who may read each
+  document)."
+- **Latency target, and freshness target** for edits and deletions.
+- **Which models may be used, and where data may live.**
+
+## Answer
+
+### Words you need first
+
+- **Token**: a piece of a word, about ¾ of a word.
+- **Chunk**: one passage cut from a document; the unit you index, search and cite.
+- **Embedding**: a list of numbers computed from a chunk by a small model, so that similar meanings get similar
+  numbers. Search by embeddings finds paraphrases; keyword search (**BM25**, the standard ranking formula) finds
+  exact terms. Using both is **hybrid search**.
+- **Top N and top k**: N is how many candidates search returns (say 50); k is how many of those, after
+  reordering, go into the prompt (say 8).
+- **recall@k**: the share of test questions whose answer chunk lands in the top k. It is the main search metric.
+
+### Design, briefly
+
+```
+Sources (drive, wiki, tickets, ...)
+   │  change events into a log
+   ▼
+Idempotent workers ── parse, chunk on headings, embed
+   │
+   ▼
+Per-customer keyword + vector indexes        ACL store (doc → groups)
+   ▲                                             ▲
+   │ (per question)                              │
+User question ── resolve user's groups ──────────┘
+   │
+   ▼
+Filtered hybrid search (top N) → merge by rank (RRF) → rerank → pack top k
+   │
+   ▼
+LLM answers with chunk ids → citation check → answer
+   │
+   └── trace: query, ids + scores at each stage, model + prompt version, check result
+```
+
+**Ingestion.** Connectors write change events into a log. Idempotent workers parse, chunk on structure, embed, and
+write to lexical and vector indexes partitioned by customer, plus an ACL store.
+
+**Serving.** Resolve the user's groups. Run hybrid search *with the permission filter inside the search*, not
+after it. Merge the two lists with **reciprocal rank fusion** (RRF, which scores each chunk by its positions in
+both lists). Rerank the candidates with a slower, more careful model, pack a token budget, generate with chunk ids,
+and verify the citations in code.
+
+**Envelope.** At 30M chunks and 768-dimension vectors, the index is about **96 GB** stored as 4-byte floats,
+including the links of an HNSW index (a graph that lets search hop toward the nearest vectors), or about **27 GB**
+as 1-byte integers (int8). Say it like this: "About 100 GB of vectors, so a few index shards, or one big machine
+with int8."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Per vector: 768 × 4 B = 3,072 B of float32, plus HNSW links 2 × 16 × 4 B = 128 B, so 3,200 B.
+- 30M × 3,200 B = **96 GB** float32; about **27 GB** with int8 vectors.
+- 95% half-width at recall 0.8 on 200 queries: 1.96 × √(0.8 × 0.2 ÷ 200) ≈ **±5.5 points**.
+- Trace storage: 5,000 answers × 20 KB = 100 MB a day, × 30 ≈ **3 GB a month** (both inputs assumed).
+
+</details>
+
+### Troubleshooting: the part to rehearse
+
+Instrument every stage so a bad answer can be traced, then walk the stages in order:
+
+| Symptom | Check | Typical cause |
+|---|---|---|
+| Wrong or invented answer | Was the right chunk in the top N candidates? | Search miss: parsing, chunking, tokenizer, embedder truncation |
+| Right chunk found, wrong answer | Was it in the packed top k? | Ranking: no reranker, or k too small |
+| Right chunk in the prompt, wrong answer | Does the answer follow it? | Generation: prompt, model, distracting chunks |
+| Outdated answer | Index lag for that source; cache keys | Stale index or stale cache |
+| Slow answers | Latency per stage | Reranker depth, cold caches, the provider's time to first token |
+| Empty answers for some users | Counts dropped by the permission filter | ACL filter applied after ranking |
+
+### Follow one ticket through it
+
+A user reports: *"The bot says contractors get 30 days' notice. The handbook says 14."* (An invented example.)
+
+1. **Pull the trace.** The rewritten query was "notice period for contractors". Good.
+2. **Was the right chunk in the top N?** Yes: "Contractors > Ending a contract" was 31st of 50 candidates.
+3. **Was it in the packed top k?** No. k was 8, and the top 8 were mostly the employee notice section, which says
+   30 days.
+4. **Diagnosis:** a ranking problem, not a prompt problem. The model faithfully cited what it was given.
+5. **Fix and prove it.** Add a reranker, or a heading-path prefix so "contractors" weighs more. Add this question
+   to the labelled set. Re-run, and check recall@k with its interval: at recall 0.8 on 200 queries, the 95%
+   interval is about **±5.5 points**, so "is it fixed?" has an answer.
+
+Say it like this: "I never touch the prompt until the trace shows the evidence was in front of the model."
+
+### Infra failures to name
+
+- **Mixed embedding versions.** A rollout wrote vectors from two embedding models into one index. Nearest
+  neighbours become nonsense, because vectors from different models aren't comparable. Always build a shadow index
+  and switch an alias.
+- **Index decay.** An HNSW index whose recall drops as deletes pile up, until compaction.
+- **Backlogged deletes.** An ingestion backlog that delays deletions, so removed documents still answer.
+- **Provider rate limits.** These should degrade to returning the passages without a generated answer, not to an
+  error page.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Enterprise RAG plus troubleshooting"
+  senior={["Designs the system and debugs a bad answer stage by stage from traces."]}
+  staff={["Designs the observability first (per-stage traces, lag, post-filter drops) so troubleshooting is a lookup, and names the infra failures: mixed embedding versions, index decay, backlogged deletes."]}
+/>
+
+## Small-team version
+
+As the only AI engineer, you are also the person who gets the "the bot is wrong" ticket. For every answer, log the
+rewritten query, the retrieved and packed chunk ids with scores, the model and prompt version, and the citation
+check result. With that, most tickets take minutes to classify. Add every confirmed failure to the labelled set.
+
+**Buy, don't build.** Buy the models as managed APIs. Run an open-source, self-hostable tracer (Langfuse, for
+example) or use your provider's dashboard rather than building one.
+
+**What it costs.** Trace storage is cheap: at an assumed 5,000 answers a day and 20 KB per trace, that is 100 MB a
+day, about **3 GB a month**.
+
+**When it changes.** At enterprise scale (tens of millions of chunks, per-user ACLs, several sources) you need the
+connector log, ACL store and partitioned indexes above, and usually more than one engineer.
+
+## Pitfalls
+
+- **Treating RAG as off-topic for an infra role.** The reported round opened with it.
+- **Editing the prompt before checking the trace.** If the evidence wasn't retrieved, no prompt fixes it, and the
+  edit can break other questions.
+- **No per-stage traces.** Every ticket then starts from zero, and you can't tell a search miss from a model error.
+
+## Go deeper
+
+- Family walkthrough: [Design a RAG system end to end](/system-design-labs/interviews/walkthroughs/rag-system-design/#failure-modes-and-overload).
+- Permissions at enterprise scale: [permission-aware enterprise RAG](/system-design-labs/interviews/walkthroughs/enterprise-rag-acl/).
+- Practise the stage-by-stage measurements: <LabRef lab="rag" inline />, <LabRef lab="llm-eval" inline />.

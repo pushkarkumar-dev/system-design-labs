@@ -1,0 +1,175 @@
+---
+question: infra-003
+family: batcher-to-fleet
+status: published
+labs: [load-balancer, rate-limiter, observability]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Before drawing anything, I'd size it. If one GPU does 1,000 requests a second with full batches and I run each
+> at 70%, 100,000 requests a second needs about 143 GPUs, or 151 with one spare 8-GPU node. Little's law says
+> about 10,000 connections are open at any moment, which sizes the API tier. GPU workers pull from queues sharded
+> per model, so nothing has to track capacity. And because a new GPU takes over a minute to load a large model,
+> spikes are absorbed by rejecting work at the edge, not by autoscaling."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see you scale a one-GPU design by arithmetic before you draw boxes, and find where the
+bottlenecks really are.
+
+Scaling a normal stateless service is easy to reason about: if one server handles 2,000 requests a second, 50
+servers handle 100,000, and autoscaling adds servers in seconds when traffic rises. A fleet of GPUs serving a
+model is different in three ways:
+
+1. **One GPU's capacity depends on how full its batches are.** A GPU runs requests in **batches** (groups run
+   together in one pass of the model), and a full batch serves many more requests per second than a small one.
+2. **Adding a GPU is slow.** A new GPU must load the model's **weights** (the large set of numbers that make up
+   the model) before serving anything. For a large model that takes over a minute.
+3. **GPUs are expensive.** Every bit of headroom costs real money, so the utilisation target is a business
+   decision.
+
+The source is a DesignGurus prep guide, not a candidate report. It lists "an LLM token-generation service handling
+very high request rates (on the order of 100,000 requests per second)" and expects "throughput math, horizontal
+scaling, request routing, and where the bottlenecks actually are" (<Cite id="s-5f44d8637a" />). Its "GPU dies
+mid-batch" case belongs to the single-GPU question, so raise it here, but don't treat it as the fleet prompt.
+
+## Clarify first
+
+- **One GPU's throughput at full batches?** "I'll assume 1,000 requests a second: batches of 100 that take
+  100 ms each. That's an assumption."
+- **Latency target?** "p99 under 300 ms."
+- **Target utilisation and failure domain?** "I'll run GPUs at 70% of their maximum, and assume a whole 8-GPU
+  server (a **node**) can fail at once."
+- **One model?** "Yes for now; several models mean several pools."
+- **Model size?** Ask, because it sets cold-start time. "I'll use a model with 70 billion weights as the example."
+
+## Answer
+
+### Size it in four steps
+
+Follow the arithmetic as a running total. Each step answers one question the interviewer will ask.
+
+| Step | Question | Result | What to say in the interview |
+|---|---|---|---|
+| 1 | How many GPUs? | 100,000 ÷ (0.7 × 1,000) ≈ **143** | "At 70% utilisation each GPU does 700 a second." |
+| 2 | Room for a failure? | + one 8-GPU node = **151** | "A whole node can fail, so I keep one spare." |
+| 3 | How many open connections? | about **10,400** | "That sizes the API tier; it isn't a problem." |
+| 4 | How long may the queue get? | **140 requests per GPU** | "Past that, a request would miss its deadline, so reject it." |
+
+**Step 3 uses Little's law**: the number of things inside a system equals the arrival rate times how long each
+one stays. Assume each batch costs a fixed 40 ms plus 0.6 ms per request (assumed numbers that make a full batch
+of 100 take 100 ms). At 700 requests a second per GPU, batches settle at about 48 requests and take about 69 ms. A
+request waits about half a batch, then rides one: about **104 ms** in the system. So 100,000 requests a second
+× 0.104 seconds ≈ 10,400 callers waiting at any moment, each holding a connection with a parked **future** (an
+object the handler waits on until the answer arrives).
+
+**Step 4 bounds the queue by time.** If a request may wait at most an assumed 200 ms, each GPU's share of the
+queue is 700 × 0.2 = 140 requests, about 1.4 full batches.
+
+Say it like this: "I size for 70% utilisation plus one failed node, about 150 GPUs, and bound each GPU's queue by
+the 200 ms a request can afford to wait."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Fleet size"
+  expr="GPUs = λ_total ÷ (ρ × X_max)"
+  vars={[
+    { sym: 'λ_total', meaning: 'fleet arrival rate' },
+    { sym: 'ρ', meaning: 'target utilization (assumed 0.7)' },
+    { sym: 'X_max', meaning: 'one GPU at full batches (assumed 1,000/s)' },
+  ]}
+  example="100,000 ÷ (0.7 × 1,000) = 142.9, so 143 GPUs; plus one 8-GPU node of failure headroom gives 151"
+/>
+
+- **Batch size at 700/s per GPU**, with `T(b) = 40 ms + 0.6 ms × b`: b* = λa ÷ (1 − λc) = 28 ÷ 0.58 = 48, and
+  T = 69 ms.
+- **Time in system** ≈ T/2 + T ≈ 104 ms. **Little's law:** 100,000/s × 0.104 s ≈ 10,400.
+- **Queue bound:** 700 × 0.2 s = 140 requests per GPU.
+- **Cold load:** 70 × 10⁹ weights × 2 bytes (bf16) = 140 GB, name-rounded. At an assumed 2 GB/s: 70 s.
+
+</details>
+
+### The design
+
+```
+Callers
+   │
+   ▼
+L4 load balancers ── spread connections across API pods
+   │
+   ▼
+API pods ── tenant token buckets, deadlines, parked futures
+   │  enqueue by model, sharded by hash of request id
+   ▼
+Queue shards per model ── bounded by waiting time
+   │  free GPU workers pull batches
+   ▼
+GPU workers (151) ── run batches, send results to the caller's pod
+```
+
+Stateless API pods sit behind **L4 load balancers** (network-level balancers that spread TCP connections). At the
+edge, each tenant (customer) has a **token bucket**, a counter that refills at a fixed rate and limits how fast
+they may send. Queues are sharded per model. GPU workers pull from their shard when they are free, so nothing has
+to track which GPU has capacity. Results go straight to the pod holding the caller's connection.
+
+### Where the bottlenecks are
+
+- **The queue tier.** 100,000 enqueues and dequeues a second is too much for one queue, so shard it.
+- **The API tier.** About 10,000 open connections, spread over many pods. Normal for web servers.
+- **GPU supply and cold start.** A 70-billion-parameter model in **bf16** (a 16-bit number format, 2 bytes per
+  weight) has about **140 GB** of weights. At an assumed 2 GB/s, loading them takes **70 seconds**. So
+  autoscaling cannot absorb a 30-second spike. Admission control can: deciding at the door what to accept, and
+  rejecting the rest quickly.
+
+### Overload and failure
+
+Shed load at the edge, lowest priority first. Retry once, at one layer only, within a budget, so retries don't
+multiply during an incident. Lease batches, so a dead GPU's items reappear on the queue. Scale on **queue wait**,
+not GPU utilisation: utilisation reads 100% both when a GPU is healthily busy and when it is drowning.
+
+Say it like this: "New GPUs arrive a minute late, so the edge has to reject work during a spike. I autoscale on
+queue wait for the slow trend, not for the spike."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="100k requests per second"
+  senior={["Sizes GPUs and connections from formulas with stated assumptions, shards queues per model and autoscales on queue wait."]}
+  staff={["Uses cold-start time to argue for admission control over autoscaling, plans failure domains, and names the cost per month the fleet implies."]}
+/>
+
+## Small-team version
+
+No company of 50–500 people runs this fleet. The habit transfers: before any self-hosting decision, write
+rate × time per request ÷ capacity on one line.
+
+For scale, 151 GPUs at an A100 rental range of $1.39–$2.79 an hour (RunPod community cloud to Lambda, fetched
+2026-10-11) cost about **$153,000–$308,000 a month**. Numbers like that are why small teams buy inference from a
+hosted API and keep their own work to admission, deadlines and fallbacks.
+
+Revisit only if you ever self-host: then size from your measured peak with the same four steps.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+151 × $1.39 × 730 hours ≈ $153,000; 151 × $2.79 × 730 ≈ $308,000 a month.
+
+</details>
+
+## Pitfalls
+
+- **Drawing the architecture before computing GPU count.** The numbers decide the shape; boxes first hides that.
+- **Using the saturated latency in Little's law.** 150 ms is the value when each GPU is full at 1,000 a second;
+  it gives 15,000 connections, not about 10,400.
+- **Expecting autoscaling to absorb spikes.** A cold start takes a minute or more (70 s in the example).
+- **Round-robin across GPUs with uneven queues.** A slow GPU keeps getting its share; pulling avoids that.
+
+## Go deeper
+
+- Family walkthrough: [From one GPU batcher to a fleet](/system-design-labs/interviews/walkthroughs/batcher-to-fleet/), "The fleet" and "Failure modes and overload".
+- Routing and retry budgets: <LabRef lab="load-balancer" inline />. Edge admission: <LabRef lab="rate-limiter" inline />. Metrics: <LabRef lab="observability" inline />.

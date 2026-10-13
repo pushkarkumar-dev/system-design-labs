@@ -1,0 +1,185 @@
+---
+question: eng-057
+family: concurrent-llm-client
+status: published
+labs: [load-balancer, rpc-framework]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll find the one place where this code makes the call and wrap it, instead of adding try blocks
+> everywhere. The wrapper retries only failures that can go away: timeouts, dropped connections, 429s and
+> server errors. It waits a random, growing time between attempts, puts one deadline around each whole
+> attempt, and never catches cancellation. Before adding a loop I'll check whether the SDK already retries,
+> because stacked retry loops multiply."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer is checking whether you can add resilience to someone else's async Python without breaking
+it. That means retries that don't retry the wrong things, timeouts that actually bound the call, waits that
+don't make every client retry at the same moment, and cancellation that still works.
+
+You have added retries to services before. Four things make this version trickier than it looks:
+
+1. **It's existing code.** You have to read before you type. The right place for the retry is usually one
+   function, and finding it is half the answer.
+2. **Python's async timeouts are easy to get wrong.** The HTTP library's timeout is per step, not per call, so
+   a slow server can stay under it forever.
+3. **Cancellation is an exception too.** In asyncio, "the caller gave up" arrives as an exception. A broad
+   `except` turns it into a retry.
+4. **The library may already retry.** The official LLM SDKs (the provider's own client libraries) retry by
+   default. A second loop on top multiplies the number of requests during an outage.
+
+This item comes from an Aced question list tagged Sierra (<Cite id="s-5f98d711e8" />). The entry was not
+visible on that page when it was re-fetched on 2026-10-12, so treat the wording as approximate.
+
+## Clarify first
+
+Ask these, and say your assumption for each:
+
+- **What do failures look like?** Status codes, exceptions, a Retry-After header (the server telling you how
+  many seconds to wait)?
+- **Is the call idempotent?** That is: if a timed-out attempt still completes on the server, is it safe that
+  the work happens twice?
+- **What budget does the caller have?** A deadline per call, or for the whole batch?
+- **Does the code already use an SDK that retries?** The OpenAI and Anthropic Python SDKs retry 2 times by
+  default (their docs, fetched 2026-10-12), so a new loop would stack on top.
+- **Python version?** "I'll assume 3.11 or later, for `asyncio.timeout` and `TaskGroup`."
+
+## Answer
+
+### Words you need first
+
+- **429** is the HTTP status "Too Many Requests": you went over the provider's rate limit. **5xx** statuses
+  mean the server had a problem. **408** is a request timeout reported by the server.
+- **Backoff** is waiting longer after each failed attempt: 0.1 s, then 0.2 s, then 0.4 s.
+- **Full jitter** makes each wait a random number between zero and that growing ceiling. Without it, clients
+  that failed together retry together, and knock the server over again.
+- A **deadline** is a limit on total time. Here, one deadline wraps each whole attempt.
+- An **idempotency key** is an id you send with a call, the same on every retry, so a server that supports it
+  can recognise a repeat and do the work only once.
+
+### Where the wrapper goes
+
+```
+existing code: summarize(ticket), classify(doc), ...    ← unchanged
+   │
+   ▼
+the one call site: client.call(...)                      ← wrap HERE, once
+   │
+   ▼
+retry wrapper ── classify outcome → wait (jittered, Retry-After capped) → next attempt
+   │  each attempt inside asyncio.timeout(t)
+   ▼
+HTTP library / SDK (check: does it already retry?)
+```
+
+The existing callers don't change. The wrapper sits at the single point where the code talks to the network.
+Below it is the HTTP library or SDK, and you need to know whether that layer retries too.
+
+### The five rules
+
+1. **Classify outcomes.** Retry connection errors, timeouts, 408, 429 and 5xx. Raise immediately on other
+   4xx. Never catch `asyncio.CancelledError` (it derives from `BaseException`), or "the caller left" becomes
+   "try again".
+2. **Backoff with full jitter**: sleep `uniform(0, min(cap, base × 2^attempt))`. On a Retry-After header, wait
+   the larger of the hint and the backoff, capped so a bad header can't park the job for an hour.
+3. **A whole-attempt timeout**: `async with asyncio.timeout(t)`. httpx's own timeout applies per phase (each
+   read), so a server that trickles one byte a second never trips it. Say it like this: "httpx's timeout is
+   per read. I want one deadline per attempt, so I wrap it."
+4. **Use monotonic time** for deadlines: a clock that never jumps backwards when the system clock is
+   adjusted.
+5. **An idempotency key per logical call**, reused across retries.
+
+### Follow one call through it
+
+The family walkthrough's version of this loop ran on 2026-10-12 against a fake server. Three prompts show the
+three paths:
+
+| Prompt | What the server does | What the wrapper does | What to say in the interview |
+|---|---|---|---|
+| `flaky-1` | 503, 503, then 200 | waits a jittered moment twice, succeeds on attempt 3 | "Server errors are worth a retry." |
+| `bad-1` | 400 | raises after exactly 1 attempt | "A bad request fails the same way every time. Don't retry it." |
+| `slow-1` | first attempt takes 3 s | the deadline fires, the retry succeeds | "But the server finished both attempts." |
+
+That last row is the one to talk about. The client abandoned the first attempt, but the server completed it
+anyway. One idempotency key, two completed requests. A real provider would bill both unless it deduplicates on
+the key. Say it like this: "A timeout on my side doesn't stop the work on theirs."
+
+### How long can one call take?
+
+With 5 attempts, a 2-second deadline each, and backoff starting at 0.1 s, one call can take up to about
+**11.5 s** when every attempt times out. If that is more than the caller can wait, lower the number of
+attempts or wrap the whole batch in its own deadline.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Worst-case latency of one call"
+  expr="T_max = A × t_attempt + Σ (n = 0 … A − 2) min(cap, base × 2^n)"
+  vars={[
+    { sym: 'A', meaning: 'max attempts' },
+    { sym: 't_attempt', meaning: 'per-attempt deadline' },
+    { sym: 'base, cap', meaning: 'backoff base and cap, seconds' },
+  ]}
+  example="A = 5, t = 2 s, base 0.1 s, cap 5 s: 10 + (0.1 + 0.2 + 0.4 + 0.8) = 11.5 s"
+/>
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Async retries"
+  senior={["Classifies outcomes, uses full jitter and a whole-attempt deadline, and keeps cancellation working, with tests."]}
+  staff={["Counts retries across layers (SDK, client, gateway), adds a retry budget, and derives deadlines from the caller's budget."]}
+/>
+
+In plain words: a Senior answer makes this call resilient. A Staff answer looks at the whole chain. If the
+SDK, your client and a gateway each retry 3 times, one request can become 27 at the bottom. A **retry budget**
+caps retries as a share of all requests (for example 20%), so an outage can't multiply your traffic.
+
+## Small-team version
+
+Most of this is already in your provider SDK. So the work is mostly settings and tests:
+
+- **Set the SDK's `timeout` and `max_retries` deliberately.** The default timeout is 10 minutes in both SDKs,
+  far past any user-facing deadline.
+- **Add only what it lacks:** a deadline from the user's budget, a concurrency cap, and a check that a
+  spend-limit 429 fails fast. Anthropic documents a spend-limit 429 with no retry-after, which retrying won't
+  fix.
+- **Delegate the wrapper, keep the tests.** Have an agent write the wrapper. Write the tests yourself for
+  400-not-retried, cancellation, and slow-trickle timeouts.
+- **Keep one retry loop** and a retry budget (20% caps the extra load at 1.2×).
+
+Why one loop matters: a five-attempt loop around an SDK that already makes 3 attempts can send up to **15
+requests per call** during an outage. On an assumed nightly job of 200,000 calls, that is up to **3M requests**
+against your rate limit, which locks out daytime traffic.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Attempts:** the SDK's 2 retries are 3 attempts. Your loop of 5 attempts around it: 3 × 5 = 15 requests per
+  call in the worst case.
+- **Nightly job:** 200,000 calls (assumed) × 15 = 3,000,000 requests.
+- **With a 20% retry budget:** at most 1.2 × 200,000 = 240,000 requests.
+
+</details>
+
+## Pitfalls
+
+- **`except Exception: retry` around everything.** It retries 400s and real bugs, which never succeed.
+- **`except BaseException` or a bare `except`.** It swallows cancellation, so a caller who left keeps
+  paying for work.
+- **Trusting httpx's timeout as a deadline.** It applies per read, so a trickling server never trips it.
+- **No jitter.** Every client retries on the same tick and hits the recovering server together.
+- **A loop on top of an SDK that already retries.** The attempts multiply during exactly the outage you are
+  trying to survive.
+
+## Go deeper
+
+- Family walkthrough: [Concurrent LLM API client](/system-design-labs/interviews/walkthroughs/concurrent-llm-client/), stages 2 and 3 and the measurement behind the 429 default.
+- Retry budgets in code: <LabRef lab="load-balancer" inline />. Cancellation through a context: <LabRef lab="rpc-framework" inline />.

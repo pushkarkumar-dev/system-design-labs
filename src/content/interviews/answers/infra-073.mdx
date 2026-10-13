@@ -1,0 +1,180 @@
+---
+question: infra-073
+family: roofline-sharded-matmul
+status: published
+labs: [llm-inference, transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Both phases read every weight once per pass. Prefill reads the whole prompt at once, so each weight is used
+> for thousands of tokens and the math takes longer than the reading: compute-bound. Decode writes one token per
+> user per pass, so each weight is used only as many times as there are users in the batch, and the GPU waits on
+> memory. Attention during single-request decode is memory-bound too, at every context length, because each
+> saved key and value is read for only a few operations. Batching fixes the weight reads, because users share
+> the weights, but not attention, because each user has their own saved history."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see that you can explain a GPU's speed with the same reasoning you already use for
+servers. A backend request is slow because it waits on the CPU, the disk or the network, and the slowest one
+sets the time. A GPU has two resources: math units, and the memory that feeds them numbers. An H100 can do
+roughly a thousand trillion operations a second but fetch only a few trillion bytes a second. So what matters is
+how many operations each fetched byte pays for.
+
+What makes this question different is that the same model, with the same weights, is limited by different
+resources at different moments. Nothing about the code changes. Only how many tokens go through the weights
+together.
+
+(Two prep guides list this. One asks "Why is decode memory-bound and prefill compute-bound?"
+<Cite id="s-f07fcd5321" />. The CUDA guide asks whether attention during single-request decode is memory- or
+compute-bound and answers memory-bound, because at batch one "you re-read the weights and the growing KV cache
+for every token" <Cite id="s-55d540eda9" />.) A strong answer derives both with arithmetic intensity, and knows
+that batching rescues the weight matmuls but not attention.
+
+### Words you need first
+
+- A **token** is a chunk of text of about ¾ of a word. **Prefill** is the model reading the whole prompt in one
+  pass. **Decode** is the model then writing the reply one token at a time, one pass per token.
+- A **matmul** (matrix multiply) of M token vectors against a K × N weight costs **2MKN FLOPs**
+  (floating-point operations, counting a multiply-add as 2).
+- **Arithmetic intensity** is FLOPs ÷ bytes fetched from GPU memory. The GPU's **ridge point** is its peak FLOPs
+  per second ÷ its memory bandwidth. Above the ridge: **compute-bound**. Below: **memory-bound**.
+- The **KV cache** is the model's saved memory of the conversation: for every earlier token, in every layer, a
+  **key** and a **value** vector that attention compares the new token against.
+- A **batch** is the set of users whose next tokens are computed in the same pass.
+
+## Clarify first
+
+- **Which GPU?** "I'll assume an H100 SXM: about 989.5 dense bf16 TFLOPS, 3.35 TB/s of memory bandwidth, so a
+  ridge of 295 FLOPs per byte." (**bf16** is the usual 16-bit number format, 2 bytes per value.)
+- **Which model?** "Llama-3.1-70B: 64 query heads, 8 KV heads, head size 128, bf16 cache." (Heads are explained
+  below.)
+- **What batch?** "Single request first, then a batch."
+
+## Answer
+
+### The worked example: one request on a 70B model
+
+Follow one user's request through Llama-3.1-70B on H100s. It has a 2,000-token prompt, and then the model
+writes a reply.
+
+| Step | Phase | What limits it | What to say in the interview |
+|---|---|---|---|
+| 1 | Prefill: 2,000 tokens through every weight | Math: 71 ms of compute against a 10.5 ms weight read (on 4 H100s) | "Prefill is compute-bound by about 7×." |
+| 2 | Decode, first reply token, batch 1 | Memory: one full weight read for one token, 10.5 ms per token on 4 H100s | "The Tensor Cores are mostly idle; the step time is the weight read." |
+| 3 | Decode attention for that token | Memory: 8 FLOPs per byte of cache, against 295 | "Attention is memory-bound at any context length." |
+| 4 | Add 63 more users to the batch | Weight read shared; cache reads multiply | "Batching amortizes the weights, not the KV cache." |
+| 5 | Grow the context to 100,000 tokens | Cache read now 1.2 ms per step on each of 8 GPUs | "Long contexts cut throughput even when they fit." |
+
+### Steps 1–2: weight matmuls, decode vs prefill
+
+A matmul of M tokens against a K × N weight does 2MKN FLOPs and reads about s × KN bytes of weight (s is bytes
+per value). Divide them and the intensity is about 2M ÷ s, which is **M in bf16**. So the intensity is simply
+the number of tokens processed together.
+
+- **Decode** processes one new token per user, so M is the batch size. At batch 1 the intensity is about 1,
+  against a ridge of 295. The step time is the weight read. For the 70B model split across 4 H100s (**tensor
+  parallelism**: each GPU holds a quarter of every weight), each GPU reads 35.28 GB per token: **10.5 ms per
+  token**, with the **Tensor Cores** (the GPU's math units) mostly idle.
+- **Prefill** processes the whole prompt at once, so M is the prompt length. A 2,000-token prompt on the same
+  4 H100s needs about **71 ms** of compute against the **10.5 ms** weight read: compute-bound by about **7×**.
+  (On 4 A100s it is 226 ms against 17.3 ms, about 13×, as the family walkthrough works out.)
+
+Say it like this: "Same weights, different M. Prefill reuses each weight thousands of times per read; decode
+reuses it once per user in the batch."
+
+### Step 3: attention during single-request decode
+
+To write the next token, attention compares it with every earlier token. Instead of recomputing the earlier
+tokens, the model reads their saved keys and values from the KV cache. Llama-3.1-70B uses **grouped-query
+attention** (**GQA**): its 64 **query heads** (the parts that ask "what should I look at?") share 8 sets of
+keys and values, the 8 **KV heads**. So each cached number is used by 8 heads. That group size of 8 is all the
+reuse decode attention gets.
+
+Count it and the intensity comes out at **8 FLOPs per byte** for a bf16 cache, far below 295. And the context
+length cancels: a longer conversation means more FLOPs and more bytes in the same proportion. So decode
+attention is memory-bound **at every context length**. With ordinary multi-head attention (no sharing) it
+would be 1; with an fp8 (8-bit) cache, 16.
+
+### Steps 4–5: why batching doesn't help attention
+
+The weights are shared by every user in a batch. Each user's KV cache is their own. So a batch of 64 shares
+**one** weight read but does **64** separate cache reads. Adding users adds cache bytes in proportion to the
+FLOPs, and attention's intensity doesn't improve.
+
+At long context this becomes a real cost. At 100,000 tokens the 70B cache is **32.8 GB**. Split over 8 H100s
+that is **4.1 GB (1.2 ms)** per GPU per step, next to **17.6 GB (5.3 ms)** of weights.
+
+Prefill attention is different. There, n prompt tokens all reuse each key and value, so its intensity grows
+with n and it is compute-bound. For a 100,000-token prompt on 8 H100s, attention adds about as many FLOPs as
+the weights: about **3.4 s** in total at peak, against **1.78 s** from the weights alone.
+
+Say it like this: "Batching amortizes the weights, not the KV cache. That's why long contexts hurt throughput
+even when they fit in memory."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Decode floor, 70B bf16, TP = 4, H100:** 35.28 GB ÷ 3.35 TB/s = 10.5 ms per token.
+- **Prefill, 2,000 tokens, 4×H100:** 2 × 70.55 × 10⁹ × 2,000 ÷ (4 × 989.5 × 10¹²) = 71 ms, against the
+  10.5 ms weight read: about 6.8×. On 4×A100: ÷ (4 × 312 × 10¹²) = 226 ms, against
+  35.28 GB ÷ 2,039 GB/s = 17.3 ms, about 13×.
+
+<Formula
+  title="Decode attention intensity"
+  expr="FLOPs = 4 × n_heads × n_ctx × head_dim;  bytes = 2 × n_kv_heads × n_ctx × head_dim × s;  intensity = 2 × (n_heads ÷ n_kv_heads) ÷ s"
+  vars={[
+    { sym: 'n_ctx', meaning: 'cached tokens; it cancels' },
+    { sym: 'n_heads ÷ n_kv_heads', meaning: 'GQA group size, 8 here' },
+    { sym: 's', meaning: 'bytes per cached value' },
+  ]}
+  example={[
+    'Llama-3.1-70B, bf16 cache: 2 × 8 ÷ 2 = 8 FLOP/byte, far below 295: memory-bound',
+    'Check at 8,192 tokens, one layer: 268 MFLOP over 33.5 MB = 8. Multi-head attention: 1. fp8 cache: 16',
+  ]}
+/>
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Decode vs prefill"
+  senior={["Derives intensity ≈ M for the weights and the GQA-group formula for decode attention."]}
+  staff={["Explains why batching amortizes weights but not KV, and what that means for long-context throughput, fp8 caches and chunked prefill."]}
+/>
+
+In plain words: Senior gets both verdicts right with the arithmetic. Staff also explains the consequences for
+a real server: long contexts cost throughput, an fp8 cache halves the attention bytes, and **chunked prefill**
+(reading a long prompt in slices between decode steps) keeps one long prompt from stalling everyone else.
+
+## Small-team version
+
+Two consequences for a self-hosting team:
+
+- **A faster-compute GPU barely moves batch-1 decode latency; bandwidth does.** H100 vs A100 is 1.64× the
+  bandwidth and 3.2× the compute.
+- **Long contexts cut throughput even when they fit**, because every step reads every user's cache. Cap context
+  per request, and consider an fp8 cache after a quality test on your own prompts (an **eval**) shows
+  quality holds.
+
+Default to a managed API. If you self-host, rent for bandwidth. At RunPod list prices (fetched 2026-10-11), an
+A100 80GB costs about **$1,010–$1,160 a month** always on, and an H100 SXM about **$1,960–$2,550**. So the H100's
+1.64× faster decode costs 1.9–2.2× as much. The answer flips toward the H100 for long prompts, where prefill is
+compute-bound and its 3.2× compute pays.
+
+## Pitfalls
+
+- **"Decode is memory-bound because the KV cache is large."** The weight read alone makes it so at small batch.
+- **Calling long-context decode attention compute-bound.** Its intensity doesn't depend on context length.
+- **Expecting batching to fix attention bandwidth.** Each user reads their own cache, so bytes grow with the batch.
+- **Using the sparse 1,979 TFLOPS figure.** It assumes a special zero pattern in the weights and doubles the ridge.
+
+## Go deeper
+
+- Family walkthrough: [Roofline and sharded-matmul math](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/#derivations), sections 2–4.
+- KV sizes and step time: [KV cache and GPU memory math](/system-design-labs/interviews/walkthroughs/kv-cache-memory-math/#derivations).
+- Labs: <LabRef lab="llm-inference" inline />, <LabRef lab="transformer" inline />.

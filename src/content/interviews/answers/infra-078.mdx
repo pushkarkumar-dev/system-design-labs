@@ -1,0 +1,192 @@
+---
+question: infra-078
+family: diagnose-infra-performance
+status: published
+labs: [observability, container-runtime]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "First I'll pin down which number got worse and what changed. Then I'll go resource by resource, CPU,
+> memory, disk, network, and the software limits like locks and container quotas, and for each ask how
+> busy it is, whether work is queuing for it, and whether it shows errors. Several of the usual numbers
+> mislead: load average counts tasks waiting on disk, a disk at 100% utilization can still have room, and
+> a container can be throttled on an idle host. So for each number I'll say what it actually counts before
+> I act on it."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you have a method for a Linux machine that is "slow", and whether you
+know what each metric really measures.
+
+You have done this on call. What is different here is that you have no dashboards. You name a command, and
+the interviewer tells you what it shows. And most follow-ups are traps of one kind: "this number looks bad,
+but does it mean what you think?" Three examples:
+
+1. **Load average** counts tasks waiting for a CPU *and* tasks stuck waiting on a disk. High load with idle
+   CPUs points at I/O, not compute.
+2. **A disk's `%util`** is the share of time it had at least one request in flight. An SSD that serves many
+   requests at once can show 100% and still have room.
+3. **A container's CPU limit** is enforced per container, in short time slices. The container can be
+   stopped for most of each slice while the host's CPU graph looks flat.
+
+Answering those correctly is where this round is decided.
+
+(These come from four PracHub titles from a Together AI technical screen, covering logging saturation,
+container network throughput, CPU and storage I/O <Cite id="s-8b84fedc37" />. Only the titles are
+candidate-reported; the follow-ups are listed on the PracHub pages. Confidence is low.)
+
+## Clarify first
+
+- **Which user-facing number got worse, and since when?** p99, throughput, errors? What changed?
+- **Bare metal, VM or container?** Container limits change almost every answer below.
+- **For logging:** which resource is exhausted? Disk space, disk bandwidth, or request threads blocked on
+  the place logs are sent? The listing asks you to establish that before touching logging.
+- **For network:** throughput, latency or connection setup? Host and container both, or only the
+  container?
+- **For storage:** reads or writes, random or sequential, local or remote volume, any forced sync to disk
+  on each write?
+
+## Answer
+
+### Words you need first
+
+- **Utilization**: how busy a resource is, as a share of time.
+- **Saturation**: how much work is queued waiting for it. This is what turns into latency.
+- **Errors**: failed operations on that resource.
+
+Checking those three for every resource is Brendan Gregg's **USE method**: "For every resource, check
+utilization, saturation, and errors" ([USE](https://www.brendangregg.com/usemethod.html), read
+2026-10-12). Say it like this: "I care more about saturation than utilization. A busy resource with no
+queue is fine; a queue adds wait to every request."
+
+### Follow one case through: the server that logs too much
+
+The logging question is the best one to walk through end to end. Here is a version run on 2026-10-12 for
+the family walkthrough. Sixteen request threads. Each request does 1 ms of real work and writes five log
+lines. The log handler takes 2 ms per line, standing in for a slow disk or remote log collector (an
+assumed figure). Python's handler takes a lock for each line, so only one thread writes at a time.
+
+| Step | What you do | What you find | What to say in the interview |
+|---|---|---|---|
+| 1. Define slow | Ask for throughput and latency | 79 requests/s, median 201 ms | "1 ms of work takes 200 ms. Something makes it wait." |
+| 2. Guesses | Logging can exhaust space, disk bandwidth, or the request path | Three different fixes | "Logs can fill the disk, clog it, or block the request." |
+| 3. Commands | `df -h`, `du -xh --max-depth=1 /var/log`, `lsof +L1`, `iostat -xz 1`, `pidstat -d 1` | Here the slow part is the sink; every thread waits for its lock | "The threads are queued behind the log writer." |
+| 4. Fix | Move logging off the request path with a `QueueHandler` | About 11,700 requests/s at 1.3 ms median | "Requests drop the line in a queue; a separate thread does the slow write." |
+| 5. Prevent | Bound the queue and count drops | With a 1,000-entry queue, 6,947 of 8,000 lines dropped | "The queue doesn't make the sink faster. I choose block, buffer or drop, and count drops." |
+
+The ceiling is simple to explain. A sink at 2 ms a line writes **500 lines a second**. At five lines per
+request, the server tops out at **100 requests a second**, however many threads it has. The measured 79 is
+just under that.
+
+`lsof +L1` is on the list for a reason. It lists files that were deleted but are still open. Deleting a
+log file that a process still holds frees nothing, so a "deleted" log can keep the disk full. Truncate it,
+or make the process reopen its log.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Sink ceiling:** 1 line ÷ 2 ms = 500 lines/s; 500 ÷ 5 lines per request = **100 requests/s**.
+- **Median check (Little's law):** requests in flight = rate × time inside, so time inside = 16 ÷ 79 ≈
+  0.20 s ≈ **200 ms**, matching the measured 201 ms median <Cite id="s-b9e76e614c" />.
+
+</details>
+
+### CPU
+
+Run `uptime`, `vmstat 1`, `mpstat -P ALL 1`, `pidstat -t 1`, and a profiler (`perf top`, or `py-spy top`
+for Python) to see the hot function.
+
+- **High load, low CPU busy** means tasks are in uninterruptible I/O wait. Check `vmstat`'s `b` (blocked)
+  column and `wa` (CPU idle while waiting for I/O).
+- **One core pinned** while the others idle means a single hot thread: an event loop, Python's global
+  interpreter lock, or one lock holder. More cores won't help.
+- **Inside a container**, a Linux kernel feature called a **cgroup** enforces the CPU limit. Read
+  `cpu.max` and `cpu.stat`. Under cgroup v2, `nr_throttled` and `throttled_usec` show the container being
+  stopped by its quota while the host looks idle
+  ([cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)).
+
+Say it like this: "On Linux, load average counts tasks stuck on disk too, so high load and idle CPUs sends
+me to I/O next."
+
+### Storage
+
+Run `iostat -xz 1` for `r_await` and `w_await` (average time per read and write, including queueing) and
+`aqu-sz` (average queue size); `pidstat -d` to find which process is doing the I/O; and `strace -e fsync`
+to see whether the app forces every write to disk.
+
+`%util` means "at least one request outstanding". A device that serves requests in parallel can show
+100% with headroom. Trust wait time and queue size instead, and cross-check them with Little's law: queue
+≈ IOPS (I/O operations per second) × await <Cite id="s-b9e76e614c" />. If those don't agree, you are
+reading the wrong device or column.
+
+### Network in containers
+
+Use `iperf3` host-to-host, then pod-to-pod, with one stream and then eight. Use `ss -ti` for round-trip
+time (RTT), the TCP window and retransmits. Use `ping -M do -s 1472` to test whether a full 1,500-byte
+packet fits through the container network's extra headers (the MTU). Use `mpstat`'s `%soft` to spot one
+core busy with network interrupts.
+
+If eight streams are fast and one is slow, the network is fine. One connection can't have more than its
+**window** of unacknowledged bytes in flight, and it gets one window through per round trip:
+
+<Formula
+  title="Single-connection ceiling"
+  expr="throughput ≤ window ÷ RTT"
+  vars={[{ sym: 'window', meaning: 'unacknowledged bytes allowed' }, { sym: 'RTT', meaning: 'round-trip time, seconds' }]}
+  example="An assumed 64 KiB window at 10 ms: 65,536 ÷ 0.01 ≈ 6.6 MB/s, however fast the link"
+/>
+
+A CPU problem can look like a network problem too: if the sender is throttled, the link sits idle and
+throughput stays flat.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Linux diagnosis"
+  senior={["Right command per resource, correct reading of load, %util, throttling and deleted-open files, and a verified fix."]}
+  staff={["Starts from what changed and the user-facing metric, separates stabilizing from fixing, and leaves a default (async logging with drop counters, sane limits) plus an alert."]}
+/>
+
+In plain words: a Senior answer reads every number correctly and fixes the cause. A Staff answer also
+starts from what changed, stops the user pain before the real fix, and leaves defaults and alerts behind.
+
+## Small-team version
+
+On a small team the "server" is often one inference or ingestion container. A handful of defaults prevent
+most of these four problems:
+
+- Asynchronous logging with a bounded buffer and a metric for dropped lines.
+- CPU limits set from measured use, or no CPU limit at all with sensible requests.
+- An alert on how long until the disk is full.
+- A dashboard with throttled periods next to p99.
+
+**Buy** hosted logs and metrics rather than running a logging cluster, and size the bill first. At an
+assumed 2M requests a day × 20 lines × 300 bytes, that is **12 GB of logs a day**, times your vendor's
+price per GB.
+
+An agent is good at explaining an unfamiliar column. Read the command output yourself before acting.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Log volume:** 2 × 10⁶ × 20 × 300 bytes = 1.2 × 10¹⁰ bytes = **12 GB/day** (all inputs assumed).
+
+</details>
+
+## Pitfalls
+
+- **Deleting the open log file.** The space comes back only when the last process holding it closes it.
+- **Reading `%util` at 100% as a saturated SSD.** It means "never idle", not "full"; wait time and queue
+  size tell you about saturation.
+- **Blaming the container network when the sender is CPU-throttled.** An idle link with flat throughput
+  can be a CPU limit.
+- **Changing log levels in production before knowing which resource is exhausted.** Space, bandwidth and
+  a blocked request path need different fixes.
+
+## Go deeper
+
+- Family walkthrough: [Diagnose slow or stuck infrastructure](/system-design-labs/interviews/walkthroughs/diagnose-infra-performance/), worked examples 1–4.
+- A logger that serializes on one mutex: <LabRef lab="observability" inline />. cgroup limits from the kernel side: <LabRef lab="container-runtime" inline />.

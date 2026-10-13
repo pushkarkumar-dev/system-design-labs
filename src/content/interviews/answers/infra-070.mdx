@@ -1,0 +1,192 @@
+---
+question: infra-070
+family: roofline-sharded-matmul
+status: published
+labs: [transformer, llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "A matrix multiply costs arithmetic and memory traffic, and the GPU takes whichever is longer. I count FLOPs
+> and bytes, divide them, and compare that ratio with the GPU's ratio of compute to memory speed, about 295 on
+> an H100. A big square multiply is far above it, so it is compute-bound. When one dimension is a handful of
+> tokens, as in decode, the ratio is about the number of tokens, so it is memory-bound. If I split the multiply
+> across GPUs, splitting rows or columns needs no adding up, but splitting the inner dimension needs an
+> all-reduce, and that is network-bound whenever the inner dimension is below a threshold set by the hardware."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants a clean **performance model**: a few lines of arithmetic that predict how long an
+operation takes and which part of the hardware limits it.
+
+You already do this for backend systems. A query is slow because it waits on the CPU, the disk or the network,
+and the slowest one sets the time. A GPU is the same, with two resources inside it: math units and memory. The
+difference is how unbalanced they are. An H100 can do roughly a thousand trillion operations a second, but
+fetch only a few trillion bytes a second. So the question is never "how many operations?" alone. It is "how many
+operations per byte fetched?", compared with what the hardware can supply. Then, when the work is split across
+GPUs, a third resource joins in: the link between them.
+
+(This is an Anthropic onsite question listed on PracHub, a site that collects reported questions. Only the title
+is candidate-reported; the write-up adds the small-M case, sharding on M, N or K, and when K-sharding becomes
+network-bound <Cite id="s-5198fc4992" />.) Constants and units are checked as closely as the algebra.
+
+### Words you need first
+
+- A **matmul** is `C = A × B`, with A of size M × K and B of size K × N. Each number in C is a dot product of
+  length K. Counting a multiply-add as 2 operations, it costs **2MKN FLOPs** (floating-point operations).
+- **P** is the GPU's peak FLOPs per second. **W** is its memory bandwidth: bytes per second from its memory
+  (**HBM**) to the math units. **s** is bytes per number: 2 for **bf16**, the usual 16-bit format.
+- **Arithmetic intensity** is FLOPs ÷ bytes. The GPU's **ridge point** is P ÷ W. Above the ridge an operation is
+  **compute-bound**; below it, **memory-bound**. The chart of this is the **roofline**.
+- **Sharding** means splitting the work across `D` devices. A **collective** is a group communication step. An
+  **all-reduce** adds every device's full-size partial result so all of them get the sum. An **all-gather**
+  gives every device all the slices. `L` is the link bandwidth in each direction.
+
+## Clarify first
+
+Say these out loud before you compute:
+
+- **Symbols or hardware?** "I'll derive with P, W, L and D, then use an H100: about 989.5 dense bf16 TFLOPS,
+  3.35 TB/s of memory bandwidth, and NVLink (NVIDIA's fast GPU-to-GPU link) at 450 GB/s each way."
+- **Is one operand a weight?** "In decode, B is a weight matrix that stays in memory, and A is a few token
+  vectors."
+- **Where does C go?** "Does every device need all of C, or can C stay split for the next layer?"
+- **Overlap?** "Can communication run during compute? Then I take the max of the times; if not, the sum."
+- **Convention.** "I count a multiply-add as 2 FLOPs."
+
+## Answer
+
+### The worked example: one weight matrix from a 70B model
+
+We follow one real matrix: the **up-projection** in Llama-3.1-70B's feed-forward block, a weight of
+K = 8,192 rows by N = 28,672 columns, in bf16 on an H100. (A **token** is a chunk of text of about ¾ of a word.
+**Decode** is the model writing its reply one token at a time; **prefill** is it reading the whole prompt in
+one pass.) M is the number of token vectors pushed through the matrix together.
+
+| Step | Case | What happens | What to say in the interview |
+|---|---|---|---|
+| 1 | A big square multiply | Intensity in the thousands; math takes about 9× longer than memory | "Square matmuls are compute-bound." |
+| 2 | Decode, one user (M = 1) | 470 MB fetched for half a microsecond of math | "Memory-bound by about 300×; the math units are idle." |
+| 3 | Decode, a batch of users | Intensity ≈ M; still memory-bound until M ≈ 295 | "Extra users in a batch are nearly free below the ridge." |
+| 4 | Split on N across 8 GPUs | Each GPU computes whole columns of C | "No communication." |
+| 5 | Split the inner dimension K | Partial sums; link time vs math time ≈ 1.07 for K = 28,672 | "Split K only over NVLink, and only for big K." |
+
+### Steps 1–3: one multiply on the roofline
+
+The bytes are the three matrices crossing memory once. The FLOPs are 2MKN. For a square multiply, the intensity
+grows with the size. An 8,192-cubed multiply on an H100 does **2,731 FLOPs per byte**, far above the ridge of
+**295**. Its math takes **1,111 µs** and its memory traffic **120 µs**: compute-bound.
+
+Now make M small. When B is a weight, its bytes dominate, and the intensity comes out at about 2M ÷ s. In bf16
+that is simply **M**. At M = 1 the up-projection does about 4.7 × 10⁸ FLOPs over 4.7 × 10⁸ bytes: **0.47 µs**
+of math against **140 µs** of memory.
+
+Say it like this: "In bf16, intensity is about the number of tokens processed together. Decode at batch 1 is
+intensity 1 against a ridge of 295, so it stays memory-bound until the batch reaches about 295 on an H100.
+Prefill has thousands of tokens, so it is compute-bound."
+
+### Steps 4–5: sharding on M, N or K
+
+There are three dimensions to split, and the choice decides the communication:
+
+| Split | Result | Collective |
+|---|---|---|
+| M | complete rows of C | none, or all-gather if all of C is needed |
+| N | complete columns of C | same |
+| K | partial sums of all of C | all-reduce (2(D − 1) ÷ D × MNs per device) or reduce-scatter |
+
+A **reduce-scatter** is an all-reduce where each device keeps only its own slice of the sum. It moves half the
+bytes, so use it when the next layer can take slices.
+
+The interesting question is when K-sharding becomes network-bound. Each GPU does 1/D of the math, but must send
+almost twice the size of C. Work out the ratio of link time to math time, and **M and N cancel**. The ratio
+depends only on K, D, s and the hardware's P ÷ L. So batch size doesn't decide it.
+
+On 8 H100s over NVLink, K-sharding is network-bound below **K = 30,784**. The 70B model's down-projection
+(K = 28,672) gives a ratio of **1.07**, about balanced. A layer with K = 8,192 gives **3.76**, network-bound.
+Over PCIe Gen5 (the ordinary expansion bus, 64 GB/s each way), the threshold is **216,453**, about 7× higher.
+
+That explains the standard layout. **Tensor-parallel** layers (one model split across GPUs) shard the first
+matmul of a block on N, with no communication, and the second on K, paying one reduction per block. And they
+keep tensor parallelism inside NVLink.
+
+Say it like this: "M and N cancel, so the K threshold is a property of the hardware and the layer, not the
+batch. On H100 NVLink it's about 30,000, which is why tensor parallelism stays inside one node."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Roofline"
+  expr="FLOPs = 2MKN;  bytes = s(MK + KN + MN);  intensity = FLOPs ÷ bytes;  ridge = P ÷ W;  time ≥ max(FLOPs ÷ P, bytes ÷ W)"
+  vars={[
+    { sym: 's', meaning: 'bytes per element, 2 for bf16' },
+    { sym: 'P, W', meaning: 'peak FLOP/s, memory bandwidth' },
+  ]}
+  example={[
+    'Ridge: A100 312 ÷ 2.039 = 153; H100 989.5 ÷ 3.35 = 295 FLOP/byte',
+    'Square 8,192³ on H100: intensity 2,731, compute 1,111 µs vs memory 120 µs: compute-bound',
+  ]}
+/>
+
+- **M = 1 up-projection:** 2 × 8,192 × 28,672 = 4.7 × 10⁸ FLOPs ÷ 989.5 × 10¹² = 0.47 µs. Weight bytes
+  8,192 × 28,672 × 2 = 4.7 × 10⁸ ÷ 3.35 × 10¹² = 140 µs.
+
+<Formula
+  title="When K-sharding is network-bound"
+  expr="comm ÷ compute = (D − 1) × s × P ÷ (K × L)"
+  vars={[
+    { sym: 'L', meaning: 'link bandwidth per direction' },
+    { sym: 'K', meaning: 'full inner dimension' },
+  ]}
+  example={[
+    'H100, bf16, D = 8, L = 450 GB/s: network-bound below K = 30,784',
+    'K = 28,672 (70B down-projection): ratio 1.07. K = 8,192: ratio 3.76. Over PCIe Gen5 (64 GB/s each way) the threshold is 216,453',
+  ]}
+/>
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Sharded matmul"
+  senior={["Counts FLOPs and bytes, uses dense peaks, gets intensity ≈ M and the collective for each split."]}
+  staff={["Derives the K threshold, uses it to justify column-then-row sharding and NVLink-only TP, and names overlap and achieved bandwidth as the assumptions to measure."]}
+/>
+
+In plain words: Senior counts correctly and names the limit. Staff also derives when the limit changes, uses it
+to explain why real systems are laid out the way they are, and says what they would measure first.
+
+## Small-team version
+
+You won't shard matmuls. But the small-M result is the most useful number in self-hosting: below the ridge, a
+bigger decode batch costs almost nothing per step. So fill batches before renting more GPUs, and choose GPUs by
+memory bandwidth for chat-style decode. Tensor parallelism over PCIe-only cards pays the 7× higher threshold
+above.
+
+The default is still a managed API; this math matters once you self-host. In money, at RunPod's list prices
+(fetched 2026-10-11):
+
+- An always-on **A100 80GB** is 730 × $1.39–$1.59 ≈ **$1,010–$1,160 a month**, with an 8B bf16 decode floor
+  of 7.9 ms per step.
+- An always-on **H100 SXM** is 730 × $2.69–$3.49 ≈ **$1,960–$2,550 a month**, for a 4.8 ms floor.
+
+For decode-bound chat the A100 buys more bandwidth per dollar. Pay for the H100 when the work is prompt-heavy
+(compute-bound prefill) or your latency budget sits below the A100's floor.
+
+## Pitfalls
+
+- **Sparse peak.** The H100 page's 1,979 TFLOPS is "with sparsity"; the dense bf16 peak is half that.
+- **Total link speed as per-direction.** NVLink's 900 GB/s is both directions; one direction gets 450.
+- **Max or sum unstated.** Your total is ambiguous by up to 2× until you say whether compute and communication
+  overlap.
+- **Undercounting the K-shard reduction.** Each device sends 2(D − 1) ÷ D × MNs, not MNs.
+
+## Go deeper
+
+- Family walkthrough: [Roofline and sharded-matmul math](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/#derivations), sections 1, 2, 5 and 6.
+- Memory side: [KV cache and GPU memory math](/system-design-labs/interviews/walkthroughs/kv-cache-memory-math/).
+- Count a real model in <LabRef lab="transformer" inline />; see prefill and decode paths in <LabRef lab="llm-inference" inline />.

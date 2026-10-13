@@ -1,0 +1,214 @@
+---
+question: infra-008
+family: continuous-batching
+status: published
+labs: [llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll keep a first-in, first-out queue and a fixed array of slots. Every step, I fill each free slot from the
+> queue, call the model once with every active prefix, and give the k-th token it returns to the k-th active
+> slot, using a list I rebuild after the refill. Then I check stop token, stop sequence and length, in that order,
+> and free finished slots so the next request starts on the very next step. To test it, I run each request alone
+> through the same model and check the batched outputs are identical."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The interviewer wants to know one thing: can you keep the bookkeeping right while the batch changes under you at
+every step?
+
+Here is why that is harder than it sounds. A language model writes text one **token** at a time (a token is
+roughly ¾ of a word; in code it is just an integer). To get the next token you hand the model the request's
+**prefix**: its prompt plus everything it has written so far. One call that adds one token to each request is a
+**step**. The model accepts many prefixes in one call, a **batch**, and returns one next token per prefix, in the
+same order. Each place in the batch is a **slot**.
+
+In a normal batch job, such as flushing 100 buffered writes to a database, every item is one unit of work and the
+whole batch finishes together. Here, each request needs many steps, and their lengths vary a lot. One reply stops
+after 3 tokens, another runs for 1,000. A model call costs about the same whether it carries one prefix or many,
+so an empty slot is wasted money. The fix is to refill a slot at the very next step after its request finishes.
+This is called **continuous batching**. The catch is that the batch's membership now changes in the middle of the
+run, and the token in position 1 may belong to a different request than it did a few steps ago.
+
+(PracHub lists this as an xAI machine learning engineer onsite coding question; the statement on the page may be
+the site's own restatement <Cite id="s-8d74591878" />.)
+
+## Clarify first
+
+Spend a minute pinning down the rules. The PracHub statement answers most of them, so confirm them out loud:
+
+- **The interface.** A black box `model_next(batch_prefixes)` returns one token per prefix, in order. Say: "So
+  position k in the output belongs to position k in the input. I'll build my mapping around that."
+- **Stop rules.** Each request carries `max_tokens` and exactly one of a stop token or a stop sequence. Say: "The
+  statement says the stop token or sequence stays in the output, and I'll match the stop sequence only against
+  generated tokens, so a stop token sitting in the prompt doesn't end the reply early."
+- **Order.** Free slots refill from a FIFO queue, and outputs come back "in the original request order"
+  (<Cite id="s-8d74591878" />). Say: "Each result also gets a finish reason, stop or length."
+- **Zero-token requests.** A request with `max_tokens == 0` finishes immediately with an empty output. Say: "So it
+  must never take a slot, or it would receive one token."
+- **Is the model deterministic?** Assume yes. Say: "Then I can test by running each request alone and comparing."
+- **Limits.** Batch size up to 1,000, up to 10,000 requests, at most 100,000 generated tokens. Say: "At these
+  sizes the scheduler's own overhead per step matters, so I'll avoid copying prefixes."
+
+## Answer
+
+### The loop, in a picture
+
+```
+waiting queue (FIFO) ──refill free slots──▶ slots[0..N-1]
+                                               │
+                         active = occupied slot indices, rebuilt now
+                                               ▼
+                         model([prefix of each active slot])   ← one call
+                                               │
+                         k-th token ──▶ request in active[k]
+                                               ▼
+                         append, check stop rules, free finished slots
+                                               │
+                                     back to refill
+```
+
+**The waiting queue** holds requests in arrival order. **The slots** are the batch: each is empty (`None`) or
+holds one request. **`active`** is the list of occupied slot numbers, in order, rebuilt *after* the refill on every
+step. **The model call** happens exactly once per step. **Append and check** gives each token to its owner, decides
+who is finished, and frees their slots.
+
+### The state you keep
+
+- `waiting`: a deque in submission order.
+- `slots`: a fixed array, where `None` means free.
+- `seqs[i]`: slot i's prompt plus output so far, appended to in place.
+
+### Each step, in order
+
+1. **Refill.** For every free slot, pop from the queue. A request with `max_tokens == 0` is marked finished on the
+   spot and never takes a slot; the same slot then takes the next request.
+2. **Collect.** Build `active`, the occupied slot indices, *after* the refill.
+3. **One model call** with `[seqs[i] for i in active]`.
+4. **Pair by position.** The k-th returned token belongs to `active[k]`. Append it to that request's output and to
+   its prefix.
+5. **Stop check, in this order.** Last token equals the stop token; the tail of the output equals the stop
+   sequence; the output length has reached `max_tokens`. Checking stop before length means a stop on the last
+   allowed token reports "stop", not "length". On any of them, record the reason and free the slot.
+6. **Loop** while the queue or any slot is non-empty. Return the input list; its objects were updated in place, so
+   the order is the submission order.
+
+```python
+nxt = model([seqs[i] for i in active])   # one call per step
+for i, tok in zip(active, nxt):          # k-th token -> k-th active slot
+    r = slots[i]
+    r.out.append(tok); seqs[i].append(tok)
+    r.reason = stop_reason(r)
+    if r.reason:
+        slots[i] = None                  # refilled at the top of the next step
+```
+
+### Follow one small workload through it
+
+Use a toy model you can run in your head: **it always returns the last token plus one, modulo 10**. Use 2 slots
+and four requests: A (prompt `[3]`, up to 4 tokens, stop token 6), B (prompt `[1]`, up to 2 tokens, stop token 9),
+C (up to 0 tokens) and D (prompt `[0]`, up to 5 tokens, stop sequence `3, 4`). This trace comes from running the
+family walkthrough's tested loop with that toy model.
+
+| Step | Slot 0 | Slot 1 | Tokens back | What to say in the interview |
+|---|---|---|---|---|
+| 1 | A | B | `4`, `2` | "Both slots filled from the queue; one model call for both." |
+| 2 | A | B | `5`, `3` | "B reached its 2-token limit, so its slot frees now." |
+| 3 | A | D | `6`, `1` | "C asked for zero tokens, so it finished during the refill without a slot, and D took slot 1. The token `1` goes to D, not B." |
+| 4 | (empty) | D | `2` | "A hit its stop token. The queue is empty, so the batch runs part-full. That's normal." |
+| 5 | (empty) | D | `3` | "One active slot, so one prefix goes to the model." |
+| 6 | (empty) | D | `4` | "D's last two tokens are 3, 4, its stop sequence. Done." |
+
+Final outputs: A `4, 5, 6` (stop), B `2, 3` (length), C empty (length), D `1, 2, 3, 4` (stop). Six model calls.
+
+Step 3 is the one the interviewer watches. If your code remembered "slot 1 is B" from step 1, it would append D's
+first token to B's finished output, and both would be wrong. Rebuilding `active` after every refill is what
+prevents that.
+
+Say it like this: "The mapping from returned tokens to requests is rebuilt every step. That one line is where most
+bugs in this problem come from."
+
+### How to test it
+
+The model is deterministic, so you have a perfect reference: run each request alone, one token at a time, with no
+batching. A reference used this way is called an **oracle**. Batching must never change an output. Generate random
+workloads with random slot counts, run them through your loop, and assert every output equals the oracle's. Also
+check that no model call ever gets more than `num_slots` prefixes.
+
+The family walkthrough's code passed this check over 300 random workloads in a run on 2026-10-12. Its mock model
+uses a small vocabulary, so stop tokens and short stop sequences fire often and the edge cases get exercised.
+
+Say it like this: "My definition of done is that batched outputs equal one-at-a-time outputs on hundreds of
+random workloads."
+
+### Cost and complexity
+
+**Scheduler work per step** grows with the number of slots: finding free ones and active ones. That is
+microseconds. The model call is the real cost.
+
+**Total steps** are at least the longest reply, and at least the total tokens divided by the number of slots.
+Continuous batching approaches the second bound when the queue stays full.
+
+**Append, don't rebuild.** Appending each new token to `seqs[i]` is constant work. Rebuilding `prompt + out` for
+every request on every step costs time in proportion to its length, which at 100,000 generated tokens becomes a
+quadratic amount of copying.
+
+**Why bother with continuous batching at all?** If you instead wait for a whole batch to finish before starting the
+next (**static batching**), every batch runs as long as its longest reply. With an assumed mix of 90% 50-token and
+10% 1,000-token replies, **only about 14.5% of slot-steps do useful work**, and the best possible gain from
+refilling slots is **about 6.9×** fewer steps. On a mock with that mix, the family walkthrough measured 6.5–6.7×.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Mean reply length: 0.9 × 50 + 0.1 × 1,000 = **145 tokens**.
+- A static batch almost always contains a 1,000-token reply, so it lasts 1,000 steps. Useful work per slot is 145
+  steps on average. Occupancy = 145 ÷ 1,000 = **14.5%**.
+- If every slot stays busy, the best gain is max ÷ mean = 1,000 ÷ 145 ≈ **6.9×**.
+- The walkthrough's step-counting run (10,000 requests, 100 slots, five seeds) gave 6.5–6.7×. It counts steps on a
+  mock, so it measures scheduling, not GPU time.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Decode loop"
+  senior={["Gets the mapping right after refills, handles every edge case (zero tokens, part-full batches, stop before length), returns results in order, and tests against a one-request oracle."]}
+  staff={["Adds the memory-aware version (admitting only what fits in GPU memory, evicting a request when memory runs out, cancelling on disconnect) and explains why text-level stop strings need output held back while streaming."]}
+/>
+
+## Small-team version
+
+Nobody at a 50–500 person company ships this loop. Open-source serving engines such as vLLM, and hosted model
+APIs, already run it. Knowing it explains what you see in production:
+
+- **Latency rises with concurrency**, because every request in the batch shares each step.
+- **Long prompts slow other users' streams**, because reading a new prompt happens in the same steps.
+- **A stop string can leak into a stream** when the server doesn't hold output back until it knows whether the
+  text is the start of a stop string.
+
+If you ever wrap an engine with your own stop logic, the oracle test is still the right check.
+
+Self-host only when the numbers say so. Two A100 80GB GPUs (NVIDIA data-centre GPUs) for redundancy at RunPod's
+$1.39 an hour cost 2 × 1.39 × 730 hours ≈ **$2,030 a month** before engineer time (family walkthrough, price
+fetched 2026-10-11). Compare that with your monthly per-token bill from a provider.
+
+## Pitfalls
+
+- **Mapping by a stale index.** An index captured before refills hands tokens to whichever request used to sit in
+  that slot.
+- **Giving a zero-token request a slot.** It then receives one token, but the statement says it finishes empty.
+- **Checking length before stop.** A stop token on the last allowed step is then misreported as "length".
+- **Rebuilding every prefix every step.** It turns linear work into quadratic copying at the stated limits.
+- **Testing only by eye.** Without the one-request oracle, mapping bugs hide until a refill happens in the wrong
+  place.
+
+## Go deeper
+
+- Family walkthrough: [Continuous batching](/system-design-labs/interviews/walkthroughs/continuous-batching/), stages 1 and 2 and the verification section.
+- <LabRef lab="llm-inference" inline />: compare its `scheduler_step` with the tested loop.
+- The design context: [From one GPU batcher to a fleet](/system-design-labs/interviews/walkthroughs/batcher-to-fleet/).

@@ -1,0 +1,174 @@
+---
+question: infra-054
+family: move-big-bytes
+status: published
+labs: [gossip, cdn-edge]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Before I draw anything, I'll work out how long each plan takes. If every machine downloads the file from
+> one source, that source's bandwidth is shared by all of them, so the copy takes minutes. If I cut the file
+> into chunks and let machines pass chunks to each other, every machine adds its own upload, and the whole
+> fleet finishes in about the time one machine needs to download the file alone. After that, the local disk
+> becomes the slowest step. And every chunk is checked by hash before it is stored or passed on."
+>
+> The rest of this page explains each part of that answer.
+
+The task: one huge file has to reach thousands of machines, and each machine has limited bandwidth in and
+out. The interviewer wants to see whether you turn that into arithmetic before you draw boxes.
+
+### What makes this different from a normal deploy
+
+You already ship builds to a fleet. A service build is a few hundred MB at most. Every machine pulls it from
+a registry, and the download takes seconds, so nobody designs around it.
+
+Here the file is a model's **weights**: the numbers a model learned in training, stored as files. For a large
+model that is about 150 GB, roughly a thousand times bigger than a service build. Now the download is the
+main event. If every machine pulls from one place, that place has to send the whole file once per machine,
+and it becomes the bottleneck. The design question is how to stop one source from being shared by everyone.
+
+The good news: this is a classic distributed-systems problem. You need no machine learning knowledge.
+
+The question comes from a first-hand Anthropic Staff infra account, where the candidate called it a classic
+distributed-systems question in AI clothing; the reported follow-up was whether to send to fewer hosts faster
+or split bandwidth across many (<Cite id="s-e9fee3985a" />).
+
+## Clarify first
+
+Say each assumption out loud and write it down:
+
+- **File size, and does it change?** "I'll assume 150 GB that never changes once published, so I can name
+  pieces by their hash."
+- **How many machines, and where?** "1,000 hosts of 8 GPUs, in 4 regions of 250. A host keeps one copy on
+  disk however many GPUs it has, so I'll count hosts, not GPUs."
+- **Bandwidth.** "Each host sends and receives about 10 GB/s at the same time. Each region's cache can send
+  50 GB/s in total."
+- **Can machines send to each other?** And what does traffic between regions cost?
+- **Disk and deadline.** "Local SSD writes at 4 GB/s." How fast must the whole fleet have it?
+
+## Answer
+
+### Words you need first
+
+- **Chunk**: a fixed-size piece of the file, here 64 MB. Chunks let a machine forward piece 1 while it is
+  still receiving piece 2.
+- **Swarm** (also called **peer-to-peer**, the BitTorrent idea): every machine that has a chunk also uploads
+  it to other machines, so every machine becomes a source.
+- **Chain** (or **pipeline**) and **tree**: machine 1 forwards to machine 2, which forwards to machine 3; or
+  each machine forwards to k children.
+
+### One region, several plans
+
+Follow one region: 250 hosts, each needing 150 GB.
+
+| Plan | Time for 250 hosts | Why | What to say in the interview |
+|---|---|---|---|
+| Everyone from the cache | **12.5 min** | 250 hosts share 50 GB/s | "The source's bandwidth is shared N ways. That doesn't scale." |
+| Chain, whole file per hop | **62.5 min** | each host waits for the whole file before forwarding | "Without chunks, a chain is the worst plan." |
+| Chain, 64 MB chunks | **16.6 s** | each hop adds only one chunk's delay | "Fastest on paper, but one slow host slows everyone after it." |
+| Tree, 2 children, chunks | **about 30 s** | each sender splits its upload two ways | "Width divides bandwidth; depth costs only a few chunk-times." |
+| Tree, 4 children, chunks | **about 60 s** | upload split four ways | |
+| Swarm | **about 15 s** (lower bound) | every host uploads what it has | "A swarm uses all the upload, including the tree's idle leaves." |
+
+The first row is the naive plan. The cache sends 50 GB/s and 250 hosts share it, so each host gets a fifth of
+a GB per second. One host alone could download the file in **15 seconds**. So the cache, not the hosts, is the
+limit.
+
+The swarm's best case is about 15 seconds, set by one host's own link. It stays there however many hosts you
+add, because each new host brings 10 GB/s of upload with it.
+
+### Answering the reported follow-up
+
+"Fewer hosts faster, or split bandwidth across many?" Say it like this: "With whole files, send to fewer hosts
+at a time, because a finished host can start relaying. With chunks, a narrow tree beats a wide one, because
+width divides each sender's bandwidth while depth costs only a few chunk-times. A swarm avoids the choice,
+because every host uploads." In a tree with 2 children, about half the hosts are leaves that upload nothing.
+A swarm puts that idle upload to work.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Symbols: N hosts (250), S file size (150 GB), U cache egress (50 GB/s), B per-host bandwidth (10 GB/s),
+c chunk size (64 MB, so c ÷ B = 6.4 ms), k tree fan-out. All bandwidths are assumptions.
+
+- **Everyone from the cache:** max(N × S ÷ U, S ÷ B) = max(250 × 150 ÷ 50, 150 ÷ 10) = max(750 s, 15 s) =
+  **750 s**.
+- **Swarm lower bound:** max(S ÷ U, S ÷ B, N × S ÷ (U + Σ B_up)), where Σ B_up is the total upload of all hosts.
+  37,500 ÷ (50 + 2,500) ≈ 14.7 s, so the bound is about **15 s**, set by one host's own link.
+- **Chain with chunks:** S ÷ B + (N − 1) × c ÷ B = 15 + 249 × 6.4 ms ≈ **16.6 s**. Whole file per hop:
+  250 × 15 s = 62.5 minutes.
+- **Tree with chunks:** about k × S ÷ B plus a few chunk-times per level: 30 s at k = 2, 60 s at k = 4.
+
+</details>
+
+### What the system looks like
+
+```
+Origin store (the published file)
+   │  one fetch per chunk per region
+   ▼
+Regional cache ── fallback source for every host
+   │
+   ▼
+Host ◄──► Host ◄──► Host ◄──► ...   (peers swap verified chunks inside the region)
+```
+
+The **origin** holds the published file. The **regional cache** fetches each chunk from origin once and serves
+it to hosts that can't find it on a peer. The **hosts** fetch chunks from each other first, in any order,
+preferring the chunks fewest peers have so every chunk spreads. Keep peers inside a region so the swarm
+doesn't fill expensive links between regions.
+
+### Name what breaks next
+
+Once the network is fast, the disk is slower. Writing 150 GB to a local SSD at 4 GB/s takes **37.5 seconds**,
+more than twice the 15-second network bound. Say: "Once the swarm fixes the network, the disk is the
+bottleneck. I'll either stream into host memory and load the GPUs from there, or accept about 40 seconds and
+stop optimizing the network."
+
+### Finish with safety
+
+A peer is a stranger, so never trust it; trust hashes. The publisher writes a **manifest**: the list of every
+chunk's SHA-256 hash, signed. Each host checks a chunk's hash before writing it or forwarding it, so one bad
+peer can't corrupt the swarm. Each host also records which chunks it has in a **bitmap** on disk, so a
+restart resumes instead of starting over. If peers fail, the cache is always there as a fallback.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="One file, many machines"
+  senior={["Derives the time for each plan, picks a chunk size with reasons, and notices the disk becomes the bottleneck."]}
+  staff={["Counts hosts rather than GPUs, keeps the swarm inside regions to protect cross-region links, and says which metric (straggler time, origin egress) shows the plan is wrong."]}
+/>
+
+In plain words: Senior gets the numbers right. Staff also asks the questions that change the numbers and says
+what to watch: the slowest host's finish time ("stragglers") and how much the origin is sending.
+
+## Small-team version
+
+You will not ship to thousands of machines. At 5 to 20 GPU nodes reading from an object store in the same
+region, each node pulls in parallel, and its own read path is the limit: 40 GB at an assumed 2 GB/s is about
+**20 s**.
+
+The fan-out problem only appears when the source sits behind a fixed pipe, such as an on-prem store behind an
+assumed 10 Gbit/s link. Then 20 nodes × 40 GB through 1.25 GB/s takes **640 s, about 11 minutes**. Fix that
+with a copy of the bucket in the cluster's own region, not a swarm. Keep the hash check: it is one line of code
+and catches truncated downloads.
+
+Say: "At our size I'd mirror the weights into a bucket next to the cluster and check hashes; a swarm only pays
+off when many nodes share one fixed pipe."
+
+## Pitfalls
+
+- **Drawing a CDN or BitTorrent box first.** Without the times, you can't say why it helps.
+- **Counting 8,000 GPUs instead of 1,000 hosts.** That inflates every byte eight times.
+- **Tuning the network past the disk.** Once the disk is slower, more network speed buys nothing.
+- **Relaying chunks before checking them.** One bad peer then corrupts the whole swarm.
+
+## Go deeper
+
+- Family walkthrough: [Move big bytes fast](/system-design-labs/interviews/walkthroughs/move-big-bytes/), especially [Back-of-envelope](/system-design-labs/interviews/walkthroughs/move-big-bytes/#back-of-envelope) and [chunked fan-out](/system-design-labs/interviews/walkthroughs/move-big-bytes/#chunked-fan-out-with-and-without-a-coordinator).
+- Coordinator-free membership: <LabRef lab="gossip" inline />. Coalescing at a cache tier: <LabRef lab="cdn-edge" inline />.
+- The chunk-pipeline variant: [infra-055](/system-design-labs/interviews/questions/infra-055/).

@@ -1,0 +1,164 @@
+---
+question: infra-039
+family: roofline-sharded-matmul
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "The output layer turns the model's final vector into one score per vocabulary word. If I split it by
+> vocabulary, each GPU computes complete scores for its words, and the only traffic is combining decisions. If
+> I split it by hidden dimension, each GPU has partial scores for every word, and adding them moves 15.7× more
+> bytes. With a vocabulary split, the global top k is exact: merge each GPU's top k. But sampling from the full
+> distribution is not the same as sampling from those candidates, because any word can be picked. For an exact
+> sample I'd use Gumbel-max, where each GPU sends one pair."
+>
+> The rest of this page explains each part of that answer.
+
+This question is about the model's last step. After all its layers, the model has one vector of numbers for
+the next position. The **LM head** (language-model head) multiplies that vector by a big weight matrix to get
+one score per word in the vocabulary. Those scores are called **logits**. A **softmax** turns them into
+probabilities, and a **sampler** picks the next token.
+
+The backend analogy is a top-k query over a sharded table. If each shard holds complete rows, you can ask every
+shard for its top k and merge: that is exact. But if the query were "pick one row at random, weighted by
+score", the per-shard top k would not be enough, because a row outside every top k can still be picked. The
+interview is about keeping those two problems apart.
+
+(A PracHub listing for a Microsoft onsite, 2026: compare sharding the `[H, V]` head by vocabulary and by hidden
+dimension, and explain why local top-k candidates give an exact global top-k but not exact full-softmax
+sampling <Cite id="s-85ccfb1fcb" />. PracHub is a site that collects reported questions.) The page warns:
+"Exact full-distribution sampling is different from top-k sampling; do not silently replace one with the
+other." The test is precise reasoning about partial versus complete dot products, and about what a decision
+needs from the whole distribution.
+
+### Words you need first
+
+- **H** is the hidden size, the length of the model's final vector. **V** is the vocabulary size. A **token** is
+  one vocabulary entry, a chunk of text of about ¾ of a word.
+- **Sharding** splits the matrix across `D` GPUs (here called **ranks**). An **all-reduce** adds every rank's
+  full-size partial result. An **all-gather** gives every rank all the slices. A **reduce-scatter** adds and
+  leaves each rank only its slice.
+- **Top-k** means the k highest-scoring tokens. **Temperature** divides the logits before the softmax, to make
+  sampling more or less random. **Top-p** samples from the smallest set of tokens whose probabilities add up to p.
+
+## Clarify first
+
+- **What arrives?** "Is the incoming hidden vector copied to every rank, or split across them?"
+- **What does the consumer need?** "All the logits, the global top k, or an exact sample from the full softmax?"
+- **Sizes?** "Llama-3.1-70B's head: H = 8,192, V = 128,256, bf16 (2 bytes per number), D = 8 ranks on NVLink,
+  NVIDIA's fast GPU-to-GPU link."
+
+## Answer
+
+### The worked example: one token through a 70B model's head
+
+The head is 8,192 × 128,256 = 1.05 × 10⁹ weights, **2.10 GB** in bf16. Reading it once takes 0.63 ms on one H100,
+or 78 µs per rank split eight ways. We follow one token's final vector through the head on 8 ranks.
+
+| Step | Decision | Bytes per token | What to say in the interview |
+|---|---|---|---|
+| 1 | Split by vocabulary | 16.4 KB gather (only if the vector arrives split) | "Complete logits per rank; no reduction." |
+| 2 | Or split by hidden dimension | 256.5 KB all-reduce | "15.7× more bytes, so vocabulary wins." |
+| 3 | Need the top 50 | 400 (value, index) pairs | "Merging local top-k is exact." |
+| 4 | Need an exact sample | 2 scalars, or 1 pair per rank | "Candidates aren't enough; use Gumbel-max or a global normalizer." |
+
+### Steps 1–2: vocabulary vs hidden sharding
+
+**Vocabulary sharding** (`[H, V/D]` per rank). Each rank needs the full hidden vector and computes complete
+logits for its V/D tokens. No reduction is needed to form logits. If the hidden vector arrives split, all-gather
+it first: H × s = **16.4 KB** per token.
+
+**Hidden sharding** (`[H/D, V]` per rank). Each rank computes partial dot products for every vocabulary entry.
+The logits exist only after an all-reduce (or a reduce-scatter into vocabulary slices) of V × s = **256.5 KB**
+per token in bf16. That is V ÷ H = **15.7×** the vocabulary scheme's gather.
+
+It wins only if the hidden vector already arrives split and you can't afford the gather, which is rare given
+the sizes. This answers the item's third follow-up: an earlier layer that outputs hidden slices removes the
+gather but not the logits reduction.
+
+Say it like this: "Vocabulary sharding gives complete logits; hidden sharding gives partial ones and a V-wide
+reduction. V is 15.7 times H here, so vocabulary sharding."
+
+### Step 3: exact global top-k from local top-k
+
+If a token is in the global top k, fewer than k tokens beat it overall. So fewer than k beat it within its own
+slice, which means it is in that slice's local top k. All-gather the D × k (value, index) pairs and take the top
+k. With k = 50 and D = 8, that is 400 pairs per token instead of 128,256 logits.
+
+### Step 4: why that isn't exact full-softmax sampling
+
+A full-softmax sample can pick any token, in proportion to its probability, including the long tail that
+appears in no slice's top k. Sampling among the gathered candidates samples a cut-off, renormalized
+distribution. When the distribution is flat, the missing probability is large. Two exact alternatives:
+
+- **A distributed normalizer.** Each rank finds its largest logit and its sum of `exp(logit − max)`. One
+  all-reduce gives the global max, a second the rescaled total. Pick a rank in proportion to its share, then
+  sample inside it. Two scalars per token cross the network.
+- **Gumbel-max.** Each rank adds independent random noise of a particular kind (**Gumbel noise**) to its logits,
+  after applying temperature, and returns its largest value and its index. The global largest of these noisy
+  values is an exact sample from the softmax. One (value, index) pair per rank.
+
+Top-k *sampling* (sample within the global top k) is exact with the candidate merge. Top-p needs the global
+sorted running total of probability, so it needs more communication.
+
+Say it like this: "Top-k merges exactly. Full-softmax sampling doesn't, because the tail matters. Gumbel-max
+fixes it with one pair per rank."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Head size:** 8,192 × 128,256 = 1.05 × 10⁹ weights × 2 B = 2.10 GB; ÷ 3.35 TB/s = 0.63 ms; ÷ 8 = 78 µs.
+- **Gather vs reduce:** 8,192 × 2 B = 16.4 KB; 128,256 × 2 B = 256.5 KB; ratio 15.7.
+
+<Formula
+  title="Distributed normalizer"
+  expr="Z = Σ over ranks of exp(m_d − m) × Z_d;  pick rank d with probability exp(m_d − m) × Z_d ÷ Z, then sample inside it"
+  vars={[
+    { sym: 'm_d, Z_d', meaning: "rank d's max logit and its sum of exp(logit − m_d)" },
+    { sym: 'm', meaning: 'global max, from an all-reduce of maxima' },
+  ]}
+  example="Per token: one all-reduce of the max and one of the rescaled sums, two scalars, instead of 128,256 logits"
+/>
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="LM-head sharding"
+  senior={["Explains complete vs partial dot products, sizes both collectives, and proves the top-k merge is exact."]}
+  staff={["Keeps top-k and full-softmax sampling apart, gives an exact distributed sampler, and says which sampling settings need which collective."]}
+/>
+
+In plain words: Senior picks the right split and proves the merge. Staff also refuses to swap one sampling
+problem for another, and gives an exact method that is cheap on the network.
+
+## Small-team version
+
+Serving engines handle vocabulary-split heads for you. The part that matters to a small team is the sampling
+distinction. When you change sampling settings (temperature, top-k, top-p) on a self-hosted model, check outputs
+on your eval (your own set of test prompts), because the settings change the distribution you ship.
+
+The check is cheap: 200 prompts × 400 output tokens is **80,000 tokens per setting**. That is about **80 s** of
+GPU time at an assumed 1,000 tokens per second batched, **a few cents** on a rented A100 at $1.59 an hour.
+
+On a managed API you usually get only temperature and top-p, and the provider's sampler is not yours to shard.
+The question only becomes yours if you self-host a large model across GPUs.
+
+## Pitfalls
+
+- **Gathering all logits to every rank.** When only the top k is needed, D × k pairs are enough.
+- **Calling candidate-only sampling "exact".** It drops the tail of the distribution.
+- **Picking hidden sharding without sizing it.** Its V-wide reduction is 15.7× the vocabulary scheme's gather.
+- **Adding Gumbel noise before temperature.** Temperature must be applied to the logits first, or the sample is
+  from the wrong distribution.
+
+## Go deeper
+
+- Family walkthrough: [Roofline and sharded-matmul math](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/#derivations), section 9.
+- Sampling code from scratch: [LLM internals from scratch](/system-design-labs/interviews/walkthroughs/llm-from-scratch/).
+- Add a sharded head to the GPT in <LabRef lab="transformer" inline />.

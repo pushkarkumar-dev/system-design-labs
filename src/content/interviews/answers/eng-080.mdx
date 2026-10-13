@@ -1,0 +1,166 @@
+---
+question: eng-080
+family: fde-discovery
+status: published
+labs: [observability, load-balancer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "First I'd narrow the symptom: which requests fail, since when, how they fail, and what changed. Then I'd walk
+> the diagram one hop at a time. At each hop I'll say my most likely cause, the one piece of evidence that would
+> confirm it, and where I go next if it's clean. If something sits in the path that calls an AI model, I'll check
+> its usual failures early: rate limits, oversized inputs, timeouts and unparseable output."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer shows you an architecture diagram and says a customer reports that requests are failing. The
+question is whether you can debug a system you can't see by asking for the right evidence in the right order.
+
+### Why this is different from your normal incident call
+
+On a real incident you open dashboards and logs yourself. Here you have none. The first-hand account says you get a
+diagram and "A customer reported that requests are failing. Debug the issue.", with "No stack traces. No error
+codes." (<Cite id="s-88b41bdbd6" />). Every piece of evidence costs you a question to the interviewer, so the order
+of your questions is what gets graded.
+
+The candidate's summary of the round: "The entire round is about whether you can run a hypothesis-driven debugging
+process under ambiguity." (<Cite id="s-88b41bdbd6" />). A **hypothesis** here is a specific, testable guess: "the
+model provider is rejecting our calls because we hit a limit". By that account, the method matters more than whether
+you find the root cause.
+
+The second difference: the system may call a **large language model** (LLM), a text-in, text-out model rented
+through a paid API. That adds failure types your usual checklist doesn't have. This question was reported from a
+Cohere forward deployed engineer (FDE) loop (<Cite id="s-88b41bdbd6" />).
+
+## Clarify first
+
+Narrow the symptom before you touch the diagram. Each question cuts the search space:
+
+- **Which requests fail?** All, one endpoint, one customer, only large inputs? Assume one customer's large requests.
+- **Since when, and what changed then?** A deploy, a config change, a new model or prompt, a key rotation, a traffic
+  jump? Assume unknown.
+- **Fail how?** Errors with which status codes, timeouts, or wrong answers? Assume errors at the client.
+- **How many, and in what pattern?** What fraction, steady or in bursts? Assume a few percent, bursty.
+
+Say it like this: "Before I look at the boxes, I want to know which requests fail and what changed when it started.
+That usually halves the diagram."
+
+## Answer
+
+### Words you need first
+
+- A **hop** is one box-to-box step a request takes: browser to gateway, gateway to app, app to a database.
+- A **trace** is the record of one request's path through every hop, with timings, tied together by a shared
+  request ID. Passing that ID along every hop is called **trace context propagation**.
+- A **token** is the unit a model reads and writes, roughly ¾ of a word. Model providers limit and bill by tokens.
+
+### Walk the diagram hop by hop, saying a hypothesis each time
+
+The candidate's script works: "The most likely failure domain is X because of Y. To confirm, I'd want to see Z. If
+that's clean, I'd move to W." (<Cite id="s-88b41bdbd6" />). Ask for the cheapest evidence that splits the remaining
+possibilities, and say why you want it.
+
+Picture a typical diagram for a service that uses a model:
+
+```
+Client
+   │
+   ▼
+API gateway ── auth, rate limits, timeouts
+   │
+   ▼
+App service ── builds the prompt, parses the model's reply
+   │                 │
+   ▼                 ▼
+Retrieval store    Model provider API ── rate limits, spend cap, context window
+```
+
+**API gateway.** The front door. It checks credentials, applies limits, and cuts off slow requests after a timeout.
+
+**App service.** Your code. It gathers documents, builds the text sent to the model, and turns the model's reply into
+a response. A crash or a failed parse shows up here as a 500 error.
+
+**Retrieval store.** Where the customer's documents are searched. If it is slow or down, the app may fail before it
+calls the model.
+
+**Model provider API.** The rented model. It has its own limits on requests, tokens and monthly spend.
+
+### A sensible order of requests
+
+Here is one worked run through the diagram. The interviewer's answers are illustrative.
+
+| Step | You ask for | Why | Illustrative answer | What to say next |
+|---|---|---|---|---|
+| 1 | Error rate and status codes at the edge, split by customer and endpoint | Shows who is affected and how | "Only customer B, HTTP 500s, bursty" | "One customer, so I suspect something about their requests, not the whole system." |
+| 2 | The same per hop | Finds the first hop that fails | "Gateway and retrieval are clean; the app returns 500 after the model call" | "So the model call or the parsing after it." |
+| 3 | One full trace of a failing request next to a succeeding one | Shows what differs | "The failing one sent far more input tokens" | "That points at input size." |
+| 4 | Deploy and config history aligned with the start time | Finds the trigger | "Customer B uploaded large contracts that day" | "That fits: their documents push prompts past the model's limit." |
+| 5 | Saturation signals: connection pools, queue depth, CPU and memory, provider rate-limit headers | Rules out load as a cause | "All normal" | "Good, that rules out capacity." |
+
+### If a model sits in the path, check its own failure types
+
+These explain "requests are failing" often, and a backend checklist misses them:
+
+- **Provider limits.** The API returns HTTP **429** ("too many requests") when you pass a rate limit or a monthly
+  spend cap. Anthropic's [rate-limit docs](https://platform.claude.com/docs/en/api/rate-limits) (fetched
+  2026-10-11) say that at the cap the API returns 429 without `retry-after`, so retries keep failing.
+- **Inputs too large.** One customer's long documents push the request past the **context window** (the most tokens
+  the model can read at once).
+- **Timeouts.** A model or prompt change made outputs longer, and the gateway timeout was set for the old length.
+- **Unparseable output.** The app expects, say, a particular structured format, the model writes something else, and
+  the app returns a 500.
+- **Expired credentials.** A key that expired or was rotated in one region only.
+
+### When the evidence contradicts you, say so and pivot
+
+The account stresses acknowledging contradicting data rather than explaining it away. Say it like this: "That
+contradicts my guess, so I'll drop it. Next cheapest check is the per-hop error rate."
+
+### Finish with three things
+
+1. **The fix:** for the worked run, split or trim oversized inputs before the model call.
+2. **The mitigation for now:** shed or queue the requests, raise a limit, or fail fast with a clear error message
+   instead of a generic 500.
+3. **The monitor that would have caught it:** for example, an alert on per-customer error rate, or on requests near
+   the model's input limit.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Debug from a diagram"
+  senior={["Narrows the symptom, asks for specific data per hop with a reason, updates hypotheses, and reaches a fix plus mitigation."]}
+  staff={["Also separates customer communication from investigation, proposes the missing telemetry (trace propagation, per-tenant error rates) and the alert that would have fired first."]}
+/>
+
+In plain words: a Senior answer finds the problem methodically. A Staff answer also keeps the customer informed
+while it does, and leaves behind the monitoring that makes the next incident short.
+
+## Small-team version
+
+On a small team this is a normal Tuesday: a customer emails that "the AI feature is broken".
+
+The preparation is boring and decisive. Put these in place before the first incident:
+
+- Trace context passed through every hop, so one request ID finds the whole path.
+- Error rates per customer, not only overall, so one customer's problem doesn't hide in an average.
+- The provider's status and rate-limit response headers in your logs.
+- An alert on the spend cap, before you hit it.
+
+With those, the question takes minutes instead of an afternoon. Without them, you are in the interview's position:
+guessing from a diagram.
+
+## Pitfalls
+
+- **A checklist with no hypothesis.** Reciting every possible cause shows no judgment about which is likely.
+- **Asking for "all the logs".** A specific signal with a reason shows you know what it will tell you.
+- **Ignoring what changed and when.** Most failures start at a change, so the timeline is the cheapest clue.
+- **Explaining away a contradiction.** The account stresses that contradicting data should change your hypothesis.
+
+## Go deeper
+
+- Family walkthrough: [Customer discovery and scoping before architecture](/system-design-labs/interviews/walkthroughs/fde-discovery/#debugging-from-a-diagram-eng-080).
+- Second family: [diagnosing slow or stuck infrastructure](/system-design-labs/interviews/questions/infra-094/) uses the same method on infra.
+- Labs: <LabRef lab="observability" inline />, <LabRef lab="load-balancer" inline />.

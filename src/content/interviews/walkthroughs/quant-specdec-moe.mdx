@@ -1,0 +1,968 @@
+---
+title: "Quantization, speculative decoding and MoE as measurable trade-offs"
+summary: "Three ways to serve a model cheaper or faster: fewer bits per number, a small model that guesses ahead, and a model that uses only part of itself per word. For each, say what it saves, what it costs and how you'd measure it."
+track: ai-infra
+format: deep-dive
+family: quant-specdec-moe
+smallTeamFocus: "Turn these levers on through vLLM or a provider; don't write the kernels. Your job is the paired eval that shows quality held and the load test at your real number of users."
+rounds: [practical-coding, domain-deep-dive, debugging]
+level: both
+timeboxMin: 45
+order: 228
+status: published
+basedOn: [infra-084, infra-085, infra-086, infra-087, infra-088, r2b-016]
+askedAt: [nvidia, applied-ai-generic]
+labs:
+  - { lab: model-quantizer, role: partial, note: "Symmetric INT8 and grouped INT4 in NumPy, with GPT-2 weight error measured on real weights; its perplexity table is an illustration." }
+  - { lab: speculative-decoding, role: partial, note: "Draft-and-verify with rejection sampling, plus expected_speedup, expected_net_speedup and optimal_K; the draft and target are mock models." }
+  - { lab: transformer, role: proof, note: "A small GPT whose feed-forward block you can replace with the MoE layer on this page." }
+  - { lab: llm-inference, role: partial, note: "The KV cache is real, so you can reason about verify passes; its batching runs one forward pass per request." }
+gapLabs: []
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "All three are ways to serve the same model cheaper or faster, and each one has a price. Quantization stores the
+> model's numbers in fewer bits, so it needs less GPU memory and reads fewer bytes per word. The price is a little
+> accuracy, which I measure with an eval on our own prompts. Speculative decoding lets a small model guess a few
+> words and the big model check them all in one step. It wins only while the GPU has spare compute, so it can lower
+> throughput at large batch sizes. A mixture-of-experts model uses only a slice of its numbers for each word, which
+> cuts compute, but every slice still has to sit in GPU memory. For each lever I say what it saves, what it costs
+> and what I'd measure to know which won."
+>
+> The rest of this page explains each part of that answer.
+
+This family covers three serving techniques that interviewers ask about as one cluster: write a quantizer that
+turns 32-bit floats into 8-bit integers; work out how many words speculative decoding produces per step, and why it
+can make a busy server slower; and explain what a "671B total, 37B active" mixture-of-experts model costs to serve.
+
+### What makes this different from optimizations you already know
+
+You have used all three ideas in backend work under other names.
+
+1. **Quantization is lossy compression.** Think of storing a timestamp in seconds instead of nanoseconds, or saving
+   a photo as a JPEG. The data gets smaller and faster to read, but some detail is gone for good. Whether the lost
+   detail mattered is something you test, not something you assume.
+2. **Speculative decoding is speculative execution.** A CPU's branch predictor guesses which way a branch goes and
+   runs ahead; optimistic concurrency does work first and checks for conflicts at commit. Both win when checking is
+   cheap and guesses are usually right. Both lose when the machine is already busy, because every wrong guess
+   burns capacity someone else needed.
+3. **Mixture of experts is a sharded service with hot keys.** Each request touches only a few shards, so each
+   request does less work. But you still provision every shard, and if most traffic lands on three shards, those
+   three set your latency.
+
+Two things make the AI versions harder. First, the price of quantization is **quality**, and quality loss doesn't
+throw an exception. A model that got slightly worse still returns fluent text, so you need a test set and a score
+to see it. Second, whether a GPU has "spare capacity" depends on a balance between its memory speed and its math
+speed that most backend engineers have never had to think about. The next subsection explains that balance, because
+all three levers depend on it.
+
+### Words you need first
+
+- A **large language model (LLM)** is a large set of learned numbers called **weights** (or **parameters**),
+  arranged in repeated layers; the standard layer design is called a **transformer**. Llama-3.1-70B, the open model
+  this page uses as its example, has 70.55 billion of them. Stored as **bf16** (a 16-bit floating-point format, 2
+  bytes per number), they take **141.1 GB** (1 GB = 10⁹ bytes). A data-centre GPU such as the NVIDIA A100 or H100
+  has 80 GB of memory, so this model doesn't fit on one GPU.
+- The model writes text one **token** (roughly ¾ of a word) at a time. Producing each new token means running every
+  weight through the math once. This token-by-token phase is called **decode**.
+- A GPU serves many conversations at once. One decode step produces one token for every conversation in the
+  **batch**, the set of conversations being served together.
+- Every step takes the longer of two times: the time to **read** the weights from GPU memory, and the time to do the
+  **math**. An A100 does 312 trillion bf16 operations per second (**312 TFLOPS**; FLOP means one floating-point
+  multiply or add) and reads 2,039 GB per second <Cite id="s-8e443a8b66" />. Divide one by the other: it can do
+  about **153 operations for every byte it reads**. That break-even figure is called the **ridge point**.
+
+The last point is the key one. In decode, each weight (2 bytes) is used for 2 operations (a multiply and an add)
+per token in the step. So the operations per byte, called **arithmetic intensity**, is roughly the number of tokens
+processed together. With a batch of 1, that is 1, far below 153. The GPU spends its time waiting for memory and its
+math units sit mostly idle. That state is called **memory-bound**. With hundreds of tokens per step, intensity
+passes 153 and the math becomes the limit: **compute-bound**. The picture with these two limits is called a
+**roofline**.
+
+Now the three levers fit in one sentence each. Quantization cuts the bytes, so memory-bound decode gets faster.
+Speculative decoding spends the idle math to make several tokens per weight read. Mixture of experts cuts the math
+per token, but not the bytes you must keep in memory.
+
+### The example that runs through this page
+
+Follow one model through every section: Llama-3.1-70B serving chat. Because it doesn't fit on one GPU, it is
+usually split across several GPUs that each hold a slice of every weight matrix and work on every step together.
+That is called **tensor parallelism**, written TP = 4 for four GPUs.
+
+| Lever | What happens to our 70B model | What to say in the interview |
+|---|---|---|
+| None (bf16) | 141.1 GB of weights. On 4 A100s, each GPU reads its 35.28 GB share every step: **17.3 ms per step**, at any small batch. | "At small batch, decode speed is set by bytes read, not by math." |
+| Quantize to INT4 (4-bit integers) | **39.69 GB** including the scale factors. Fits on one 80 GB GPU. | "Fewer bytes per weight means fewer GPUs and a faster memory-bound step; I check quality with a paired eval." |
+| Speculative decoding with a small 1B (1-billion-parameter) draft model | About **2.73×** faster at batch 1, about **0.69×** (slower) at batch 128 in an idealized model. | "It spends idle compute. When the batch has already used that compute, it becomes overhead." |
+| Swap for a mixture-of-experts (MoE) model with 671B total and 37B active parameters | 74 GFLOP (billion operations) per token, 18× less than a dense 671B model that uses every parameter for every token, but **671 GB** of weights at 8 bits. | "Active parameters set compute; total parameters set memory and the GPU count." |
+
+Every number in this table is worked out later on the page, in the section for that lever, along with every term in it.
+
+### Where these questions come from
+
+One NVIDIA-tagged question bank entry, two prep guides and one review snippet report this cluster, as summarized
+below; only the first names a company and a round. Don't worry about the terms in these titles yet;
+each one is explained further down.
+
+- **Quantization (infra-084).** A PracHub entry tagged NVIDIA (software engineer, onsite, September 2026) is
+  titled "FP32 to Int8 Tensor Quantization: Scale, Zero Point, Clipping and Outliers" <Cite id="s-e6bac4f7b9" />.
+  The parts listed on the page ask for a NumPy quantizer that divides, rounds and clamps to −128…127, then a zero
+  point and a dequantizer, a bound on the round-trip error, and saturation instead of wraparound. Its follow-ups
+  are per-tensor versus per-channel scales, why activations are harder than weights, and requantizing int32
+  sums back to int8. On PracHub only the title is candidate-reported; the parts are the page's write-up.
+- **Speculative decoding (infra-087, infra-088).** A techinterview.org prep guide (August 2026) asks for the
+  expected tokens committed per target-model pass, and why throughput can drop after you turn speculation on at
+  high batch sizes <Cite id="s-4525fcd815" />. These are the guide's own examples, not candidate reports.
+- **Mixture of experts (infra-085, infra-086).** A companion prep guide (August 2026) asks what "671B total, 37B
+  active" predicts about serving cost, and what went wrong when a router sends 80% of tokens to three of
+  thirty-two experts <Cite id="s-9e6b455b13" />. Again, the guide's examples.
+- **An MoE layer in code (r2b-016).** A Glassdoor review for an NVIDIA deep-learning engineer role, seen only as a
+  search snippet, describes implementing an MoE layer with the tensor shapes at each step, after a discussion of
+  GPU kernels, fusion and launch overhead <Cite id="s-0f8d1c21c4" />. Snippet-only, so low confidence.
+
+<QuestionRow id="infra-084" />
+<QuestionRow id="infra-085" />
+<QuestionRow id="infra-086" />
+<QuestionRow id="infra-087" />
+<QuestionRow id="infra-088" />
+<QuestionRow id="r2b-016" />
+
+Because most of this comes from prep guides, prepare the material, not a script for one company's loop.
+
+## What is being tested
+
+- **Numbers with their cost attached.** Interview guides say interviewers want quantization and speculative
+  decoding treated as trade-offs with a measurable cost, not as buzzwords <Cite id="s-f440daaea4" />. For each
+  lever, be ready to say three things: what it saves (bytes, math, or big-model steps), what it costs (accuracy,
+  extra work, memory), and which measurement tells you whether it won.
+- **Careful code for a small numeric routine** (infra-084). The PracHub page's hints point at the bugs people
+  actually write: converting to int8 before limiting the range, forgetting that 0.0 must come back exactly, and
+  wasting integer values on a badly placed range <Cite id="s-e6bac4f7b9" />.
+- **Memory versus compute.** The MoE guide's core point: "Active parameters set the FLOPs per token, so they govern
+  latency and throughput" <Cite id="s-9e6b455b13" />. Total parameters still have to sit in memory.
+- **Roofline reasoning in a debugging story** (infra-088). Speculative decoding spends spare compute. When a large
+  batch has already used it, speculation becomes overhead, and you should be able to show where that flip happens.
+- **Shapes and data movement** (r2b-016). An MoE layer gathers the tokens for each expert, runs one matrix multiply
+  per expert and scatters the results back. The interesting part is the bookkeeping, and what GPU launch costs do
+  to a loop over experts.
+
+## Clarify and scope
+
+Ask these before you write anything. If the interviewer doesn't answer, say the assumption you'll use and write it
+down.
+
+**Quantization**
+- "Are we quantizing weights or activations?" **Activations** are the intermediate values that flow between layers
+  for a given input. Weights never change, so you can measure their range offline. Activations change with every
+  input.
+- "Symmetric or asymmetric?" Symmetric means 0.0 maps to the integer 0. Use the page's range −128…127, or −127…127
+  so the positive and negative sides match?
+- "Which rounding rule for ties?" Round half to even (NumPy's `rint`) or half away from zero. Say which, because
+  tests depend on it.
+- "One scale for the whole tensor, one per output channel, or one per group of 32 weights? How wide is the sum
+  register?" A **tensor** is a multi-dimensional array of numbers, such as one weight matrix; an output channel is
+  one row of it. The options are explained in Core concepts.
+- "Which GPU?" Newer NVIDIA GPUs have hardware for 8-bit floating point (**FP8**) in their matrix units (**Tensor
+  Cores**). The H100 (the Hopper generation) has it; the A100 (Ampere) doesn't. The A100 spec page has no FP8 row
+  <Cite id="s-8e443a8b66" />, and the quantization table of vLLM (a widely used open-source serving engine) marks FP8 W8A8 (8-bit weights and 8-bit activations) as
+  supported on Ada and Hopper (newer NVIDIA generations), not Ampere
+  ([vLLM quantization docs](https://docs.vllm.ai/en/latest/features/quantization/), page dated 2026-09-14).
+
+**Speculative decoding**
+- "What is the batch size, or the queries per second at peak?" This decides the answer to infra-088.
+- "Greedy or sampled decoding?" Greedy always picks the most likely token; sampled picks at random by probability.
+  Both stay exact with the right acceptance rule, but acceptance rates differ.
+- "What can draft?" A small sibling model, an **n-gram lookup** (copy a continuation of text that already appeared
+  in the prompt), or a small extra layer trained to guess ahead.
+- "Are we optimizing one user's latency or total throughput?"
+
+**Mixture of experts**
+- "Inference or training?" A balancing penalty during training is a training fix. Serving fixes are where you put
+  experts and how many tokens each may take.
+- "How many GPUs, and does each GPU hold whole experts (**expert parallelism**) or a slice of every expert (tensor
+  parallelism)?"
+- "Does each token go to one expert (top-1) or several (top-k)? Is there a capacity limit that drops tokens?"
+
+**Out of scope:** writing the GPU code itself (that is the
+[GPU kernel family](/system-design-labs/interviews/walkthroughs/gpu-kernel-perf/)), training a model to tolerate
+quantization, and the internals of GPTQ and AWQ (two well-known 4-bit methods) beyond what they fix.
+
+## Core concepts
+
+### Quantization: storing each number in fewer bits
+
+Start with a tiny example. You have three weights: −1.0, 0.0 and 1.0. You want to store them as 8-bit integers,
+which hold whole numbers from −128 to 127. Pick a **scale** of 0.1, meaning each integer step stands for 0.1. Divide
+by the scale and round: you store −10, 0 and 10. To read them back, multiply by the scale: −1.0, 0.0 and 1.0
+exactly. That round trip is **quantization** and **dequantization**.
+
+Real values don't land on exact steps. A weight of 0.234 becomes round(2.34) = 2, which reads back as 0.2. So every
+value comes back with an error of at most half a step. That is the whole accuracy cost of quantization, and the
+rest of this section is about keeping the step small where it matters.
+
+Sometimes the values are all positive, for example the output of ReLU, an activation function that turns negatives
+into 0. Then you shift the integers so that the range of values uses all 256 of them. The integer that stands for
+0.0 is called the **zero point**. Symmetric quantization has a zero point of 0; asymmetric quantization picks one.
+Here is the general rule:
+
+<Formula
+  title="Affine INT8 quantization"
+  expr="q = clamp(round(x ÷ s) + z, −128, 127);   x̂ = s × (q − z)"
+  vars={[
+    { sym: 's', meaning: 'scale: the float step between two adjacent integer codes' },
+    { sym: 'z', meaning: 'zero point: the integer code that represents 0.0 (0 for symmetric)' },
+    { sym: 'symmetric', meaning: 's = max|x| ÷ 127, z = 0' },
+    { sym: 'asymmetric', meaning: 's = (max − min) ÷ 255, z = round(−128 − min ÷ s), with min ≤ 0 ≤ max so 0.0 is representable' },
+  ]}
+  example={[
+    'x = [−1.0, 0.0, 1.0], s = 0.1, z = 0 → q = [−10, 0, 10] → x̂ = [−1.0, 0.0, 1.0]',
+    'In-range error is at most s ÷ 2 per element: s = 0.000745 gave a worst error of 0.000373 on a 256 × 1,024 test matrix',
+  ]}
+/>
+
+"Clamp" means limit to the range: anything below −128 becomes −128, anything above 127 becomes 127. That is called
+**saturation**. Three things go wrong in practice:
+
+1. **Converting before clamping.** If you convert a float to int8 first, an out-of-range value doesn't saturate; it
+   can wrap around. On the machine used for this page (NumPy, Apple M1 Ultra, run 2026-10-12),
+   `np.array([200.0]).astype(np.int8)` gave −56. Out-of-range float-to-int conversion is not something to rely on,
+   so `np.clip` comes first. Say: "Clamp, then cast. Otherwise 200 becomes −56."
+2. **Wasted integer values.** For a ReLU output in [0, 6], symmetric quantization spends half its integers on
+   negative values that never occur. In the run, symmetric used 128 distinct values with an RMS (root-mean-square)
+   error of 0.0136. Asymmetric used all 256 with 0.0068, half the error.
+3. **Outliers.** With one scale for the whole tensor, the single largest value sets the step for every value. One
+   extreme weight makes the step large, and many ordinary weights round to zero. Worked example 2 shows this with
+   numbers.
+
+### Finer scales, wide sums, and why activations are harder
+
+The fix for outliers is to use more scales. **Per-channel** means one scale per output row of a weight matrix, so an
+outlier only coarsens its own row. **Per-group** means one scale per 32 or 128 consecutive weights. 4-bit formats
+such as GGUF (a popular file format for running models locally) use groups, because with only 16 integer values available, a coarse step hurts a lot.
+
+Scales cost memory too, and a common interview slip is to forget them. A 16-bit scale shared by 32 weights adds
+half a bit to each weight, so "4-bit" really costs 4.5 bits. For our 70B model that is **39.69 GB, not 35.28 GB**.
+
+<Formula
+  title="Weight memory with scales"
+  expr="bytes = params × (bits + scale_bits ÷ group) ÷ 8"
+  vars={[
+    { sym: 'bits', meaning: 'bits per weight: 16 bf16, 8 int8/fp8, 4 int4' },
+    { sym: 'scale_bits ÷ group', meaning: 'scale overhead per weight: an fp16 scale per 32 weights adds 0.5 bit' },
+  ]}
+  example="Llama-3.1-70B (70.55B params): bf16 141.1 GB; int8 70.55 GB; int4 alone 35.28 GB; int4 with fp16 scales per 32 weights = 4.5 bits → 39.69 GB"
+/>
+
+Next, the math itself. A layer's core operation is a **dot product**: multiply many pairs of numbers and add the
+results. With 8-bit inputs, the running sum (the **accumulator**) needs far more than 8 bits. Hardware keeps it in
+a 32-bit integer, which is safe for any realistic layer size: at least **131,072 worst-case terms**. A 16-bit
+accumulator would overflow after two. At the end, the 32-bit sum is turned back into an 8-bit value for the next
+layer. That step is called **requantization**: multiply the sum by one combined scale, round, add the output zero
+point and clamp. With per-channel weight scales, that combined scale is a list, one value per output channel.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Largest product:** an int8 × int8 product is at most 128 × 128 = 16,384 in magnitude.
+- **int16 accumulator:** its limit is 32,767, so two worst-case products (32,768) overflow it.
+- **int32 accumulator:** 2³¹ ÷ 16,384 = **131,072** worst-case terms before overflow.
+- **Requantization multiplier:** the int32 sum represents x × w in units of s_x × s_w. To express it in the output's
+  units, multiply by s_x × s_w ÷ s_y, round, add z_y and clamp to −128…127.
+- **Scales on 70B:** 70.55 × 10⁹ × 4.5 bits ÷ 8 = 39.69 GB; without scales 70.55 × 10⁹ × 0.5 B = 35.28 GB.
+
+</details>
+
+Weights are the easy part: they never change, and you can see their whole range before you serve. Activations
+change with every input and carry a few channels with very large values. The LLM.int8() paper reports "highly
+systematic emergent features" in transformer activations. It handles them with a mixed-precision split in which
+"more than 99.9% of values are multiplied in 8-bit" while the outlier dimensions go through 16-bit
+([Dettmers et al., arXiv 2208.07339](https://arxiv.org/abs/2208.07339), 2022). SmoothQuant goes the other way,
+"migrating the quantization difficulty from activations to weights with a mathematically equivalent
+transformation", and reports up to 1.56× speedup with W8A8
+([Xiao et al., arXiv 2211.10438](https://arxiv.org/abs/2211.10438), revised 2024).
+
+Say it like this: "The problem is outliers in the activations. One family of fix keeps the outlier channels in
+higher precision; the other moves them into the weights. Either way, I'd measure the result on our model rather than
+trust the paper's number."
+
+### Speculative decoding: one big-model step, several tokens
+
+Go back to the 70B model on 4 A100s. At small batch, each decode step reads all the weights (17.3 ms) and makes one
+token per conversation. The math units are mostly idle. Here is the trick. Processing 6 tokens in one step reads
+the same weights once and does 6 times the math, which is still far below the ridge point of 153 tokens. So a step
+over 6 tokens costs about the same as a step over 1.
+
+**Speculative decoding** uses that. A small, cheap model, the **draft**, guesses the next K tokens one at a time.
+The big model, the **target**, then checks all K guesses in a single step called the **verify pass**. It keeps the
+guesses up to the first one it disagrees with, and adds one token of its own.
+
+```
+Draft model (1B, cheap)
+   │  1. guess K = 5 tokens, one small step each
+   ▼
+"the" "cat" "sat" "on" "a"
+   │  2. send all 5 guesses to the big model
+   ▼
+Target model (70B) ── one verify pass over the 5 guesses + 1 extra position
+   │  3. accept guesses left to right until the first one it rejects
+   ▼
+"the" "cat" "sat" ✓✓✓   "on" ✗  → target writes its own token instead ("in")
+   │  4. commit 4 tokens from one big-model step, then repeat
+   ▼
+Stream to the user
+```
+
+The draft box is the cost: K small steps per round. The target box is the saving: one big step instead of several.
+The accept box is where quality is protected: the target has the final word on every token, so the output follows
+the target's choices, not the draft's. If all K guesses are accepted, the target's extra position gives a free
+**bonus token**, so a round commits between 1 and K + 1 tokens.
+
+How many on average? Call **α** (alpha) the chance that the target accepts any one draft guess. Guess 1 counts if it
+is accepted (chance α). Guess 2 counts only if guesses 1 and 2 are both accepted (α²), and so on. The target's own
+token always counts. Add them up:
+
+<Formula
+  title="Expected tokens per target pass"
+  expr="E = 1 + α + α² + … + α^K = (1 − α^(K+1)) ÷ (1 − α)"
+  vars={[
+    { sym: 'α', meaning: 'probability that each draft token is accepted, assumed independent and equal across positions' },
+    { sym: 'K', meaning: 'draft tokens proposed per round' },
+    { sym: '+1', meaning: 'the target always contributes one token: a correction at the first rejection, or a bonus token if all K pass' },
+  ]}
+  example={[
+    'Prep-guide example, α = 0.6, K = 4: (1 − 0.6⁵) ÷ 0.4 = 0.92224 ÷ 0.4 = 2.31',
+    'α = 0.82, K = 5: (1 − 0.82⁶) ÷ 0.18 = 0.69599 ÷ 0.18 = 3.87',
+    'Upper limit as K grows: 1 ÷ (1 − α), which is 5.56 at α = 0.82',
+  ]}
+/>
+
+A simulation that drew independent accept/reject outcomes (200,000 rounds, run 2026-10-12) gave 3.868 tokens per
+pass against the formula's 3.867.
+
+**Tokens per pass is not the speedup.** The draft's K small steps take time too. Call **c** the cost of one draft
+step as a fraction of one target step. At small batch both models are memory-bound, so c is roughly the ratio of
+their weight bytes per GPU. One round then costs 1 + K × c target steps:
+
+<Formula
+  title="Net speedup at small batch"
+  expr="speedup ≈ E ÷ (1 + K × c)"
+  vars={[
+    { sym: 'c', meaning: 'one draft step ÷ one target step; with both memory-bound, about draft weight bytes ÷ target weight bytes per GPU' },
+  ]}
+  example={[
+    'α = 0.82, K = 5, c = 0.10: 3.867 ÷ 1.5 = 2.58×. K = 6 gives 4.171 ÷ 1.6 = 2.61×, the best value of K here',
+    'Llama-3.2-1B draft (2.47 GB) for Llama-3.1-70B at TP = 4 (35.28 GB per A100): c = 2.47 ÷ 35.28 = 0.070. At α = 0.8, K = 5: 3.689 ÷ 1.35 = 2.73×',
+  ]}
+/>
+
+The second example is our running case: the **2.73×** in the table at the top of the page.
+
+Does it change the answers? Not in distribution, if you use the right accept rule. That rule is "accept with
+probability min(1, p_target ÷ p_draft), otherwise resample from the normalized positive part of p_target − p_draft"
+<Cite id="s-4525fcd815" />. Here p_target and p_draft are the probabilities each model gives that token; this
+scheme is called **rejection sampling**. Leviathan et al. report 2–3× on T5-XXL "without changing the distribution"
+([arXiv 2211.17192](https://arxiv.org/abs/2211.17192), 2022). vLLM's documentation adds a practical caveat: it is
+"theoretically lossless up to the precision limits of hardware numerics", and changes in batch size can shift
+**logprobs** (the model's log-probabilities for each token)
+([vLLM speculative decoding docs](https://docs.vllm.ai/en/latest/features/speculative_decoding/), page dated
+2026-09-25).
+
+### Mixture of experts: total parameters for memory, active for compute
+
+Each layer of a normal transformer (the model design used by all of these LLMs) has a **feed-forward block**: two
+large matrix multiplies that every token goes through. A **mixture-of-experts (MoE)** layer replaces that one block
+with many smaller ones, called **experts**, plus a tiny scoring layer called the **router**. For each token, the
+router scores every expert, keeps the best k (**top-k**), and the token's output is a weighted sum of those k
+experts' outputs. The weights in that sum are the **gates**.
+
+```
+Token's hidden state (one vector per token)
+   │
+   ▼
+Router ── scores all experts, keeps the top k (here k = 2) and their gate weights
+   │
+   ├────────────────┬────────────────┐
+   ▼                ▼                ▼
+GPU 0: experts    GPU 1: experts    … GPU n: experts      ← all experts sit in memory
+ 0-3               4-7                                       (only k do work per token)
+   │                │                │
+   └──── tokens travel to their experts' GPUs and back (all-to-all) ────┘
+   ▼
+Combine ── gate-weighted sum of the k expert outputs → next layer
+```
+
+The router is cheap: one small matrix multiply per token. The expert boxes are where the saving is: each token
+touches only k experts, so the math per token follows the **active parameters**, not the total. Active parameters are the parts every token
+uses: the attention block (where each token looks at earlier tokens), the router, any shared expert, and the k
+chosen experts. The memory box is where the saving stops: every expert must be in
+GPU memory, because the next token might pick any of them. The arrows are new cost. When experts are spread across
+GPUs (**expert parallelism**), each token's vector must travel to the GPU that owns its expert and come back. That
+exchange, where every GPU sends to every other GPU, is called an **all-to-all**, and it happens twice per MoE layer.
+
+<Formula
+  title="MoE serving cost"
+  expr="FLOPs per token ≈ 2 × active params;   weight bytes = total params × bytes per param"
+  vars={[
+    { sym: 'active params', meaning: 'attention + router + shared experts + the k routed experts a token uses' },
+    { sym: 'total params', meaning: 'every expert in every layer' },
+  ]}
+  example="671B total / 37B active: 2 × 37 × 10⁹ = 74 GFLOP per token, against 1,342 GFLOP if dense (18× fewer). Weights: 671 GB at fp8, 1,342 GB at bf16"
+/>
+
+The "671B / 37B" model is DeepSeek-V3. Its model card says "671B total parameters with 37B activated for each
+token". Its technical report gives each MoE layer 1 shared expert and 256 routed experts, with 8 routed experts
+active per token ([DeepSeek-V3 technical report, arXiv 2412.19437](https://arxiv.org/abs/2412.19437), revised
+2025-02-18). The MoE guide puts the lesson bluntly: "It saves compute. The memory bill, if anything, goes up"
+<Cite id="s-9e6b455b13" />.
+
+Because the busiest GPU sets the time of every step, routing balance is a systems problem, not only a modelling
+one. It is the hot-key problem from the backend analogy. Two families of fix exist:
+
+- **A penalty during training (auxiliary loss).** Training minimizes an error score called the **loss**. The Switch
+  Transformer adds an extra term, `α × N × Σ fᵢ × Pᵢ`, where N is the number of experts, fᵢ is the fraction of
+  tokens sent to expert i, Pᵢ is the router's average probability for it, and α = 10⁻² sets its weight (this α is
+  unrelated to the acceptance rate above). Without α, the term N × Σ fᵢ × Pᵢ equals 1.0 when routing is uniform and grows as it skews.
+  Switch also caps each expert at a **capacity** of (tokens ÷ experts) × a **capacity factor**. Tokens past the cap
+  skip the layer "through the residual connection", the side path that carries a token's vector around each block
+  unchanged ([Fedus et al., arXiv 2101.03961](https://arxiv.org/abs/2101.03961)).
+- **A bias on selection (DeepSeek-V3).** Each expert gets a bias that is added to its scores only when choosing the
+  top k. The gate weight still comes from the original score. After each training step, an overloaded expert's bias
+  goes down by a small amount γ and an underloaded one's goes up. DeepSeek-V3 also limits each token to at most M
+  machines and "does not drop any tokens during training" (arXiv 2412.19437, §2.1.2).
+
+## Worked examples
+
+### 1. FP32 to INT8 in NumPy (infra-084)
+
+This is the round trip the PracHub parts ask for: symmetric and zero-point versions, saturation before the
+conversion, and an exact zero. It ran in a Python 3.13 environment with NumPy on 2026-10-12. FP32 is the ordinary
+32-bit float; the code turns it into int8 and back.
+
+```python
+import numpy as np
+QMIN, QMAX = -128, 127
+
+def quantize(x, scale, zero_point=0):
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("scale must be positive and finite")
+    q = np.rint(x / scale) + zero_point            # round half to even
+    return np.clip(q, QMIN, QMAX).astype(np.int8)    # saturate, then cast
+
+def dequantize(q, scale, zero_point=0):
+    return scale * (q.astype(np.float32) - zero_point)
+
+def params_symmetric(x):
+    amax = float(np.max(np.abs(x)))
+    return (amax / 127.0 if amax > 0 else 1.0), 0
+
+def params_asymmetric(x):
+    lo, hi = min(float(x.min()), 0.0), max(float(x.max()), 0.0)  # range must contain 0
+    scale = (hi - lo) / (QMAX - QMIN) if hi > lo else 1.0
+    zp = int(np.clip(np.rint(QMIN - lo / scale), QMIN, QMAX))
+    return scale, zp
+```
+
+Read it top to bottom. `quantize` refuses a bad scale, divides and rounds, adds the zero point, then clamps and
+only then converts. `params_symmetric` picks the scale so the largest magnitude lands on 127; an all-zero tensor
+gets a scale of 1.0 instead of a division by zero. `params_asymmetric` first widens the range to include 0, so that
+0.0 (padding, ReLU zeros) always round-trips exactly.
+
+| Input | What the run printed | What to say in the interview |
+|---|---|---|
+| `quantize([-1, 0, 1], 0.1)` | `[-10, 0, 10]`, and back to `[-1, 0, 1]` exactly | "The simple case round-trips exactly." |
+| 256 × 1,024 matrix of small random weights (normal, standard deviation 0.02) | scale 0.000745, worst round-trip error 0.000373 | "That's exactly half a step, the bound I expect." |
+| Asymmetric on [0, 6] | scale 0.02353, zero point −128; 0.0 → −128 → exactly 0.0 | "Zero must survive, so the range always includes it." |
+
+Tests worth naming out loud: ties (2.5 rounds to 2 under half-to-even), values just past the range saturate to 127
+and −128, an all-zero tensor doesn't divide by zero, NaN or a zero scale raises, and empty and 0-d arrays keep their
+shape.
+
+### 2. One outlier, one scale per tensor versus one per row
+
+Take the same 256 × 1,024 matrix. Its largest ordinary weight is 0.095. Set one weight to 1.0 and quantize again
+(run 2026-10-12). The table shows the relative error of the whole matrix (‖ŵ − w‖ ÷ ‖w‖, the size of the error
+compared with the size of the weights) and how many weights collapsed to zero.
+
+| Scheme | Relative error | Weights that round to 0 |
+|---|---|---|
+| Per-tensor, no outlier | 1.08% | — |
+| Per-tensor, with the outlier | 11.3% | 15.5% |
+| Per-channel (one scale per row), with the outlier | 1.0% | 1.1% |
+
+One value in 262,144 made the per-tensor error ten times worse. With one scale per row, the damage stays in one row.
+
+The model-quantizer lab measured the same effect on real GPT-2 weights at 4 bits, where it is larger because there
+are only 16 integer values. One scale per 32 weights gave a mean weight error of
+<LabNumber lab="model-quantizer" metric="INT4 weight error, one scale per 32 weights" />; one scale per tensor gave
+<LabNumber lab="model-quantizer" metric="INT4 weight error, one scale per tensor" />. That is error in the weights,
+not model quality. The lab's **perplexity** table (perplexity is a standard score of how well a model predicts text;
+lower is better) is an illustration, so it can't tell you what INT4 does to GPT-2's output.
+
+### 3. int32 accumulation and requantization
+
+Quantize a 4 × 1,024 activation with one scale, and the 256 × 1,024 weight with one scale per output row. Multiply in
+int32, then rescale:
+
+```python
+acc = qx.astype(np.int32) @ qw.astype(np.int32).T      # [4, 256] int32
+y   = acc * (s_x * s_w[None, :])                         # back to float, one s_w per output channel
+y_q = np.clip(np.rint(acc * (s_x * s_w / s_y)[None, :]), -128, 127).astype(np.int8)   # requantize
+```
+
+In the run, the int32 sums ranged from −105,201 to 115,835. That is well past what 16 bits can hold (32,767) and far
+inside 32 bits. The float result was 1.30% off the full-precision matrix multiply, and the requantized int8 output
+1.50% off. Say: "The sums need 32 bits; the error after requantizing is about 1.5% here, and I'd check it per layer."
+
+### 4. Choosing K for speculative decoding (infra-087)
+
+How many tokens should the draft guess? Each extra guess adds a little to E but costs a full draft step. With α =
+0.82 and a draft at 10% of the target's cost (c = 0.10), the formulas above give:
+
+| K | E (tokens per pass) | Net speedup |
+|---|---|---|
+| 1 | 1.82 | 1.65× |
+| 3 | 3.04 | 2.34× |
+| 5 | 3.87 | 2.58× |
+| 6 | 4.17 | 2.61× |
+| 8 | 4.62 | 2.57× |
+| 10 | 4.93 | 2.47× |
+
+The best K is flat between 5 and 8, which matches the prep guide's "somewhere between 3 and 8"
+<Cite id="s-4525fcd815" />. The reason is simple. The K-th guess only adds α^K expected tokens, which shrinks fast,
+while its cost stays at c. Stop adding guesses when the gain falls below the cost: here, at K = 6.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Stopping rule:** adding the K-th draft token pays only while α^K exceeds c × the net speedup you already have.
+  At α = 0.82 and c = 0.10, the 7th token adds 0.82⁷ = 0.249, less than 0.10 × 2.61 = 0.261, so stop at K = 6.
+- **E values:** (1 − 0.82^(K+1)) ÷ 0.18. For K = 6: (1 − 0.82⁷) ÷ 0.18 = 4.171; ÷ (1 + 6 × 0.10) = 2.61×.
+- **Measured acceptance trap:** under the same model, accepted ÷ proposed = (E − 1) ÷ K = 2.867 ÷ 5 = 0.573 at
+  α = 0.82, K = 5.
+
+</details>
+
+One measurement trap is worth saying out loud. Many serving engines report an "acceptance rate" equal to accepted
+guesses divided by proposed guesses. That is not α. At α = 0.82 and K = 5, that ratio is **0.573**, because guesses
+after the first rejection are thrown away even if they were good. Invert E to recover α; the lab's
+`implied_alpha()` does that by bisection (a binary search on α).
+
+### 5. Reading "671B total / 37B active" (infra-085)
+
+Walk the two numbers through the questions an operator asks:
+
+| Question | Answer for 671B / 37B | What to say in the interview |
+|---|---|---|
+| How many GPUs? | 671 GB of 8-bit weights doesn't fit on one 80 GB GPU, and doesn't fit in an 8-GPU machine (640 GB) even before any per-conversation memory. You need more than one machine, or fewer bits. | "Total parameters set the GPU count." |
+| What does a token cost once it fits? | 74 GFLOP per token, about what a dense 37B model needs. At batch 1, each token reads only the active weights, about 37 GB at 8 bits instead of 671 GB. | "Active parameters set the cost per token." |
+| Does the saving hold at large batch? | Not for bytes. With 256 routed experts and 8 per token, a batch of a few hundred tokens touches nearly every expert, so each step reads close to all the weights. The guide makes the same point about compute savings at large batch <Cite id="s-9e6b455b13" />. | "Under heavy load, the byte saving mostly disappears." |
+| What about per-conversation memory? | It follows the attention design, not the parameter count. See below. | "Size the cache separately." |
+
+The last row needs one more term. While the model writes a reply, the GPU keeps a saved summary of every earlier
+token, so it doesn't redo that work for each new token. This is the **KV cache**. Llama models shrink it with
+**grouped-query attention (GQA)**, which shares saved values across groups of attention heads. DeepSeek-V3 uses a
+different design, **Multi-head Latent Attention**, which caches a 512-number compressed vector plus a 64-number
+position key per layer. That is 61 × (512 + 64) × 2 bytes = **70,272 bytes per token** in bf16 (derived from the
+model config). Don't apply the GQA formula to it.
+
+### 6. A router sends 80% of tokens to 3 of 32 experts (infra-086)
+
+First, the size of the skew. With uniform routing each expert gets 100 ÷ 32 = **3.125%** of tokens. Each hot expert
+gets 80 ÷ 3 = **26.7%**, which is **8.5×** its share.
+
+What breaks next depends on one question: does the system cap how many tokens an expert can take?
+
+| Setup | What happens | What to say in the interview |
+|---|---|---|
+| With a capacity limit (Switch-style, capacity factor 1.25, one expert per token) | Each expert accepts about 3.9% of the batch. The three hot experts overflow, and about **68%** of all tokens skip the layer. | "Nothing looks slow. Quality drops quietly." |
+| Without a limit (no dropping), 32 experts on 8 GPUs, 4 each | A GPU with one hot expert does **2.3×** the balanced load. If all three hot experts share one GPU, it does **6.5×**. Every step waits for it. | "The busiest GPU sets the step time." |
+| The training penalty as a dashboard number | The Switch balance term reads **6.87**, against 1.0 for uniform routing. | "Track it per layer, with tokens per expert and dropped tokens." |
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Capacity:** each expert takes 1.25 ÷ 32 = 3.9% of the batch. Each hot expert overflows by 26.7 − 3.9 = 22.8
+  points. With top-1 routing, 3 × 22.8 = 68% of tokens skip the layer.
+- **No dropping:** balanced load is 4 ÷ 32 = 12.5% of tokens per GPU. The 29 cold experts share 20%, 0.69% each. A
+  GPU with one hot and three cold experts does 26.7 + 3 × 0.69 = 28.7%, which is 2.3× the balanced load. All three
+  hot experts on one GPU: 80 + 0.69 = 80.7%, which is 6.5×.
+- **Balance term:** with fᵢ = Pᵢ, N × Σ fᵢ × Pᵢ = 32 × (3 × 0.267² + 29 × 0.0069²) = 6.87.
+
+</details>
+
+Fixes, in the order to propose them:
+
+1. **Check it's real.** One tenant's traffic or one language can legitimately favour a few experts.
+2. **At serving time,** copy the hot experts onto more GPUs and re-place experts by observed load.
+3. **In training,** check the balancing term (the penalty weight, or the bias step γ), check that the router runs
+   in 32-bit floats (Switch casts the router input to float32), and check the capacity factor.
+
+The guide adds router z-loss (a second penalty that keeps router scores from growing too large) and warns that a
+balancing penalty weighted too strongly hurts quality <Cite id="s-9e6b455b13" />.
+
+### 7. An MoE layer with the shapes at each step (r2b-016)
+
+The idea in plain words: decide which experts each token goes to, group the tokens by expert so each expert does
+one dense matrix multiply, then put the results back in token order, weighted by the gates. This ran in PyTorch
+2.14 on CPU on 2026-10-12 with a model width d = 64, an expert inner width d_ff = 128, 8 experts and k = 2. It
+matched a simple reference that runs every expert on every token and masks out the unchosen ones (max difference
+0.0).
+
+```python
+class MoE(torch.nn.Module):
+    def __init__(self, d=64, d_ff=128, n_experts=8, k=2):
+        super().__init__()
+        self.k, self.E = k, n_experts
+        self.router = torch.nn.Linear(d, n_experts, bias=False)
+        self.w_in  = torch.nn.Parameter(torch.randn(n_experts, d, d_ff) * d ** -0.5)
+        self.w_out = torch.nn.Parameter(torch.randn(n_experts, d_ff, d) * d_ff ** -0.5)
+
+    def forward(self, x):                                  # x: [B, S, d]
+        B, S, d = x.shape
+        t = x.reshape(-1, d)                               # [T, d], T = B*S
+        probs = self.router(t.float()).softmax(-1)         # [T, E], router in fp32
+        gate, idx = probs.topk(self.k, dim=-1)             # [T, k], [T, k]
+        gate = gate / gate.sum(-1, keepdim=True)           # renormalize over the k chosen
+        flat_e = idx.reshape(-1)                           # [T*k] expert of each assignment
+        flat_t = torch.arange(t.shape[0]).repeat_interleave(self.k)   # [T*k] its token
+        flat_g = gate.reshape(-1)                          # [T*k] its gate
+        order = flat_e.argsort()                           # group assignments by expert
+        counts = torch.bincount(flat_e, minlength=self.E)  # [E], sums to T*k
+        out, start = torch.zeros_like(t), 0
+        for e in range(self.E):
+            sel = order[start:start + int(counts[e])]; start += int(counts[e])
+            if sel.numel() == 0:
+                continue
+            tok = flat_t[sel]                              # [n_e]
+            h = torch.nn.functional.gelu(t[tok] @ self.w_in[e])   # [n_e, d] @ [d, d_ff] -> [n_e, d_ff]
+            y = h @ self.w_out[e]                          # [n_e, d_ff] @ [d_ff, d] -> [n_e, d]
+            out.index_add_(0, tok, y * flat_g[sel, None])  # scatter back, gate-weighted
+        return out.reshape(B, S, d)                        # [B, S, d]
+```
+
+Follow one input through it. x has shape [2, 16, 64]: 2 sequences of 16 tokens, each token a vector of 64 numbers.
+
+| Step | Shape | What to say in the interview |
+|---|---|---|
+| Flatten | tokens [32, 64] | "Experts don't care about sequences, only tokens." |
+| Router + softmax (scores turned into probabilities, in fp32) | probabilities [32, 8] | "Keep the router in 32-bit floats for stability." |
+| Top-2 | indices and gates [32, 2], gates renormalized to sum to 1 | "Each token now has two assignments." |
+| Group by expert | 64 assignments, split 8, 6, 11, 7, 7, 11, 6, 8 | "Sort by expert; `bincount` gives the group sizes." |
+| Expert 0 | gather [8, 64] → hidden [8, 128] → out [8, 64] | "One dense multiply per expert." |
+| Scatter | gate-weighted `index_add_` into [32, 64] → reshape to [2, 16, 64] | "`index_add_` sums both of a token's experts correctly." |
+
+Then the GPU discussion, which is where this question started. On a GPU, each operation runs as a small program called a
+**kernel**, and starting one (a **kernel launch**) has a fixed overhead. The Python loop launches at
+least two matrix multiplies, an activation and a scatter for every expert. With 256 experts that is over a thousand
+small launches per layer. Production MoE code uses a **grouped GEMM** (GEMM is the standard name for a general
+matrix multiply; a grouped one runs all experts' multiplies in one launch) and **fuses** the gather, activation and
+scatter into it, so the data doesn't make extra round trips through GPU memory. Say that, and say you would profile
+before claiming it is the bottleneck. The [GPU kernel family](/system-design-labs/interviews/walkthroughs/gpu-kernel-perf/)
+covers launch overhead and fusion.
+
+## Common follow-ups in depth
+
+### Throughput dropped after enabling speculative decoding at high batch (infra-088)
+
+This is the debugging version of the speculative-decoding question, and the backend analogy predicts the answer.
+At small batch, the verify pass is nearly free because the math units are idle. At batch B, the verify pass carries
+B × (K + 1) tokens. Once that number passes the ridge point, the pass is compute-bound and costs in proportion to
+its tokens. Every rejected guess is now paid-for math that produced nothing.
+
+The prep guide's explanation is the same: at high batch the target is already compute-bound, the spare compute is
+gone, and rejected drafts become pure overhead. It says speculation "can leave throughput flat or make it slightly
+worse" <Cite id="s-4525fcd815" />.
+
+You can show where the flip happens with a simple step-time model of our running example. Assumptions: Llama-3.1-70B
+in bf16 at TP = 4 on A100s, a 1B draft, K = 5, α = 0.8, peak compute, and the KV cache reads ignored.
+
+| Batch B | Normal step | Verify step (B × 6 tokens) | Round with 5 draft steps | Speedup |
+|---|---|---|---|---|
+| 1–16 | 17.3 ms | 17.3 ms | 23.4 ms | 2.73× |
+| 32 | 17.3 ms | 21.7 ms | 27.8 ms | 2.30× |
+| 64 | 17.3 ms | 43.4 ms | 49.5 ms | 1.29× |
+| 96 | 17.3 ms | 65.1 ms | 71.2 ms | 0.90× |
+| 128 | 17.3 ms | 86.8 ms | 92.9 ms | 0.69× |
+
+Read the table from the top. Up to batch 16, the verify pass still fits under the weight-read time, so speculation
+gives the full 2.73×. Past about batch 25, the verify pass becomes compute-bound and grows with every token. By
+batch 128 the server is doing 31% less useful work than without speculation.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Weight read per step:** 141.1 GB ÷ 4 GPUs = 35.28 GB per GPU ÷ 2,039 GB/s = **17.3 ms**.
+- **Compute per step:** 2 × 70.55 × 10⁹ × tokens ÷ (4 × 312 × 10¹²) = 0.113 ms per token. Step time is the larger
+  of the two. The compute term passes 17.3 ms at about **153 tokens per step**.
+- **Verify pass crossover:** B × 6 tokens passes 153 at B ≈ 153 ÷ 6 ≈ **25**.
+- **Batch 32:** 192 tokens × 0.113 = 21.7 ms. **Batch 128:** 768 tokens × 0.113 = 86.8 ms.
+- **Draft steps:** 2.47 GB ÷ 2,039 GB/s = 1.21 ms each; 5 of them add 6.05 ms (c = 1.21 ÷ 17.3 = 0.070).
+- **Speedup** = E × normal step ÷ round time. E = 3.689 at α = 0.8, K = 5. Batch 1: 3.689 × 17.3 ÷ 23.4 = 2.73×.
+  Batch 128: 3.689 × 17.3 ÷ 92.9 = 0.69×.
+
+</details>
+
+This idealized model makes the drop steeper than the guide's "slightly worse", so trust its direction more than its
+size. Real batches are also ragged: different sequences accept different numbers of guesses, so some slots waste
+work.
+
+The fixes: turn speculation off, or shrink K, above a batch threshold you measure. Prefer cheaper drafts; n-gram
+lookup costs almost nothing to propose. Measure per-request latency and total throughput separately, because
+speculation can still cut latency for the requests it serves. vLLM's docs describe the feature as a way "to reduce
+inter-token latency under medium-to-low QPS (queries per second), memory-bound workloads" (vLLM docs, 2026-09-25).
+Inter-token latency is the gap between words as the user sees them.
+
+Say it like this: "Speculation spends idle compute. Above roughly batch 25 on this setup there isn't any, so I'd
+make it conditional on batch size and measure both latency and throughput."
+
+### What changes on FP8 hardware
+
+On an H100, 8-bit floating point halves the bytes per weight and doubles the matrix-unit peak compared with bf16.
+So the step gets faster whether it is limited by memory or by math. Weight-only
+INT4 is different: the weights are stored in 4 bits but expanded back to bf16 for the math. That cuts bytes but not
+math. So INT4 helps most at small batch, where bytes are the limit, and stops helping at around **83 tokens per step**
+on an H100, where the math becomes the limit.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **FP8 peak:** the H100 spec page prints 3,958 TFLOPS with sparsity, so about 1,979 dense, against about 989.5
+  dense for bf16 (halving the page's sparse figures). FP8 ridge point: 1,979 ÷ 3.35 TB/s = **591 FLOP/byte**.
+- **INT4 weight-only:** with an fp16 scale per 32 weights a weight costs 0.5625 bytes, so arithmetic intensity is
+  about 2M ÷ 0.5625 = 3.56M, where M is tokens per step. The H100's bf16 ridge is 989.5 ÷ 3.35 = 295, so the
+  crossover is M ≈ 295 ÷ 3.56 ≈ **83 tokens**.
+
+</details>
+
+### Why not quantize everything to INT4?
+
+Fewer integer values means more error; the lab's GPT-2 numbers above show it even with good grouping. Methods such as
+**GPTQ** (which corrects rounding error using a small set of sample inputs) and **AWQ** (which protects the weights
+that matter most for the activations) exist because naive rounding at 4 bits loses quality. Pick the lowest
+precision that passes your eval. Keep the embedding layer (which turns tokens into vectors) and the output layer (which
+turns vectors into word probabilities) at higher precision, if your eval says they matter.
+
+### Does an MoE save memory?
+
+No. The MoE guide's Mixtral example: it "runs at roughly the speed of a 13B dense model but occupies the memory of a
+47B one" <Cite id="s-9e6b455b13" />. When memory is the binding constraint, a dense model of the same active size
+can beat an MoE on a single GPU.
+
+### Where does the time go in the MoE layer on a GPU?
+
+Two all-to-alls per layer under expert parallelism, the router's scoring and top-k, many small expert matrix
+multiplies unless they are grouped, and the scatter. The guide claims the all-to-all, not the matrix multiplies, is
+often the bottleneck <Cite id="s-9e6b455b13" />. Treat that as a claim to check with a profiler on your own setup,
+not a constant.
+
+## Small-team version
+
+You own AI at a company of 50 to 500 people. You will turn these levers on; you will not build them. Your job is to
+know when each is a cheap win, and to prove that quality held.
+
+### Start from the managed option
+
+Most small teams don't run their own GPUs, and the comparison is often decided before any of this matters. On
+2026-10-11, Together AI listed Llama 3.3 70B at **$1.04 per million** input and output tokens, and gpt-oss-120B at
+$0.15 in and $0.60 out ([together.ai/pricing](https://www.together.ai/pricing), fetched 2026-10-11).
+
+Compare that with renting one H100 at an assumed **$4.19 per GPU-hour** (Lambda's per-GPU price on a 2-GPU instance, as cited by Cohorte on 2026-09-20; a single-GPU instance lists at $4.29). That
+is about **$3,059 a month**. The same money buys about 2,940 million tokens from the endpoint, an average of 1,119
+tokens per second around the clock. Unless your steady volume is near that, the pay-per-token endpoint is cheaper
+than any quantized model you host. Cohorte's analysis reaches the same conclusion for gpt-oss-120b on 2× H100:
+against the same model served per token at $0.60 per million output tokens, the rented machine "cannot break even"
+at business-hours usage ([cohorte.co](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even), 2026-09-20).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **One GPU for a month:** $4.19 × 730 hours = $3,059.
+- **Tokens for the same money:** $3,059 ÷ $1.04 per million ≈ 2,940 million tokens.
+- **As a rate:** 2,940 × 10⁶ ÷ (730 × 3,600 s) ≈ 1,119 tokens per second.
+
+</details>
+
+The endpoint is itself a choice of quantization and possibly an MoE. gpt-oss-120b has "117B parameters with 5.1B
+active parameters", ships with MXFP4 (a 4-bit format) quantization of the MoE weights, and fits on "a single 80GB
+GPU" ([model card](https://huggingface.co/openai/gpt-oss-120b), fetched 2026-10-12). Ask the provider what
+precision it serves, and run your eval against that endpoint rather than trusting a paper's numbers.
+
+### When self-hosting, quantization is the first lever
+
+If you do host (data-residency rules, steady high volume, a fine-tuned model), quantization is the cheapest lever,
+because it changes how many GPUs you rent. Back to our running example:
+
+| Setup | GPUs | Room for 8K-token conversations | Monthly cost at $4.19/GPU-hour (assumed) |
+|---|---|---|---|
+| Llama-3.1-70B, bf16 | 2 × H100 | about 3 at once | $6,117 |
+| Llama-3.1-70B, INT4 with group scales | 1 × H100 | about 13 at once | $3,059 |
+
+Half the cost, more conversations at once, and faster words for each one: the batch-1 decode floor drops from
+**21.1 ms** per token to **11.8 ms**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **KV cache per 8K-token conversation:** 327,680 bytes per token (Llama-3.1-70B, bf16) × 8,192 = 2.68 GB.
+- **bf16 on 2 GPUs:** 160 GB − 141.1 GB weights − 10 GB overhead (assumed 5 GB per GPU) = 8.9 GB ÷ 2.68 ≈ 3.
+- **INT4 on 1 GPU:** 80 − 39.69 − 5 = 35.3 GB ÷ 2.68 ≈ 13.
+- **Decode floor on an H100 (3.35 TB/s):** 39.69 GB ÷ 3.35 TB/s = 11.8 ms on one GPU, against 70.55 GB per GPU at
+  TP = 2 ÷ 3.35 TB/s = 21.1 ms.
+
+</details>
+
+Use a pre-quantized build that your serving engine supports. vLLM, a widely used open-source serving engine, lists
+AWQ, GPTQ and FP8 paths, with FP8 W8A8 marked for Ada and Hopper. Don't quantize the model yourself unless no build
+exists.
+
+### Checking quality is the part you own
+
+- **Run a paired eval on your own prompts**: the same items through both models, compared item by item. With a
+  paired design, the noise depends on how often the two models disagree, called the **discordant rate**. At 300
+  items, an 8% discordant rate and a true drop of 2 points, your margin is about **±3.2 points**, too wide to see the
+  drop. To get to ±2 points you need about **770 items**.
+- **Look at the failures**, not only the score. Quality loss may not be spread evenly, so put long-context, numeric
+  and rare-language prompts in the set on purpose.
+- **Load-test speculative decoding at your real concurrency.** Turning it on in vLLM is one flag
+  (`--speculative-config` with a method and `num_speculative_tokens`). Measure inter-token latency and throughput at
+  your peak batch, and keep it only where it wins. Try n-gram lookup first for retrieval-heavy and code workloads,
+  which the prep guide recommends because it needs no training or extra memory <Cite id="s-4525fcd815" />.
+- **Pin versions.** A precision or engine upgrade is a model change. Re-run the eval when either changes.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Margin at n = 300:** √((0.08 − 0.02²) ÷ 300) = 0.0163; × 1.96 for a 95% interval = ±3.2 points.
+- **Items for ±2 points:** 1.96² × 0.08 ÷ 0.02² = 3.84 × 0.08 ÷ 0.0004 ≈ 770.
+
+</details>
+
+### Skip
+
+Writing quantization or MoE kernels, training your own draft model, and tuning expert placement. Those pay at
+provider scale. An agent can write the eval harness and the load-test script; you choose the items, read the diffs
+and decide.
+
+### Revisit when
+
+Steady volume reaches a large fraction of a GPU's throughput at your latency target, a residency rule forces
+self-hosting, or your eval shows the provider's precision costs you accuracy you can measure and value.
+
+<AINative title="Let the agent write the quantizer; you write the tests that would catch it">
+A coding agent will produce the NumPy round trip in seconds, and it will often convert before clamping or pick a
+rounding rule silently. Your part is the test list: ties, saturation at both ends, exact zero, all-zero tensors, NaN,
+and a round-trip error bound of half a step. For speculative decoding, an agent can draft the load test, but you
+decide which batch sizes and prompts represent production, and you check that its "acceptance rate" is the per-token
+α and not accepted ÷ proposed. The same habit applies to every lever here: the agent produces a number, and you check
+what the number actually measured.
+</AINative>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Three levers, one habit"
+  senior={[
+    "Writes a correct quantize/dequantize with saturation and an exact zero, and explains per-channel scales and 32-bit sums.",
+    "Derives E = (1 − α^(K+1)) ÷ (1 − α), corrects it for the draft's cost, and explains the high-batch drop with the ridge point.",
+    "Reads total versus active parameters correctly and computes the skew on a hot expert.",
+  ]}
+  staff={[
+    "Asks which metric would show each lever failed (a paired eval, inter-token latency at peak batch, dropped-token rate) before turning it on.",
+    "Turns the high-batch result into a policy: speculation on below a batch threshold, off above it, with the threshold measured per model and GPU.",
+    "Separates capacity-limited routing (silent quality loss) from no-drop routing (slow stragglers), and says who owns the fix: training or serving.",
+  ]}
+/>
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="(Listed on the PracHub page, NVIDIA) Per-tensor or per-channel scales for weights, and why are activations harder?">
+    Per-channel for weights: one outlier then costs one row, not the whole matrix (1.0% against 11.3% relative error
+    in the example above). Activations change with every input and carry outlier channels, so their range has to be
+    measured on representative data, kept in higher precision for the outlier dimensions (LLM.int8()), or moved
+    into the weights (SmoothQuant).
+  </FollowUp>
+  <FollowUp q="(Listed on the PracHub page, NVIDIA) How do you requantize an int32 accumulator back to int8?">
+    Multiply by s_x × s_w ÷ s_y (one multiplier per output channel when weights are per-channel), round, add the
+    output zero point, clamp to −128…127. In integer-only kernels the float multiplier is stored as a fixed-point
+    integer and a shift; say that you would test it against the float reference.
+  </FollowUp>
+  <FollowUp q="(Prep guide) Why not draft 20 tokens instead of 4?">
+    Token 20 counts only if all 19 before it were accepted: at α = 0.8 that is 0.8²⁰ ≈ 1.2%. E approaches
+    1 ÷ (1 − α) = 5 while the draft cost keeps growing by c per token, so net speedup falls past K ≈ 7 (for a draft step costing 7% of a target step, as in the 1B-draft example).
+  </FollowUp>
+  <FollowUp q="(Prep guide) Does speculative decoding change the outputs?">
+    Not in distribution, with the min(1, p_target ÷ p_draft) accept rule and residual resampling. In practice,
+    floating-point differences between a K + 1-token verify pass and a 1-token step can change logprobs slightly,
+    and vLLM says so in its docs.
+  </FollowUp>
+  <FollowUp q="(Prep guide) Where does expert parallelism add latency that tensor parallelism doesn't?">
+    Two all-to-alls per MoE layer whose size depends on routing, so they are uneven, plus waiting for the busiest
+    GPU. Tensor parallelism's exchange (an all-reduce) has a fixed size and is the same on every GPU.
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) Your INT4 build passes the benchmark but users report worse answers. What do you check?">
+    Whether the eval set covers what users send (long context, numbers, other languages), whether the KV cache was
+    also quantized, the engine version, and a paired comparison on a sample of real traffic with the failures read
+    by hand.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Casting before clamping.** Out-of-range floats wrap or produce undefined values; the PracHub page's first hint
+  is about exactly this <Cite id="s-e6bac4f7b9" />.
+- **Counting INT4 as 0.5 bytes per weight.** With 16-bit scales per 32 weights it is 0.5625 bytes: 39.69 GB, not
+  35.28 GB, for Llama-3.1-70B.
+- **Quoting weight error as quality.** An error in the weights says nothing about task accuracy on your prompts.
+- **Calling tokens per pass a speedup.** E ignores the draft's cost, and the verify pass's cost at large batch.
+- **Using accepted ÷ proposed as α.** At α = 0.82 and K = 5 that ratio is 0.573.
+- **Saying MoE saves memory.** It saves math per token; memory follows total parameters.
+- **Treating router imbalance only as a speed problem.** With a capacity limit, it is a silent quality problem.
+- **Quoting a paper's speedup as yours.** SmoothQuant's 1.56× and Leviathan's 2–3× are their setups; measure yours.
+
+## Prove it with a lab
+
+<LabRef lab="model-quantizer" role="partial" note="v0 is symmetric per-tensor INT8; v1 is grouped INT4 with two values packed per byte; scripts/gpt2_weight_error.py measures per-group against per-tensor error on GPT-2." />
+
+Add a zero-point version to v0 and the saturation tests from worked example 1. The lab's sizes are calculated from
+the storage format: <LabNumber lab="model-quantizer" metric="INT8 model size" showMetric /> and
+<LabNumber lab="model-quantizer" metric="INT4 size with one fp32 scale" showMetric />. Quantizing every GPT-2 weight
+to INT4 took <LabNumber lab="model-quantizer" metric="Quantize all GPT-2 weights" />. A good extension is a real
+perplexity measurement, which the lab doesn't have yet.
+
+<LabRef lab="speculative-decoding" role="partial" note="speculative_step implements draft, verify and rejection sampling; v1_batched.py has expected_speedup, expected_net_speedup, optimal_K and implied_alpha." />
+
+Its formula gives <LabNumber lab="speculative-decoding" metric="Expected tokens per target call" /> at α = 0.82,
+K = 5, and <LabNumber lab="speculative-decoding" metric="Net speedup with a draft at 10% of target cost" /> net. Its
+simulation with mock models measured <LabNumber lab="speculative-decoding" metric="mock draft" /> at an observed
+acceptance of 0.895, against a formula value of 4.63 at that acceptance. That checks the math, not real model speed.
+
+<LabRef lab="transformer" role="proof" note="Swap its feed-forward block for the MoE layer above and watch tokens per expert during training." />
+
+<LabRef lab="llm-inference" role="partial" note="Use its KV-cache code to see why a verify pass over K + 1 tokens costs about one decode step at small batch." />
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-e6bac4f7b9" />: the NVIDIA-tagged FP32-to-INT8 question; only the title is candidate-reported.
+- <Cite id="s-4525fcd815" />: speculative-decoding prep guide (formula, acceptance by method, the high-batch question).
+- <Cite id="s-9e6b455b13" />: MoE prep guide (671B / 37B, router skew, balancing, expert parallelism).
+- <Cite id="s-0f8d1c21c4" />: Glassdoor snippet for the NVIDIA MoE-layer question.
+- <Cite id="s-f440daaea4" />: Baseten interview guide (trade-offs, not buzzwords).
+- <Cite id="s-8e443a8b66" />: NVIDIA A100 specifications (fetched 2026-10-11).
+- NVIDIA H100 specifications, [www.nvidia.com/en-us/data-center/h100](https://www.nvidia.com/en-us/data-center/h100/) (fetched 2026-10-11; Tensor Core figures are with sparsity).
+- Dettmers et al., LLM.int8(), [arxiv.org/abs/2208.07339](https://arxiv.org/abs/2208.07339) (2022, accessed 2026-10-12).
+- Xiao et al., SmoothQuant, [arxiv.org/abs/2211.10438](https://arxiv.org/abs/2211.10438) (revised 2024-03-29, accessed 2026-10-12).
+- Leviathan et al., Fast Inference from Transformers via Speculative Decoding, [arxiv.org/abs/2211.17192](https://arxiv.org/abs/2211.17192) (2022, accessed 2026-10-12).
+- Fedus et al., Switch Transformers, [arxiv.org/abs/2101.03961](https://arxiv.org/abs/2101.03961) (revised 2022, accessed 2026-10-12).
+- DeepSeek-AI, DeepSeek-V3 Technical Report, [arxiv.org/abs/2412.19437](https://arxiv.org/abs/2412.19437) (revised 2025-02-18, accessed 2026-10-12).
+- vLLM docs: speculative decoding [docs.vllm.ai/en/latest/features/speculative_decoding](https://docs.vllm.ai/en/latest/features/speculative_decoding/) (dated 2026-09-25) and quantization [docs.vllm.ai/en/latest/features/quantization](https://docs.vllm.ai/en/latest/features/quantization/) (dated 2026-09-14), accessed 2026-10-12.
+- gpt-oss-120b model card, [huggingface.co/openai/gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b) (accessed 2026-10-12).
+- Cohorte, Self-Hosted LLM Cost vs API: The Second Break-Even, [cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even) (2026-09-20); Together AI pricing [www.together.ai/pricing](https://www.together.ai/pricing) (fetched 2026-10-11).

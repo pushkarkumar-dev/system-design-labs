@@ -1,0 +1,147 @@
+---
+question: eng-061
+family: llm-from-scratch
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Beam search is a bounded best-first search over the model's next-token predictions. I keep the k best
+> partial sentences, extend each one by every possible token, score each candidate as its parent's
+> log-probability plus the new token's, keep the top k, and move any that end to a finished list. It costs
+> about k times the work and memory of greedy decoding. I'd test it against brute force on a tiny vocabulary.
+> And I'd say when not to use it: for open-ended chat, sampling gives better text, so beam search belongs to
+> tasks with one right answer, like translation."
+>
+> The rest of this page explains each part of that answer.
+
+For an AI engineer role, beam search tests three things at once. Can you keep a bounded frontier of
+candidates in a search? Can you do probability arithmetic in log space? And can you explain when the algorithm
+is the wrong choice?
+
+A backend engineer has seen the shape before: a top-k heap over a stream, or a pruned breadth-first search.
+What is different is the scale of the branching and the scoring. Every step branches into the whole
+vocabulary, often tens of thousands of tokens, and every score is a sum of small negative numbers. The
+follow-ups usually move to efficiency (running beams as a batch, reusing the model's stored state) and to why
+production chat uses sampling instead.
+
+(Perplexity's 1point3acres listing has the title "Beam Search Decoding" (2026/1/1) and nothing else
+<Cite id="s-bebe1e8956" />.)
+
+## Clarify first
+
+- **Model interface.** "I'll assume a function that returns next-token log-probs for a batch of prefixes."
+- **Parameters.** "Beam width, maximum length and an end-of-sequence (EOS) token are all parameters?"
+- **Output.** "Return only the best sequence and its probability, or the top n with scores? I'll return the
+  best plus its probability."
+- **Length.** "Do you want length normalization? I'll default to none and offer it."
+
+## Answer
+
+### Words you need first
+
+- **Token**: one small piece of text, as an integer id. The **vocabulary** has `V` of them.
+- **Log-probability (log-prob)**: the natural log of a probability, always 0 or negative. Along a sentence,
+  log-probs add.
+- **Beam**: one partial sentence being kept, with its total log-prob. **Beam width** k is how many are kept.
+- **EOS**: the end-of-sequence token. A beam that emits it is finished.
+- **KV cache**: the model's stored keys and values for every token so far, so each new step only processes the
+  new token.
+- **Sampling**: drawing the next token at random, weighted by probability, instead of searching for the best.
+
+### The algorithm in four steps
+
+1. Start with the prompt as the only beam, score 0.
+2. Each step, extend every beam by every token. A candidate's score is the parent's score plus the token's
+   log-prob.
+3. Keep the top k candidates. Move any that end in EOS to a finished list.
+4. Stop at the maximum length or when no beams are alive. Return the best finished or alive beam.
+
+The heart of it is three lines:
+
+```python
+total = beam_scores[:, None] + logp           # (k, V): every beam x every token
+top = torch.topk(total.flatten(), k)          # best k of k*V candidates
+parent, tok = divmod(flat_index, V)           # recover which beam and which token
+```
+
+### Follow one step
+
+Say k = 3 and the vocabulary has 50,000 tokens. The `total` table is `(3, 50000)`: 150,000 candidates. One
+`topk` over the flattened table picks the best 3. If the winning flat index is 100,007, then
+`divmod(100007, 50000)` gives parent beam 2 and token 7. Say: "One `topk` over the flattened table, then
+`divmod` to recover parent and token. No Python loop over 150,000 items."
+
+The full tested function is in the family walkthrough and in the
+[Microsoft variant's card](/system-design-labs/interviews/questions/r2b-005/).
+
+### What to cover beyond the code
+
+- **Cost.** Each step runs the model on `k` rows, so compute and KV-cache memory are k times greedy's. With a
+  cache you keep one row per beam. After each step, reorder the rows to follow each survivor's parent
+  (`index_select` on the batch axis). Sharing the prompt's cache across beams avoids k copies;
+  PagedAttention describes this kind of "flexible sharing of KV cache within and across requests"
+  ([Kwon et al., 2023](https://arxiv.org/abs/2309.06180), read 2026-10-12).
+- **Correctness.** Brute force on a tiny vocabulary is the oracle. A beam wide enough to keep every candidate
+  must equal exhaustive search, and width 1 must equal greedy.
+- **Quality.** Beam search maximizes likelihood, which suits tasks with one right answer (translation,
+  structured extraction). For open-ended text, the nucleus-sampling paper reports that likelihood
+  maximization gives "bland and strangely repetitive" output
+  ([Holtzman et al., 2019](https://arxiv.org/abs/1904.09751), read 2026-10-12).
+- **Length.** Raw summed log-probs favour short sequences, because every token adds a negative number. Divide
+  by `length^alpha` to compare beams fairly.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Candidates per step: k × V = 3 × 50,000 = 150,000 (illustrative sizes).
+- Flat index to (parent, token): 100,007 = 2 × 50,000 + 7.
+- Memory: k beams hold k cache rows; with the prompt shared, only the generated part is stored k times.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Beam search"
+  senior={["Correct implementation with EOS and log-space scores, plus a brute-force test."]}
+  staff={["Discusses cache reordering and prefix sharing, the k-times memory cost, and when sampling or constrained decoding is the better tool."]}
+/>
+
+## Small-team version
+
+At a company calling hosted models, you won't implement this. The idea behind it transfers to a cheap pattern
+you might use: **best-of-n**. Generate n samples, score each with a checker or with log-probs, and keep the best.
+That spends n times the output tokens, so use it only on the requests where a better answer is worth the cost,
+and measure the gain with your eval before rolling it out.
+
+The numbers, with an assumed workload: 400 output tokens at $10 per 1M (Claude Sonnet 5 list price, 2026-10-11)
+cost $0.004 per sample. Best-of-4 on 5,000 of 50,000 daily requests adds about **$60 a day, or $1,800 per 30
+days**, before the extra input tokens (cheap if the prompt prefix is cached).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- One sample: 400 × $10/M = $0.004.
+- Best-of-4 adds 3 extra samples: 3 × $0.004 × 5,000 requests = $60 a day; × 30 = $1,800.
+
+</details>
+
+Default: one sample per request. Revisit when an eval shows best-of-n lifts a metric you are paid for.
+
+## Pitfalls
+
+- **Looping in Python over `k × V` items.** With a real vocabulary that is hundreds of thousands of iterations
+  per step; one `topk` over the flattened table does it at once.
+- **Products of probabilities instead of sums of logs.** Long products underflow to zero and every beam ties.
+- **Never terminating when no beam emits EOS.** Always cap `max_len`, or a model that never ends never returns.
+- **Claiming beam search always beats greedy.** It keeps more candidates, but it doesn't guarantee a better
+  result, and for chat it often reads worse.
+
+## Go deeper
+
+- Family walkthrough: [Stage 6: decoding](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#stage-6-decoding) and [Complexity and performance](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#complexity-and-performance).
+- Lab: <LabRef lab="transformer" inline /> (add beam search to its generate()).

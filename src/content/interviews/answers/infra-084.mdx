@@ -1,0 +1,188 @@
+---
+question: infra-084
+family: quant-specdec-moe
+status: published
+labs: [model-quantizer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Quantizing to int8 means picking a scale, dividing by it, rounding, and clamping to −128…127, always clamping
+> before converting so big values saturate instead of wrapping. A zero point shifts the range so 0.0 comes back
+> exactly and no integer values are wasted. In range, the error is at most half a step. The real risk is outliers:
+> with one scale per tensor, one huge value makes the step coarse for everything, so I'd use one scale per output
+> channel. Products are summed in int32 and then requantized back to int8."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants two things: a small numeric routine that is correct at the edges, and an understanding of why
+the error depends on where the scale comes from.
+
+Here is what makes this different from ordinary code. A model's learned numbers, its **weights**, are usually
+stored as 32-bit or 16-bit floats. **Quantization** stores them as small integers instead, 8 bits here, which is
+like lossy compression: the model gets 4× smaller than in 32-bit and faster to read, but every number comes back
+slightly wrong. Nothing crashes when the error is too big. The model just gets a little worse. So the code must be
+exactly right at the edges, and the design choices (where the scale comes from) decide how much accuracy you lose.
+
+This question is a PracHub entry tagged NVIDIA, titled "FP32 to Int8 Tensor Quantization: Scale, Zero Point,
+Clipping and Outliers" <Cite id="s-e6bac4f7b9" />. Only the title is candidate-reported; the step-by-step parts
+(symmetric quantizer, zero point, error bounds, saturation, then per-channel scales and int32 sums) are the page's
+write-up. The round is decided on edge cases and on the outlier follow-up.
+
+## Clarify first
+
+Ask these, and say the assumption you'll use if the interviewer doesn't answer:
+
+- **Signed range:** "−128…127, as stated, or −127…127 so both sides match?" Assume −128…127.
+- **Tie rule:** "Round half to even (`np.rint`) or half away from zero?" Assume half to even and say so; tests
+  depend on it.
+- **What we quantize:** "Weights or **activations** (the values flowing between layers for one input)? One scale
+  per tensor, per output channel or per group?" A **tensor** is a multi-dimensional array, such as one weight
+  matrix; an output channel is one row of it.
+- **Bad input:** "What should a zero scale, NaN or an empty array do?" Assume raise for bad scales, keep shapes for
+  empty input.
+- **Use downstream:** "Does the output feed an integer matrix multiply, so the zero point must stay an integer?"
+
+## Answer
+
+### Words you need first
+
+- **Scale (s):** the float value of one integer step. With s = 0.1, the integer 10 means 1.0.
+- **Zero point (z):** the integer that stands for 0.0. **Symmetric** quantization uses z = 0; **asymmetric** picks
+  z so the integers cover the actual range of values.
+- **Saturation:** values past the range are clamped to −128 or 127, rather than wrapping around.
+
+### The worked example: three numbers, then a ReLU output
+
+Start with x = [−1.0, 0.0, 1.0] and s = 0.1. Divide and round: [−10, 0, 10]. Multiply back: [−1.0, 0.0, 1.0]
+exactly. A value such as 0.234 would become round(2.34) = 2 and come back as 0.2, so every in-range value comes
+back within half a step (s ÷ 2).
+
+Write the round trip, clamping before the cast:
+
+```python
+QMIN, QMAX = -128, 127
+def quantize(x, scale, zero_point=0):
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("bad scale")
+    q = np.rint(x / scale) + zero_point
+    return np.clip(q, QMIN, QMAX).astype(np.int8)
+
+def dequantize(q, scale, zero_point=0):
+    return scale * (q.astype(np.float32) - zero_point)
+```
+
+Then choose the scale and zero point from the observed range. Widen the range to include 0 first, so that 0.0
+(padding, or the zeros a ReLU produces) maps exactly. **ReLU** is a common activation function that turns negative
+values into 0, so its output is never negative:
+
+<Formula
+  title="Range to scale and zero point"
+  expr="s = (max − min) ÷ 255;   z = round(−128 − min ÷ s);   symmetric: s = max|x| ÷ 127, z = 0"
+  vars={[
+    { sym: 'min, max', meaning: 'observed range, with min ≤ 0 ≤ max' },
+    { sym: 's ÷ 2', meaning: 'the largest round-trip error for an in-range value' },
+  ]}
+  example={[
+    'x = [−1, 0, 1], s = 0.1: q = [−10, 0, 10], dequantized exactly',
+    'ReLU output in [0, 6]: s = 0.02353, z = −128, so 0.0 → −128 → 0.0',
+  ]}
+/>
+
+Now walk the edge cases, using the runs from the family walkthrough (NumPy, 2026-10-12):
+
+| Case | What happened in the run | What to say in the interview |
+|---|---|---|
+| Cast 200.0 straight to int8, no clamp | Gave −56, a wrapped value | "Clamp, then cast. Otherwise 200 becomes −56." |
+| ReLU output in [0, 6], symmetric | Half the integers (all negatives) unused; asymmetric halved the RMS error | "A zero point puts all 256 values where the data is." |
+| 0.0 with the asymmetric parameters | 0.0 → −128 → exactly 0.0 | "Zero must survive the round trip." |
+| An all-zero tensor | Scale falls back to 1.0, no division by zero | "Guard the max-is-zero case." |
+
+### The outlier follow-up
+
+With one scale for the whole tensor, the single largest magnitude sets the step for every value. In a 256 × 1,024
+test matrix of small weights (the largest was 0.095), setting one weight to 1.0 raised the relative error from 1.08%
+to 11.3%, and 15.5% of the weights rounded to zero. Using one scale per row (**per-channel**) brought it back to
+1.0%. One value in 262,144 made the whole matrix ten times worse; per-channel scales keep the damage in one row.
+
+On real GPT-2 weights at 4 bits, the model-quantizer lab measured a mean weight error of
+<LabNumber lab="model-quantizer" metric="INT4 weight error, one scale per 32 weights" /> with one scale per 32
+weights (**per-group**), against <LabNumber lab="model-quantizer" metric="INT4 weight error, one scale per tensor" />
+with one per tensor. That is error in the weights, not proof of model quality.
+
+Say it like this: "Per-channel scales for weights. One outlier then costs one row, not the whole matrix."
+
+### Why activations are harder
+
+Weights never change, so you can see their whole range before serving. Activations change with every input, and a
+few channels carry very large values. Their range has to be measured on representative data, called
+**calibration**. The two known fixes are to keep the outlier channels in higher precision, or to move the
+difficulty into the weights with an equivalent rescaling (the family walkthrough cites the LLM.int8() and
+SmoothQuant papers for these).
+
+### Summing and requantizing
+
+A layer's core step is a **dot product**: multiply many pairs and add them up. The running sum, the
+**accumulator**, needs more than 8 bits. Hardware uses 32-bit integers, which are safe for **131,072 worst-case
+terms**. To hand the result to the next layer as int8, you **requantize**: multiply by one combined scale (one per
+output channel with per-channel weights), round, add the output zero point and clamp.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Largest int8 product:** 128 × 128 = 16,384. An int32 accumulator holds 2³¹ ÷ 16,384 = **131,072** of them; an
+  int16 one overflows after two.
+- **Requantization multiplier:** s_x × s_w ÷ s_y, where s_x, s_w and s_y are the input, weight and output scales.
+- **Asymmetric example:** [0, 6] gives s = 6 ÷ 255 = 0.02353 and z = round(−128 − 0 ÷ s) = −128.
+- **Worst error on the test matrix:** s = 0.000745, so s ÷ 2 = 0.000373, which the run matched.
+
+</details>
+
+Tests to name out loud: ties (2.5 rounds to 2 under half-to-even), saturation at both ends, exact zero, an
+all-zero tensor, NaN or a zero scale raising, and empty and 0-d arrays keeping their shape.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="INT8 round trip"
+  senior={["Correct saturation, exact zero, the s ÷ 2 bound, per-channel scales and int32 accumulation, with tests for each."]}
+  staff={["Explains why activations are harder (outlier channels, calibration data) and asks what eval will show the quantized model is still good enough."]}
+/>
+
+## Small-team version
+
+You will not ship this function. Your serving engine and a pre-quantized model build will. What you take from the
+exercise is how quantization fails: outliers and coarse scales cost accuracy, quietly. So a quantized build needs a
+**paired eval** on your own prompts before it replaces the original: the same items through both models, compared
+item by item.
+
+An agent can write this quantizer in seconds. Your part is the test list: ties, saturation at both ends, exact
+zero, empty and 0-d arrays, bad scales.
+
+The eval is cheap next to the GPU bill. To measure a 2-point quality drop to within ±2 points, when the two models
+disagree on 8% of items, takes about **770 paired items** (the family walkthrough shows the sample-size math).
+Running them through a hosted 70B reference model costs about **$2.72**.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Cost of the eval:** 770 items × (3,000 input + 400 output tokens) × $1.04 per 1M tokens (Together's Llama 3.3
+  70B price, fetched 2026-10-11) = 770 × 3,400 × 1.04 ÷ 10⁶ ≈ **$2.72**.
+
+</details>
+
+Default: a pre-quantized build your engine supports, adopted only after that paired eval passes.
+
+## Pitfalls
+
+- **Casting before clamping.** `astype(np.int8)` before `np.clip` lets values wrap instead of saturating.
+- **A range that leaves out 0.** Then 0.0 (padding, ReLU zeros) doesn't round-trip exactly.
+- **An unstated tie rule.** Tests disagree across implementations, and you can't tell which is wrong.
+- **Treating weight error as model quality.** A small weight error says nothing about accuracy on your prompts.
+
+## Go deeper
+
+- Family walkthrough: [Quantization, speculative decoding and MoE](/system-design-labs/interviews/walkthroughs/quant-specdec-moe/), worked examples 1–3 and the small-team section.
+- Extend the lab's v0 with a zero point and these tests: <LabRef lab="model-quantizer" inline />.

@@ -1,0 +1,133 @@
+---
+question: infra-009
+family: batcher-to-fleet
+status: published
+labs: [embedding-pipeline, llm-inference, rate-limiter]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Batching pays because each GPU batch has a big fixed cost, so the fuller the batch, the cheaper each request.
+> I'd queue requests in front of the GPU and flush whenever the GPU is free, taking everything waiting up to the
+> limit; under load the batches fill themselves. Each caller waits on a future, deadlines travel with the work,
+> and the queue is bounded by waiting time. For generated text I'd use continuous batching, where a finished
+> reply's slot is refilled at the next step, and admission checks GPU memory. For a fleet, I size GPUs from one
+> GPU's throughput and scale on queue wait."
+>
+> The rest of this page explains each part of that answer.
+
+This report is thin, so the interviewer's real question is unknown. The safe reading: can you design a system that
+groups requests onto GPUs under latency limits, and can you adapt when they tell you which version they mean?
+
+Why batching matters at all, for a backend engineer: in a normal service, each request costs its own processing
+time, and handling two at once costs about twice as much. A GPU running a model is different. One pass of the
+model reads the whole model from GPU memory, whether it processes one input or a hundred. So running inputs
+together in a **batch** costs only a little more than running one. Batching can multiply throughput many times
+over, but every request in a batch waits for the batch. The whole design is about that trade.
+
+A university career blog lists "inference batching systems" among xAI interview topics, and only a search snippet
+of it was seen (<Cite id="s-a297e9309b" />). It gives no prompt, round, level or follow-ups, so this card prepares
+you for the canonical version of the problem. A related xAI coding report, the continuous-batching decode loop
+(infra-008), suggests the company also cares about the case where the model generates text.
+
+## Clarify first
+
+Because the prompt is unknown, the clarifying questions do the scoping:
+
+- **Fixed-cost inputs or generated text?** Classification or **embeddings** (turning text into a list of numbers
+  for search) cost one fixed pass each. Generating a reply takes one pass per **token** (roughly three quarters of
+  a word), so replies of different lengths cost very different amounts.
+- **One GPU or a fleet, and at what request rate?**
+- **What latency budget, and are callers synchronous or streaming?**
+- **Design discussion, or code it?**
+
+State the default you'll take if the interviewer leaves it open: "I'll start with one GPU, up to 100 inputs per
+batch and callers who wait synchronously, then move to generation."
+
+## Answer
+
+Give the canonical answer in about five minutes, then follow the interviewer. Here it is as a five-minute clock,
+with the worked numbers from the family walkthrough: one GPU, batches that cost a fixed 40 ms plus 0.6 ms per
+input (assumed), and 800 requests a second arriving.
+
+| Minute | Point | The worked number | What to say in the interview |
+|---|---|---|---|
+| 0–1 | **Cost model first.** Batch time = a fixed cost + a cost per input. | Batch of 1: about 25 requests/s. Batch of 100: 1,000/s. | "The fixed cost is why batching pays." |
+| 1–2 | **Flush policy.** Flush when the GPU is free and the batch is full, the oldest request has waited a short window `W`, or a deadline is at risk. | At 800/s the batch settles at about 62, with no timer. | "Under load, the batches fill themselves." |
+| 2–3 | **Returning results.** Each caller waits on a **future** (an object completed later with the answer). The work carries the address of the server holding the caller's connection. | A request's answer arrives in about 115 ms on average. | "The reply address travels with the work." |
+| 3 | **Bounded queue.** Bound it by estimated wait; reject what can't meet its deadline. | Queue wait is the number to watch. | "Overload becomes fast rejections, not timeouts." |
+| 3–4 | **Failure.** Workers take batches under a **lease** (items reappear if the worker dies). Requeue once. If a batch keeps failing, split it in halves to find the **poison input** that crashes workers. | | "The batch is the unit of failure." |
+| 4 | **Generation.** A simple batch holds every slot until its longest reply ends. **Continuous batching** refills a finished slot at the next step, and admission checks GPU memory for each reply's **KV cache** (saved per-token results the model keeps while writing). | With 90% short and 10% long replies, a simple batch uses about 15% of its slots. | "With generation, memory is the limit, not slots." |
+| 5 | **Fleet.** GPUs = arrival rate ÷ (utilisation × one GPU's maximum). Scale on queue wait. | 100,000/s at 70% → about 143 GPUs. | "New GPUs load slowly, so admission absorbs spikes." |
+
+Say it like this: "Let me give you the whole design in five minutes, and then you tell me which part your team
+cares about most."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Batch time `T(b) = a + c × b`, a = 40 ms, c = 0.6 ms (assumed). Throughput `b ÷ T(b)`: 1 ÷ 40.6 ms ≈ 24.6/s;
+  100 ÷ 100 ms = 1,000/s.
+- Self-clocking batch size `b* = λa ÷ (1 − λc)`: at 800/s, 32 ÷ 0.52 = 61.5, T = 77 ms. Average latency ≈ T/2 + T
+  ≈ 38 + 77 = 115 ms.
+- Generation mix: mean reply 0.9 × 50 + 0.1 × 1,000 = 145 tokens; occupancy 145 ÷ 1,000 = 14.5%.
+- Fleet: 100,000 ÷ (0.7 × 1,000) = 142.9 → 143 GPUs.
+
+</details>
+
+### If it turns into coding
+
+Write the continuous-batching loop: a fixed number of slots, and at each step, finished sequences leave and
+waiting requests take their slots. Test it against a simple one-request-at-a-time version that gives the right
+answer slowly. Both must produce the same output for every request. The continuous-batching family has tested code
+for this.
+
+### Why this order works
+
+You start with the cost model because every later choice depends on it. You give failure and overload before
+being asked, because the prompt rarely mentions them and interviewers notice who raises them unprompted. You save
+generation and the fleet for last, because those are where the interviewer is most likely to steer you, and you
+want to have shown the basics first.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Unspecified batching prompt"
+  senior={["Scopes the unknown prompt with clarifying questions and delivers the canonical design with formulas."]}
+  staff={["Picks the version that matters for the interviewer's team (fixed-cost vs generation), says what would change the design, and gets to failure and overload unprompted."]}
+/>
+
+## Small-team version
+
+A small company asks this as "should we self-host this model, and how do we keep it from falling over?" The
+default answer is a hosted API, which batches for you.
+
+If you do self-host, use a serving engine that batches internally, put a deadline and a bounded queue in front of
+it, and size it from measured traffic. An always-on NVIDIA L4 (a small data-centre GPU) at $0.44–$0.80 an hour
+(RunPod to Modal, fetched 2026-10-11) costs about **$320–$580 a month** before redundancy.
+
+Self-hosting becomes the right call only with a data-residency rule, a model the APIs don't offer, or steady
+volume high enough to keep the GPU busy. At business-hours traffic it mostly sits idle, and you pay for it anyway.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+730 hours × $0.44–$0.80 ≈ $321–$584 a month, rounded to $320–$580.
+
+</details>
+
+## Pitfalls
+
+- **Inventing details about the xAI round.** The source gives no prompt, round or level; say you're answering the
+  canonical version.
+- **Jumping into model internals first.** The queueing design is what's being asked; internals come only if
+  invited.
+- **Forgetting overload and failure.** The prompt won't mention them, and that is why raising them counts.
+
+## Go deeper
+
+- Family walkthrough: [From one GPU batcher to a fleet](/system-design-labs/interviews/walkthroughs/batcher-to-fleet/).
+- The coding version: [Continuous batching](/system-design-labs/interviews/walkthroughs/continuous-batching/) and [infra-008](/system-design-labs/interviews/questions/infra-008/).
+- <LabRef lab="embedding-pipeline" inline />, <LabRef lab="llm-inference" inline />, <LabRef lab="rate-limiter" inline />.

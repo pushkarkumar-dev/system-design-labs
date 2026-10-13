@@ -1,0 +1,970 @@
+---
+title: "Run many models for many tenants on a shared GPU fleet"
+summary: "Keep about 200 open models and many tenants' small add-on adapters on shared GPUs: which models stay loaded, how 8-GPU and 1-GPU models fit together, how tenants avoid starving each other, and when a customer gets their own GPUs."
+track: ai-infra
+format: design
+family: multi-tenant-gpu-serving
+smallTeamFocus: "Rent first: per-token endpoints, plus several fine-tuned variants of one model as adapters on one GPU. Build loading, packing and fairness only if you sell inference; a 200-model fleet is a provider's problem."
+rounds: [system-design]
+level: both
+timeboxMin: 45
+order: 227
+status: published
+basedOn: [infra-006, infra-043, infra-048, infra-049, infra-051, infra-058]
+askedAt: [anthropic, baseten, fireworks-ai, together-ai]
+labs:
+  - { lab: faas-runtime, role: proof, note: "A warm pool with a per-function cap, idle eviction after 5 minutes and snapshot restore: the residency policy in miniature. Its cold start is a simulated 50 ms sleep, so it proves the policy logic, not GPU load times." }
+  - { lab: rate-limiter, role: proof, note: "Per-tier token buckets (free, basic, premium) for per-tenant admission in front of the shared pool. Charge tokens, not requests, when you adapt it." }
+  - { lab: llm-inference, role: partial, note: "A real KV cache and the KV-heads memory formula in code. Its continuous batching runs one forward pass per request, so it cannot show batch-slot contention between tenants." }
+  - { lab: lora-finetune, role: partial, note: "LoRA math, adapter save, load and merge, and an AdapterServer that swaps one adapter at a time on a shared base. It does not batch several adapters together, and 2 of its 13 tests fail." }
+  - { lab: container-orchestrator, role: partial, note: "A level-triggered reconcile loop with a first-fit scheduler on CPU and memory. It has no GPU resource, no gang placement and no best-fit; adding them is the exercise. Its informer test fails and the suite times out." }
+  - { lab: consistent-hashing, role: partial, note: "Virtual nodes for adapter-affinity routing. Its virtual-nodes test fails, and it has no bounded-load code, so the spill-over rule here is yours to add." }
+gapLabs: [gpu-scheduler, multi-lora-serving]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "Inside 'a GPU' there are three different scarce things, and I'd give each its own mechanism. First, which
+> models are loaded: a big model takes from about a second to over a minute to load depending on where its
+> weights sit, so I keep a warm copy in the server's RAM and unload from the GPU by a rent-or-buy rule. Second,
+> where each copy runs: a big model needs all 8 GPUs of one machine at once, so I pack small models tightly to
+> keep whole machines free. Third, who gets the next slot in a batch: tenants' adapters are tiny, but every
+> tenant competes for the same GPU memory for in-flight requests, so I use a fair queue that charges tokens,
+> per-tenant caps, and aging so no one waits forever. A dedicated endpoint is a pricing decision: worth it when
+> the customer's own load fills a GPU, or when isolation is in the contract."
+>
+> The rest of this page explains each part of that answer.
+
+### Why this is not an ordinary shared fleet
+
+You have run shared fleets before: many services on a Kubernetes cluster, many customers behind one load balancer.
+In that world a container starts in a second or two, any server can run any request, and every request costs
+roughly the same. A fleet that serves large language models (LLMs) breaks all three of those habits.
+
+1. **Programs are enormous and slow to load.** A model is mostly a big file of learned numbers. A
+   70-billion-parameter model is about 140 GB. Moving it onto GPUs takes from about a second to over a minute,
+   depending on where the file sits. So "start one when a request arrives" stops being free.
+2. **Some programs need several GPUs at once, on one machine.** A big model is split across all 8 GPUs of a
+   machine, and those 8 GPUs must work together on every step. Eight free GPUs scattered over eight machines
+   are useless to it.
+3. **Requests differ wildly in cost, and they hold memory while they run.** One request may read 50 words and
+   write 10. Another may read a whole book and write a report. While a request runs, it holds a chunk of GPU
+   memory, and that memory is what limits how many requests fit at once.
+4. **Many customers share one copy of a model through small add-ons.** Tenants customise a shared base model
+   with a small file of their own. The add-ons are cheap. The memory and time they compete for are not.
+
+If you explain those four things and then give each scarce resource its own mechanism, you have the core answer.
+
+### Words you need first
+
+- **GPU memory (HBM).** Each GPU has its own fast memory, called HBM (high-bandwidth memory). An NVIDIA H100 has
+  80 GB of it. A model must be in HBM to serve requests. Sources sometimes call it VRAM.
+- **Weights.** The learned numbers that make up the model. Each is usually stored in a 2-byte format (bf16), so
+  a model with 8 billion parameters needs about 16 GB, and a 70-billion-parameter one (written 70B) about 140 GB.
+- **Token.** Models read and write text in small pieces called tokens, roughly ¾ of a word each. Requests are
+  measured in tokens: the prompt's tokens in, the reply's tokens out.
+- **KV cache.** While the model writes a reply, it keeps a saved summary of every token so far in GPU memory, so
+  it doesn't re-read the whole conversation for each new token. That saved summary is the KV cache. It grows with
+  every token and is freed when the request ends.
+- **Replica.** One running copy of a model, on one or more GPUs, serving requests. A model with heavy traffic has
+  several replicas.
+- **Tenant.** A customer account. Tenants share replicas unless they pay for their own.
+
+Other terms are defined where they first appear.
+
+### The prompt as an interviewer might give it
+
+You run an inference service with a catalogue of about 200 open models on GPUs that every tenant shares. Most
+models fit on one GPU; a few need a whole 8-GPU machine. Tenants upload small add-on files called LoRA adapters
+(explained below) for some base models, and a few large customers want a dedicated endpoint with a promise on
+their slowest requests. Design the layer that decides which models stay loaded, where each replica runs, how
+requests for different adapters share a base model without one tenant starving the others, when a customer gets
+dedicated capacity, and what happens when a GPU fails.
+
+That prompt is a composite. Six reported questions each take one corner of it, from Together AI, Anthropic,
+Baseten and Fireworks (<Cite id="s-9597947584" />, <Cite id="s-62f6a22994" />, <Cite id="s-806beee74a" />,
+<Cite id="s-81dd7e6306" />). An interviewer usually picks one corner and pushes.
+
+<QuestionRow id="infra-058" />
+<QuestionRow id="infra-048" />
+<QuestionRow id="infra-043" />
+<QuestionRow id="infra-049" />
+<QuestionRow id="infra-051" />
+<QuestionRow id="infra-006" />
+
+The machinery underneath (placing GPU workloads on machines, machine health and draining) has its own family:
+[GPU cluster control plane](/system-design-labs/interviews/walkthroughs/gpu-cluster-control-plane/).
+
+## What is being tested
+
+Every corner of this prompt is the same kind of problem you already know: admission control and bin-packing. The
+difference is that the items are huge, slow to move, and sometimes need several GPUs at once. The interviewer
+wants to see whether you notice that "a GPU" hides three separate scarce resources:
+
+- **Placement:** which GPUs hold which base model. Changing it costs seconds to minutes and whole GPUs.
+- **Cache:** which tenants' adapters sit next to a base model. Changing it costs milliseconds and megabytes.
+- **Batch slots:** how many requests fit in the GPU memory left over after the weights. This is decided again
+  every few milliseconds.
+
+A strong answer names all three and gives each its own mechanism. A weak one uses one mechanism (usually "an LRU
+cache of models") for everything.
+
+The second thing being tested is whether you put numbers on things. The Together AI prep article says
+interviewers "care about the constant factors, not only the big-O" (<Cite id="s-9597947584" />). In this problem
+the constants are load times, memory per request and dollars per GPU-hour.
+
+### What the reports say
+
+- **Together AI** (a prep article, July 2026, which names no first-hand sources). Sample prompts on deciding
+  "what stays resident and what gets evicted" for open models on shared GPUs, multi-tenant adapters where one
+  customer can't starve another, and a customer who wants "a dedicated endpoint with tight tail-latency
+  guarantees". It notes that at long context "the KV cache, not the weights, is what eats your VRAM", and that
+  cold-loading a 70B model "takes real seconds" (<Cite id="s-9597947584" />).
+- **Anthropic** (a tech-screen title on PracHub, posted 2026-09-08). Route and batch inference on eight GPUs that
+  serve one model needing all eight and one needing a single GPU. The page splits it into routing, batch
+  formation and GPU allocation, and lists two follow-ups: one GPU in the eight-GPU group fails, and continuous
+  small-model traffic delays the eight-GPU work indefinitely. PracHub's own write-up (not the interviewer's) asks
+  for consistent resource accounting across router, scheduler and workers, bounded waiting with a clear overload
+  outcome, and measurements that would validate the choices (<Cite id="s-62f6a22994" />).
+- **Baseten** (a tech-screen title on PracHub, posted 2026-07-26). "Design production inference serving for one or
+  more large language models from admission through streamed token generation", with a topic list: model
+  lifecycle, accelerator-aware batching, memory pressure, fairness, cancellation, autoscaling, crash recovery and
+  latency-throughput observability (<Cite id="s-806beee74a" />). A Baseten prep guide says strong candidates
+  raise cold starts unprompted, and warns that "GPU utilization lies, while queue depth or time-to-first-token
+  track real load" (<Cite id="s-f440daaea4" />). Time to first token is how long a user waits for the first word of
+  the reply.
+- **Fireworks AI** (a prep site, undated). Candidates report design questions on "serving large models with low
+  delay, sharing GPUs across many customers, and keeping the service reliable" (<Cite id="s-81dd7e6306" />).
+
+No first-hand account we found describes a multi-tenant adapter round or a dedicated-versus-shared
+round; both come from the one prep article. Prepare them because they are the obvious next questions after
+"which models stay loaded", not because they are known to be common.
+
+## Clarify and scope
+
+Spend a minute here. Ask each question, then say the answer you'll assume if the interviewer doesn't give one.
+
+1. **Model mix.** "How many models, what sizes, and how skewed is traffic?" Assume 200 models: 150 small (up to
+   about 8B, one GPU each), 40 medium (two GPUs) and 10 large 70B-class models that each use a whole 8-GPU
+   machine. Assume a steep head: about 10 models carry most of the traffic.
+2. **Hardware.** Assume machines (call them **nodes**) with 8 NVIDIA H100 SXM GPUs, each with 80 GB of HBM, joined
+   inside the node by NVLink, NVIDIA's fast GPU-to-GPU link
+   ([NVIDIA H100 page](https://www.nvidia.com/en-us/data-center/h100/), fetched 2026-10-11). Assume 1 TB of
+   ordinary server RAM (**host DRAM**) and a local SSD (**NVMe**) per node. Ask whether several GPU generations
+   share the fleet.
+3. **Latency promises.** Two delays matter for a model that streams its reply: **time to first token (TTFT)**,
+   how long until the first word appears, and **inter-token latency (ITL)**, the gap between later words. Ask for
+   both per tier. Ask what the first request to a rarely used model may do while it loads: wait in a queue with a
+   position, get a 503 with Retry-After, or fall back to another model.
+4. **Tenancy.** Shared endpoints, dedicated endpoints, per-tenant adapters. Which tiers exist, and may a lower
+   tier be pushed out (**preempted**) for a higher one?
+5. **Fairness unit.** Fair per tenant, per organisation or per API key? Fair by requests, tokens or GPU-seconds?
+6. **Failure promises.** Are retries allowed? What does the API promise a client whose reply is already streaming
+   when a GPU fails?
+
+**Out of scope, said out loud:** the GPU code inside one replica (treat the serving engine as a black box with a
+known capacity), training and fine-tuning jobs, billing, and the pipeline that copies weights to thousands of
+hosts. Accept the interviewer's setup quickly. One Staff inference candidate who didn't get an offer believes, in
+hindsight, that they pushed on assumptions "too directly" (<Cite id="s-4e04a1689c" />).
+
+### The example we follow through this page
+
+One tenant and one request, with illustrative names and assumed values.
+
+- **Acme** runs a customer-support bot. They uploaded one adapter for **Llama-3.1-8B**, a popular small model
+  that sits on one GPU.
+- At 14:02 Acme sends a request: a **2,000-token prompt** (instructions plus a chat transcript) and a reply of up
+  to **300 tokens**.
+- Two other tenants share the same 8B replicas right now. One of them, a batch-processing customer, is sending
+  thousands of long requests.
+- Elsewhere in the fleet, a node runs one replica of a **70B** model across all 8 GPUs. Later we'll put a small
+  model next to it, and then lose one of its GPUs.
+
+We'll follow Acme's request through the design, then ask what happens when its model isn't loaded, when the batch
+customer floods the queue, and when Acme asks for a dedicated endpoint.
+
+## Back-of-envelope
+
+Four numbers come before any boxes: how much memory the weights take, how many requests fit beside them, how long
+a model takes to load, and how big an adapter is. Explain each in words, give the result, and keep the
+derivation for the box at the end of this section. All hardware rates are assumptions; swap in the interviewer's
+numbers.
+
+### 1. Weights: what a model costs just to be loaded
+
+At 2 bytes per parameter, the 8B model needs **16 GB** and fits on one 80 GB GPU with room to spare. The 70B model
+needs **140 GB**, more than one GPU holds, so it is split across GPUs. This page uses the name-rounded basis
+(70 × 10⁹ × 2 bytes); Llama-3.1-70B's exact 70.55B parameters give 141.1 GB.
+
+Splitting one model across several GPUs so they compute each step together is called **tensor parallelism**
+(**TP**). "TP = 8" means the model is cut into 8 slices on 8 GPUs. Those GPUs exchange data on every layer of
+every step, so they must sit on one node, joined by NVLink. A set of GPUs that must be free together, on one node,
+is called a **gang**.
+
+### 2. KV headroom: how many requests fit beside the weights
+
+Whatever memory the weights and runtime don't use holds KV caches, and that sets how many requests a replica can
+serve at once. Each in-flight request is a **sequence** (its prompt plus the reply so far); the set of sequences a
+replica works on together is its **batch**, and each place in it is a **batch slot**.
+
+Assume each sequence holds up to 4,096 tokens and each GPU loses an assumed 8 GB to runtime overhead:
+
+| Replica | Weights | Left for KV | Sequences of 4,096 tokens |
+|---|---|---|---|
+| 8B on 1 GPU | 16 GB | 56 GB | **about 104** |
+| 70B on 8 GPUs | 140 GB | 436 GB | **about 324** |
+| Same 70B node, 128K-token sequences | 140 GB | 436 GB | **about 10** |
+
+The last row is the point the Together article makes. Nothing about the weights changed. Going from 4K-token to
+128K-token sequences cut the node from 324 requests to 10, because each long sequence's KV cache is about 43 GB.
+Model shapes come from the Llama-3.1 configs (<Cite id="s-6fdd575dc5" />, <Cite id="s-20bffa9709" />).
+
+Say: "A model that fits in memory may still be unable to serve its traffic. Placement has to count KV memory, not
+just weights."
+
+### 3. Load time: "loaded" is not one state
+
+Where the weights sit decides how long a load takes. With assumed rates of 2 GB/s from an object store, 6 GB/s from
+local NVMe and 20 GB/s per GPU from host DRAM:
+
+| Where the weights are | 70B (140 GB) on 8 GPUs | 8B (16 GB) on 1 GPU |
+|---|---|---|
+| In HBM | serving now | serving now |
+| Host DRAM | **about 0.9 s** | about 0.8 s |
+| Local NVMe | **about 23 s** | about 2.7 s |
+| Object store only | **about 70 s** | about 8 s |
+
+So a model is in one of four states, from "serving now" to "over a minute away". These times leave out engine
+start-up and warm-up, which you measure rather than guess. With an assumed 1 TB of DRAM per node, one node can keep
+about **62 small models** a second away from serving.
+
+**What if everything stayed in HBM?** One replica of every model needs **310 GPUs**, about 39 nodes, before any
+extra replicas for load. Most of those GPUs would sit idle for the rarely used models. That cost is why "which
+models stay loaded" is a question at all.
+
+### 4. Adapter size: why tenants' customisations are cheap
+
+A **LoRA adapter** (low-rank adaptation) is a small add-on that customises a shared base model. Instead of
+changing the model's big weight matrices, it adds a thin correction to some of them. The thinness is set by a
+number called the **rank**; rank 16 is common. Many tenants can share one copy of the base model, each with their
+own adapter.
+
+For the 8B model with rank-16 adapters on four of the attention matrices in every layer, one adapter is about
+**27 MB**. A 4 GB pool of adapter memory on one GPU holds about **146 of them**, and copying one in from DRAM takes
+about **1.4 ms**. The same adapter shape on the 70B model is about 131 MB.
+
+An adapter doesn't change the size of the KV cache: the base model's shapes are the same. So:
+
+- base models cost **seconds and whole GPUs** to move: a **placement** problem;
+- adapters cost **milliseconds and megabytes**: a **cache** problem;
+- every tenant's requests compete for the **same KV memory**: a **scheduling** problem.
+
+Say: "Base models are a placement problem, adapters a cache problem, batch slots a scheduling problem. I won't use
+one mechanism for all three."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="KV headroom: how many sequences fit beside the weights"
+  expr="sequences ≈ (GPUs × HBM − weight bytes − GPUs × overhead) ÷ (2 × layers × n_kv_heads × head_dim × bytes × tokens_per_seq)"
+  vars={[
+    { sym: 'GPUs × HBM', meaning: 'total GPU memory of one replica' },
+    { sym: 'overhead', meaning: 'activations, runtime context, fragmentation; assumed 8 GB per GPU' },
+    { sym: 'n_kv_heads, head_dim', meaning: '8 and 128 for both Llama-3.1-8B and -70B (grouped-query attention: many query heads share 8 key-value heads)' },
+    { sym: 'tokens_per_seq', meaning: 'prompt plus output held per sequence; assumed 4,096' },
+  ]}
+  example={[
+    "8B on 1 GPU: KV per token = 2 × 32 × 8 × 128 × 2 = 131,072 B. Free = 80 − 16 − 8 = 56 GB. 56 × 10⁹ ÷ 131,072 ≈ 427,000 tokens ≈ 104 sequences",
+    "70B on 8 GPUs: KV per token = 2 × 80 × 8 × 128 × 2 = 327,680 B. Free = 640 − 140 − 64 = 436 GB ≈ 1.33M tokens ≈ 324 sequences",
+    "Same 70B node at 128K context: one sequence is 131,072 × 327,680 B ≈ 42.9 GB, so 436 ÷ 42.9 ≈ 10 sequences",
+  ]}
+/>
+
+<Formula
+  title="Cold-load time"
+  expr="T_load ≈ weight bytes ÷ min(source bandwidth, GPUs × host-to-GPU bandwidth) + T_init"
+  vars={[
+    { sym: 'source bandwidth', meaning: 'object store, local NVMe or host DRAM' },
+    { sym: 'host-to-GPU bandwidth', meaning: 'per-GPU copy rate; assumed 20 GB/s' },
+    { sym: 'T_init', meaning: 'engine start, allocation, warm-up: measure it, do not guess' },
+  ]}
+  example={[
+    "70B (140 GB) from an object store at an assumed 2 GB/s: 70 s",
+    "70B from local NVMe at an assumed 6 GB/s: about 23 s",
+    "70B from host DRAM into 8 GPUs at 8 × 20 = 160 GB/s: about 0.9 s",
+    "8B (16 GB): about 2.7 s from NVMe, 0.8 s from DRAM, 8 s from the object store",
+  ]}
+/>
+
+- **Warm DRAM tier:** 1,000 GB ÷ 16 GB ≈ **62** small models per node.
+- **Everything in HBM:** 150 × 1 + 40 × 2 + 10 × 8 = **310 GPUs**, ÷ 8 ≈ 39 nodes.
+
+<Formula
+  title="LoRA adapter size"
+  expr="adapter params = layers × rank × Σ (d_in + d_out) over the adapted matrices"
+  vars={[
+    { sym: 'rank', meaning: 'LoRA rank r; each adapted matrix gets A (r × d_in) and B (d_out × r)' },
+    { sym: 'd_in, d_out', meaning: 'input and output width of each adapted projection' },
+  ]}
+  example={[
+    "Llama-3.1-8B, r = 16 on q, k, v, o: q and o are 4,096 → 4,096; k and v are 4,096 → 1,024. Per layer 16 × (8,192 + 5,120 + 5,120 + 8,192) = 425,984. × 32 layers = 13.6M params ≈ 27.3 MB in bf16",
+    "Llama-3.1-70B, same adapters: 65.5M params ≈ 131 MB in bf16",
+    "A 4 GB adapter pool on an 8B GPU holds 4 × 10⁹ ÷ 27.3 × 10⁶ ≈ 146 rank-16 adapters (36 at rank 64); copying one from DRAM at 20 GB/s takes about 1.4 ms",
+  ]}
+/>
+
+</details>
+
+## High-level design
+
+Here is the system, top to bottom. Requests flow down the left side; decisions about what is loaded where flow
+down the right.
+
+```text
+          tenants: shared endpoints · dedicated endpoints · LoRA adapters
+                                    │
+                       ┌────────────▼────────────┐
+                       │ gateway / router         │ auth, tier, per-tenant token budgets,
+                       │                          │ route by (model, adapter, KV headroom)
+                       └────┬───────────────┬─────┘
+             requests       │               │ demand: queue depth, TTFT, cold misses
+                 ┌──────────▼────┐   ┌──────▼──────────────────┐
+                 │ replicas       │◄──│ placement controller     │ desired state:
+                 │ engine + base  │   │ residency tiers, packing,│ model → replicas → GPUs
+                 │ + adapter pool │   │ tiers, drain, failures   │
+                 └──────────┬─────┘   └──────┬──────────────────┘
+                 ┌──────────▼────────────────▼──┐
+                 │ node agents                    │ load / evict / start / stop;
+                 │ HBM │ DRAM │ NVMe              │ report free GPUs, health, KV use
+                 └──────────┬─────────────────────┘
+                            │
+                 model + adapter store (versioned, immutable)
+```
+
+**Gateway and router.** This is the front door. It checks who the tenant is, finds their tier and their token
+budget, and sends each request to a replica that already has the base model in HBM. Among those, it prefers one
+that already holds the tenant's adapter and has free KV memory. It also runs admission control: per-tenant queues
+with deadlines, and a definite answer when a queue is full.
+
+**Placement controller.** This owns the plan: how many replicas each model gets, which GPUs each replica uses, and
+where every model's weights should sit (HBM, DRAM, NVMe or only the object store). It is **level-triggered**, like a
+Kubernetes controller: each pass compares the plan with what is actually running and fixes the difference. A crash
+or a missed event is repaired on the next pass, because nothing depends on replaying events.
+
+**Node agents.** One per node. They move weights between storage tiers, start and stop replicas, and report back
+free GPUs, GPU health, loaded models and KV memory in use.
+
+**Replicas.** One serving engine per base model (vLLM is a common open-source one), sliced across its GPUs, with a
+small pool of adapter slots in HBM. The engine runs **continuous batching**: finished requests leave the batch and
+waiting ones join between steps, so the batch is always changing.
+
+**Model and adapter store.** Immutable, versioned files. Getting them onto hosts quickly is a separate design.
+
+Two rules give the "consistent resource accounting" the Anthropic write-up asks for. First, the controller is the
+only writer of GPU assignments, and each assignment carries a version number, so two controller workers can't hand
+one GPU to two replicas. Second, replicas report KV memory in use, not just request counts, so the router balances
+on memory headroom rather than open connections.
+
+### Acme's request through the boxes
+
+Two words first. The model handles a request in two phases. It reads the whole prompt in one big pass, called
+**prefill**; the first token of the reply appears when prefill ends. Then it writes the reply one token per step,
+called **decode**. Prefill is limited by the GPU's arithmetic. Decode is limited by how fast the GPU can read the
+weights from memory on every step. That difference matters later, when one tenant's long prompt slows everyone
+else down.
+
+Here is Acme's 2,000-token request at 14:02, in the common case where the 8B base model is already loaded. Times
+are rough floors on an H100; the derivations are in the box below.
+
+| Clock | Step | What happens | What to say in the interview |
+|---|---|---|---|
+| 0 ms | **Gateway** | Checks Acme's key and tier. Reserves 2,000 + 300 = 2,300 tokens from Acme's budget. | "I charge tokens, not requests: the batch customer's requests can cost a hundred times more than Acme's." |
+| ~1 ms | **Router** | Finds 8B replicas in HBM. Prefers one where Acme's adapter is already loaded and KV memory is free. | "Route by model, then adapter, then KV headroom. Never by connection count." |
+| ~1 ms | **Fair queue** | Acme's request waits its turn in a queue that shares tokens fairly between tenants. | "The batch customer can't fill every slot; I'll show the queue in the deep dive." |
+| +1.4 ms if needed | **Adapter slot** | If Acme's adapter isn't in HBM, the replica copies it in from DRAM. | "An adapter miss costs about a millisecond. A base-model miss costs seconds." |
+| +~32 ms | **Prefill** | The model reads all 2,000 prompt tokens in one big pass. The first token appears. | "This is the floor for time to first token on this hardware." |
+| ≥4.8 ms per token | **Decode** | The model writes the reply one token per step, sharing each step with the other sequences in the batch. | "300 tokens take at least 1.4 s, longer when the batch is full." |
+| end | **Release** | The KV cache and batch slot are freed; unused budget goes back to Acme. | "If the client disconnects early, free the slot at once." |
+
+**The cold case.** Now say Acme's adapter belongs to a rarely used model that was unloaded an hour ago. If its
+weights are in DRAM, the request waits about 0.8 s more. From NVMe, about 2.7 s. From the object store, about 8 s
+for an 8B model and over a minute for a 70B one. That spread is what the residency deep dive is about.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Prefill floor:** reading a prompt costs about 2 × parameters × prompt tokens of arithmetic:
+  2 × 8.03 × 10⁹ × 2,000 ≈ 3.2 × 10¹³ operations. One H100 SXM does about 989.5 × 10¹² dense bf16 operations per
+  second (half the 1,979 TFLOPS "with sparsity" on NVIDIA's page), so 3.2 × 10¹³ ÷ 989.5 × 10¹² ≈ **32 ms**.
+  This is a floor at 100% of peak, a derived value.
+- **Decode floor:** every decode step reads all the weights from HBM. 16 GB ÷ 3.35 TB/s ≈ **4.8 ms per token** at
+  batch 1. Reading the KV caches of a full batch adds to it. 300 × 4.8 ms ≈ **1.4 s**.
+- **Adapter copy:** 27.3 MB ÷ 20 GB/s ≈ **1.4 ms**.
+- **Cold load of the 8B:** 16 GB ÷ 20 GB/s = 0.8 s; ÷ 6 GB/s ≈ 2.7 s; ÷ 2 GB/s = 8 s (all rates assumed).
+
+</details>
+
+## Deep dives
+
+### Residency: which models stay loaded
+
+**Residency** means where a model's weights live right now: in HBM (serving), in DRAM (about a second away), on NVMe
+(seconds to tens of seconds away) or only in the object store (up to over a minute away). The question is when to
+move a model down a tier.
+
+Treat every quiet period of a model as a rent-or-buy choice. Keeping it in HBM is renting: it costs its GPUs for
+every idle second. Unloading it is buying: you pay once, with a reload and a slow first request for the next user.
+This is the classic **ski-rental problem**. Its rule is to keep renting until the rent you've paid equals the
+price of buying, and then buy. That rule never costs more than twice the best choice you could have made with
+hindsight.
+
+Turned into a timeout: **unload a model after it has been idle for τ seconds**, where τ is its reload time plus the
+price of a slow first request, spread over the GPUs it holds. The price of a slow first request (call it the
+**cost of a cold miss**) is a product decision, not an engineering one. With an assumed price of 300 GPU-seconds:
+
+- the 8B model on one GPU, falling back to NVMe, stays loaded for **about 5 minutes** of idleness;
+- the 70B model on eight GPUs, falling back to NVMe, stays loaded for only **about 61 seconds**.
+
+The big model is unloaded sooner because idling costs eight GPUs. If a 23-second wait hurts its users more than a
+3-second wait hurts the 8B's users, raise its cold-miss price.
+
+**What it means for Acme.** Suppose Acme's adapter sits on a long-tail 8B model that gets one request every 10
+minutes on average. With τ at 5 minutes, about **3.6 of the 6 quiet gaps an hour** end in an unload, so about 3.6
+users an hour wait an extra 2.7 seconds. If that is too many, either raise that model's cold-miss price or keep its
+weights in DRAM, where a miss costs under a second.
+
+Three consequences to say out loud:
+
+- **The DRAM tier makes mistakes cheap.** With weights a second away, unloading from HBM aggressively is safe.
+  "Page models in on demand" works between HBM and DRAM. It does not work from the object store: a 140 GB model at
+  2 GB/s keeps a user waiting over a minute.
+- **Pin the head.** The ten busiest models never sit idle long enough for τ to matter, so pin them.
+- **Watch for thrash.** A model unloaded and reloaded several times an hour costs more than a small permanent
+  replica. Give it one.
+
+Unloading is also a packing decision. Freeing eight GPUs for a large model helps only if all eight are on one node.
+So pick models to unload that free a usable gang, not just the least recently used ones.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Break-even idle time before eviction"
+  expr="τ = T_load + C_miss ÷ G"
+  vars={[
+    { sym: 'τ', meaning: 'idle time after which the model leaves HBM' },
+    { sym: 'T_load', meaning: 'reload time from the tier it falls back to' },
+    { sym: 'C_miss', meaning: 'what a cold miss costs users, priced in GPU-seconds (a product decision)' },
+    { sym: 'G', meaning: 'GPUs the model holds while resident' },
+  ]}
+  example={[
+    "8B on 1 GPU, falls back to NVMe (2.7 s), miss priced at 300 GPU-seconds: τ = 2.7 + 300 ÷ 1 ≈ 5 minutes",
+    "70B on 8 GPUs, NVMe (23 s), same price: τ = 23 + 300 ÷ 8 ≈ 61 seconds",
+  ]}
+  note="300 GPU-seconds is an assumption to make the arithmetic concrete. The real price of a cold miss comes from the product owner."
+/>
+
+- **Acme's long-tail model:** with random (Poisson) arrivals at one per 600 s, the chance a quiet gap outlasts
+  τ = 300 s is e^(−300/600) ≈ 0.61. With 6 gaps an hour, 6 × 0.61 ≈ **3.6** unloads and cold misses an hour.
+
+</details>
+
+### Packing: gangs, fragmentation and best-fit
+
+Recall that the 70B replica on 8 GPUs is a gang: all 8 must be free on one node at the same time. Counting free GPUs
+across the whole fleet says nothing about whether a gang fits.
+
+**Fragmentation, with numbers.** Take ten nodes (80 GPUs) carrying 40 one-GPU replicas. Packed tightly, that is
+five full nodes and five empty ones, so five 8-GPU gangs still fit. After a few days of replicas starting and
+stopping, the same 40 replicas end up spread four to a node across all ten nodes. Now 40 GPUs are free, and not one
+gang fits. Track it as a number:
+
+**fragmentation = 1 − (GPUs usable by the largest waiting shape ÷ free GPUs)**
+
+It is 0 when packed tightly and 1.0 after the churn in this example. Alert on it the way you alert on free
+capacity.
+
+Three tools, in the order you'd reach for them:
+
+1. **Best-fit for small replicas.** Put each new one-GPU replica on the node with the fewest free GPUs that still
+   fits it. That refills holes and keeps empty nodes empty. A simple index (`buckets[f]` = the nodes with exactly
+   `f` free GPUs, f = 0…8) finds the right node in at most nine lookups. The object-oriented version of this
+   scheduler is worked in the [control-plane family](/system-design-labs/interviews/walkthroughs/gpu-cluster-control-plane/).
+2. **Shape pools.** Keep a pool of whole nodes for 8-GPU replicas. Small replicas may borrow idle whole nodes only
+   as preemptible guests.
+3. **Reservation with backfill.** When a gang has waited too long, reserve the node that is cheapest to empty and
+   stop placing new long-lived work on it. The batch scheduler Slurm states the precise rule: start lower-priority
+   work only "if doing so does not delay the expected start time of any higher priority jobs"
+   ([Slurm scheduling docs](https://slurm.schedmd.com/sched_config.html), version 26.05, fetched 2026-10-12). That
+   needs runtime estimates, which serving replicas don't have, so for serving the practical rule is simpler:
+   "nothing new lands on a reserved node".
+
+<Pitfall title="Counting GPUs instead of gangs">
+"We have 40 free GPUs, so the 70B replica fits" is the classic miss. Ask whether 8 of them are free on one node.
+Track fragmentation as a number and alert on it the way you alert on free capacity.
+</Pitfall>
+
+### One node, a large model and a small one
+
+The Anthropic screen is the packing problem shrunk to one node: a 70B model at TP = 8 and an 8B model on the same
+eight GPUs.
+
+**Memory is not the conflict.** The 70B's weights take 140 ÷ 8 = 17.5 GB per GPU, so the 8B (16 GB) fits beside
+them on any GPU. The conflict is that the two models become **coupled**, in two ways.
+
+- **Step-time coupling.** Every 70B decode step finishes only when its slowest slice finishes. Put the 8B on GPU 0,
+  and every 70B step waits whenever GPU 0 is busy running 8B work.
+- **Memory coupling.** Each 70B sequence spreads its KV cache evenly over all eight GPUs. So the fullest GPU sets
+  the whole replica's capacity. Alone, the replica holds about 324 sequences. Put the 8B plus an assumed 10 GB of
+  its own KV cache on GPU 0, and that GPU's free memory drops from 54.5 GB to 28.5 GB. The whole 70B replica now
+  holds only **about 169 sequences**. One small model on one GPU roughly halves the big model's capacity.
+
+Say: "The 8B fits in memory, but it would halve the 70B's batch and slow every 70B step. So the real choice is
+between these four options."
+
+| Option | What it costs |
+|---|---|
+| **Take turns:** the node runs one model at a time | A switch cost each way. With weights in DRAM a switch takes about 0.9 s, so 30-second turns keep **97%** of the time useful. With weights on NVMe a switch takes about 23 s and the same turns keep only **57%** |
+| **Share:** put the small model on one GPU | Halves the big model's capacity in the example, and adds jitter to every big-model token |
+| **Shrink the big model** (for example 8-bit weights on 4 GPUs) | Frees four GPUs for four small replicas, but needs a quality check. The split must divide the model's 64 query heads and 8 key-value heads evenly, so 2, 4 and 8 GPUs are valid and 7 is not |
+| **Add hardware** | The answer when both models need low latency at the same time and the node can't give it. The PracHub write-up asks you to say so |
+
+**The starvation follow-up.** If the node takes turns, a rule of "switch when the node is idle" never switches,
+because small-model traffic never stops. Give the large model a guaranteed share instead. Once its oldest waiting
+request passes a bound, stop admitting new small-model work, let in-flight small work finish (up to a deadline),
+and switch. Report the large model's maximum wait as a metric; that is the starvation signal.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **KV per token per GPU at TP = 8:** the 8 key-value heads split one per GPU, so 327,680 B ÷ 8 = 40,960 B per
+  token per GPU.
+- **Alone:** 80 − 17.5 − 8 = 54.5 GB free per GPU, which gives the 324 sequences above.
+- **With the 8B on GPU 0:** 54.5 − 16 − 10 = 28.5 GB. 28.5 × 10⁹ ÷ 40,960 ≈ 696,000 tokens per GPU, and since every
+  sequence needs the same share on every GPU, the replica holds 696,000 ÷ 4,096 ≈ **169 sequences**.
+- **Taking turns:** for a turn length T and switch cost s, the useful share is T ÷ (T + s). 30 ÷ 30.9 ≈ 97%;
+  30 ÷ 53 ≈ 57%.
+
+</details>
+
+### Many tenants' adapters on one base model, without starvation
+
+From the back-of-envelope: one GPU holds over a hundred adapters next to an 8B base. So adapter memory is not the
+scarce thing. **Batch slots** and **which requests share a batch** are.
+
+Here is what happens at 14:02 without any fairness. The batch customer has 300 long requests queued. Acme has one.
+A first-come-first-served queue gives the batch customer every one of the 104 slots on the replica, and Acme waits
+behind all 300. Five mechanisms fix this.
+
+- **Fair share by tokens.** Use **weighted fair queueing**: each tenant gets a share of service in proportion to a
+  weight from their tier. Deficit round robin is a simple way to do it. Each request costs its prompt tokens plus
+  its expected output tokens, because a tenant sending long prompts and long replies uses far more KV memory and
+  decode time per request. With weights 1, 1 and 2 for three active tenants (Acme, a second tenant and the batch
+  customer on a higher tier), they get **25%, 25% and 50%** of the tokens served. It is **work-conserving**: when
+  the others go quiet, one tenant may use everything.
+- **Concurrency caps.** Cap each tenant's in-flight sequences per replica, for example **32 of the 104 slots**. A
+  cap bounds the damage while the fair queue sorts out the rest.
+- **Adapter slots as a cache.** Keep a least-recently-used (LRU) cache of adapter slots per replica, refilled from
+  DRAM in about a millisecond. Pin adapters for tenants who pay for reserved capacity. A high adapter miss rate
+  means the router spreads a tenant across too many replicas.
+- **Adapter affinity.** Send each tenant to a small set of replicas by consistent hashing on the adapter id, with a
+  load bound so a busy tenant spills onto more replicas instead of overloading its first choice.
+- **Batches that mix adapters.** Serving several adapters in one batch needs special GPU code (a **kernel**) that
+  applies a different correction to each sequence. Punica reported 12× higher throughput than the serving systems
+  it compared against, "only adding 2ms latency per token"
+  ([arXiv 2310.18547](https://arxiv.org/abs/2310.18547), October 2023). S-LoRA serves "thousands of LoRA adapters
+  on a single GPU" with one shared memory pool ([arXiv 2311.03285](https://arxiv.org/abs/2311.03285), November
+  2023). Both compare against 2023 baselines, so measure your own engine. In vLLM, `--max-loras` is the "Max number
+  of LoRAs in a single batch" and defaults to 1
+  ([vLLM engine arguments](https://docs.vllm.ai/en/latest/configuration/engine_args.html), fetched 2026-10-12).
+  Leave it at 1 and requests for different adapters cannot share a batch.
+
+**Starvation comes in two forms, and each needs its own guard.** A heavy tenant can fill every batch slot; the fair
+queue and the caps stop that. A rarely used adapter can wait behind popular ones if the scheduler prefers batches
+of one adapter because they run faster; **aging** stops that. Once any request passes its wait bound, it joins the
+next batch whatever that does to batch efficiency.
+
+Say: "Fair by tokens, capped per tenant, and aged so even the rarest adapter has a maximum wait."
+
+### Dedicated endpoint or shared pool
+
+A **dedicated endpoint** is a replica (or several) that serves only one customer. It buys isolation and a
+**p99** (the latency 99% of requests beat) that you can promise. It costs utilisation, because you size it for the
+customer's peak and they pay for their quiet hours too.
+
+The shared pool wins by **statistical multiplexing**: when customers' bursts are independent, they rarely peak at
+the same moment, so they partly cancel out. A pool needs much less headroom than the sum of everyone's private
+headroom.
+
+**With numbers.** Take 20 customers, each using on average 0.3 of a replica, with a typical swing (standard
+deviation) of 0.2 replica, and size for three standard deviations of headroom (all assumed):
+
+- **Dedicated:** each needs 0.3 + 3 × 0.2 = 0.9, rounded up to **1 replica each, 20 in all**.
+- **Pooled:** all 20 together need **9 replicas**, and one customer's fair share of those is about **0.43
+  replica**.
+- So a dedicated replica costs this customer about **2.3×** their share of the pool.
+
+**Independence is the assumption that breaks.** Bursts that share a cause (everyone's business hours, one viral
+launch) don't cancel, and the pool needs more headroom.
+
+A rule falls out. **Dedicate** when the customer's own peak fills most of a whole replica (so little is wasted),
+when their p99 promise is tighter than the pool can hold under correlated bursts, or when isolation is in the
+contract. **Otherwise sell a priority tier** in the shared pool: their requests go first, so their p99 is protected
+while the lower tiers absorb bursts.
+
+Price whichever you choose. A dedicated H100 endpoint lists at $5.49 per GPU-hour on Together's page, about
+**$4,008 a month** for one always-on GPU ([Together pricing](https://www.together.ai/pricing), fetched 2026-10-12).
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Capacity: dedicated versus pooled"
+  expr="dedicated_i = ⌈μ_i + z × σ_i⌉ replicas;   pool = Σμ + z × √(Σσ²);   fair share_i = μ_i + z × σ_i² ÷ √(Σσ²)"
+  vars={[
+    { sym: 'μ_i, σ_i', meaning: "customer i's mean and standard deviation of load, in replicas" },
+    { sym: 'z', meaning: 'headroom factor from the latency target; 3 here (assumed)' },
+    { sym: 'fair share_i', meaning: "customer i's share of pooled capacity; the shares sum exactly to the pool" },
+  ]}
+  example={[
+    "20 independent customers, each μ = 0.3, σ = 0.2 replica (assumed). Dedicated: 0.3 + 0.6 = 0.9 → 1 replica each, 20 in all",
+    "Pooled: 6 + 3 × 0.2 × √20 = 6 + 2.68 = 8.68 → 9 replicas. Each customer's fair share ≈ 0.3 + 3 × 0.04 ÷ 0.894 ≈ 0.43 replica",
+    "So a dedicated replica costs this customer about 1 ÷ 0.43 ≈ 2.3× their pooled share",
+  ]}
+  note="Independence is the load-bearing assumption. Bursts that share a cause (everyone's business hours, one viral launch) do not cancel, and the pool needs more headroom."
+/>
+
+- **Monthly price:** $5.49 × 730 hours ≈ $4,008.
+
+</details>
+
+### Keeping per-token latency when other tenants share the batch
+
+Sharing works at all because decode is cheap to share. Each decode step reads all the weights from memory once,
+whatever the batch size, so adding more tenants' sequences to a batch costs little extra time, until reading their
+KV caches and doing their arithmetic catch up. The Fireworks report ("sharing GPUs across many customers") is about
+exactly this trade.
+
+The noisy neighbour inside a replica is **prefill**. Reading a long prompt is heavy arithmetic. If the engine
+inserts a whole long prompt into the running batch, every other tenant's next token waits for it. On the 70B at
+TP = 4 on A100s, a 2,000-token prompt takes about 226 ms to read. A decode step there takes at least about 17 ms,
+so the prompt delays everyone else's next token by about **13 decode steps**. The fix is **chunked prefill**: split long prompts into pieces processed between decode steps,
+so each step stays within the inter-token budget. For large models, a second fix is separate pools of GPUs for
+prefill and for decode. The [low-latency card](/system-design-labs/interviews/questions/infra-051/) works through it.
+
+## Failure modes and overload
+
+### One GPU in an 8-GPU group fails
+
+This is a reported follow-up. The whole 70B replica is down, because every token needs every slice.
+
+1. The node agent reports the GPU error, and the router stops sending requests to that replica.
+2. Requests that haven't started streaming are retried on another replica. For replies already streaming, the API
+   must say what it promises: either an error event, or a **resume**, where another replica reads the prompt plus
+   the tokens already sent (one extra prefill) and continues from there. A resume keeps the text coherent, because
+   the continuation is based on exactly what the user saw.
+3. The controller marks the GPU bad. The node now has 7 healthy GPUs and can't host an 8-GPU replica.
+4. Restore capacity on a spare whole node (keep N + 1 whole nodes per large model for this), or relaunch at TP = 4
+   on 4 of the 7 healthy GPUs. At TP = 4 the replica holds **about 110 sequences** of 4,096 tokens, a third of the
+   324 the full node held. TP = 7 isn't an option, because 7 divides neither the 64 query heads nor the 8 key-value
+   heads. TP = 2 leaves room for only about two sequences.
+5. Give the three leftover GPUs to one-GPU models until the repair.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **TP = 4:** 4 × 80 = 320 GB. 320 − 140 − 32 = 148 GB of KV room. 148 × 10⁹ ÷ 327,680 B ≈ 451,000 tokens ≈ **110
+  sequences** of 4,096.
+- **TP = 2:** 160 − 140 − 16 = 4 GB, room for 4 × 10⁹ ÷ (4,096 × 327,680 B) ≈ 2.98, so **two** sequences of 4,096.
+
+</details>
+
+### Other failures
+
+**Planned drain.** **Cordon** the node first (mark it so nothing new is placed there), start replacements elsewhere,
+wait until they load and pass health checks, shift traffic, let in-flight requests finish up to a deadline, then
+stop the old replicas. Stop-then-start leaves a hole as long as the load time: over a minute for a large model from
+the object store.
+
+**Controller crash.** Node agents keep running what they have. The plan lives in a replicated store. On restart the
+controller asks the agents what is actually running and reconciles. Because it is level-triggered, it doesn't need
+to replay missed events.
+
+**Cancellation.** A client that disconnects must free its KV memory and batch slot at once. Otherwise the replica
+keeps writing tokens nobody reads while live requests wait for memory.
+
+**Overload.** Shed in tier order: free first, then paid on-demand, never reserved capacity. Bound queues by both
+length and wait time. A request for a model that isn't loaded gets a fast answer: a queue position with an
+estimated wait if the load fits its deadline, otherwise a 503 with Retry-After. Autoscale replica counts on queue
+depth and time to first token, not GPU utilisation. Utilisation can read full while requests wait for KV memory
+(<Cite id="s-f440daaea4" />).
+
+## Evals and observability
+
+A shared fleet fails quietly: requests wait, GPUs sit idle, promises break, and nothing returns an error. Watch these.
+
+- **Residency:** share of requests served without a load, by tier; cold misses per model; load time split into
+  fetch, copy and start-up; thrash (models unloaded and reloaded within an hour).
+- **Packing:** the fragmentation number, GPUs assigned versus GPUs doing work, how long gangs wait, how often
+  reservations fire.
+- **Fairness:** each tenant's share of tokens served against its entitled share while active; the maximum queue
+  wait per tenant and per adapter (the starvation signal); adapter miss rate.
+- **Latency:** time to first token and inter-token latency per model and tier, at p50 and p99. Break them down per
+  customer too, so one customer's slowdown isn't hidden inside a fleet-wide p99.
+- **Failure handling:** time from a GPU error to the router stopping traffic, time to restored capacity, and
+  requests lost versus retried versus resumed.
+
+**Correctness is a quality metric too.** A request served with the wrong adapter or the wrong model version returns
+fluent text and a 200. No infrastructure metric will see it. Anthropic's 2025 postmortem describes a routing error
+that affected 16% of Sonnet 4 requests in the worst hour, made worse because routing was "sticky", and says its
+evaluations "simply didn't capture the degradation users were reporting"
+([Anthropic, 2025-09-17](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues)). So keep a few
+**canary prompts** per adapter (fixed test inputs with known-good outputs), run them against live replicas on a
+schedule, and log the model version and adapter id with every response.
+
+**Invariants, checked all the time:** no GPU assigned to two replicas; assigned GPUs on a node never exceed its
+healthy GPUs; every replica in the router's table exists in the plan. A violation is a bug, not load, so page on it.
+
+**Test policy changes offline.** Record a day of arrivals (model, adapter, tenant, tokens) and replay it through a
+simulator of the controller. A new τ or packing rule must beat the current one on cold misses, waits and GPU-hours
+before it ships to one canary cell.
+
+## Trade-offs
+
+| Decision | You gain | You give up | Choose differently when |
+|---|---|---|---|
+| Warm DRAM tier and aggressive unloading from HBM | Fewer idle GPUs on rarely used models | Host DRAM, and about a second's wait on each miss | So few rarely used models that keeping them all loaded is cheap |
+| Best-fit packing | Whole nodes stay free for gangs | More replicas per node, so one node failure hits more tenants | You serve only one-GPU models: spread them for isolation |
+| Shape pools for 8-GPU replicas | Gangs always fit | Whole nodes idle when large-model traffic dips | Large-model traffic is steady and predictable |
+| Fair queueing by tokens | No tenant starves; fairness by real cost | Some batch efficiency | An internal batch tier that wants raw throughput |
+| Batches that mix adapters | One base copy serves every tenant | Kernel overhead per distinct adapter, which you must measure | A few busy adapters: merge them into their own replicas |
+| Dedicated endpoint | Isolation, a promisable p99 | About 2.3× the pooled share in the example | Steady load fills a replica, or isolation is in the contract |
+
+<AINative title="Let the agent write the scheduler; you own the invariants and the replay">
+An agent can write the bucket index, best-fit, the deficit-round-robin queue and the τ eviction loop in minutes.
+What it gets wrong are the cases the follow-ups probe: a replica removed while a scheduling call is in flight, a
+retried scheduling call creating a second assignment, an adapter request that waits forever because the batcher
+prefers full single-adapter batches. Your work moves to making the invariants executable: a randomized test that
+runs thousands of add, remove, schedule and fail operations and checks after each one that no GPU is assigned twice
+and no request has waited past its bound; the same test under Go's race detector; and a trace replay that compares
+policies on cold misses and GPU-hours. Practise without the agent too: Anthropic's guidance allows no AI assistance
+in live interviews unless the interviewer says otherwise
+(<Dated asOf="2025-07" src="s-b4d190c38f">per Anthropic's candidate guidance</Dated>).
+</AINative>
+
+## Small-team version
+
+A company of 50–500 people does not run a 200-model fleet. What it often has is several fine-tuned variants of one
+open model (one per customer segment, language or task), and one question: rent, or run them on our own GPU? The
+provider's big problem shrinks to three choices.
+
+### Buy first
+
+- **Pay per token (serverless).** Fireworks lists open models of 4B–16B parameters at **$0.20 per million
+  tokens**, input and output alike ([Fireworks serverless pricing](https://docs.fireworks.ai/serverless/pricing)),
+  and its pricing page says "Serve fine-tuned models for the same price as base models"
+  ([Fireworks pricing](https://fireworks.ai/pricing), both fetched 2026-10-12). Check which base models that covers
+  before you plan on it. An assumed small-team workload of 50,000 requests a day at 3,400 tokens each is
+  **5.1 billion tokens a month: about $1,020** at that rate.
+- **Dedicated endpoints** when you need a latency promise: $5.49 per H100-hour on Together's page, **about $4,008 a
+  month** always on (fetched 2026-10-12).
+
+### Build only this much
+
+If you run it yourself, put every variant of one base model on **one GPU as adapters**, not one deployment per
+variant. In vLLM that is `--enable-lora`, with `--max-loras` raised above its default of 1, and `--max-cpu-loras`
+(adapters kept in CPU memory) sized to your variant count. Loading adapters while the server runs exists, but needs
+an environment flag, and vLLM's docs say it "should not be used in production unless it is an isolated, fully
+trusted environment" ([vLLM LoRA docs](https://docs.vllm.ai/en/latest/features/lora.html), fetched 2026-10-12).
+Load adapters at startup from a versioned list instead.
+
+**The money.** One always-on H100 at about $3.95 an hour (Modal's per-second price, fetched 2026-10-11)
+costs **about $2,884 a month**. To beat $0.20 per million tokens, it must serve **about 14.4 billion tokens a
+month**, which is about 5,490 tokens per second around the clock, before anyone's time. Six variants as six
+separate deployments would cost about $17,300 a month; as six adapters on one GPU, $2,884.
+
+The sample workload above (5.1 billion tokens) is about a third of break-even, and real traffic sits idle at night
+and at weekends. Cohorte's analysis reaches the same conclusion for a larger model: a rented 2× H100 node serving
+gpt-oss-120b could not break even against the same model on a serverless endpoint at a business-hours duty cycle,
+needing 213% of its throughput ceiling
+([Cohorte, 2026-09-20](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even)). Then add people: 15% of one
+loaded engineer is about $2,430 a month (assuming a loaded cost of about $194,000 a year: the BLS median developer
+wage divided by an assumed 0.70 wage share).
+
+Say: "At our volume, buy per-token. If we self-host, it's one GPU with every variant as an adapter, and we revisit
+when steady volume passes about 14 billion tokens a month."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Self-host break-even against a per-token price"
+  expr="break-even tokens per month = GPU $/hour × 730 ÷ (serverless $ per token)"
+  vars={[
+    { sym: 'GPU $/hour', meaning: 'one always-on GPU; $3.95 here' },
+    { sym: '730', meaning: 'hours in an average month' },
+    { sym: 'serverless $ per token', meaning: '$0.20 per million here' },
+  ]}
+  example={[
+    "One H100: 3.95 × 730 = $2,884 a month. ÷ $0.20 per million = 14.4 billion tokens a month",
+    "14.4 × 10⁹ ÷ (730 × 3,600 s) ≈ 5,490 tokens per second, sustained around the clock, before labor",
+    "Six variants as six merged deployments: 6 × $2,884 = $17,301 a month; as six adapters on one GPU: $2,884",
+  ]}
+/>
+
+- **Sample workload:** 50,000 × 3,400 × 30 = 5.1 × 10⁹ tokens; × $0.20 per million = $1,020.
+
+</details>
+
+### What you still own
+
+- An eval per adapter, run before an adapter version ships and as a canary afterwards.
+- Per-tenant token budgets and concurrency caps, even with three tenants. One batch job can still starve the chat
+  feature.
+- The mapping from adapter to base-model version: an adapter trained on one base revision is wrong on another.
+- Data terms: where prompts and adapter weights live, and the provider's retention policy.
+
+### Skip
+
+Residency tiers, gang packing, shape pools and custom batching kernels. One box with every adapter loaded has
+nothing to unload and nothing to pack.
+
+### Revisit when
+
+Steady volume passes the break-even above for months; you need a latency promise the per-token tier can't hold;
+data may not leave your cloud; you have more variants than one GPU's adapter pool holds; or your provider doesn't
+serve your base model.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Shared GPU fleet with many models and tenants"
+  senior={[
+    "Does the weight, KV-headroom, load-time and adapter arithmetic first, and sees that long context, not weights, sets capacity.",
+    "Separates placement, cache and batch slots, and gives each its own mechanism: best-fit with gangs, an adapter LRU, a token-weighted fair queue with caps and aging.",
+    "Handles a GPU failure in a tensor-parallel group end to end, including what the API promises a stream already in flight.",
+    "Drains with surge: the replacement is ready before the old replica stops.",
+  ]}
+  staff={[
+    "Turns residency into a cost model with an explicit price on a cold miss, and names who owns that price.",
+    "Prices dedicated versus shared with a pooling model, states the independence assumption, and turns the answer into tiers instead of one-off exceptions.",
+    "Treats a wrong-adapter or wrong-version response as a quality incident and adds canary prompts per adapter.",
+    "Makes every policy change testable before rollout with trace replay and a canary cell, and defines the invariants that page.",
+  ]}
+/>
+
+In plain words: a Senior answer gets the numbers and the three mechanisms right and survives the GPU-failure
+follow-up. A Staff answer also says who decides the business inputs (the price of a cold miss, the tiers), how a
+policy change is proven before it ships, and how a silent wrong answer would be caught.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="Listed on the PracHub page (Anthropic): one GPU in the eight-GPU group fails. What happens to the large-model replica?">
+    The replica is down as a whole, because every token needs every slice. Stop routing to it, retry requests that
+    haven't started streaming, then send an error or resume the streams in flight (a resume reads the prompt plus
+    the tokens already sent on another replica and carries on). Mark the GPU bad, restore on a spare whole node or
+    at TP = 4 on four healthy GPUs (about a third of the KV capacity in the example), and give the leftover GPUs to
+    one-GPU models.
+  </FollowUp>
+  <FollowUp q="Listed on the PracHub page (Anthropic): how do you stop continuous small-model traffic from delaying the eight-GPU work indefinitely?">
+    "Switch when idle" never fires under continuous traffic. Reserve instead: once the big model's oldest request
+    passes its bound, admit no new small work on that node, let in-flight work finish up to a deadline, then
+    switch. In a fleet, keep a pool of whole nodes so reservations are rare, and alert on the big model's maximum
+    wait.
+  </FollowUp>
+  <FollowUp q="Together AI prep article: a customer wants a dedicated endpoint with tight tail-latency guarantees. What changes?">
+    Ask for their steady load, burst size and p99 target. If their own peak fills most of a replica, dedicate; the
+    waste is small. Otherwise offer a priority tier in the pool. Either way, price it: in the example a dedicated
+    replica costs about 2.3× their share of the pool.
+  </FollowUp>
+  <FollowUp q="Together AI prep article: why can't you load models on demand like a web cache?">
+    A 140 GB model from an object store at an assumed 2 GB/s takes 70 s, so the first user times out. Loading on
+    demand works between DRAM and HBM (about a second for the same model), so keep a warm DRAM tier and unload from
+    HBM by the τ rule.
+  </FollowUp>
+  <FollowUp q="Not reported; a natural next push: a tenant's adapter was trained on an older base revision. What breaks?">
+    Nothing visible. The adapter's correction is applied to weights it wasn't trained against, and output quality
+    drops silently. Store the base revision with each adapter, refuse to load a mismatched pair, and run the
+    adapter's canary prompts after any base-model upgrade.
+  </FollowUp>
+  <FollowUp q="Baseten (PracHub topic list): how do you autoscale this, and on what signal?">
+    On queue depth and time to first token per model and tier, with scale-up started early enough to cover the load
+    time from the tier the weights sit in. GPU utilisation can read high while requests wait for KV memory, so it
+    is the wrong trigger.
+  </FollowUp>
+  <FollowUp q="Not reported; a natural next push: how do you test a new eviction or packing policy before turning it on?">
+    Replay a recorded day of arrivals through a simulator of the controller and compare cold misses, queue waits
+    and GPU-hours against the current policy. Then try it on one canary cell, watching the invariants and the
+    starvation metric.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Treating GPUs as one interchangeable counter.** Large replicas need gangs on one node. Track fragmentation and
+  use best-fit plus shape pools. The PracHub community answer to Together's scheduler screen calls fragmentation
+  the key edge case (<Cite id="s-3a3d9c8dba" />).
+- **Placing models by weights alone.** At long context the KV cache sets capacity, the signal the Together article
+  names (<Cite id="s-9597947584" />). Count KV headroom and route on reported KV use.
+- **Loading large models from storage on demand.** A user waits over a minute. Keep a warm DRAM tier, pin the busy
+  models, and unload by load time.
+- **Fairness by request count.** Requests differ by orders of magnitude in tokens. Charge tokens.
+- **Leaving the adapters-per-batch limit at its default.** With vLLM's `--max-loras` at 1, requests for different
+  adapters can't share a batch, and the rare adapter waits.
+- **Autoscaling on GPU utilisation.** The Baseten guide's warning (<Cite id="s-f440daaea4" />): it can read full
+  while requests wait. Scale on queue depth and time to first token.
+- **Stop-then-start drains.** They leave a hole as long as the load time. Start the replacement first.
+
+## Prove it with a lab
+
+No lab on this site schedules GPUs or batches several adapters together. Two labs prove the policy pieces; the
+partial labs give you control-plane and adapter code to extend once their tests pass.
+
+<LabRef lab="faas-runtime" role="proof" note="Its warm pool, per-function cap and 5-minute idle eviction are the residency rule with a fixed τ. Replace the fixed timeout with τ = T_load + C_miss ÷ G per function and measure cold starts on a replayed trace." />
+
+<LabRef lab="rate-limiter" role="proof" note="Per-tier buckets for per-tenant admission. Change the unit from requests to tokens and put a deficit-round-robin queue behind it." />
+
+<LabRef lab="container-orchestrator" role="partial" note="Add a GPU count to Resources, replace first-fit with the free-GPU bucket index and best-fit, add all-or-nothing gang placement and the fragmentation metric. None of these exist today." />
+
+<LabRef lab="lora-finetune" role="partial" note="Work the adapter-size formula by hand for its model and compare with estimate_adapter_size_bytes; don't quote the lab's trainable-parameter figures, which conflict. Its AdapterServer serves one adapter at a time, so mixed-adapter batching stays a gap." />
+
+<LabRef lab="llm-inference" role="partial" note="Check the KV-headroom formula against kv_cache_size_formula, then reason about batch slots; the lab runs one forward pass per request, so it can't show contention between tenants." />
+
+<LabRef lab="consistent-hashing" role="partial" note="Adapter-affinity routing on virtual nodes. Fix its failing test, then add the load bound that spills a hot tenant to more replicas." />
+
+Two planned labs would close the gap: a GPU-aware scheduler (gangs, fragmentation, drain) and multi-adapter serving
+(batches that mix adapters, per-tenant fairness). Until they exist, claim the arithmetic and the control-plane
+code, not GPU measurements.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-9597947584" />
+- <Cite id="s-62f6a22994" />
+- <Cite id="s-3650fe20d8" />
+- <Cite id="s-806beee74a" />
+- <Cite id="s-04e47ee1f3" />
+- <Cite id="s-f440daaea4" />
+- <Cite id="s-81dd7e6306" />
+- <Cite id="s-3a3d9c8dba" />
+- <Cite id="s-4e04a1689c" />
+- <Cite id="s-b4d190c38f" />
+- <Cite id="s-6fdd575dc5" />
+- <Cite id="s-20bffa9709" />
+- NVIDIA H100 specifications, [https://www.nvidia.com/en-us/data-center/h100/](https://www.nvidia.com/en-us/data-center/h100/) (official, fetched 2026-10-11)
+- Chen et al., "Punica: Multi-Tenant LoRA Serving", [https://arxiv.org/abs/2310.18547](https://arxiv.org/abs/2310.18547) (2023-10-28, fetched 2026-10-12)
+- Sheng et al., "S-LoRA: Serving Thousands of Concurrent LoRA Adapters", [https://arxiv.org/abs/2311.03285](https://arxiv.org/abs/2311.03285) (2023-11-06, fetched 2026-10-12)
+- vLLM engine arguments and LoRA docs, [https://docs.vllm.ai/en/latest/configuration/engine_args.html](https://docs.vllm.ai/en/latest/configuration/engine_args.html) and [https://docs.vllm.ai/en/latest/features/lora.html](https://docs.vllm.ai/en/latest/features/lora.html) (official, fetched 2026-10-12)
+- Slurm scheduling configuration (backfill), [https://slurm.schedmd.com/sched_config.html](https://slurm.schedmd.com/sched_config.html) (version 26.05, fetched 2026-10-12)
+- Anthropic, "A postmortem of three recent issues", [https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues) (2025-09-17, fetched 2026-10-12)
+- Together AI pricing, [https://www.together.ai/pricing](https://www.together.ai/pricing); Fireworks pricing, [https://fireworks.ai/pricing](https://fireworks.ai/pricing) and [https://docs.fireworks.ai/serverless/pricing](https://docs.fireworks.ai/serverless/pricing) (official, fetched 2026-10-12)
+- Modal pricing, [https://modal.com/pricing](https://modal.com/pricing) (official, fetched 2026-10-11)
+- C. Mouzouni, "Self-Hosted LLM Cost vs API: The Second Break-Even", [https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even) (2026-09-20)

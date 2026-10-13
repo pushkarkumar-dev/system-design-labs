@@ -1,0 +1,206 @@
+---
+question: infra-044
+family: llm-platform-gateway
+status: published
+labs: [load-balancer, rate-limiter, llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Each request is classified by model, priority class and estimated cost in tokens, then queued for that model's
+> pool of machines. Inside a class, tenants share the pool by weighted fair queuing: each earns credits by its
+> weight, each request is charged its token cost, and whoever has the most credit goes next, so a heavy tenant
+> can't starve a light one and idle share is never wasted. Interactive work goes ahead of batch work, but with a
+> cap so batch never starves. Batching itself belongs to the serving engine, and admission to a pool is limited by
+> GPU memory and tokens, not request count. The temperature-0 cache is a policy choice, not a guarantee, so its
+> key must include tenant and model version."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you can share scarce, mixed hardware across many customers without
+starving anyone, while still meeting latency targets.
+
+You have scheduled shared resources before: thread pools, database connections, a Kubernetes cluster. Serving
+large language models (LLMs) on your own machines is different in three ways:
+
+1. **Work is measured in tokens, and requests differ a thousandfold.** A **token** is a small piece of text,
+   roughly ¾ of a word. One request reads 50 tokens and writes 10; another reads 50,000. Fairness by request count
+   lets the second kind take the machine.
+2. **Hardware is mixed and scarce.** Small models can run on CPUs or small GPUs; large ones need large GPUs.
+   Requests for one model can only go to machines that hold that model.
+3. **GPUs are efficient only in batches.** A GPU running a model does far more work per second when it processes
+   many requests in the same step. So the scheduler must keep requests for the same model together.
+
+It is as much a serving question as a gateway question.
+
+PracHub's write-up of this Anthropic MLE onsite (posted 2025-09-06) asks for tenant and request-class priority,
+dynamic batching, a query result cache and credit-based fairness, over GPU and CPU backends running several model
+versions, and gives no QPS, latency or fleet numbers (<Cite id="s-f6f4e54967" />).
+
+## Clarify first
+
+Say your assumptions out loud:
+
+- **Request classes.** "I'll assume three: interactive streaming, interactive non-streaming, and batch."
+- **Fleet.** "Small models on CPUs or small GPUs, large models on large GPUs, several versions live at once."
+- **Latency targets.** "A p95 time-to-first-token target for interactive classes; hours for batch." Time to first
+  token (TTFT) is how long until the first piece of the reply appears.
+- **Credits.** "Each tenant buys a weight; credits refill in proportion to it."
+- **Cache.** "Only temperature-0 requests, on routes that opt in." (Temperature is explained below.)
+
+## Answer
+
+### Words you need first
+
+- **Pool.** The set of machines serving one model version. Requests for that model go only to its pool.
+- **Serving engine.** The program that runs the model on a machine, such as vLLM. It groups requests into batches
+  itself. Modern engines do **continuous batching**: requests join and leave the batch between steps, instead of
+  waiting for a whole batch to finish.
+- **KV cache.** While a request is being answered, the GPU keeps a saved summary of every token so far for that
+  request, so it doesn't re-read the whole conversation for each new token. That memory grows with every token
+  and is freed when the request ends. It is usually what limits how many requests fit on one GPU at once.
+
+### The request's path
+
+```
+API tier
+   │  authenticate, check the tenant's token limits
+   ▼
+Classify ── which model, which priority class, estimated cost in tokens
+   │
+   ▼
+Queue per (pool, class)    e.g. "large-model pool / interactive"
+   │
+   ▼
+Scheduler ── picks the next request by class priority, then tenant credit
+   │
+   ▼
+Serving engine on the pool ── batches continuously, streams tokens back
+   │
+   ▼
+Accounting ── charge the tenant's credits with actual tokens
+```
+
+**API tier** checks who the tenant is and its token limits. **Classify** decides the model, the class and the
+estimated cost. **Queues** are kept per pool and class, so a backlog for one model never blocks another. The
+**scheduler** decides who goes next. The **serving engine** does the batching. **Accounting** settles the real
+cost once the reply is done.
+
+### Priority and fairness
+
+Start with classes. Interactive work goes ahead of batch work. But strict priority starves batch forever when
+interactive traffic is heavy, so cap the interactive share, or **age** waiting batch work (raise its priority the
+longer it waits).
+
+Inside a class, use **weighted fair queuing with credits**. Each tenant earns credits per second in proportion to
+its weight. Each request is charged its estimated cost in tokens: the prompt tokens plus the expected output,
+weighted by model size. The tenant with the most remaining credit goes next. This is the deficit-style version of
+weighted fair queuing. It is **work-conserving**: when a tenant is idle, its share is used by the others instead
+of being wasted.
+
+### Follow two tenants through it
+
+Tenant A pays for weight 3 and tenant B for weight 1. They share a pool that does an assumed 40,000 weighted tokens
+per second.
+
+| Moment | What happens | What to say in the interview |
+|---|---|---|
+| Both busy | A gets **30,000** and B **10,000** tokens per second. | "Shares follow weights, measured in tokens, not requests." |
+| A sends a 50,000-token prompt | It is charged 50,000 tokens of credit, so A waits longer for its next turn. | "Charging by tokens is what stops long prompts from taking the GPU." |
+| B goes idle | A may use all **40,000** tokens per second. | "Work-conserving: idle share isn't wasted." |
+| B returns | B starts earning credits again, and shares go back to 3 : 1. | "Credits refill by weight, so B gets its share back without starving A." |
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Weighted fair share"
+  expr="share_i = w_i ÷ Σ w_active × capacity"
+  vars={[{ sym: 'capacity', meaning: 'pool throughput in weighted tokens/s (assumed 40,000)' }]}
+  example="A (w = 3) and B (w = 1) busy: 30,000 and 10,000 tokens/s. B idle: A may use all 40,000."
+/>
+
+</details>
+
+### Batching
+
+Route every request for a model to that model's pool, so the engine can batch them. Continuous batching belongs in
+the engine, not in the router: the engine knows how much memory each request is holding. Say it like this:
+**"Admission to a pool is bounded by tokens and KV memory, not request count."** Each request also carries a
+deadline, so work that has gone stale is dropped instead of served late.
+
+### The result cache
+
+**Temperature** is the sampling setting that controls randomness. At temperature 0 the model is asked to pick its
+most likely next token every time, so the same request should give the same answer, and a cache seems safe.
+
+Key the cache on tenant, model id and version, the normalised messages, the system prompt, tools and every sampling
+parameter. Admit only temperature-0 requests that repeat; evict by least-recently-used with a time-to-live; flush
+on a model version change.
+
+Then say the caveat: served outputs vary at temperature 0 mainly because the GPU's arithmetic results change with
+batch size, which changes with load ([Thinking Machines](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/),
+2025-09-10). A hit means "an acceptable answer", not "the same answer".
+
+### Failures and experiments
+
+- **A machine is lost.** Requeue its in-flight non-streamed work within a retry budget. Streamed work fails
+  visibly after its first token, because the user has already seen part of the answer.
+- **Stragglers.** Hedge interactive requests near their deadline: send a second copy and use whichever starts first.
+- **Hot keys.** Cap any one tenant's share of a cache shard.
+- **Tuning.** Tune batch limits and cache admission with A/B tests on pools, measuring p95 TTFT, throughput and cost
+  per token per tenant.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Routing and scheduling layer"
+  senior={["Weighted fair queuing on token cost, pools per model, admission by KV memory, a correctly keyed cache."]}
+  staff={["Names the metric that shows fairness failing (per-tenant p95 under contention), sets the cache's acceptance policy with product owners, and plans capacity per pool from measured tokens per second."]}
+/>
+
+In plain words: a Senior answer builds a fair scheduler that counts tokens. A Staff answer also says how you would
+see fairness failing in production, who decides what a cache hit is allowed to return, and how big each pool must be.
+
+## Small-team version
+
+A small team almost never runs this.
+
+- **With hosted APIs**, the provider schedules for you. Your part is per-tenant token budgets and priority between
+  features at your gateway.
+- **If you host one or two models yourself**, a serving engine that batches internally plus a token bucket per
+  tenant covers it.
+- **Build a credit scheduler only** when several paying tenants share GPUs you own.
+
+The cost comparison usually settles it. A practitioner cost study
+([Cohorte, 2026-09-20](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even)) prices two rented H100 GPUs
+at Lambda's $4.19 per GPU-hour: about **$6,117 a month** before anyone's time. The same open model (gpt-oss-120B)
+on Together's serverless endpoint is **$0.15 per million input tokens and $0.60 per million output tokens**, paid
+only when used ([Together pricing](https://www.together.ai/pricing), fetched 2026-10-11). The study finds that a
+rented node serving business-hours traffic (8 hours a day, 5 days a week) can't beat that serverless price. Revisit when traffic is steady around the clock, or data rules forbid a hosted
+endpoint.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Rented GPUs:** 2 × $4.19 × 730 hours ≈ $6,117 a month.
+
+</details>
+
+## Pitfalls
+
+- **Fairness by request count.** One tenant's long prompts take the GPU, because a 50,000-token request counts the
+  same as a 50-token one.
+- **Strict priority with no cap.** Batch work starves whenever interactive traffic is heavy.
+- **A cache key without model version or tenant.** You serve answers from a model you no longer run, or leak one
+  tenant's answer to another.
+- **Batching in the router.** The engine already batches continuously and knows each request's memory; the router
+  doesn't.
+
+## Go deeper
+
+- Family walkthrough: [Internal LLM platform](/system-design-labs/interviews/walkthroughs/llm-platform-gateway/#deep-dives), the routing and scheduler deep dive.
+- Second family: [Run many models for many tenants on a shared GPU fleet](/system-design-labs/interviews/walkthroughs/multi-tenant-gpu-serving/).
+- Labs: <LabRef lab="load-balancer" inline />, <LabRef lab="rate-limiter" inline />, <LabRef lab="llm-inference" inline />.

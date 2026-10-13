@@ -1,0 +1,163 @@
+---
+question: infra-080
+family: diagnose-infra-performance
+status: published
+labs: [container-orchestrator, container-runtime]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Pending covers two different problems, so I split them first: does the pod have a node or not? If not,
+> the scheduler couldn't place it, and `kubectl describe pod` tells me why: not enough requested CPU,
+> memory or GPU on any one node, a taint, a selector nothing matches, or a volume. If it has a node, the
+> delay is on that node: pulling the image or mounting a volume. For GPU pods I also check the device
+> plugin, and I look at free GPUs per node, not across the cluster."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you understand what Pending means, and whether you can find the
+reason in under a minute with the right commands.
+
+What makes this tricky for someone used to "the server is up or it isn't" is that Pending is a waiting
+state with many causes, and some of them look impossible. A pod can wait on a cluster that is mostly idle.
+A GPU pod can wait on a cluster that has free GPUs. Both make sense once you know two things: the
+scheduler counts what pods *ask for*, not what they *use*, and it places a pod on one node, so only free
+space on a single node counts.
+
+(Glassdoor snippets from CoreWeave, 2025, describe a pod stuck in Pending, alongside a CoderPad exercise
+on Linux, Kubernetes and Bash commands <Cite id="s-5e2c5b84e0" />. They are snippets only, so confidence
+is low. At a GPU cloud the GPU-specific reasons are the likely follow-ups.)
+
+## Clarify first
+
+- **Does the pod have a node assigned?** This splits the problem in two.
+- **What does it request** (CPU, memory, `nvidia.com/gpu`), with what selectors, affinity and tolerations?
+- **Any volume claims?** In which zone?
+- **Is there a cluster autoscaler**, and was it supposed to add a node?
+
+## Answer
+
+### Words you need first
+
+- The **scheduler** picks a node for each new pod. It places pods by **requests**: the CPU, memory or GPUs
+  each container says it needs.
+- A **taint** is a mark on a node that keeps pods off unless they carry a matching **toleration**. GPU
+  nodes are often tainted so ordinary pods stay away.
+- A **nodeSelector** or **affinity** rule says which nodes a pod may run on, usually by label (for example,
+  a GPU type).
+- A **PVC** (PersistentVolumeClaim) is a pod's request for storage. If it isn't bound to a disk, or is
+  bound to one in another zone, the pod can't start.
+- A **device plugin** is a small agent on each node that tells Kubernetes how many GPUs the node has.
+  Without it, Kubernetes doesn't know the GPUs exist.
+
+### Split first
+
+Kubernetes' definition: Pending "includes time a Pod spends waiting to be scheduled as well as the time
+spent downloading container images over the network"
+([pod lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/), read 2026-10-12).
+Run `kubectl get pod <pod> -o wide`. An empty NODE column means the scheduler couldn't place it. A node
+name means look at image pulls and volume mounts on that node. Say it like this: "First I check whether
+it's a scheduling problem or a node problem; that one column tells me."
+
+### Follow one pod through
+
+Take a training pod that asks for 2 GPUs and has been Pending for twenty minutes. The cluster has four
+GPU nodes, 8 GPUs each, with 7 in use on every node. Here is the path:
+
+| Step | Command | What you find | What to say in the interview |
+|---|---|---|---|
+| 1 | `kubectl get pod -o wide` | NODE is empty | "It's unscheduled, so I read the scheduler's reasons." |
+| 2 | `kubectl describe pod` | A FailedScheduling event: insufficient `nvidia.com/gpu` | "The scheduler says no node has enough GPUs." |
+| 3 | Node allocatable vs requested | Each node: 8 allocatable, 7 requested | "The device plugin is fine; every node shows its 8 GPUs." |
+| 4 | Add up the free GPUs | 4 free in total, but only 1 per node | "There are 4 free GPUs, but no single node has 2. That's fragmentation." |
+| 5 | Cluster autoscaler events | Whether it tried to add a node, and why not | "Either the autoscaler adds a node, or I need to pack GPU jobs better." |
+
+Say it like this: "Totals across the cluster don't schedule pods. Free space on one node does."
+
+### Unscheduled: read the scheduler's reasons
+
+`kubectl describe pod <pod>` ends with events. The FailedScheduling event counts how many nodes each
+reason ruled out. Then check each reason:
+
+```bash
+kubectl describe node <node> | sed -n '/Capacity/,/Allocated resources/p'   # allocatable vs requested
+kubectl describe node <node> | grep -i taint
+kubectl get nodes -L <label-your-selector-uses>
+kubectl get pvc; kubectl describe pvc <claim>
+kubectl get pods -n kube-system | grep -i -E 'nvidia|device-plugin'
+```
+
+The scheduler places by **requests**, not usage, so a cluster with idle machines can still be full. The
+other reasons: untolerated taints, a selector or affinity nothing matches, an unbound claim or one bound
+in another zone, and `hostPort` conflicts, where two pods want the same port on a node. The last is on
+Kubernetes' own debug page
+([debug pods](https://kubernetes.io/docs/tasks/debug/debug-application/debug-pods/)).
+
+### GPU specifics
+
+GPUs come from a vendor device plugin as an extended resource such as `nvidia.com/gpu`, and are set in
+`limits` ([scheduling GPUs](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/)). A node whose
+device plugin isn't running advertises no GPUs. Every GPU pod then reports insufficient GPUs, even on a
+GPU machine. A driver upgrade that breaks the plugin causes exactly this.
+
+Fragmentation is the other trap, as in the walk-through above: four nodes with 8 GPUs and 7 in use each
+have 4 free in total, yet a 2-GPU pod stays Pending because no single node has 2.
+
+### Scheduled but not running
+
+If the pod has a node, `describe` shows image pull errors or volume mount timeouts on that node.
+Kubernetes' page lists the checks for the image: is the name right, was it pushed, and can it be pulled
+by hand?
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Pending pod"
+  senior={["Splits scheduled vs unscheduled, reads FailedScheduling, and checks requests, taints, selectors, volumes and the device plugin."]}
+  staff={["Explains requests-vs-usage and per-node fragmentation, and proposes prevention: bin-packing or GPU-size node pools, alerts on long-Pending pods, autoscaler visibility."]}
+/>
+
+In plain words: a Senior answer finds the reason fast. A Staff answer also explains why an idle or
+half-free cluster can't place the pod, and changes how GPU jobs are packed so it happens less.
+(**Bin-packing** means filling one node before starting the next, so whole nodes stay free for big jobs.)
+
+## Small-team version
+
+A small team that self-hosts a model on managed Kubernetes hits this the first time a GPU node pool is
+scaled to zero, or a driver upgrade breaks the device plugin. Three cheap habits:
+
+- Alert on any pod Pending longer than a few minutes.
+- Keep a one-page runbook with the commands above.
+- Weigh a managed endpoint, or a per-second serverless GPU platform, against owning the device plugin,
+  drivers and node pools yourself.
+
+For scale: Modal listed an H100 at $0.001097 a second, about **$3.95 an hour** ([Modal pricing](https://modal.com/pricing),
+fetched 2026-10-11). A model busy 4 hours a day costs about **$474 a month** there, against about **$2,884** for
+the same GPU held all month. Owning the cluster pays only when GPUs are busy most of the day.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Hourly:** $0.001097 × 3,600 s ≈ **$3.95 an hour**.
+- **Busy 4 hours a day:** 4 × 3.95 × 30 ≈ **$474 a month**.
+- **Held all month:** 3.95 × about 730 hours ≈ **$2,884 a month**.
+
+</details>
+
+## Pitfalls
+
+- **Treating Pending as one problem.** "No node" and "node but not started" have different causes and
+  different commands.
+- **Reading cluster-wide free GPUs.** The scheduler places a pod on one node, so only per-node allocatable
+  counts.
+- **Deleting and recreating the pod.** It changes nothing and clears the events that explain the problem.
+- **Forgetting the device plugin.** A GPU node showing zero GPUs usually means the plugin or driver is
+  down, not that the GPUs are gone.
+
+## Go deeper
+
+- Family walkthrough: [Diagnose slow or stuck infrastructure](/system-design-labs/interviews/walkthroughs/diagnose-infra-performance/), worked example 6.
+- A scheduler that leaves unfittable pods Pending: <LabRef lab="container-orchestrator" inline />. cgroups and namespaces underneath: <LabRef lab="container-runtime" inline />.
+- GPU placement at fleet scale: [GPU cluster control plane](/system-design-labs/interviews/walkthroughs/gpu-cluster-control-plane/).

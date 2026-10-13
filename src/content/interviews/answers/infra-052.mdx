@@ -1,0 +1,169 @@
+---
+question: infra-052
+family: gpu-cluster-control-plane
+status: published
+labs: [container-orchestrator]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "GPUs talk at three speeds. Inside a node, NVLink gives an H100 450 GB/s each way; the normal server bus, PCIe Gen
+> 5, gives 64 GB/s each way; between nodes it's the network card. NCCL is the library that picks the right path
+> for collective operations like all-reduce. Kubernetes sees GPUs as a counted resource, `nvidia.com/gpu`,
+> advertised by NVIDIA's device plugin, and requested in `limits`. To share one GPU you can time-slice, which
+> isolates nothing; use MPS; or use MIG, which splits an H100 into up to seven isolated pieces. And a pod that
+> requests no GPU can see all of them."
+>
+> The rest of this page explains each part of that answer.
+
+This is a deep dive: expect "why?" after every answer. The interviewer wants to know whether you know the GPU stack
+below the scheduler well enough to debug it, and precise caveats (what isolates, what doesn't, which number is
+per direction) count for more than naming components.
+
+### What makes this different from the stack you already know
+
+On a normal server, you rarely think about how a CPU talks to memory or to the network card. The operating system
+hides it, and Kubernetes treats CPU and memory as finely divisible numbers.
+
+GPUs expose those layers.
+
+1. **The path between two GPUs decides speed.** Two GPUs in the same box can be connected by a dedicated link many
+   times faster than the path between boxes. Which GPUs a job gets is a performance decision.
+2. **Kubernetes doesn't understand GPUs.** It only counts them, using a plugin from NVIDIA. Its defaults have
+   surprises, and you need to know them to debug a pod stuck in Pending or a pod seeing GPUs it shouldn't.
+3. **Sharing a GPU is not like sharing a CPU.** There are three ways to share, and only one of them isolates
+   tenants from each other.
+
+A prep site says candidates for Fireworks AI infrastructure roles "report questions about GPUs and inter-GPU
+communication", plus Kubernetes and NVIDIA's Kubernetes plugins (<Cite id="s-81dd7e6306" />).
+
+## Clarify first
+
+- **Training, inference or both?** "Their communication patterns differ: training exchanges gradients every step;
+  inference mostly stays inside one node."
+- **Hardware.** "I'll assume H100 SXM GPUs, 8 per node."
+- **Whole or shared GPUs?** "Does each pod get whole GPUs, or do pods share them?"
+
+## Answer
+
+### How GPUs talk
+
+Three layers, fastest first.
+
+| Path | What it is | Speed per H100 GPU |
+|---|---|---|
+| NVLink, through NVSwitch | NVIDIA's direct GPU-to-GPU link inside a node; NVSwitch is the switch chip that connects all 8 GPUs | 18 links at "25 GB/sec effective bandwidth in each direction": **450 GB/s each way**, 900 GB/s for both directions |
+| PCIe Gen 5 | The ordinary server bus that connects GPUs, CPUs and network cards | **64 GB/s each way** |
+| InfiniBand or RoCE | The network between nodes, through network cards (NICs); RoCE carries the same direct-memory transfers over Ethernet | Set by the network card |
+
+The NVLink and PCIe numbers come from NVIDIA's Hopper architecture blog
+([Hopper blog](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/)). NVLink is about **7×**
+faster than PCIe, which is why **tensor parallelism** (splitting one model's layers across GPUs, which talks
+constantly) stays on NVLink.
+
+Say it like this: "900 GB/s is both directions added together. Per direction it's 450."
+
+**Across nodes**, **GPUDirect RDMA** lets a network card read GPU memory directly, without a copy through the CPU.
+The two devices "must share the same upstream PCI Express root complex"
+([GPUDirect RDMA docs](https://docs.nvidia.com/cuda/gpudirect-rdma/index.html)): the same branch of the server's
+internal bus. So each GPU should be paired with the network card on its branch.
+
+**In software**, **NCCL** (NVIDIA's collective communications library) provides "inter-GPU communication primitives
+that are topology-aware": all-reduce, all-gather, reduce-scatter and the rest, over PCIe, NVLink, InfiniBand or
+sockets ([NCCL overview](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/overview.html)). An
+**all-reduce** is the step where every GPU contributes an array and every GPU ends up with the sum or average; a
+training job does one on its gradients every step. In a **ring all-reduce**, each GPU sends about twice the array's
+size, however many GPUs there are.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- NVLink: 18 links × 25 GB/s each way = 450 GB/s each way; × 2 directions = 900 GB/s.
+- NVLink vs PCIe Gen 5: 450 ÷ 64 ≈ 7.
+- Ring all-reduce: each GPU sends 2(N − 1) ÷ N × S bytes for an array of S bytes on N GPUs. As N grows this
+  approaches 2S.
+
+</details>
+
+### Follow one pod down the stack
+
+A pod for an inference server asks for 2 GPUs on a node of 8. Here is what happens, layer by layer.
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| 1. The pod spec | It sets `nvidia.com/gpu: 2` under `limits`. | "GPU requests go in limits; requests may be left out or must equal limits." |
+| 2. Scheduling | Kubernetes looks for a node advertising at least 2 free `nvidia.com/gpu`. | "If none has 2 free, the pod sits in Pending, and its events say why." |
+| 3. The node | The NVIDIA device plugin on that node hands 2 specific GPUs to the container. | "The plugin also tracks GPU health and can mark a GPU unusable." |
+| 4. Inside the pod | The model is split across the 2 GPUs (tensor parallelism), which talk over NVLink through NCCL. | "Both GPUs are in one node, so the chatty traffic stays on the fastest link." |
+| 5. A neighbour pod | Another pod on the same node has **no** GPU request at all. | "With the device plugin, that pod sees all eight GPUs. That's the classic surprise." |
+
+### How Kubernetes sees GPUs
+
+- **The device plugin** is a DaemonSet (one pod per node) that exposes GPU counts per node as `nvidia.com/gpu`,
+  tracks GPU health and runs GPU containers. Pods ask in `limits` (requests must equal limits if set). Without a GPU
+  request, the plugin exposes all the node's GPUs inside the container
+  ([k8s-device-plugin](https://github.com/NVIDIA/k8s-device-plugin), v0.17.1, fetched 2026-10-12).
+- **The GPU Operator** installs everything a GPU node needs: the driver, the container toolkit, the device plugin,
+  GPU Feature Discovery labels (node labels describing the GPU model), DCGM monitoring (NVIDIA's GPU health and
+  diagnostics tool) and the MIG manager.
+- **Dynamic Resource Allocation (DRA)**, stable since Kubernetes v1.35, lets a pod claim devices by attribute,
+  filtered with CEL (Kubernetes' small expression language), and lets pods share a claim
+  ([Kubernetes DRA](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/)). It
+  replaces "give me 2 GPUs" with "give me 2 GPUs of this kind".
+
+### Sharing one GPU
+
+| Route | What you get | What it doesn't give you |
+|---|---|---|
+| **Time-slicing** | Several pods take turns on one GPU | No memory or fault isolation: one pod can crash or starve the others |
+| **MPS** (Multi-Process Service) | Memory and compute partitioned in space | Experimental in the device plugin as of v0.15.0 |
+| **MIG** (Multi-Instance GPU) | Up to seven hardware instances, each with its own memory and fault isolation; on an H100 80 GB, from 7 × 1g.10gb up to 1 × 7g.80gb | Fixed sizes only |
+
+A MIG profile name reads as compute share, then memory: **1g.10gb** is one-seventh of the compute with 10 GB of
+memory.
+
+Say it like this: "If two tenants share a GPU, it has to be MIG. Time-slicing gives them no isolation at all."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="GPU communication and Kubernetes"
+  senior={["Gives the bandwidth tiers with numbers and the device plugin's request and sharing semantics, with isolation caveats."]}
+  staff={["Connects them to placement: TP inside NVLink, GPU-NIC pairing, MIG for tenant isolation, and where DRA changes the scheduler."]}
+/>
+
+In plain words: a Senior answer knows the layers, the numbers and the caveats. A Staff answer turns them into
+placement rules and knows what DRA will change.
+
+## Small-team version
+
+On managed Kubernetes most of this is installed for you: GKE installs GPU drivers automatically and offers MIG,
+time-sharing and MPS. What you must still know:
+
+- the `limits` semantics, including that a pod with no GPU request sees every GPU;
+- that time-slicing gives no isolation between tenants;
+- how to read a pod stuck in Pending because no node has enough free `nvidia.com/gpu`.
+
+MIG is also a cost lever. An 8-billion-parameter model stored at 4 bits per number (**int4**) needs about 4.5 GB
+for its weights once the small per-group scaling factors are counted (8.03 × 10⁹ × 4.5 bits ÷ 8), so it fits a
+1g.10gb slice. One H100 at **$2.69–$3.49 an hour** (RunPod, fetched 2026-10-11) can
+then serve up to **seven small isolated tenants** instead of one. Check first that each slice leaves enough memory
+for the model's working state at your context length (the **KV cache**: the model's saved memory of the
+conversation so far, which grows with every token).
+
+Say it like this: "For small models, MIG can put seven isolated tenants on one H100, if each slice still has room
+for the conversation memory."
+
+## Pitfalls
+
+- **Treating time-slicing as isolation.** It isolates neither memory nor faults.
+- **Not knowing a pod without a GPU request can see all GPUs.** That is a tenant-isolation bug waiting to happen.
+- **Quoting 900 GB/s as one-direction bandwidth.** It is both directions added; 450 GB/s each way.
+
+## Go deeper
+
+- Family walkthrough: [how GPUs talk, and how Kubernetes sees them](/system-design-labs/interviews/walkthroughs/gpu-cluster-control-plane/#deep-dives).
+- Collective math: [roofline and sharded matmul](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/).
+- Lab: <LabRef lab="container-orchestrator" inline />.

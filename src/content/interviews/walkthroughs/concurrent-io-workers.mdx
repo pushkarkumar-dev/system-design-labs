@@ -1,0 +1,1040 @@
+---
+title: "Concurrent I/O workers: crawler, thread pool, file pipelines, chunked download"
+summary: "Write a crawler, make it concurrent without losing pages or hanging at the end, then reuse the same shape for duplicate files, an image pipeline, a thread pool and a parallel chunked download. Built in stages, run and timed."
+track: ai-infra
+format: coding
+family: concurrent-io-workers
+smallTeamFocus: "You will write this yourself: embedding a corpus or running an LLM over every row is a bounded worker pool. Size it from the provider's rate limit (workers = rate × latency), use batch APIs for offline work, and make every job resumable."
+rounds: [practical-coding, ai-assisted-coding]
+level: both
+timeboxMin: 60
+order: 222
+status: published
+basedOn: [infra-021, infra-020, infra-022, infra-029, infra-030, infra-033, eng-093]
+askedAt: [anthropic, baseten, coreweave, glean]
+labs:
+  - { lab: rate-limiter, role: proof, note: "Token buckets and sliding windows, the server side of the crawler's politeness limit. Its intermittently failing concurrency test is a check-then-act race that Go's -race flag does not report." }
+  - { lab: embedding-pipeline, role: proof, note: "Dynamic batching in front of an encoder: the small-team version of this family, where each worker's unit of work is a batch of texts." }
+  - { lab: load-balancer, role: proof, note: "A 20% retry budget and a circuit breaker: what stops a crawler's retries from multiplying load on a struggling host." }
+  - { lab: io-model, role: background, note: "Blocking, thread-per-connection, epoll and io_uring servers in C: why one event loop can hold thousands of sockets. Linux-only; not built for this guide." }
+gapLabs: []
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll get a plain sequential version printing the right answer first, because it becomes the test for
+> everything after it. Then I'll add a fixed number of workers that do only the slow part, the network or
+> disk call. One piece of code owns the shared state, like the set of pages already seen, so nothing is
+> updated from two places at once. The job is finished when nothing is waiting **and** nothing is still
+> running, not when the queue looks empty. On top of that: a timeout on every call, retries only for
+> errors that can succeed later, and a worker count worked out from the rate limit instead of guessed."
+>
+> The rest of this page explains each part of that answer, and builds it in code, stage by stage.
+
+### What makes this different from the concurrency you already use
+
+As a backend engineer you use concurrency every day, but usually someone else wrote the scheduling. A web
+server gives each request its own thread or coroutine. A queue consumer library pulls messages and runs your
+handler. A database connection pool hands out connections. You write the handler; the framework decides how
+many run at once and when everything is done.
+
+In this round you write that framework yourself, in about an hour, and three things make it harder than it
+looks:
+
+1. **The work creates more work.** A crawler fetches a page and finds new links to fetch. The list of jobs is
+   not known up front, so "the queue is empty" does not mean "we are done". Another worker may be about to add
+   ten more jobs.
+2. **Shared state has to stay correct.** All the workers need the same record of which pages have already been
+   found. If two workers check and update it at the same time, a page gets fetched twice, or worse.
+3. **Something outside limits you.** The website, the API or the disk has its own limit. Past a certain number
+   of workers, more workers only make you wait in line, or get you blocked.
+
+The interviewer is not testing whether you know what a thread is. They want to see a correct, testable program
+quickly, and then a concurrent version that finishes exactly when the work runs out.
+
+### Words you need first
+
+- **Worker pool**: a fixed number of workers (threads, coroutines or processes) that take jobs one at a time.
+  "Bounded" means the number is capped, say 16, so the program can't open ten thousand connections at once.
+- **Frontier**: the list of URLs found but not yet fetched. In other problems it is the list of files, byte
+  ranges or images still to process. In general, the **source of work**.
+- **Seen set**: the set of every URL already found, so each one is queued only once.
+- **In flight**: a job a worker has taken but not finished. A fetch that is waiting on the network is in
+  flight.
+- **Termination rule**: the test for "we are done". For this family it is always: nothing queued **and**
+  nothing in flight.
+- **Oracle**: a simple version you trust, used to check the clever one. Here the sequential crawler is the
+  oracle: the concurrent crawler must find exactly the same pages.
+
+### The prompt as it is given
+
+Write a web crawler. Start from a seed URL on a small site, follow links on the same host, normalize them so
+`/p/7`, `/p/7/` and `/p/7#top` count once, and print every unique page. Then make it concurrent: many
+fetches in flight, a shared record of what has been seen, per-host politeness (not hitting one site too
+fast), timeouts and retries, and a crawl that stops exactly when the work runs out.
+
+That is the canonical form. The family's seven questions are the same problem in different clothes: many
+slow, independent I/O operations, a bounded number of workers, a shared structure that must stay correct,
+and a clean end.
+
+<QuestionRow id="infra-021" />
+<QuestionRow id="infra-020" />
+<QuestionRow id="infra-022" />
+<QuestionRow id="infra-029" />
+<QuestionRow id="infra-030" />
+<QuestionRow id="infra-033" />
+<QuestionRow id="eng-093" />
+
+### The reported versions, in one table
+
+| Version | What you are asked | Where it was reported (read 2026-10-12) |
+|---|---|---|
+| **Crawler, then threads** | Crawl a small toy site in Replit, strip extra URL details, print the unique links, then "How would you make it multithreaded?" | Anthropic Staff phone screen, first-hand <Cite id="s-2348518c66" /> |
+| **Duplicate files** | Find duplicate files in a real file environment, write a test that creates the files, then follow-up variants | Anthropic Senior/Staff, first-hand; the candidate calls it "one of their standard company-wide questions" <Cite id="s-4e04a1689c" /> |
+| **Image pipeline** | A project with tests, images and a spec file: apply steps such as rotate, invert, recolor, crop or format conversion to each image | Anthropic Staff, first-hand <Cite id="s-e9fee3985a" /> |
+| **Thread pool** and **chunked download** | "Parallelize Blocking API Calls with a Thread Pool"; "Parallelize chunked file download and verify integrity" | Baseten technical screen, PracHub titles <Cite id="s-fa7d3ae628" /> |
+| **Go concurrency** | A Go concurrency challenge and a multithreading phone screen; the task isn't described | CoreWeave Senior, Glassdoor snippets, low confidence <Cite id="s-5e2c5b84e0" /> |
+| **Rate-limited crawler with an AI pair** | In 75 minutes, pairing with an AI coding assistant, crawl Wikipedia: titles starting with a letter not yet seen go first; after all 26 letters, crawl at random; respect a rate limit (no number given) | Glean MLE, aggregator <Cite id="s-9adea8ab98" /> ([question page](https://prachub.com/interview-questions/ai-paired-rate-limited-wikipedia-crawler-that-prioritizes-unseen-title-initials), dated 2026-09-30) |
+
+Listed on the PracHub page (Baseten) for the thread pool: keep each result tied to its input and in input
+order, and define worker limits, timeout and failure semantics, cancellation, and tests for out-of-order
+completion. The download page gives only the title. Listed on the PracHub page (Glean): bounding the search for
+rare letters such as Q, X and Z, parallelizing without breaking the rate limit, and resuming after a crash.
+
+### The example this page follows
+
+One case runs through the whole page: **crawling a fake 200-page website**, written for this page so every
+number below could be measured. Each page has five links, with deliberate noise: `#fragment`, `?utm` tracking
+parameters, trailing slashes, and one link to another host. Every response sleeps 50 ms to imitate the network
+(an assumption, not a measurement of any real site). Three pages misbehave on purpose:
+
+- `/p/13` returns a server error (HTTP 500) once.
+- `/p/17` returns HTTP 429 ("Too Many Requests") once, with a `Retry-After: 1` header that means "wait one
+  second before trying again".
+- `/p/19` can hang for 5 seconds.
+
+188 pages are reachable if `/p/13`'s single failure is not retried. Here is what each stage of the solution
+does to that one crawl. Everything was run on 2026-10-12 on an Apple M1 Ultra (Python 3.13.7, httpx 0.28.1;
+Go 1.26.9).
+
+| Stage | What changes | Result on the fake site | What to say in the interview |
+|---|---|---|---|
+| 1. Sequential | One fetch at a time | 188 pages, 2 errors, **about 10.2 s** | "This is slow but correct. It is my oracle." |
+| 2. Threads | 16 or 64 fetches in flight, one owner of state | Same 188 pages in **0.79–0.86 s** (16) and **0.40–0.43 s** (64) | "The loop ends when nothing is queued and nothing is running." |
+| 3. asyncio (one thread, many network calls) | Rate limit, retries, timeouts, clean shutdown | **2.01 s** under a 100 requests/s limit | "The rate limit, not the worker count, sets the time now." |
+| 4. Go | Same design with Go's lightweight threads and pipes | All pages found with 1, 8 and 64 workers; race detector clean | "One goroutine owns the seen map; the others only fetch." |
+| The bug | End the crawl when the queue looks empty | **1 page** out of 188, in 10 runs of 10 | "An empty queue is not the end; a fetch can still be running." |
+
+The last row is the one to remember. The most common bug in this round finds one page instead of 188, and it
+looks correct when you read it.
+
+## What is being tested
+
+**Working code fast, then the follow-up.** Three of the reports end the same way: a candidate who was
+comfortable with the idea did not finish the concurrent or end-to-end part in time. The crawler candidate had
+the baseline quickly, ran out of time on the multithreaded version, and was rejected overall; the interviewer
+"basically said he thought I could finish it" (<Cite id="s-2348518c66" />). The image-pipeline candidate had
+prepared for a multithreaded algorithm question, had to look up an image library on the spot, "never even got
+one image fully working end to end", and was rejected with no feedback (<Cite id="s-e9fee3985a" />). The
+duplicate-files candidate says "the base question felt straightforward, and the real signal was in the
+follow-ups" (<Cite id="s-4e04a1689c" />). None of the three gives an interviewer's rejection reason, so read
+this as a pattern in the reports, not as a rubric. The round seems to reward a working, testable slice early,
+and depth after that.
+
+**Correctness of shared state, and of the end.** The interesting bugs in concurrent workers are not in the
+fetch. They are in three questions: who owns the seen set, how the program knows that no more work can
+appear, and what happens to the work in flight when something fails. A crawler that decides it is done
+because the queue is momentarily empty is the classic one. It is easy to write, and in Verification it finds
+one page out of 188.
+
+**Judgment about the resource.** Work is **I/O-bound** when it spends its time waiting on the network or
+disk, and **CPU-bound** when it spends its time computing. The crawler and the download are network-bound,
+the duplicate finder is disk-bound, and the image pipeline is CPU-bound. Each one wants a different tool:
+threads for blocking I/O, an event loop (one thread juggling many waiting connections) for many sockets, processes for CPU-bound work in Python, and a worker
+count derived from a rate limit rather than picked. Saying which case you are in, and why, is part of the
+answer.
+
+**Failure semantics.** That is the interview name for "what happens when a call fails". It means a timeout
+on every call, retries only for errors that can succeed later, a cap on total attempts, and an explicit choice
+between "skip and report" and "fail the whole job". The Baseten listing names these directly.
+
+## Clarify and scope
+
+Spend two or three minutes here. Ask, then write the assumptions down where the interviewer can see them:
+
+- **What counts as the same page?** Fragments (`#top`) almost always go, because they point inside the same
+  page. Query strings depend on the site: drop tracking parameters, keep `?page=2`. Trailing slashes and host
+  case: normalize. Say it like this: "I'll treat `/p/7`, `/p/7/` and `/p/7#top` as one page, and drop the
+  query string unless you tell me it matters."
+- **Scope of the crawl.** Same host only? A page or depth cap? The Anthropic toy site was small, so a cap is a
+  safety net, not a requirement.
+- **Politeness.** Is there a rate limit, and is it per host or global? Should robots.txt be honored? That is
+  the file where a site lists which paths crawlers may visit. RFC 9309 says a crawler that downloads
+  robots.txt "MUST follow the parseable rules"
+  ([RFC 9309](https://www.rfc-editor.org/rfc/rfc9309.html), September 2022, read 2026-10-12).
+- **Failures.** Which errors are worth retrying? Timeouts, 429 and 5xx (server errors) can succeed on a later
+  try. A 404 or a page you can't parse will fail the same way every time. Does one bad page fail the crawl?
+  Default: record it and continue.
+- **Output.** Print as you go, or return a set at the end? In what order? Default: a set, printed sorted.
+- **Language and concurrency model.** Python threads, asyncio, or Go. Default: whatever you are fastest in.
+  Python has a **GIL** (global interpreter lock): only one thread runs Python code at a time. That sounds
+  fatal for threads, but the GIL is released while a thread waits on a socket, so threads are fine for a
+  crawler, which mostly waits.
+
+Out of scope unless asked: running a page's JavaScript, distributed crawling across machines, and spotting
+pages that are similar but not identical.
+
+## Plan before code
+
+Say the shape out loud before writing anything. Every problem in this family has the same four parts, and
+drawing them takes thirty seconds:
+
+```
+Source of work ── the frontier: URLs (or files, byte ranges, images) not yet done
+   │  hand out at most W jobs at a time
+   ▼
+Worker pool (W workers) ── does only the slow part: fetch, hash, transform, download
+   │  hand back the result (or the error)
+   ▼
+Owner of shared state ── the only code that updates the seen set, the frontier and the output
+   │  new links go back to the source of work
+   ▼
+Termination check ── done when nothing is queued AND nothing is in flight
+```
+
+**The source of work** is the frontier in a crawler. In the other problems it is the files under a directory,
+the list of byte ranges, or the list of images. The only difference is that a crawler's source keeps growing
+while it runs.
+
+**The worker pool** does the part that waits. It should not decide anything. A worker that fetches a page and
+hands back the HTML is easy to reason about. A worker that also edits the shared seen set is where the bugs
+start.
+
+**The owner of shared state** is one place that updates the seen set and the frontier. If only one thread
+touches them, they need no lock. If many threads touch them, they need a lock, and every read-then-write must
+happen inside it.
+
+**The termination check** is the box candidates forget. The job is done only when nothing is queued **and**
+nothing is in flight. Say it before you type it.
+
+### Two clean ways to own state
+
+In the **coordinator** design, one thread owns the frontier and the seen set. Workers only do I/O and hand
+results back. Nothing shared is changed by two threads, so there are no locks.
+
+In the **shared queue** design, workers pull from a thread-safe queue and push new links into it themselves.
+The seen set then needs a lock, and termination needs a count of in-flight work. Python's queue keeps that
+count for you: each worker calls `task_done()` when it finishes a job, and `join()` returns only when every
+job put on the queue has been marked done. Go's `sync.WaitGroup` does the same job.
+
+Both are correct. The coordinator is easier to get right under time pressure and is what Stage 2 uses. Stage 3
+uses the shared queue with `join()`. Say it like this: "I'll have one coordinator own the seen set, so I don't
+need locks, and it ends when nothing is queued and nothing is running."
+
+### The time box
+
+Plan the hour like this: a sequential version that prints correct output (10 to 15 minutes), the concurrent
+version with a test that compares its output with the sequential one (15 minutes), then politeness, timeouts
+and retries in whatever order the interviewer pushes.
+
+### How fast should it get?
+
+Before measuring, predict. A good prediction tells you when to stop adding workers. Three separate limits
+bound a crawl, and the slowest one wins:
+
+1. **The workers.** With W workers, each taking about L seconds per request, you finish at most W requests
+   every L seconds. Double the workers and this limit halves.
+2. **The chain of discovery.** You can't fetch a page before you have fetched the page that links to it. If
+   the deepest page is D links away from the seed, the crawl takes at least D round trips, however many
+   workers you have.
+3. **The rate limit.** If the site allows R requests per second, N requests take at least N ÷ R seconds.
+
+Written as one line:
+
+<Formula
+  title="Crawl time lower bound"
+  expr="T ≥ max(N × L ÷ W, D × L, N ÷ R)"
+  vars={[
+    { sym: 'N', meaning: 'requests made (pages plus retries)' },
+    { sym: 'L', meaning: 'latency per request, in seconds' },
+    { sym: 'W', meaning: 'workers (requests in flight at once)' },
+    { sym: 'D', meaning: 'length of the longest chain of discoveries: a page can only be fetched after the page linking to it' },
+    { sym: 'R', meaning: 'rate limit, requests per second, for the host' },
+  ]}
+  example="N = 190, L = 0.05 s (assumed, injected by the fake site below): W = 4 → 2.4 s; W = 16 → 0.59 s; W = 64 → 0.15 s, but D = 7 levels gives 0.35 s; R = 100/s → 1.9 s"
+/>
+
+For the fake site, the prediction says: 16 workers should take a bit over half a second, 64 workers hit the
+discovery chain at about **0.35 s**, and a 100 requests/s limit holds the crawl to about **1.9 s** no matter
+how many workers you add.
+
+The rate-limit term has a useful twin. **Little's law** says that the number of things in a system equals
+their arrival rate times how long each one stays (<Cite id="s-b9e76e614c" /> gives it as L = λ × W). Applied
+here: to keep up R requests per second when each takes L seconds, you need about **R × L** requests in flight.
+At 100 requests/s and 50 ms, that is **5 workers**. A 64-worker pool against that limit is 59 workers waiting
+their turn under the limit. Say it like this: "The worker count should be rate times latency. Beyond that, workers just
+queue."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Workers term, 16 workers:** 188 pages × 0.05 s ÷ 16 = 0.5875 s ≈ **0.59 s**. With 4 workers:
+  188 × 0.05 ÷ 4 = **2.35 s** (the formula's example uses N = 190, which gives 2.4 s).
+- **Workers term, 64 workers:** 190 × 0.05 ÷ 64 ≈ 0.15 s, which is below the discovery term.
+- **Discovery term:** 7 levels × 0.05 s = **0.35 s**. This is why 64 workers can't go much faster than 0.35 s.
+- **Rate term:** 190 requests ÷ 100 per second = **1.9 s**.
+- **Sequential:** 188 × 0.05 s = **9.4 s** of pure waiting, before any parsing overhead.
+- **Little's law sizing:** 100 requests/s × 0.05 s = **5** requests in flight; 64 − 5 = 59 idle workers.
+
+</details>
+
+## Solution in stages
+
+All four stages crawl the same fake site described above. Each stage is tested against the one before it.
+
+### Stage 1: sequential, correct output
+
+Get this printing the right set first. It is also the oracle every later stage is tested against. The crawl
+is a **breadth-first search**: take the oldest URL from the frontier, fetch it, add any new links to the back.
+A `deque` is a list that is fast to pop from the front.
+
+```python
+import re
+import urllib.request
+from collections import deque
+from urllib.parse import urldefrag, urljoin, urlsplit, urlunsplit
+
+HREF = re.compile(r'href="([^"]+)"')
+
+def normalize(base: str, href: str) -> str | None:
+    url, _frag = urldefrag(urljoin(base, href))   # resolve relative, drop #fragment
+    s = urlsplit(url)
+    if s.scheme not in ("http", "https"):
+        return None
+    path = s.path.rstrip("/") or "/"
+    return urlunsplit((s.scheme, s.netloc.lower(), path, "", ""))  # drop ?query noise
+
+def fetch(url: str, timeout: float = 2.0) -> str:
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+def crawl(seed: str, max_pages: int = 10_000):
+    host = urlsplit(seed).netloc
+    seen, errors = {normalize(seed, seed)}, {}
+    frontier = deque(seen)
+    while frontier and len(seen) <= max_pages:
+        url = frontier.popleft()
+        try:
+            html = fetch(url)
+        except Exception as e:             # one bad page must not end the crawl
+            errors[url] = type(e).__name__
+            continue
+        for href in HREF.findall(html):
+            link = normalize(url, href)
+            if link and urlsplit(link).netloc == host and link not in seen:
+                seen.add(link)
+                frontier.append(link)
+    return seen, errors
+```
+
+`normalize` does three things. `urljoin` turns a relative link like `../p/7` into a full URL. `urldefrag`
+drops the `#fragment`. The last line lowercases the host, strips the trailing slash and drops the query
+string. Every link passes through it before the seen-set check, so `/p/7`, `/p/7/` and `/p/7#top` become one
+entry.
+
+Mark a URL as seen when you **enqueue** it, not when you fetch it. If you mark on fetch, two pages that both
+link to `/p/7` can each queue it before either fetch happens, and it is fetched twice. A regex is enough for a
+toy site; say that you would use an HTML parser for real pages.
+
+Result: 188 pages, two errors (the 500 and the 429), 10.18 to 10.27 s across two runs. That is 188 × 50 ms of
+waiting plus overhead. Almost all of the time is spent waiting, which is exactly what concurrency fixes.
+
+### Stage 2: threads with a coordinator
+
+Now the interviewer asks the reported question: "How would you make it multithreaded?" Say the termination
+rule first, then type. This version keeps the coordinator (the main thread) as the only owner of `seen` and
+`frontier`. A `ThreadPoolExecutor` runs `fetch` on worker threads and returns a **future** for each call: an
+object that will hold the result, or the exception, once the call finishes. `wait(..., FIRST_COMPLETED)`
+blocks until at least one future is done.
+
+```python
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+def crawl(seed: str, workers: int = 16, max_pages: int = 10_000):
+    """Only this thread touches `seen` and `frontier`; workers return raw HTML."""
+    host = urlsplit(seed).netloc
+    start = normalize(seed, seed)
+    seen, errors, frontier = {start}, {}, [start]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        in_flight = {}                                   # future -> url
+        while frontier or in_flight:                     # done = nothing queued AND nothing running
+            while frontier and len(in_flight) < workers: # at most `workers` fetches in flight
+                url = frontier.pop()
+                in_flight[pool.submit(fetch, url)] = url
+            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in done:
+                url = in_flight.pop(fut)
+                try:
+                    html = fut.result()
+                except Exception as e:
+                    errors[url] = type(e).__name__
+                    continue
+                for href in HREF.findall(html):
+                    link = normalize(url, href)
+                    if link and urlsplit(link).netloc == host and link not in seen \
+                            and len(seen) < max_pages:
+                        seen.add(link)
+                        frontier.append(link)
+    return seen, errors
+```
+
+Read the loop condition aloud: `while frontier or in_flight`. That is the termination rule written as code.
+The `in_flight` dictionary maps each running future to its URL, so the coordinator always knows how much work
+is still out. Submitting only up to `workers` futures keeps memory bounded on a big site. Submitting the whole
+frontier at once works on a toy site and is a fair shortcut to name and skip.
+
+How did the prediction hold up?
+
+| Workers | Time (two runs) | Predicted floor |
+|---|---|---|
+| 1 (Stage 1) | 10.18–10.27 s | 188 × 0.05 = 9.4 s |
+| 4 | 2.63–2.69 s | 2.35 s |
+| 16 | 0.79–0.86 s | 0.59 s |
+| 64 | 0.40–0.43 s | 0.35 s (7 levels of discovery × 50 ms) |
+
+Same 188 pages in every run. Each measured time sits a little above its floor, which is the overhead of
+threads and parsing. Past about 16 workers the discovery chain, not the pool, is the limit. Say it like this:
+"Going from 16 to 64 workers only saved about 0.4 s, because the site is only seven links deep."
+
+### Stage 3: asyncio with politeness, retries and a clean shutdown
+
+The interviewer now adds more: respect a per-host rate limit, retry 429 and 5xx with backoff, honor
+`Retry-After`, time out slow pages, and stop cleanly on Ctrl-C. A few terms first.
+
+- **asyncio** is Python's way of running many network calls on one thread. Each job is a **coroutine**, a
+  function that pauses at every `await` while it waits on the network. One **event loop** switches between
+  the paused coroutines. Because only one coroutine runs at a time, and switches happen only at `await`, the
+  seen set needs no lock.
+- **Backoff** means waiting longer after each failed attempt: 0.1 s, then 0.2 s, then 0.4 s. **Jitter** means
+  picking a random wait up to that amount, so many workers that failed together don't all retry on the same
+  tick. Picking anywhere from zero to the cap is called **full jitter**.
+- A **pacer** spaces out request starts so the crawler never goes faster than the limit. Here it hands each
+  request the next free time slot for its host.
+
+```python
+import asyncio, random, time
+import httpx
+
+RETRYABLE = {429, 500, 502, 503, 504}
+
+class HostPacer:
+    """At most `rate` request starts per second per host."""
+    def __init__(self, rate: float):
+        self.gap, self.next_ok, self.lock = 1.0 / rate, {}, asyncio.Lock()
+
+    async def wait(self, host: str) -> None:
+        async with self.lock:                       # reserve a slot, sleep outside the lock
+            now = time.monotonic()
+            t = max(now, self.next_ok.get(host, now))
+            self.next_ok[host] = t + self.gap
+        await asyncio.sleep(t - now)
+
+async def get(client, pacer, url, attempts=4, base=0.1, cap=2.0):
+    for n in range(attempts):
+        await pacer.wait(urlsplit(url).netloc)      # every attempt counts against the limit
+        try:
+            r = await client.get(url)
+            if r.status_code not in RETRYABLE:
+                r.raise_for_status()
+                return r.text
+            ra = r.headers.get("retry-after")
+            delay = float(ra) if ra and ra.isdigit() else random.uniform(0, min(cap, base * 2 ** n))
+        except httpx.TimeoutException:
+            delay = random.uniform(0, min(cap, base * 2 ** n))    # full jitter
+        if n < attempts - 1:
+            await asyncio.sleep(delay)
+    raise RuntimeError(f"gave up after {attempts} attempts")
+
+async def crawl(seed, workers=16, rate=100.0, timeout=1.0, max_pages=10_000):
+    host = urlsplit(seed).netloc
+    start = normalize(seed, seed)
+    seen, errors, q = {start}, {}, asyncio.Queue()
+    q.put_nowait(start)
+    pacer = HostPacer(rate)
+
+    async def worker(client):
+        while True:
+            url = await q.get()
+            try:
+                html = await get(client, pacer, url)
+                for href in HREF.findall(html):
+                    link = normalize(url, href)
+                    if link and urlsplit(link).netloc == host and link not in seen \
+                            and len(seen) < max_pages:
+                        seen.add(link)
+                        q.put_nowait(link)
+            except Exception as e:
+                errors[url] = str(e) or type(e).__name__
+            finally:
+                q.task_done()                  # counts in-flight work, so join() can't return early
+
+    limits = httpx.Limits(max_connections=workers)
+    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+        tasks = [asyncio.create_task(worker(client)) for _ in range(workers)]
+        try:
+            await q.join()                     # every queued URL fetched or failed
+        finally:
+            for t in tasks:                    # clean shutdown, also on Ctrl-C or outer cancel
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    return seen, errors
+```
+
+Walk the interviewer through it in three parts.
+
+**The pacer reserves, then sleeps.** It takes the lock only long enough to claim the next time slot, then
+sleeps *outside* the lock. Sleeping while holding the lock would line every worker up behind the slowest
+sleeper. Each retry also waits for a slot, so retries can't push the crawler over the limit. That is the Glean
+follow-up about parallelizing without breaking the rate limit.
+
+**The retry loop sorts outcomes.** A status not in `RETRYABLE` either succeeds or raises at once, because a
+404 will be a 404 next time too. A 429 or 5xx waits for `Retry-After` if the server sent it, and otherwise
+backs off with full jitter. A timeout backs off too. After four attempts it gives up and the worker records
+the error.
+
+**Termination is the queue's job now.** This is the shared queue design. Every `q.get()` is matched by a
+`q.task_done()` in a `finally`, even when the fetch fails. So `q.join()` returns only when every URL ever put
+on the queue has been fully handled. The `finally` around `join()` cancels the workers, which also runs on
+Ctrl-C.
+
+Results, two runs each. With 64 workers and a generous 1,000 requests/s limit, the crawl took 1.27 to 1.30 s
+with no errors and 190 requests (188 pages plus the two retries). The floor here is the `Retry-After: 1` on
+`/p/17`: nothing can finish before that second passes. At 100 requests/s the same crawl took 2.01 s both
+times, against the prediction of 190 ÷ 100 = 1.9 s. The rate limit, not the 64 workers, set the time.
+
+### Stage 4: the same crawler in Go
+
+For the CoreWeave-style Go round, the coordinator maps onto Go's own tools. A **goroutine** is a very cheap
+thread managed by the Go runtime. A **channel** is a typed pipe between goroutines; sending blocks until
+someone receives. A `select` waits on several channel operations and runs whichever is ready first. A
+`context.Context` carries a cancellation signal: when the caller cancels, `ctx.Done()` becomes ready.
+
+One goroutine owns `seen`. The trick worth naming is the **nil channel**: sending on a nil channel blocks
+forever, so inside a `select` that case is simply never chosen. Setting `send` to nil when the frontier is
+empty switches off the "hand out a job" case, and one `select` handles both directions.
+
+```go
+func Crawl(ctx context.Context, seed string, workers int) (map[string]bool, map[string]error) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	jobs, results := make(chan string), make(chan result)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	for i := 0; i < workers; i++ {
+		go func() {
+			for u := range jobs {
+				links, err := fetch(ctx, client, u)
+				select {
+				case results <- result{u, links, err}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	start := normalize(seed, seed)
+	host := hostOf(start)
+	seen, errs := map[string]bool{start: true}, map[string]error{}
+	frontier, inFlight := []string{start}, 0
+	for len(frontier) > 0 || inFlight > 0 {
+		var send chan string // nil: the send case is disabled when there is nothing to send
+		var next string
+		if len(frontier) > 0 {
+			send, next = jobs, frontier[len(frontier)-1]
+		}
+		select {
+		case send <- next:
+			frontier = frontier[:len(frontier)-1]
+			inFlight++
+		case r := <-results:
+			inFlight--
+			if r.err != nil {
+				errs[r.url] = r.err
+				continue
+			}
+			for _, l := range r.links {
+				if l != "" && hostOf(l) == host && !seen[l] {
+					seen[l] = true
+					frontier = append(frontier, l)
+				}
+			}
+		case <-ctx.Done():
+			close(jobs)
+			return seen, errs
+		}
+	}
+	close(jobs) // workers leave their range loop
+	return seen, errs
+}
+```
+
+The loop condition is the same rule again: `len(frontier) > 0 || inFlight > 0`. The coordinator is the only
+sender on `jobs`, so it is the one that closes it, and closing it makes every worker's `range` loop end.
+Workers select on `ctx.Done()` when sending a result, so a cancelled crawl doesn't leave them stuck on a send
+nobody will receive.
+
+`fetch`, `normalize` and `hostOf` mirror the Python helpers. Two tests ran against an `httptest` server (Go's
+built-in fake HTTP server for tests): all 200 pages found with 1, 8 and 64 workers, and a context cancelled
+after 120 ms stops the crawl in well under a second. `go test -race -count=20` passed (34 s); `-race` turns on
+Go's race detector, and `-count=20` runs each test twenty times. The first version of the test failed, and not
+because of the crawler: the fake server's "fail once" state was shared across three crawls, so only the first
+crawl saw the 500. Shared state in the test harness is still shared state.
+
+### The same shape, four more times
+
+The other questions in the family use the same four boxes. Only the source of work, the slow part and the
+resource change. For each one, say which box is which before you write code.
+
+| Question | Source of work | Slow part | Bound by |
+|---|---|---|---|
+| Duplicate files | a directory walk | reading and hashing files | the disk |
+| Image pipeline | the list of images | transforming pixels | the CPU |
+| Thread pool | a list of inputs | a blocking API call | the remote API |
+| Chunked download | the list of byte ranges | downloading each range | the network |
+
+**Duplicate files (infra-020).** Two files are duplicates when their bytes are identical. Reading every file
+in full is the slow, naive way. The fast way narrows cheaply first. Group files by size, which comes free from
+`stat` (the call that returns a file's metadata) without reading any contents. Then hash only the first 4 KiB
+of files that share a size. Then compute a full **SHA-256** (a fingerprint of the file's bytes; two different
+files practically never share one), read in 1 MiB blocks. Most files are never read in full.
+
+Three file-system details matter. A **symlink** is a pointer to another path; following it can loop back to
+the root and walk forever, so skip symlinks. A **hard link** is a second name for the same file on disk; both
+names share one **inode** (the file's identity number), so treat them as one file, not as duplicates. And skip
+files you can't read instead of crashing.
+
+```python
+def find_duplicates(root, head=4096):
+    by_size, inodes = defaultdict(list), set()
+    for path, st in walk(root):                      # os.scandir, no symlinks, skips OSError
+        if (st.st_dev, st.st_ino) in inodes:         # a hard link is the same file
+            continue
+        inodes.add((st.st_dev, st.st_ino))
+        by_size[st.st_size].append(path)
+    groups = list(by_size.values())                       # 1. same size
+    groups = refine(groups, lambda p: digest(p, head))    # 2. same first 4 KiB
+    groups = refine(groups, digest)                       # 3. same full SHA-256
+    return sorted(sorted(g) for g in groups)
+```
+
+The test creates its own files under pytest's `tmp_path` (a fresh temporary directory per test): two
+identical files in different directories, a file with the same size and the same first 4 KiB but a different
+last byte, a same-size random file, two empty files, a hard link, a symlink, a symlink loop back to the root,
+and an unreadable file. Its first run failed: the finder reported `a_hardlink.bin` where the test expected
+`a.bin`, because which of two hard-link names is seen first depends on directory order. The fix compares
+groups by inode, and the test then passed five runs out of five. The test caught an assumption in the test,
+which is the kind of follow-up the reporting candidate says carried the signal. Hashing is disk-bound, so a
+thread pool over step 3 helps on SSDs and can hurt on a spinning disk, whose head has to seek between files.
+Say so rather than parallelizing by reflex.
+
+**Image pipeline (infra-022).** Get one image through every step first, write it, open it. Then fan out.
+Image transforms are CPU-bound, and because of the GIL, Python threads can't run them in parallel. Use
+**processes** instead: `ProcessPoolExecutor` starts separate Python processes, each with its own GIL. Pillow
+(the usual Python image library) wasn't installed in the scratch environment, so this version uses NumPy on
+binary PPM files, a very simple image format. In the interview, use the library the project already imports.
+
+```python
+def process(src, dst, steps):
+    img = read_ppm(src)
+    for name, args in steps:            # steps parsed once from the spec file: [("rotate", ["90"]), ...]
+        img = OPS[name](img, *args)
+    write_ppm(dst, np.ascontiguousarray(img))   # writes to dst.tmp, then os.replace
+    return dst
+
+def run(in_dir, out_dir, spec_path, workers):
+    steps = parse_spec(open(spec_path).read())   # fail fast on an unknown step, before any work
+    jobs = {os.path.join(in_dir, n): os.path.join(out_dir, n)
+            for n in sorted(os.listdir(in_dir)) if n.endswith(".ppm")}
+    ok, failed = [], {}
+    with ProcessPoolExecutor(workers) as pool:   # CPU-bound: processes, not threads
+        futs = {pool.submit(process, s, d, steps): s for s, d in jobs.items()}
+        for f in as_completed(futs):
+            try:
+                ok.append(f.result())
+            except Exception as e:               # one corrupt image doesn't stop the batch
+                failed[futs[f]] = repr(e)
+    return ok, failed
+```
+
+The test set was 48 random 1024×1024 images plus one truncated file, with rotate, invert, blur, grayscale and
+crop. One process took 0.92 s, four took 0.32 s, and eight took 0.24 to 0.26 s (two runs). All 48 were
+written and the broken file was reported, not fatal. Each output is written to a temporary name and then
+renamed with `os.replace`, which is **atomic**: the file either appears complete or not at all. So a crash
+never leaves a half-written output that a rerun would skip.
+
+**Thread pool for blocking calls (infra-029).** If the interviewer wants the pool itself, build it from a
+bounded queue, N threads and a `Future` per task. A **bounded** queue has a maximum size, so `submit` blocks
+when it is full. That pushes back on the caller, which is called **backpressure**. A **sentinel** is a special
+value put on the queue to tell a worker to stop.
+
+```python
+class ThreadPool:
+    def __init__(self, workers: int, max_queued: int = 100):
+        self.q = queue.Queue(maxsize=max_queued)          # bounded: submit blocks = backpressure
+        self.threads = [threading.Thread(target=self._run, daemon=True) for _ in range(workers)]
+        for t in self.threads:
+            t.start()
+
+    def _run(self):
+        while (item := self.q.get()) is not _STOP:
+            fut, fn, args = item
+            if fut.set_running_or_notify_cancel():         # skip tasks cancelled while queued
+                try:
+                    fut.set_result(fn(*args))
+                except BaseException as e:                 # the error belongs to its task
+                    fut.set_exception(e)
+
+    def submit(self, fn, *args) -> Future:
+        fut = Future()
+        self.q.put((fut, fn, args))
+        return fut
+
+    def map(self, fn, items, timeout=None):
+        futs = [self.submit(fn, x) for x in items]
+        return [f.result(timeout=timeout) for f in futs]   # input order, not completion order
+
+    def shutdown(self):
+        for _ in self.threads:
+            self.q.put(_STOP)                              # one sentinel per worker
+        for t in self.threads:
+            t.join()
+```
+
+Five tests passed. Results came back in input order for 200 calls with random sleeps. Ten 100 ms sleeps on ten
+workers finished in under 0.3 s. An exception stayed with its own future while the next task still returned.
+`submit` blocked when the queue was full and resumed when a worker freed up. A task cancelled while queued
+never ran.
+
+One limit to say out loud: a timeout on `result()` stops the **caller** waiting, but a Python thread can't be
+killed, so the blocking call itself needs its own socket timeout or it holds a worker forever. Say it like
+this: "The pool's timeout is for the caller. The real timeout has to live in the HTTP client."
+
+**Parallel chunked download (infra-030).** HTTP lets a client ask for part of a file with a **range request**:
+the header `Range: bytes=0-8388607` asks for the first 8 MiB, and the server answers **206 Partial Content**
+with a `Content-Range` header saying which bytes it sent. A server advertises support with `Accept-Ranges:
+bytes`. An **ETag** is a version id for the file; sending it back in `If-Range` means "only give me a range if
+the file hasn't changed".
+
+The plan: a `HEAD` request for the size, `Accept-Ranges: bytes` and the ETag. Preallocate the file to its
+full size. Download fixed-size ranges in a pool, and write each one at its own offset with `os.pwrite`, which
+writes at a given position without moving a shared file cursor, so threads don't need a lock. Retry a failed
+range. Check the whole-file SHA-256. Rename only a verified file.
+
+```python
+def fetch_range(client, url, etag, a, b, attempts=4):
+    for n in range(attempts):
+        try:
+            r = client.get(url, headers={"Range": f"bytes={a}-{b}", "If-Range": etag})
+            if r.status_code == 206 and r.headers["content-range"].startswith(f"bytes {a}-{b}/") \
+                    and len(r.content) == b - a + 1:
+                return r.content
+            if r.status_code == 200:            # Range ignored, or the file changed (If-Range failed)
+                raise RuntimeError("got 200 to a range request")
+        except httpx.TransportError:
+            pass
+        time.sleep(random.uniform(0, 0.05 * 2 ** n))
+    raise RuntimeError(f"range {a}-{b} failed after {attempts} attempts")
+
+def download(url, dest, chunk=8 * 2**20, workers=8):
+    with httpx.Client(timeout=10) as client:
+        head = client.head(url)
+        if head.headers.get("accept-ranges") != "bytes":
+            raise RuntimeError("no range support: fall back to one stream")
+        size, etag = int(head.headers["content-length"]), head.headers["etag"]
+        want = head.headers["x-content-sha256"]          # or a manifest published with the file
+        tmp = dest + ".part"
+        fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.ftruncate(fd, size)
+        def one(rng):
+            a, b = rng
+            os.pwrite(fd, fetch_range(client, url, etag, a, b), a)
+        try:
+            with ThreadPoolExecutor(workers) as pool:
+                list(pool.map(one, plan(size, chunk)))   # plan: [(0, chunk-1), (chunk, 2*chunk-1), ...]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if sha256_file(tmp) != want:
+            os.remove(tmp)
+            raise ValueError("sha256 mismatch")
+        os.replace(tmp, dest)
+        return size
+```
+
+`ftruncate` sets the file's size up front, and `fsync` forces the bytes to disk before the hash check. MDN's
+range-request guide says a server that doesn't support ranges answers with 200 and the whole body, and that
+If-Range turns a stale range request into a full 200 response
+([MDN](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Range_requests), read 2026-10-12). The
+`status == 200` check handles both cases.
+
+The test server served 64 MiB plus 12,345 bytes in 8 MiB ranges. It gave one range a 503 once and flipped one
+byte in another range once. The 503 was retried silently. The flipped byte passed every per-range check
+(right status, right length), and only the final SHA-256 caught it; the second attempt then succeeded in
+0.15 s (two runs, same outcome). Without per-chunk hashes you can't tell which range was bad, so the whole
+file is fetched again. That leads to the best follow-up: publish a **manifest** (a small file listing each
+chunk's hash), and re-fetch only the chunk that fails.
+
+## Verification
+
+Four checks, each run against the fake site.
+
+**Compare against the oracle.** Every concurrent version must return the same set as Stage 1 on the same
+site. All stages returned 188 pages in every run. A concurrency bug usually shows up as a different count,
+not a crash, so the count is the first thing to compare.
+
+**Run the bug you are guarding against.** This version declares the crawl over when the queue is empty:
+
+```python
+for _ in range(workers):
+    threading.Thread(target=worker, daemon=True).start()
+time.sleep(0.01)
+while not q.empty():          # BUG: an empty queue is not "no work left"
+    time.sleep(0.01)
+return seen
+```
+
+In 10 runs out of 10 it returned **one page**. Here is the timeline. The first worker took the seed, so the
+queue was empty. The seed's fetch took 50 ms. The main thread checked after 10 ms, saw an empty queue, and
+returned, before the seed's links were ever added. A version that waits a little longer would pass on a fast
+laptop and fail in production when a page is slow. In-flight work must be counted: `task_done()` and `join()`,
+a `WaitGroup`, or the coordinator's `in_flight` dictionary.
+
+**Test the failure paths on purpose.** The fake site's 500, 429 and hang exist so that the retry and timeout
+code actually runs. With `/p/19` hanging for 5 s, the threaded crawler (2 s timeout, no retries) took 2.26 to
+2.40 s, and the asyncio one (1 s timeout, four attempts) took 4.66 to 4.70 s (16 and 64 workers, one run
+each). One page that never answers costs attempts × timeout plus backoff. Decide whether a timeout is
+retryable, and put a total deadline on each URL. Say it like this: "Four attempts with a 1-second timeout
+means one dead page can cost over four seconds. I'd cap the total time per URL."
+
+**Use the race detector, and know its limit.** A **data race** is two threads touching the same memory at the
+same time, with at least one writing. `go test -race` passed 20 runs. Go's documentation says the detector
+"only finds races that happen at runtime, so it can't find races in code paths that are not executed"
+([Go race detector](https://go.dev/doc/articles/race_detector), read 2026-10-12). It also misses **logic
+races**, also called **check-then-act** bugs: code reads a value, decides, then writes, and another thread
+changes the value in between. Every single access can be atomic and the result still wrong. The rate-limiter
+lab's flaky concurrency test is one: every access is atomic, so `-race` reports nothing while the test fails in
+5% to 37% of plain runs, depending on load (run 2026-10-11 on an Apple M1 Ultra, Go 1.26.9).
+
+## Complexity and performance
+
+**Work.** Each page is fetched once and parsed once: O(N + E) for N pages and E links, with an O(1) average
+set lookup per link. Memory is O(N) for the seen set plus the frontier.
+
+**Time.** Bounded by the three-limit formula in the plan. The measurements landed just above each
+prediction:
+
+| Setting | Predicted | Measured |
+|---|---|---|
+| Sequential | 9.4 s | 10.2 s |
+| 64 threads | 0.35 s | 0.40–0.43 s |
+| 100 requests/s limit | 1.9 s | 2.01 s |
+
+**Choosing W.** Start from W = R × L if there is a rate limit. Otherwise start from the connection limits of
+the host and the client: httpx's `max_connections` and the server's backlog (how many waiting connections it
+accepts) are limits too.
+
+**Threads, event loop or processes.** Threads are fine for tens to hundreds of blocking calls. An event loop
+holds thousands of sockets in one thread, because a waiting socket costs a little memory instead of a whole
+thread stack (the io-model lab shows why at the system-call level). CPU-bound work in Python needs processes,
+as the image pipeline's drop from 0.92 s to about 0.25 s shows.
+
+**Duplicate files.** One `stat` per file, a 4 KiB read per file that shares a size with another, and full
+reads only for files that still collide. Disk throughput, not hashing, usually sets the time.
+
+**Chunked download.** Parallel ranges help when one TCP connection can't fill the link. That happens with a
+long round-trip time to the server, or when the server caps each connection's speed. On a local link it made
+no difference worth measuring: the 64 MiB download took 0.15 s.
+
+<AINative title="Pairing with an assistant on a crawler">
+The Glean round is explicitly a pair with an AI assistant, and its third listed part is reviewing generated
+code. An assistant writes Stage 2 or Stage 3 in seconds. What it gets wrong is the part this page keeps
+pointing at: termination (an `empty()` check, a fixed sleep), a lock held across `await asyncio.sleep`, a
+retry loop that bypasses the rate limiter, or marking pages seen on fetch rather than on enqueue. Keep the
+spec and the oracle yours: write the sequential version and the comparison test first, then let the
+assistant produce the concurrent version and run the test, the fault-injecting server and the race detector
+against it. If you can't explain why its code terminates, it isn't done. The
+[AI-assisted coding family](/system-design-labs/interviews/walkthroughs/ai-coding-in-codebase/) covers the
+round tactics.
+</AINative>
+
+## Small-team version
+
+At a 50–500 person company you will write this code, not buy it, because the jobs are yours. Typical ones:
+embed a document corpus, run an LLM classification over every support ticket, re-embed everything when the
+embedding model changes, download a model's weights. (An **embedding** is a list of numbers that stands for a
+piece of text, used for search; an **embedding model** produces it.) Each job is a bounded worker pool against
+a rate-limited API or a slow disk. The crawler you just built is the template.
+
+### Build
+
+- **The worker pool, sized from the limit.** Providers publish limits per account tier, in requests per
+  minute and tokens per minute (a **token** is the unit LLMs read and bill, roughly ¾ of a word). Work out the
+  concurrency as R × L. At an assumed 50 requests/s allowed and 2 s per call, that is **100 calls in flight**;
+  500 workers would only collect 429s. Pace below the limit and treat a 429 as a signal to slow down.
+  Anthropic's rate-limit docs (fetched 2026-10-12) say that once an organization reaches its monthly spend cap,
+  the API returns 429 **without** `retry-after`, and SDK retries (the retries built into the provider's client
+  library) keep failing until the next month ([rate limits](https://platform.claude.com/docs/en/api/rate-limits)). A retry loop that waits for
+  a header that never comes needs its own cap.
+- **Batch inside each worker.** Send many items per call instead of one. Measured in the embedding-pipeline
+  lab, encoding chunk-length texts one per call vs 32 per call runs at
+  <LabNumber lab="embedding-pipeline" metric="encode(), 1 vs 32 chunk-length texts per call (CPU)" />, and
+  dynamic batching (grouping requests from many callers into one call) for 32 concurrent callers reaches
+  <LabNumber lab="embedding-pipeline" metric="v1 dynamic batching, 32 concurrent callers (CPU)" />. Most
+  hosted embedding APIs also accept a list of inputs per request.
+- **Resumability before parallelism.** Write results keyed by input id (a table, or one file per item via
+  atomic rename) and skip ids already done on restart. A backfill of a million rows that has to start over
+  after a crash at 80% costs more than any tuning saves.
+
+### Buy, or use what the provider already sells
+
+- **Batch APIs for offline work.** Anthropic, OpenAI and Google list batch processing at about 50% off for
+  jobs that can wait (pricing pages fetched 2026-10-11:
+  [Anthropic](https://platform.claude.com/docs/en/about-claude/pricing),
+  [OpenAI](https://developers.openai.com/api/docs/pricing),
+  [Google](https://ai.google.dev/gemini-api/docs/pricing)). A nightly backfill doesn't need your own pool at
+  all: you upload a file and poll for the result. Your pool is then for the online path and for providers
+  without a batch API.
+- **The cost is usually small; the time is not.** Embedding 1M chunks of 500 tokens costs about **$10**
+  (OpenAI text-embedding-3-small at $0.02 per million tokens, fetched 2026-10-11). On one CPU process at the
+  measured 112 chunk-length texts a second, the same million chunks take about **2.5 hours**. The worker pool
+  and the API's rate limit decide the wall-clock time, not the bill.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Pool size:** 50 requests/s × 2 s per call = **100** calls in flight.
+- **Embedding cost:** 1,000,000 chunks × 500 tokens = 500 million tokens; 500 × $0.02 = **$10**.
+- **Embedding time on one CPU process:** 1,000,000 ÷ 112 texts per second ≈ 8,900 s ≈ **2.5 hours** (derived
+  from the embedding-pipeline lab number above).
+
+</details>
+
+### Skip
+
+A distributed crawler, a job framework or a message broker for a one-off backfill. A queue table in the
+Postgres you already run, a script with a bounded pool, and an id-keyed results table cover a small team's
+volume. Revisit when jobs run continuously, several services produce work, or a job must survive the machine
+that started it; then the [GPU job queue family](/system-design-labs/interviews/walkthroughs/gpu-job-queue/) is
+the next step.
+
+### What you still own
+
+The rate limit and spend cap per job, the retry policy (which errors, how many, total deadline), the resume
+key, and a verification step at the end: a count of inputs vs outputs, and a hash or row count you can check.
+An agent can write the pool. You decide what "done" means and check it.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Concurrent workers"
+  senior={[
+    "Gets a correct sequential version running fast, then a concurrent one that terminates exactly when work runs out, with a test comparing the two.",
+    "Puts a timeout on every call, retries only retryable errors with jittered backoff, and keeps one bad item from failing the batch.",
+    "Picks threads, an event loop or processes from whether the work is I/O- or CPU-bound."
+  ]}
+  staff={[
+    "Derives the worker count from the rate limit and latency (R × L) and says which of the three limits bounds the job before measuring.",
+    "Designs for the restart: idempotent outputs, atomic writes, resumable progress, verification by hash or count at the end.",
+    "Names what the tests can't catch (logic races, slow-page tails, a server that ignores Range) and builds a fault-injecting harness for them."
+  ]}
+/>
+
+In plain words: a Senior answer is correct and finishes. A Staff answer also predicts the speed before
+measuring, survives a crash halfway through, and knows which bugs its own tests can't see. (**Idempotent**
+means doing it twice has the same effect as doing it once, so a rerun after a crash is safe.)
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="How would you make it multithreaded? (Reported, Anthropic)">
+    Keep one owner of the seen set (a coordinator thread, or a lock), bound the number of fetches in
+    flight, and end when nothing is queued and nothing is running. Stage 2 is the whole answer in about 25
+    lines; say the termination rule before you type it.
+  </FollowUp>
+  <FollowUp q="Parallelize without exceeding the rate limit. (Listed on the PracHub page, Glean)">
+    Put a pacer in front of every request start, including retries, shared by all workers for the host.
+    Then size the pool at about R × L; more workers only wait on the pacer. Stage 3 measured 2.01 s for 190
+    requests at 100/s against a 1.9 s prediction.
+  </FollowUp>
+  <FollowUp q="Make the crawl resumable after a crash. (Listed on the PracHub page, Glean)">
+    Persist the seen set and the frontier, or append each fetched URL to a log and rebuild both on start.
+    Mark items done only after their output is durably written. Re-fetching a page after a crash is fine if
+    processing is idempotent; losing one silently is not.
+  </FollowUp>
+  <FollowUp q="Follow-up variants on the same duplicate-file setup. (Reported, Anthropic; variants not described)">
+    Likely pushes: millions of files (stream the walk, don't hold every path; group by size first), huge
+    files (partial hash before full hash), symlinks and hard links, files changing during the scan (re-stat
+    before reporting), and the test creating its own fixtures. Ask which one they mean.
+  </FollowUp>
+  <FollowUp q="A timeout fires: does the thread stop? (Not reported; a natural next push)">
+    In Python, no. `future.result(timeout=…)` stops the caller waiting; the worker thread keeps blocking
+    until the call returns. Give the call its own I/O timeout, and use `shutdown(cancel_futures=True)`
+    (Python 3.9+) to drop queued work that hasn't started.
+  </FollowUp>
+  <FollowUp q="The final hash doesn't match. Which chunk is bad? (Not reported; a natural next push)">
+    With only a whole-file hash you can't tell, so you re-download everything. Publish per-chunk hashes in a
+    manifest, verify each range as it lands, and re-fetch only the bad one. Use If-Range or the ETag so a file
+    that changes mid-download restarts instead of mixing versions.
+  </FollowUp>
+  <FollowUp q="How would you bound the search for rare letters such as Q, X and Z? (Listed on the PracHub page, Glean)">
+    Use a priority frontier keyed by whether the title's initial is still uncovered, and add a budget: after
+    K fetches without new coverage, accept a partial result or seed from a known index page for that letter.
+    Say what you'd tell the user when the budget runs out.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Ending on an empty queue.** A fetch may still be running and about to add work; the buggy version above
+  found 1 page of 188 in all ten runs.
+- **Marking seen on fetch instead of enqueue.** Two workers can queue the same page before either fetches it,
+  so it is fetched and counted twice.
+- **No timeout, or a timeout without a total deadline.** One hung page sets the crawl time: 2.3 s with
+  threads, 4.7 s with four retried 1 s attempts in Verification.
+- **Retries that skip the rate limiter.** Retries are requests too, so every attempt must go through the
+  pacer.
+- **Threads for CPU-bound Python.** The GIL lets only one thread compute at a time; the image pipeline went
+  from 0.92 s to about 0.25 s only with processes.
+- **Parallelizing before one item works end to end.** The image-pipeline report is the cautionary case: get
+  one image through every step first (<Cite id="s-e9fee3985a" />).
+- **Trusting `-race` as proof.** It finds data races that actually execute, not check-then-act logic races.
+
+## Prove it with a lab
+
+<LabRef lab="rate-limiter" role="proof" note="Build the token bucket and sliding window a polite crawler paces against, then read its flaky concurrency test: a logic race with atomic accesses that -race does not flag." />
+<LabRef lab="embedding-pipeline" role="proof" note="Batching and dynamic batching in front of an encoder: the measured case for putting a batch, not one item, in each worker's hands." />
+<LabRef lab="load-balancer" role="proof" note="A 20% retry budget and a circuit breaker: what keeps a crawler's retries from tripling load on a struggling host. Its v2 retry has a known bug (it fires after the first response was already written)." />
+<LabRef lab="io-model" role="background" note="Why an event loop can hold thousands of sockets in one thread while thread-per-connection hits a wall. Linux-only C; not built or tested for this guide." />
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-2348518c66" />
+- <Cite id="s-4e04a1689c" />
+- <Cite id="s-e9fee3985a" />
+- <Cite id="s-fa7d3ae628" />
+- <Cite id="s-5e2c5b84e0" />
+- <Cite id="s-9adea8ab98" />
+- <Cite id="s-b9e76e614c" />
+- PracHub, [AI-paired rate-limited Wikipedia crawler](https://prachub.com/interview-questions/ai-paired-rate-limited-wikipedia-crawler-that-prioritizes-unseen-title-initials) (Glean, dated 2026-09-30; read 2026-10-12)
+- PracHub, [Parallelize blocking API calls with a thread pool](https://prachub.com/interview-questions/parallelize-blocking-api-calls-with-a-thread-pool) and [Parallelize chunked file download and verify integrity](https://prachub.com/coding-questions/parallelize-chunked-file-download-and-verify-integrity) (Baseten; read 2026-10-12)
+- Python docs, [concurrent.futures](https://docs.python.org/3/library/concurrent.futures.html) (read 2026-10-12)
+- MDN, [HTTP range requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Range_requests) (read 2026-10-12)
+- IETF, [RFC 9309: Robots Exclusion Protocol](https://www.rfc-editor.org/rfc/rfc9309.html) (September 2022; read 2026-10-12)
+- Go, [Data race detector](https://go.dev/doc/articles/race_detector) (read 2026-10-12)
+- Anthropic, [API rate limits](https://platform.claude.com/docs/en/api/rate-limits), (fetched 2026-10-12), and provider pricing pages linked above (fetched 2026-10-11)

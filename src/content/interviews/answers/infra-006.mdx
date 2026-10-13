@@ -1,0 +1,199 @@
+---
+question: infra-006
+family: multi-tenant-gpu-serving
+status: published
+labs: [llm-inference, faas-runtime, rate-limiter]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll walk one request from the front door to the last streamed word and name what can break at each step.
+> Admission charges the tenant in tokens and keeps queues bounded. Models take seconds to minutes to load, so I
+> keep a warm copy close and never cut over before the new copy is ready. Batching is limited by GPU memory for
+> in-flight requests, so when memory runs short I stop admitting and push out the lowest tier rather than crash.
+> A disconnect frees memory at once, I autoscale on queue depth and time to first token, and an engine crash has a
+> stated promise for replies already streaming."
+>
+> The rest of this page explains each part of that answer.
+
+This is a breadth question. The interviewer wants to see that you know an inference service for a large language
+model (LLM) has more moving parts than a normal API, and that you can name a mechanism and one number for each.
+
+A normal web service is easy to describe: a load balancer, stateless servers, a database. Containers start in a
+second, any server can take any request, and requests cost about the same. LLM serving breaks those habits:
+
+1. **The program is huge.** A model's learned numbers (its **weights**) take 16 GB for an 8-billion-parameter
+   model and about 140 GB for a 70-billion-parameter one (written 8B and 70B). Loading them onto GPUs takes from
+   about a second to over a minute.
+2. **Requests hold memory while they run.** The model writes its reply in small pieces called **tokens** (roughly ¾
+   of a word each), one per step. While it does, the GPU keeps a saved summary of every token so far, the **KV
+   cache**. That memory, not raw GPU speed, limits how many requests run at once.
+3. **Requests differ in cost by a hundred times or more.** A 50-token question and a 50,000-token document are
+   both "one request".
+
+Baseten's tech screen on PracHub (posted 2026-07-26) gives exactly this topic list: model lifecycle,
+accelerator-aware batching, memory pressure, fairness, cancellation, autoscaling, crash recovery and
+latency-throughput observability (<Cite id="s-806beee74a" />). A Baseten prep guide says strong candidates raise
+cold starts without being asked (<Cite id="s-f440daaea4" />). Covering every topic with one number beats going deep
+on one.
+
+## Clarify first
+
+Ask, then state what you'll assume:
+
+- **One model or many, and how big?** "I'll assume a 70B model on 4 GPUs and an 8B model on 1 GPU, 80 GB of GPU
+  memory each."
+- **Which delays matter?** Two do: **time to first token (TTFT)**, how long until the first word appears, and
+  **inter-token latency (ITL)**, the gap between later words. "Streaming is required, and I'll set targets for
+  both."
+- **Traffic shape.** Bursty or steady? May an idle model be shut down completely (**scale to zero**)?
+- **Tenants and tiers.** Several customers? Paid tiers that get priority?
+
+## Answer
+
+### The path, top to bottom
+
+```
+Client
+   │  request (HTTPS, streaming response)
+   ▼
+Admission ── tenant, tier, token budget, bounded queue with a deadline
+   │
+   ▼
+Router ── picks a replica that has the model loaded and free KV memory
+   │
+   ▼
+Replica (serving engine on 1–4 GPUs) ── continuous batching
+   │  prefill: read the prompt → first token
+   │  decode: one token per step, shared with the rest of the batch
+   ▼
+Stream back ── each token as it is written; free memory at the end or on disconnect
+
+Beside it: model store (versions) · autoscaler (queue depth, TTFT) · metrics
+```
+
+A **replica** is one running copy of a model. **Admission** decides whether a request may enter at all. The
+**router** picks a replica. Inside the replica, the serving engine (vLLM is a common open-source one) runs
+**continuous batching**: it works on many requests together, and finished ones leave while waiting ones join
+between steps.
+
+### Follow one request through it
+
+A tenant sends a chat request to the 8B model: a 2,000-token prompt and a reply of up to 300 tokens.
+
+| Step | What happens | Number to give | What to say in the interview |
+|---|---|---|---|
+| **1. Admission** | Authenticate, find the tenant's budget, reserve 2,000 + 300 tokens, put the request in a bounded queue with a deadline. | 2,300 tokens reserved | "Budgets count tokens, not requests." |
+| **2. Model lifecycle** | The model must already be loaded. If it isn't, it loads from wherever its weights sit. | 70B: about 70 s from an object store | "Scale to zero needs a warm tier, or a stated first-request penalty." |
+| **3. Batching** | The request joins a running batch if there is free KV memory. | 8B on 80 GB: about 104 requests of 4,096 tokens | "Batch size is set by memory, then by the GPU's speed limits." |
+| **4. Memory pressure** | If KV memory runs out, stop admitting, then push out the lowest tier. | — | "The engine must never run out of memory and crash." |
+| **5. Fairness** | A fair queue shares tokens by tier; each tenant has a cap. | — | "One heavy tenant can't take every slot." |
+| **6. Stream** | Each token goes out as soon as it is written. | — | "If the client disconnects, free its memory at once." |
+| **7. Crash** | If the engine dies mid-reply, the reply needs a stated outcome. | — | "Retry what hasn't started; error or resume what has." |
+
+### Each topic in plain words
+
+**1. Admission.** Authenticate, find the tenant's budget, and reserve the prompt's tokens plus the maximum reply
+length. Queues are bounded, and each request has a deadline, so overload gets a fast, definite answer instead of a
+timeout.
+
+**2. Model lifecycle.** Keep model files versioned. Loading time depends on where the weights sit: in the server's
+ordinary memory (host DRAM), on a local SSD (NVMe), or in an object store. A 140 GB model from an object store at an
+assumed 2 GB/s takes **70 s**. So scale to zero needs a warm tier, or a first-request penalty you state up front.
+Mark a replica ready only after a warm-up request succeeds. Roll out new versions by starting the new copy first
+(**surge**), never stop-then-start.
+
+**3. Batching that fits the GPU.** Two limits set the batch size. The first is memory: an 8B model on an 80 GB GPU
+has room for the KV caches of **about 104 requests** of 4,096 tokens, after an assumed 8 GB of runtime overhead. The
+second is the GPU's own balance between arithmetic and memory speed. While the model writes tokens, each step reads
+all the weights from memory once, whatever the batch size. So adding requests to the batch is almost free until the
+arithmetic catches up with the memory reads. The batch size where that happens is the **ridge point**: about
+**153 on an A100 and 295 on an H100** in the 2-byte bf16 format. Below it, writing tokens is limited by memory
+speed (**memory-bound**).
+
+**4. Memory pressure.** When KV memory runs out, first stop admitting. Then **preempt** (push out) the lowest tier's
+requests, either throwing away their KV cache to recompute later or copying it to host memory. Never let the
+engine run out of memory and crash, because that loses every request on the replica.
+
+**5. Fairness.** Use a fair queue weighted by tokens, so long requests pay for what they use, plus a cap on each
+tenant's in-flight requests.
+
+**6. Cancellation.** A client disconnect frees that request's KV memory and batch slot immediately. Otherwise the
+GPU keeps writing tokens nobody reads.
+
+**7. Autoscaling.** Scale on queue depth and time to first token. The Baseten guide's line is "GPU utilization
+lies" (<Cite id="s-f440daaea4" />): utilisation can look full while requests wait for memory. Start scaling early
+enough to cover the load time.
+
+**8. Crash recovery.** An engine crash loses the KV cache of every in-flight request. Retry requests that haven't
+started streaming. For streams already sending, either send an error or **resume**: another replica reads the
+prompt plus the tokens already sent and carries on. Restart the engine with backoff.
+
+**9. Observability.** Time to first token and inter-token latency at p50 and p99, tokens per second per GPU, queue
+depth, KV memory in use, cold starts and preemptions.
+
+Say: "I've covered each topic with a mechanism. Which one would you like me to go deeper on?"
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Load time:** 140 GB ÷ 2 GB/s (assumed object-store rate) = **70 s**.
+- **KV room for the 8B on one 80 GB GPU:** KV per token = 2 × 32 layers × 8 KV heads × 128 × 2 bytes = 131,072 B.
+  Free memory = 80 − 16 (weights) − 8 (assumed overhead) = 56 GB. 56 × 10⁹ ÷ 131,072 ≈ 427,000 tokens ÷ 4,096 ≈
+  **104 requests**.
+- **Ridge points:** peak dense bf16 arithmetic ÷ memory bandwidth. A100: 312 × 10¹² ÷ 2.039 × 10¹² ≈ **153**
+  operations per byte. H100 SXM: 989.5 × 10¹² (half the 1,979 TFLOPS "with sparsity" on NVIDIA's page) ÷
+  3.35 × 10¹² ≈ **295**.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Serving system"
+  senior={["Covers every topic with a mechanism and one number, and raises cold starts unprompted."]}
+  staff={["Picks which promises the system makes per tier (latency, no lost requests, resume), and which metric shows each is being broken."]}
+/>
+
+A Senior answer covers the whole list. A Staff answer also turns it into promises: what each tier is guaranteed,
+and which dashboard line shows the promise breaking.
+
+## Small-team version
+
+Don't build this. Use a serving engine such as vLLM behind a managed endpoint, or a hosted API. Your part is still
+real:
+
+- **Own:** per-tenant budgets at admission, client timeouts, cancellation on disconnect, and the dashboards.
+- **Self-host only** when volume, data rules or a fine-tuned model justify it.
+
+**The money.** One always-on H100 at about $3.95 an hour costs about **$2,884 a month**. That matches a per-token
+(serverless) price of $0.20 per million tokens only at about **14.4 billion tokens a month**, which is about 5,490
+tokens per second around the clock, before anyone's time. Most small teams are far below that.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- 3.95 × 730 hours ≈ **$2,884** a month.
+- $2,884 ÷ $0.20 per million ≈ 14,420 million ≈ **14.4 billion tokens** a month.
+- 14.4 × 10⁹ ÷ (730 × 3,600 s) ≈ **5,490 tokens per second**.
+- Prices from the family walkthrough (Modal's per-second H100 price and Fireworks' serverless rate).
+
+</details>
+
+## Pitfalls
+
+- **Spending the round on one topic.** The question is a list; cover it all first, then go deep where asked.
+- **Autoscaling on GPU utilisation.** It reads busy while requests wait for memory; queue depth and time to first
+  token track real load.
+- **Forgetting cold starts and the cost of scale to zero.** A 70 s load is a user-visible outage unless you plan for
+  it.
+- **No plan for a reply already streaming when the engine crashes.** The client sees half an answer unless you state
+  error or resume.
+
+## Go deeper
+
+- Family walkthrough: [Run many models for many tenants](/system-design-labs/interviews/walkthroughs/multi-tenant-gpu-serving/#failure-modes-and-overload).
+- Batching depth: [From one batcher to a fleet](/system-design-labs/interviews/walkthroughs/batcher-to-fleet/); streaming: [chat serving and streaming](/system-design-labs/interviews/walkthroughs/chat-serving-streaming/).
+- Labs: <LabRef lab="llm-inference" inline />, <LabRef lab="faas-runtime" inline />, <LabRef lab="rate-limiter" inline />.

@@ -1,0 +1,154 @@
+---
+question: infra-048
+family: multi-tenant-gpu-serving
+status: published
+labs: [rate-limiter, lora-finetune, consistent-hashing]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Adapters are cheap and batch slots are not. One GPU holds over a hundred tenants' adapters next to the base
+> model, so starvation isn't about adapter memory. It's about who gets the GPU memory for in-flight requests and a
+> place in the next batch. So I charge tokens in a weighted fair queue, cap each tenant's in-flight requests, keep
+> adapters in a small cache with affinity routing, and add aging so a rarely used adapter can't wait forever behind
+> popular ones."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see whether you look at the right scarce resource.
+
+Most engineers hear "many tenants' custom models on one GPU" and think the problem is fitting the custom models in
+memory, like a cache that's too small. It isn't. The custom part is tiny. The expensive, shared part is the GPU
+memory each running request holds and the limited number of places in each batch. That's a scheduling problem you
+already know from shared queues, with two twists: requests differ in cost by a hundred times, and the batcher has a
+reason to prefer some requests over others.
+
+The prompt appears in one prep article on Together AI, with no first-hand source (<Cite id="s-9597947584" />), so
+expect the interviewer to push on how you define "fair" and on the rarely used adapter.
+
+### Words you need first
+
+- **Base model and weights.** The shared model, a large file of learned numbers. We'll use Llama-3.1-8B: 8 billion
+  numbers at 2 bytes each, about 16 GB, on one 80 GB GPU.
+- **LoRA adapter.** A small add-on (LoRA means low-rank adaptation) that customises the base model for one tenant.
+  Instead of changing the big weight matrices, it adds a thin correction to some of them. Its thinness is called
+  the **rank**; 16 is common.
+- **Token and KV cache.** Models read and write text in tokens (about ¾ of a word). While a request runs, the GPU
+  keeps a saved summary of its tokens, the KV cache. Each running request is a **sequence**, and the set the GPU
+  works on together is a **batch**.
+
+## Clarify first
+
+- **Fair by what?** Requests, tokens or GPU-seconds? "I'll assume tokens: prompt plus expected output."
+- **Tiers.** Weights per tenant? Can a tier be pushed out of a batch for a higher one?
+- **Base model and adapter rank.** "I'll assume Llama-3.1-8B, rank 16 on the four attention matrices q, k, v and o."
+- **Latency bound per request**, and whether a tenant may burst into idle capacity.
+
+## Answer
+
+### First, size the adapters
+
+| Item | Value | What to say in the interview |
+|---|---|---|
+| One rank-16 adapter on the 8B model | **about 27 MB** | "Tiny next to a 16 GB base." |
+| Adapters in a 4 GB pool on one GPU | **about 146** | "Adapter memory isn't the limit." |
+| Copying one in from the server's memory | **about 1.4 ms** | "A miss costs a millisecond, not seconds." |
+| Running requests that fit on the GPU (4,096 tokens each) | **about 104** | "This is the scarce thing, and every tenant shares it." |
+
+Adapters don't change the KV cache size per token, because the base model's shapes are the same. So every tenant's
+requests draw on the same 104 batch slots.
+
+### The picture
+
+```
+Tenants A, B, C  ──►  Gateway: per-tenant token budget
+                          │
+                          ▼
+              Router: consistent hash on adapter id (with a load bound)
+                          │
+                          ▼
+         Replica: fair queue (tokens, weighted by tier) + per-tenant cap
+                          │
+                          ▼
+         Batch of up to ~104 sequences on one 8B base
+         Adapter cache in GPU memory (LRU, refilled from server memory)
+```
+
+### Follow one busy minute
+
+Three tenants share a replica. Tenant A sends short chat requests. Tenant B sends a few. Tenant C, on a higher tier,
+is a batch job with 300 long requests queued. With a first-come-first-served queue, C takes all 104 slots and A
+waits behind 300 long requests. Four mechanisms fix this.
+
+1. **A fair queue that charges tokens.** Use weighted fair queueing (deficit round robin is a simple version): each
+   tenant gets service in proportion to a weight from its tier, and each request costs its tokens. With weights 1,
+   1 and 2, A, B and C get **25%, 25% and 50%** of the tokens served while all three are active. It is
+   **work-conserving**: when A and B go quiet, C may use everything.
+2. **Concurrency caps.** Cap each tenant's running requests per replica, for example **32 of the 104 slots**.
+3. **An adapter cache.** Keep a least-recently-used (LRU) cache of adapters in GPU memory, refilled from the
+   server's memory. Pin the adapters of tenants who pay for reserved capacity.
+4. **Affinity routing.** Send each adapter to a small set of replicas by consistent hashing on its id, with a load
+   bound, so a busy tenant spills onto more replicas instead of overloading one.
+
+### The second starvation path: what shares a batch
+
+Running several adapters in one batch needs special GPU code (a **kernel**) that applies a different correction to
+each sequence. Punica reported only 2 ms added per token in 2023
+([arXiv 2310.18547](https://arxiv.org/abs/2310.18547)). But engines limit how many adapters share a batch: vLLM's
+`--max-loras` is "Max number of LoRAs in a single batch", with default 1
+([vLLM engine arguments](https://docs.vllm.ai/en/latest/configuration/engine_args.html), fetched 2026-10-12).
+
+If the batcher prefers batches of one adapter because they run faster, a rarely used adapter waits behind popular
+ones, maybe forever. Fix it with **aging**: once a request passes its wait bound, it joins the next batch whatever
+that does to efficiency.
+
+Say: "There are two ways to starve: a heavy tenant fills every slot, and a rare adapter never gets picked. Fair
+queueing and caps fix the first. Aging fixes the second."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Adapter size:** each adapted matrix of shape d_in → d_out gets r × (d_in + d_out) numbers. For Llama-3.1-8B, q
+  and o are 4,096 → 4,096 and k and v are 4,096 → 1,024. Per layer: 16 × (8,192 + 5,120 + 5,120 + 8,192) =
+  425,984. × 32 layers = 13.6M numbers × 2 bytes ≈ **27.3 MB**.
+- **Pool:** 4 × 10⁹ ÷ 27.3 × 10⁶ ≈ **146** adapters. **Copy:** 27.3 MB ÷ 20 GB/s (assumed) ≈ **1.4 ms**.
+- **Batch slots:** KV per token = 2 × 32 × 8 × 128 × 2 = 131,072 B. Free memory = 80 − 16 − 8 (assumed overhead)
+  = 56 GB → about 427,000 tokens ÷ 4,096 ≈ **104** sequences.
+- **Fair shares:** weights 1 : 1 : 2 → 1/4, 1/4, 2/4.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Multi-tenant LoRA"
+  senior={["Does the adapter arithmetic, then fair queueing by tokens, caps and aging."]}
+  staff={["Measures throughput against distinct adapters per batch before setting the cap, and adds per-adapter canary prompts so a wrong-adapter response is caught."]}
+/>
+
+A Staff answer also worries about the silent failure: a request served with the wrong adapter returns fluent text
+and a 200, so a few fixed test prompts per adapter, run on a schedule, are the only way to catch it.
+
+## Small-team version
+
+With a few internal variants of one model, run them as adapters on one GPU: vLLM with `--enable-lora` and
+`--max-loras` above 1. Or use a per-token (serverless) provider that serves fine-tuned models at the base price.
+Keep per-tenant token caps even with three tenants; one batch job can still starve the chat feature.
+
+**The money.** Six variants as six separate deployments on always-on H100s at about $3.95 an hour cost about
+**$17,300 a month** (6 × $2,884). As six adapters on one GPU, about **$2,884** (family walkthrough, prices fetched
+2026-10-11).
+
+## Pitfalls
+
+- **Fairness by request count.** Requests differ by 100× in tokens, so request counts reward the heaviest tenant.
+- **Assuming adapter memory is the bottleneck.** A hundred adapters fit; batch slots run out first.
+- **Leaving the adapters-per-batch limit at 1 without noticing.** Then different adapters can never share a batch.
+- **No aging.** A rarely used adapter can wait forever behind popular ones.
+
+## Go deeper
+
+- Family walkthrough: [multi-tenant LoRA deep dive](/system-design-labs/interviews/walkthroughs/multi-tenant-gpu-serving/#deep-dives).
+- Labs: <LabRef lab="rate-limiter" inline />, <LabRef lab="lora-finetune" inline />, <LabRef lab="consistent-hashing" inline />.

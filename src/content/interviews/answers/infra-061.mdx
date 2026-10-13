@@ -1,0 +1,186 @@
+---
+question: infra-061
+family: rate-limits-admission
+status: published
+labs: [rate-limiter, wal]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "GPU credits are money, so I'd build them like a payments system, not a counter. Every change is an append-only
+> ledger entry: grants that expire, holds for work that is about to run, captures for metered use, releases for
+> unused holds, and expiries. The balance is computed from the entries. Usage events carry a unique key so a retry
+> can't charge twice, and an hourly job reconciles the ledger against what the GPU scheduler says actually ran."
+>
+> The rest of this page explains each part of that answer.
+
+You may picture credits as a number in a column: the customer has 1,000, they use 24, now they have 976. That
+works until the first hard question:
+
+- **Which credits expired?** A customer has 100 promotional hours that expire next month and 1,000 purchased hours
+  that expire next year. Which ones did yesterday's job use?
+- **What if the usage event is retried?** The meter sends "used 8 GPU-minutes" twice after a network blip. Did
+  you charge twice?
+- **What about work that is still running?** A three-hour job has started. The balance looks fine now, but will it
+  cover the job?
+- **Does the bill match reality?** Did the GPUs actually run as long as you charged for?
+
+A single balance column answers none of these. A ledger answers all of them. So the interviewer is really asking:
+can you build a money-like system on top of a compute system?
+
+A **GPU** is the chip that runs AI training and inference; it is scarce and expensive, so companies sell time on
+it. A **GPU-hour** is one GPU for one hour, a common unit for credits.
+
+(The prompt, "design a GPU credit management system", is tagged OpenAI on a company-tagged question list with no
+further detail <Cite id="s-5fa409d1c2" />.)
+
+## Clarify first
+
+- **What unit?** "GPU-hours, dollars or tokens? I'll assume GPU-hours, with a conversion for inference."
+- **Prepaid or billed afterwards?** "Assume prepaid grants, purchased and promotional, each with an expiry date."
+- **What workloads?** "Both long jobs, like training a model further on customer data (fine-tuning), and short
+  inference requests."
+- **What happens at zero during a job?** "I'd ask. My default is a small overdraft, then save the job's progress
+  and stop it."
+- **How exact?** "Exact for money; jobs metered per minute."
+
+## Answer
+
+### The ledger entries
+
+Keep append-only entries per organization. Follow one customer, Acme (made up), through one fine-tuning job
+estimated at **8 GPUs for 3 hours**:
+
+| Entry | Meaning | Acme's example | What to say in the interview |
+|---|---|---|---|
+| `grant` | Credit added, with an expiry | +100 promotional (expires 2026-11-01); +1,000 purchased (expires 2027-10-01) | "Each grant keeps its own expiry." |
+| `hold` | Credit set aside for work about to run | −24 GPU-hours for the job (8 × 3) | "Admission checks available credit, not the balance." |
+| `capture` | Credit actually used, metered | −0.133 GPU-hours each minute (8 GPU-minutes), drawn from the promotional grant first | "Spend the earliest-expiring grant first, and record which grant." |
+| `release` | Unused part of a hold, given back | If the job ends after 2.5 hours, +4 GPU-hours | "Holds are estimates; releases correct them." |
+| `expire` | What was left of a grant at its expiry | Any promotional hours left on 2026-11-01 | "A scheduled job writes these, after warning the customer." |
+
+### The rules that make it correct
+
+- **Available = grants − captures − open holds − expiries.** New work is admitted only if its hold fits in
+  "available". The balance is always computed from entries, never stored as the only truth.
+- **Earliest expiry first.** Acme's 100 promotional hours are used before its purchased hours, so the customer
+  doesn't lose credit they could have used.
+- **Holds in chunks for long jobs.** One hold at the start can be outrun by a job that runs longer than
+  estimated. Take a fresh hold every so often as the job runs.
+- **Idempotent metering.** Every usage event carries a unique key such as `(job id, minute)`. If the same event
+  arrives twice, the second is ignored. Doing something twice with the same effect as once is called being
+  **idempotent**.
+- **Expiry** is a scheduled job that writes `expire` entries. Warn customers before it runs.
+- **Reconciliation.** Every hour, compare captures with the GPU-seconds in the scheduler's own records. The ledger
+  is the truth for money; the scheduler is the truth for time. Any gap gets an alert and an owner.
+
+Say: "The ledger and the scheduler should agree. If they don't, someone owns finding out why."
+
+### How it connects to the rest of the system
+
+```
+Customer submits a job
+   │
+   ▼
+Gateway / admission ── available credit ≥ hold? if not, refuse with "balance", not "retry later"
+   │ writes hold
+   ▼
+GPU scheduler ── runs the job on 8 GPUs
+   │ every minute: usage event (job id, minute, 8 GPU-minutes)
+   ▼
+Meter ── ignores duplicates by (job id, minute); writes a capture
+   ▼
+Ledger ◄── hourly reconciliation against the scheduler's GPU-seconds
+```
+
+**Gateway and admission.** It refuses work whose hold exceeds available credit. The error must say "out of
+balance", because a "try again later" error makes clients retry something that won't succeed.
+
+**GPU scheduler.** It runs the job and is the source of truth for how long the GPUs were busy.
+
+**Meter.** It turns scheduler events into captures, dropping duplicates by their key.
+
+**Ledger.** The append-only entries above, plus the hourly comparison with the scheduler.
+
+### Inference billed in GPU-hours
+
+If short inference requests also draw on GPU-hour credits, you need a conversion. Inference is measured in
+**tokens**, pieces of text roughly ¾ of a word each. The model reads the prompt's tokens (**input**) and writes
+reply tokens (**output**). At peak, one 8-GPU node writes about 18,500 tokens a second and reads about 56,100
+(from the family walkthrough's example). That gives about **0.12 GPU-hours per million output tokens** and **0.040
+per million input tokens**. Say that these are floors at full use; a real rate adds headroom for idle capacity.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Hold:** 8 GPUs × 3 h = 24 GPU-hours. **Capture per minute:** 8 GPU-minutes = 8 ÷ 60 ≈ 0.133 GPU-hours.
+- **Release in the example:** used 8 × 2.5 = 20 GPU-hours, so 24 − 20 = 4 released.
+
+<Formula
+  title="GPU-hours per million tokens"
+  expr="GPU-hours per 1 M tokens = GPUs per replica × (1,000,000 ÷ tokens per second) ÷ 3,600"
+  vars={[
+    { sym: 'tokens per second', meaning: 'per 8-GPU node at peak: about 18,500 decode, 56,100 prefill (family walkthrough)' },
+  ]}
+  example={[
+    'Output: 8 × 54 s ÷ 3,600 = 0.12 GPU-hours per 1 M tokens',
+    'Input: 8 × 17.8 s ÷ 3,600 = 0.040 GPU-hours per 1 M tokens',
+  ]}
+  note="Peak-utilization floors; a real rate adds headroom for idle capacity."
+/>
+
+In the formula, "decode" is writing output tokens and "prefill" is reading the input prompt.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="GPU credits"
+  senior={["Ledger entries with grants, holds, captures and expiry; earliest-expiry first; idempotent metering."]}
+  staff={["Defines the zero-balance policy for running work, the reconciliation between ledger and scheduler with an owner for gaps, and why prepaid exhaustion fails closed while per-minute limits may fail open."]}
+/>
+
+In plain words: a Senior answer gets the ledger right. A Staff answer also decides what happens to running work
+at zero, who owns a mismatch between ledger and scheduler, and why "out of credit" must block traffic even when a
+rate limiter would let it through during an outage (failing closed rather than open).
+
+## Small-team version
+
+**Skip GPU credits unless you resell compute.** The everyday version is a per-customer monthly token or dollar
+budget for an AI feature:
+
+- One row per customer per month, with "reserved" and "used" columns.
+- Update it in one database transaction when a request starts (reserve) and when it finishes (settle).
+- A usage page, so customers aren't surprised by their bill.
+
+**Price the budget from your cost per request.** Take the family walkthrough's assumed feature: about $0.0064
+per request on Claude Sonnet 5 (list prices fetched 2026-10-11). A plan that includes 1,000 requests a month costs
+you at most **$6.40 per customer** in model spend.
+
+**When the full ledger becomes necessary.** Build the ledger above only if you start reselling GPU time or selling
+prepaid credits. Then the money rules (fail closed, idempotent metering, reconciliation) are not optional.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Cost per request** (assumed 3,000 input tokens with 2,000 cached, 400 output; $2 / $0.20 / $10 per million
+  input / cached input / output tokens): $0.0020 + $0.0004 + $0.0040 = $0.0064.
+- **Per customer:** 1,000 × $0.0064 = $6.40.
+
+</details>
+
+## Pitfalls
+
+- **A single mutable balance column with no history.** You can't audit it, expire by grant, or undo a mistake.
+- **Charging from a grant without recording which grant.** Expiry and refunds then can't be computed.
+- **One hold at job start for a job that runs past it.** The job outruns its credit before anyone notices.
+- **Non-idempotent usage events.** A retried event charges the customer twice.
+
+## Go deeper
+
+- Family walkthrough: [Rate limits, credits and admission control](/system-design-labs/interviews/walkthroughs/rate-limits-admission/), especially "GPU credits are a ledger, not a balance".
+- The coding version with expiring credits: [multi-part practical coding](/system-design-labs/interviews/walkthroughs/multipart-practical-coding/).
+- Labs: <LabRef lab="wal" inline /> (append-only durability), <LabRef lab="rate-limiter" inline />.

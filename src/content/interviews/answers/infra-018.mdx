@@ -1,0 +1,159 @@
+---
+question: infra-018
+family: multipart-practical-coding
+status: published
+labs: [observability]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Each sample is the call stack at one moment. To turn samples into start and end events, I compare each stack
+> with the previous one and find how much of it, from the outermost frame, is still the same. Frames past that
+> shared part in the old stack have ended, so I emit their ends innermost first. Frames past it in the new stack
+> have started, so I emit their starts outermost first. I compare frames by position, not by name, so recursion
+> works. And I'll say up front what sampling can't see: calls shorter than the gap between samples."
+>
+> The rest of this page explains each part of that answer.
+
+A **sampling profiler** is a tool that finds where a program spends its time. Every few milliseconds it pauses the
+program and records the **call stack**: the list of functions currently running, from the outermost (`main`) to
+the innermost (the one actually executing). The question asks you to turn that list of snapshots into a **trace**:
+events saying "function X started at time t1" and "function X ended at time t2".
+
+This is different from parsing a log. A log tells you what happened. Samples only tell you what was true at certain
+moments, and you must infer the starts and ends between them. That makes the first version short (it is a diff
+between consecutive stacks), and it makes the follow-up interesting, because each change to the input format
+breaks a different assumption you made silently.
+
+In a 2025 Anthropic Senior/Staff report, the phone screen (about an hour, in a Colab-like notebook) asked how to
+convert stack samples to a trace, then: "Assume one of the original restrictions is removed. How would you handle
+the follow-up version efficiently?" The candidate "didn't finish that part" but kept talking through the approach
+and passed the screen (<Cite id="s-4e04a1689c" />). A Safeguards candidate's loop also had a coding round on turning
+profiling samples into execution traces (<Cite id="s-42f1c7f6dd" />).
+
+## Clarify first
+
+- **Sample format:** `(timestamp, [outermost, …, innermost])`? Assume yes.
+- **Identity:** is a frame its function name, or its position in the stack? Use position. In a recursive call
+  `main → h → h`, the second `h` is a different call from the first.
+- **Timing:** does an event take the timestamp of the sample where the change is first seen? Assume yes.
+- **End of trace:** close every open frame at the last sample's time.
+- **Same function called twice in a row:** sampling can't see the gap between the two calls; two samples with the
+  same stack look like one call. Say this limitation out loud.
+
+Say it like this: "I'll treat a frame as its position in the stack, so recursion works. And I want to flag one
+limit early: if a function returns and is called again between two samples, I'll see one call, not two."
+
+## Answer
+
+### Words you need first
+
+- A **frame** is one entry in the call stack: one function call that hasn't returned yet.
+- The **common prefix** of two stacks is how many frames, counting from the outermost, are identical in both. Those
+  calls were running at both moments.
+
+### The idea in one picture
+
+```
+ sample at t=20:  main  load  parse
+ sample at t=30:  main  render
+                  ────
+                  common prefix = 1 frame (main)
+
+ old frames past the prefix: load, parse  → end parse, then end load   (innermost first)
+ new frames past the prefix: render       → start render
+```
+
+Ends come innermost first because a function can't return before the functions it called. Starts come outermost
+first for the same reason in reverse.
+
+### The code
+
+For each sample, find the longest common prefix with the previous stack. Frames past it in the old stack ended
+(emit innermost first); frames past it in the new stack started (emit outermost first).
+
+```python
+def samples_to_events(samples):
+    """samples: list of (ts, [outermost, ..., innermost]). Frames compared by position."""
+    events, prev = [], []
+    for ts, stack in samples:
+        common = 0
+        while common < min(len(prev), len(stack)) and prev[common] == stack[common]:
+            common += 1
+        for fn in reversed(prev[common:]):            # innermost ends first
+            events.append(("end", fn, ts))
+        for fn in stack[common:]:                     # outermost starts first
+            events.append(("start", fn, ts))
+        prev = stack
+    if samples:
+        for fn in reversed(prev):
+            events.append(("end", fn, samples[-1][0]))
+    return events
+```
+
+It runs in time proportional to the total number of frames across all samples, and it keeps only the previous
+stack in memory.
+
+### Six samples through it
+
+These events come from running the function above on six samples taken every 10 ms.
+
+| Time | Stack | Events emitted | What to say in the interview |
+|---|---|---|---|
+| 0 | main | start main | "First sample: everything starts." |
+| 10 | main, load | start load | "Prefix is main; load is new." |
+| 20 | main, load, parse | start parse | "Nested start." |
+| 30 | main, render | end parse, end load, start render | "Two ends at once, innermost first, then the sibling starts." |
+| 40 | main, render, render | start render | "Recursion: the second render is a new frame because it's at a new position." |
+| 50 | main | end render, end render, end main | "Last sample: render returns twice; then I close main at the last timestamp." |
+
+The test that pins it down covers the same cases: a nested start, two ends at once in the right order, a sibling
+call replacing another, and recursion (`h` then `h, h`). It passed when run on 2026-10-12.
+
+### The follow-up: one restriction removed
+
+The report doesn't say which restriction was removed. Plausible ones, and what each changes:
+
+- **Samples may arrive out of order:** sort by timestamp first, or keep a small buffer if it is a stream.
+- **A minimum duration:** only emit calls seen in at least N consecutive samples. Hold starts as pending and emit
+  a call only once it has survived N samples. This is a **debounce**, and it needs care with nested frames.
+- **Streaming input:** the algorithm already works one sample at a time with memory proportional to stack depth;
+  say so.
+- **Multiple threads:** keep a separate `prev` per thread id.
+
+Whatever it is, name which assumption the first version relied on before changing code. Say it like this: "My
+first version assumed samples arrive sorted. Removing that breaks the `prev` comparison, so the fix goes before the
+loop, not inside it."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Stack samples to a trace"
+  senior={["Prefix diff with correct end/start ordering, frames by position, a test with recursion."]}
+  staff={["Names sampling's limits (missed short calls, repeated calls merged) unprompted, and handles the changed restriction by identifying the assumption first."]}
+/>
+
+## Small-team version
+
+You won't write a profiler, but you will read one: py-spy, perf or your cloud's profiler, when a model-serving
+service or a data-ingestion job is slow. Knowing that sampled traces miss short calls and merge repeated ones keeps
+you from over-reading a **flame graph** (the usual chart of profiler samples, where width shows time).
+
+For features built on a language model, the trace you'll read most is different: one **span** (a timed record
+with a start, an end and a parent) per model call and per tool call. An observability vendor or OpenTelemetry gives
+you that; buy it rather than building it.
+
+## Pitfalls
+
+- **Comparing frames by name.** It breaks on recursion: `h` inside `h` looks like the same call.
+- **Emitting ends outermost first.** The trace then says a function returned before the functions it called.
+- **Forgetting to close open frames at the end.** The last calls never get an end event.
+- **Spending the hour on the first version.** The follow-up is where the round is decided; leave time for it.
+
+## Go deeper
+
+- Family walkthrough: [Multi-part practical coding](/system-design-labs/interviews/walkthroughs/multipart-practical-coding/), on pacing and what follow-ups change.
+- The companion problem, from start/end events to the slowest function: [infra-019](/system-design-labs/interviews/questions/infra-019/).
+- Span data model with start, end and parent ids: <LabRef lab="observability" inline />.

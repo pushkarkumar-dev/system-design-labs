@@ -1,0 +1,889 @@
+---
+title: "KV cache and GPU memory math: sizing, paging and OOMs"
+summary: "How much GPU memory a self-hosted LLM needs and how many users it serves: weights, the per-token KV cache, TP=2 vs TP=4 for a 70B model, paged blocks, and a pod OOMKilled on an 80 GB GPU."
+track: ai-infra
+format: estimation
+family: kv-cache-memory-math
+smallTeamFocus: "Default to a managed API. If you self-host, size it first: cache memory per user picks the GPU. A smaller model that passes your eval cuts cost per user more than any GPU choice; utilization sets the break-even."
+rounds: [domain-deep-dive, debugging, ml-system-design]
+level: both
+timeboxMin: 45
+order: 114
+status: published
+basedOn: [r2a-017, r2a-026, infra-038, infra-042, infra-081, eng-077]
+askedAt: [anthropic, apple, applied-ai-generic, nvidia, modal, together-ai, fireworks-ai, groq, cerebras, faang-unnamed, other]
+labs:
+  - { lab: llm-inference, role: partial, note: "kv_cache_size_formula takes n_kv_heads, and v2's PagedKVCache hands out 16-token pages; the pages are bookkeeping only and the throughput rows are estimates." }
+  - { lab: transformer, role: proof, note: "A small GPT whose generate() re-runs the whole context with no KV cache: the baseline the cache removes." }
+  - { lab: model-quantizer, role: partial, note: "INT8 and INT4 group-scale sizes and measured GPT-2 weight error; its perplexity table is an illustration." }
+gapLabs: []
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "GPU memory holds two things: the model's weights, which are a fixed cost, and the KV cache, a working memory
+> that every active conversation adds to with every token. For Llama-3.1-70B the cache costs about a third of a
+> megabyte per token, so one 8,000-token conversation holds 2.7 GB. On four 80 GB A100 GPUs the weights take
+> 141 GB, and what is left holds about 59 such conversations at once if each one reserves its maximum, and about
+> four and a half times as many with a paged allocator that only reserves what each conversation has used. That memory number,
+> not GPU speed, decides how many users a box serves, which GPU you rent, and whether an out-of-memory crash is a
+> bug or a sizing mistake."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+Every question in this family is the same job: explain what the KV cache stores and why it makes the model
+fast, then size a real deployment from the model's published shape. The variants push on one part: how to split
+the model across GPUs, the memory allocator, or a pod that keeps crashing.
+
+### What makes this different from sizing a normal service
+
+A backend engineer sizes a normal web service by CPU and connections. Each request uses a few kilobytes of
+buffers for a few milliseconds and then frees them. Memory is rarely the limit, and when it is, you add RAM or
+another instance.
+
+Serving a large language model (**LLM**, the kind of model behind ChatGPT or Claude) on your own GPUs is closer
+to sizing a Redis cluster than a stateless web tier. Three things make it so:
+
+1. **The program itself is enormous.** A model with 70 billion parameters (the numbers it is made of) is
+   141 GB that must sit in GPU memory before the first request arrives. That is more than one GPU holds.
+2. **Every conversation keeps state on the GPU for its whole life.** While a reply is being written, which
+   takes seconds to minutes, the GPU holds a working memory for that conversation. It grows with every token
+   the model reads or writes.
+3. **GPU memory is fixed and expensive.** An A100 or H100 card has 80 GB, and you can't add more to it. When
+   it is full, the server has to refuse new work, pause a conversation, or crash.
+
+So capacity planning becomes a memory budget: a fixed cost (the weights), plus bytes per token times the
+tokens of every conversation in flight.
+
+### Words you need first
+
+- **Token**: the unit a model reads and writes, roughly ¾ of an English word. "Context" means all the tokens
+  of one conversation so far: system instructions, history, the new message and the reply.
+- **Parameters** (or **weights**): the numbers that make up the model. "70B" means about 70 billion of them.
+  Each is stored in a number format. The usual one is **bf16**, a 16-bit format that takes 2 bytes per number.
+- **GPU memory**: the memory on the GPU card itself, called **HBM** (high-bandwidth memory) on data-centre
+  cards. It has a size (80 GB on an A100) and a speed, **memory bandwidth**: how many bytes per second the GPU
+  can read from it (about 2 TB/s on an A100).
+- **Prefill and decode**: the model first reads the whole prompt in one big pass (**prefill**). Then it writes
+  the reply one token at a time, one pass per token (**decode**).
+- **KV cache**: the saved working memory from the earlier tokens, which lets each decode pass process only the
+  new token instead of re-reading everything. Section 1 of the derivations explains exactly what is in it.
+
+Other terms are defined where they first appear.
+
+### The example on this page
+
+The whole page follows one deployment. A company wants to self-host **Llama-3.1-70B** for an internal chat
+assistant. It has one server with **four A100 80 GB GPUs**, connected by NVLink (NVIDIA's fast cable between
+GPUs in one server). Each conversation may use up to **8,192 tokens** ("8K"). The numbers below are worked out
+in the derivations; this table is the map, and each term in it is explained in its section.
+
+| Step | Question | Answer for the example box | What to say in the interview |
+|---|---|---|---|
+| 1 | What does the cache hold? | Keys and values for every earlier token, per layer | "It saves work the model would otherwise redo for every new token." |
+| 2 | Bytes per token? | **320 KiB**; 2.68 GB per 8K conversation | "I use KV heads, not hidden size, or I'm 8× too high." |
+| 3 | Weights? | **141.1 GB** in bf16 | "Weights are a fixed cost, paid once per copy of the model." |
+| 4 | How many conversations fit? | **59** at a full 8K each | "That's the worst case; paging does better." |
+| 5 | How fast is each step? | **17.3 ms** alone, **36.7 ms** with 59 conversations | "Every step reads all the weights plus every conversation's cache." |
+| 6 | Split over 2 GPUs or 4? | 4 in bf16; a real trade in int8 | "Two GPUs leave room for only 3 conversations." |
+| 7 | What does paging buy? | About **268** at an average of 1,800 tokens | "Memory stops being the limit; compute and latency take over." |
+| 8 | Why did the pod crash? | Name the memory first: host or GPU | "`OOMKilled` is a host-memory event; the KV cache is on the GPU." |
+| 9 | What does it cost? | $4,059–$4,643 a month; beats an API only above 27–30% load | "Default to an API until the volume clears that bar." |
+
+These questions were reported on interview-report sites and prep guides; the next section says which.
+
+<QuestionRow id="r2a-017" />
+<QuestionRow id="r2a-026" />
+<QuestionRow id="infra-038" />
+<QuestionRow id="infra-042" />
+<QuestionRow id="infra-081" />
+<QuestionRow id="eng-077" />
+
+The speed side of the same numbers (why decode waits on memory, how a matrix multiply is split across GPUs) is
+in [Roofline and sharded-matmul math](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/).
+
+## What is being tested
+
+Interviewers use this family to check these things, in rising order of seniority:
+
+- **The concept, early.** "What is the KV cache?" was reported as the opening question of an Apple GenAI round
+  (<Cite id="s-1b8091345c" />), and CentML rounds as starting from paged attention, a way of managing that cache
+  (section 7; <Cite id="s-fdc0969e32" />). Both are short snippets, so low confidence.
+- **The formula, done live.** A serving prep guide gives the cache formula and says "interviewers like watching
+  you do it" (<Cite id="s-75e82f8882" />). A Together AI interview article puts the point plainly: "the KV cache,
+  not the weights, is what eats your VRAM" (<Cite id="s-9597947584" />). VRAM is another name for GPU memory.
+- **A decision made from the bytes.** A 2026 prep guide lists "How would you serve a 70B model on 4 A100 80GB?"
+  and "How do you choose between TP=2 and TP=4 for a given model?", two ways of splitting the model across GPUs
+  (section 6; <Cite id="s-f07fcd5321" />).
+- **Debugging by naming the memory.** A CUDA prep guide's question about a pod that keeps getting killed expects
+  an answer that "connects the KV cache growing with sequence length and batch size to the fix"
+  (<Cite id="s-55d540eda9" />).
+- **LLM fluency inside a design round.** A Blind commenter writes that "interviewers now expect fluency in
+  LLM-specific tradeoffs like KV cache management, batching strategies, and eval design"
+  (<Cite id="s-fe60d2bf1f" />).
+
+No first-hand report has an interviewer demanding a page of cache arithmetic, and one Anthropic
+engineering-manager candidate described a design round about judgment more than detailed calculation
+(<Cite id="s-4e3dc29a95" />). So practise one thing: get one number fast, with the right formula and units, then
+say what it changes.
+
+## Clarify and scope
+
+Ask these before you compute anything, and write the answers down where the interviewer can see them:
+
+1. **Which model, exactly?** You need four values from its `config.json`, the small file published with the
+   weights that lists the model's shape: the number of layers (`num_hidden_layers`), the number of KV heads
+   (`num_key_value_heads`), the size of each head (head_dim), and the parameter count. Section 2 explains heads. The name is not enough.
+   "Llama-3-70B" and "Llama-3.1-70B" have the same shape but not the same maximum context (8,192 vs 131,072
+   tokens).
+2. **What precision for the weights, and for the cache?** Precision is how many bits each stored number uses.
+   Fewer bits means less memory and some loss of accuracy; shrinking the numbers this way is called
+   **quantization**. The common choices are bf16 (16 bits), fp8 or int8 (8 bits) and int4 (4 bits). The cache
+   can use a different precision from the weights.
+3. **How long are conversations, as a distribution?** Count prompt plus reply. The maximum sizes the worst
+   case. The average sizes a paged allocator (section 7).
+4. **What latency, and how many users at once?** The usual target is the gap between words, called
+   **inter-token latency**, plus the number of conversations in flight.
+5. **Which GPUs, how many, and how are they connected?** NVLink inside one server, or the much slower PCIe bus.
+6. **Inference or training?** Training needs a different and much larger formula (section 9).
+7. **Which serving engine?** The engine is the program that runs the model, such as vLLM. It decides how much
+   memory it reserves and what happens when the cache runs out.
+
+Out of scope: GPU kernel details, mixture-of-experts memory, and serving one model across several servers.
+
+## Constants (dated)
+
+Four numbers describe a GPU for this page. **Memory** is how much fits. **Bandwidth** is how fast the GPU can
+read its memory, which sets how fast decode runs. **BF16 dense** is its peak math speed in TFLOPS (trillions of
+operations per second), which sets how fast prefill runs. **Link** is the GPU-to-GPU connection inside a server.
+NVIDIA's pages print the speed of the Tensor Cores (the GPU's matrix-math units) "with sparsity", a special case that doubles the figure; this page halves
+them to get the normal ("dense") figure. The A100 table prints both and they differ by exactly 2×.
+
+| GPU | Memory | Bandwidth | BF16 dense | Link | Source (fetched) |
+|---|---|---|---|---|---|
+| A100 80GB SXM | 80 GB HBM2e | 2,039 GB/s | 312 TFLOPS (624 sparse) | NVLink 600 GB/s total, 300 each way | <Cite id="s-8e443a8b66" label="NVIDIA A100" /> (2026-10-11) |
+| H100 SXM | 80 GB | 3.35 TB/s | ≈989.5 TFLOPS (page prints 1,979 with sparsity) | NVLink 900 GB/s total, 450 each way | [NVIDIA H100](https://www.nvidia.com/en-us/data-center/h100/) (2026-10-11) |
+| H200 SXM | 141 GB | 4.8 TB/s | ≈989.5 TFLOPS (1,979 with sparsity) | NVLink 900 GB/s | [NVIDIA H200](https://www.nvidia.com/en-us/data-center/h200/) (2026-10-12; page says "Preliminary specifications") |
+| L40S | 48 GB GDDR6 | 864 GB/s | 362.05 TFLOPS (733 sparse) | No NVLink; PCIe Gen4 64 GB/s bidirectional | [NVIDIA L40S](https://www.nvidia.com/en-us/data-center/l40s/) (2026-10-12) |
+| L4 | 24 GB | 300 GB/s | ≈121 TFLOPS (242 with sparsity; page says one-half without) | PCIe Gen4 64 GB/s | [NVIDIA L4](https://www.nvidia.com/en-us/data-center/l4/) (2026-10-12) |
+
+The per-direction NVLink figures come from NVIDIA's [Hopper architecture blog](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/)
+(fetched 2026-10-11): 18 links × 25 GB/s each way on H100, 12 on A100.
+
+The model numbers come from `config.json` copies of Meta's gated repositories, fetched 2026-10-11. A **layer** is
+one of the repeated blocks the model is built from; every token passes through all of them in order. The
+**heads** columns are explained in section 2. Parameter counts are computed from the shapes (small normalization
+weights left out). This page uses the exact 141.1 GB for the 70B model's bf16 weights, not the 140 GB you get
+from the rounded name.
+
+| Field | Llama-3.1-70B | Llama-3.1-8B | Llama-3.2-1B |
+|---|---|---|---|
+| Layers / query heads / KV heads | 80 / 64 / 8 | 32 / 32 / 8 | 16 / 32 / 8 |
+| head_dim | 128 | 128 | 64 |
+| Parameters | 70,552,387,584 | 8,029,995,008 | 1,235,746,816 |
+| KV per token, bf16 | 327,680 B (320 KiB) | 131,072 B (128 KiB) | 32,768 B (32 KiB) |
+| Weights, bf16 | 141.1 GB (131.4 GiB) | 16.06 GB (14.96 GiB) | 2.47 GB |
+| Source | <Cite id="s-6fdd575dc5" /> | <Cite id="s-20bffa9709" /> | [config.json](https://huggingface.co/unsloth/Llama-3.2-1B-Instruct/raw/main/config.json) |
+
+Units: **GB is 10⁹ bytes, GiB is 2³⁰ bytes, KiB is 1,024 bytes.** [Llama-3.3-70B's config](https://huggingface.co/unsloth/Llama-3.3-70B-Instruct/raw/main/config.json) (fetched
+2026-10-12) has the same shapes as Llama-3.1-70B, so every 70B number here applies to it too.
+
+What the serving engines have published:
+
+- vLLM's launch post (2023-06-20) says existing systems "waste 60% – 80% of memory due to fragmentation and
+  over-reservation", and that with PagedAttention there is "a mere waste of under 4%". Each block holds "the keys
+  and values for a fixed number of tokens" ([vLLM blog](https://vllm.ai/blog/2023-06-20-vllm), fetched
+  2026-10-12).
+- The PagedAttention paper reports 2–4× higher throughput than FasterTransformer and Orca "with the same level of
+  latency" ([arXiv 2309.06180](https://arxiv.org/abs/2309.06180), Sep 2023). That is a measured result for their
+  setup, not a multiplier to quote for yours.
+- vLLM's engine-arguments page lists `--gpu-memory-utilization` with a default of 0.92, and `--kv-cache-dtype`
+  with values including `fp8` ([docs](https://docs.vllm.ai/en/latest/configuration/engine_args.html), fetched
+  2026-10-12). Defaults change between versions; a January 2025 log in a vLLM issue shows 0.90.
+- vLLM's tuning page says that when cache space runs short, vLLM pauses ("preempts") requests, and "in vLLM V1,
+  the default preemption mode is `RECOMPUTE`" ([docs](https://docs.vllm.ai/en/latest/configuration/optimization.html),
+  fetched 2026-10-12).
+
+Assumptions. These are round numbers that make the arithmetic concrete; they are not quoted facts.
+
+- **5 GB per GPU of overhead that is not cache**: temporary working memory during a pass (**activations**), the
+  GPU driver's own state, and gaps between allocations. This is the number most worth measuring. The vLLM log in
+  the sanity checks shows a 9.37 GiB activation peak on a single A100.
+- **8K tokens per conversation** as the worst case, unless stated.
+- **Rental prices** are list prices fetched 2026-10-11, per GPU-hour, on demand: RunPod A100 80GB $1.39–$1.59,
+  H100 SXM $2.69–$3.49, H200 $3.59–$4.59, L40S $0.79–$1.09, L4 $0.44–$0.49 ([RunPod](https://www.runpod.io/pricing),
+  page "Updated September 27, 2026"); Lambda 1× H100 SXM $4.29 ([Lambda](https://lambda.ai/pricing)); Together
+  serverless Llama 3.3 70B $1.04 per 1M tokens in and out ([Together](https://www.together.ai/pricing)). RunPod's
+  page as recorded doesn't say whether its A100 is the SXM or the PCIe card (PCIe bandwidth is 1,935 GB/s).
+  Re-check prices before you use them.
+
+## Derivations
+
+### 1. What the cache stores, and the work it saves
+
+To write each new token, the model has to look back at every earlier token. It does this in a step called
+**attention**, inside every layer. Attention turns each token into three short lists of numbers (vectors):
+
+- a **query**: "what is this token looking for?"
+- a **key**: "what does this token contain?"
+- a **value**: "what does this token pass on if someone looks at it?"
+
+The new token's query is compared with the key of every earlier token. The better the match, the more of that
+token's value is mixed into the result.
+
+Here is the property that makes a cache possible. These models are **causal**: a token can look at earlier
+tokens but never at later ones. So once a token's key and value are computed, they never change, however long
+the conversation gets. The model can compute them once and keep them. That store of saved keys and values, for
+every layer, is the **KV cache**.
+
+```
+Without a cache                          With a KV cache
+---------------                          ---------------
+step 1: run tokens 1..1000  → token 1001  prefill: run tokens 1..1000 once,
+step 2: run tokens 1..1001  → token 1002           save their keys and values
+step 3: run tokens 1..1002  → token 1003  step 1: run token 1001 only,
+  ...  (each step redoes all the         read saved keys/values → token 1002
+        earlier tokens)                   step 2: run token 1002 only, ...
+```
+
+With the cache, each decode step pushes one new token through the model and reads the rest from memory. For a 1,000-token prompt and a
+1,000-token reply, that is the difference between about **1.5 million** token passes and about **2,000**:
+**about 750× less matrix work**.
+
+The price is memory. The cache grows with every token, and every decode step must read all of it. For the small
+Llama-3.1-8B model, those 2,000 tokens of cache take **262 MB**. The cache turns a computing problem into a
+memory problem, which is why the rest of this page is about bytes.
+
+Say it like this: "The KV cache stores each earlier token's keys and values, per layer. They never change in a
+causal model, so we compute them once. It trades recomputation for GPU memory."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Count **token-forwards**: one token pushed through every weight matrix, about 2 × parameters operations. Take a
+prompt of p tokens and a reply of n tokens.
+
+- **Without a cache**, step t re-runs all p + t tokens: Σ (p + t) for t = 0 … n − 1.
+  For p = 1,000 and n = 1,000: 1,000 × 1,000 + 999 × 1,000 ÷ 2 = **1,499,500** token-forwards.
+- **With a cache**: the prompt once, then one token per later step: p + (n − 1) = **1,999**.
+- 1,499,500 ÷ 1,999 ≈ **750×** less matrix work.
+- **Memory for the 8B model**: 2,000 tokens × 131,072 B (section 2) = **262 MB**.
+
+</details>
+
+### 2. KV bytes per token
+
+The cache size per token follows directly from what it stores. For each token, at each layer, the model saves
+one key and one value. Each key and value is really several vectors, one per **head**. A head is one
+independent copy of the attention lookup; a layer runs several heads side by side, each looking for different
+patterns. Each vector has **head_dim** numbers (128 for the Llama models here), and each number takes 2 bytes in
+bf16.
+
+One detail decides whether your answer is right or 8× wrong. Llama-3.1-70B has 64 query heads but only **8 KV
+heads**. Groups of 8 query heads share one set of keys and values. This design is called **grouped-query
+attention** (**GQA**), and it exists precisely to shrink the cache. Only the 8 KV heads are stored.
+
+So the formula is: **bytes per token = 2 (key and value) × layers × KV heads × head_dim × bytes per number.**
+
+For the example model that is **327,680 bytes, exactly 320 KiB, about a third of a megabyte per token**. One
+conversation at the full 8K tokens holds **2.68 GB** (2.5 GiB). At 128K tokens, the model's maximum, one
+conversation holds **42.95 GB**, more than half of one GPU.
+
+A common shortcut uses the model's hidden size (the width of each layer, 8,192 for the 70B) in place of KV heads
+× head_dim. That treats the model as if every query head had its own keys and values. For Llama-3.1-70B it gives
+a number **8× too high** (64 ÷ 8). Two prep pages use it (<Cite id="s-d97e9a72e2" />, <Cite id="s-f440daaea4" />).
+
+When the model is split across GPUs (section 6), the KV heads are split too: with 4 GPUs each holds 2 of the 8.
+Past 8 GPUs, heads are copied and the per-GPU cache stops shrinking.
+
+Say it like this: "Two, for K and V, times 80 layers, times 8 KV heads, times 128, times 2 bytes: 320 KiB a
+token, 2.7 GB for an 8K conversation."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **70B**: 2 × 80 × 8 × 128 × 2 = **327,680 B = 320 KiB** per token.
+- **Per 70B conversation**: 8K (8,192 tokens) → 327,680 × 8,192 = **2.68 GB** (2.5 GiB); 32K → 10.74 GB (10 GiB);
+  128K (131,072) → **42.95 GB** (40 GiB).
+- **8B**: 2 × 32 × 8 × 128 × 2 = 131,072 B (128 KiB) per token, **1.07 GB** per 8K conversation.
+- **fp8 cache** (1 byte per number): half of each. 70B: 163,840 B per token.
+- **Hidden-size form**: 2 × layers × hidden × bytes = 2 × 80 × 8,192 × 2 = 2,621,440 B. 2,621,440 ÷ 327,680 =
+  **8**, which equals 64 query heads ÷ 8 KV heads.
+- **Per GPU when split over TP GPUs**: TP = 4 → 2 heads per GPU → 81,920 B per token per GPU. TP = 8 → 1 head →
+  40,960 B. TP = 16 → heads replicated, no further saving.
+
+</details>
+
+### 3. Weights at each precision
+
+The weights are the fixed cost. Their size is simply the number of parameters times the bytes per parameter. At
+bf16 the 70B model takes **141.1 GB**. At 8 bits (fp8 or int8) it takes half, **70.55 GB**. At 4 bits (int4) it
+takes about a quarter.
+
+One trap: four bits hold only 16 values, so int4 formats store an extra **scale** for every small group of
+weights (say 32) that says how to stretch them. That makes 4.5 bits per weight, and the 70B int4 model
+**39.69 GB**, not 35.28 GB: enough to turn "fits" into "doesn't".
+
+Say it like this: "141 GB in bf16, half that in fp8, and about 40 GB in int4 once I count the scales."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+weight bytes = parameters × bits per weight ÷ 8, plus scales.
+
+- **70B**: bf16 70,552,387,584 × 2 = **141.1 GB**; fp8 or int8 **70.55 GB**; int4 without scales 35.28 GB;
+  int4 with one fp16 scale per 32 weights (16 ÷ 32 = 0.5 extra bits, so 4.5 bits) **39.69 GB**.
+- **8B**: bf16 16.06 GB; fp8 8.03 GB; int4 g32 4.52 GB.
+- On the name basis (exactly 70 × 10⁹ parameters), bf16 is 140 GB. Say which basis you use.
+
+</details>
+
+### 4. Headroom: how many conversations fit
+
+Now put the two together. Each GPU's memory holds a slice of the weights, a slice of overhead, and whatever is
+left over for the cache. Here is the example box:
+
+```
+4 × A100 80 GB = 320 GB in total
+┌──────────────────────────────────────────────────────────────────┐
+│ Weights, bf16                         141.1 GB  (fixed)          │
+├──────────────────────────────────────────────────────────────────┤
+│ Overhead: activations, driver, gaps    20 GB    (5 GB × 4, assumed)│
+├──────────────────────────────────────────────────────────────────┤
+│ KV cache pool                         158.9 GB                   │
+│   ÷ 320 KiB per token  = 484,910 tokens                          │
+│   ÷ 8,192 per conversation = 59 conversations, all at full 8K    │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+The **weights** box is the same for one user or a hundred. The **overhead** box is an assumption; a real engine
+prints it at startup. The **KV cache pool** holds every token of every active conversation.
+
+So the example box holds **59 conversations at a full 8K tokens each**. The same arithmetic for other setups:
+
+| Setup (5 GB/GPU assumed) | Free for cache | Tokens | 8K conversations |
+|---|---|---|---|
+| 70B fp8, 1× 80 GB | 4.45 GB | 13,573 | 1 |
+| 70B int4 g32, 1× 80 GB | 35.31 GB | 107,771 | 13 |
+| 70B int4 g32, 1× H200 141 GB | 96.31 GB | 293,928 | 35 |
+| 70B bf16, TP = 2 | 8.90 GB | 27,146 | 3 |
+| 70B bf16, TP = 4 | 158.90 GB | 484,910 | 59 (118 with an fp8 cache) |
+| 70B bf16, TP = 8 | 458.90 GB | 1,400,437 | 170 |
+| 70B int8/fp8, TP = 2 | 79.45 GB | 242,455 | 29 (59 with an fp8 cache) |
+| 70B int8, TP = 4 | 229.45 GB | 700,219 | 85 |
+| 8B bf16, 1× L4 24 GB | 2.94 GB | 22,431 | 2 (5 at 4K) |
+| 8B bf16, 1× L40S 48 GB | 26.94 GB | 205,536 | 25 (50 at 4K) |
+| 8B bf16, 1× 80 GB | 58.94 GB | 449,677 | 54 (109 at 4K) |
+
+("TP = 4" means the model is split across 4 GPUs; section 6 explains it.)
+
+These are worst cases, where every conversation holds its full context at once. A paged allocator only reserves
+what each conversation has used so far (section 7), so real headroom is usually better.
+
+Say it like this: "Free memory is total minus weights minus overhead. Divide by bytes per token, then by tokens
+per conversation. For 70B on four A100s that's 59 at 8K, worst case."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+conversations ≤ (GPUs × memory − weight bytes − GPUs × overhead) ÷ (KV bytes per token × tokens per conversation)
+
+- **Example box**: 4 × 80 − 141.1 − 4 × 5 = **158.9 GB**. 158.9 × 10⁹ ÷ 327,680 = **484,910 tokens**.
+  484,910 ÷ 8,192 = 59.2, so **59 conversations**.
+- **fp8 cache**: 163,840 B per token doubles the tokens, so 118.
+- **70B int4 g32 on one 80 GB GPU**: 80 − 39.69 − 5 = 35.31 GB → 107,771 tokens → 13.
+
+</details>
+
+### 5. What one decode step costs, and the three limits on batch size
+
+A serving engine doesn't run one conversation at a time. It runs a **batch**: many conversations share each
+decode pass, each getting one new token per pass. Modern engines let conversations join and leave the batch
+between passes; this is called **continuous batching**.
+
+Think of one decode pass as a full table scan over GPU memory. For every pass, the GPU must read **every weight
+once**, and that read is shared by the whole batch. Then it must read **each conversation's own cache**, which is
+not shared. Reading memory is the slow part, so the time per pass is roughly bytes read ÷ bandwidth.
+
+For the example box, with the model split over 4 GPUs, each GPU reads its quarter of the weights:
+
+- **One conversation alone: 17.3 ms per token**, so at most about 58 tokens a second for that user. This is the
+  **decode floor**: no batch can go faster.
+- **59 conversations at 8K: 36.7 ms per token.** Each user still gets about 27 tokens a second, and the box
+  produces about 1,607 tokens a second in total.
+
+So the batch is limited three ways, and the smallest limit wins:
+
+- **Cache memory**: 59 conversations at 8K on this box (section 4).
+- **Latency**: the serving guide puts inter-token latency at "somewhere around 50 to 100 milliseconds per token
+  or better" (<Cite id="s-75e82f8882" />). At 36.7 ms, 59 × 8K fits. Longer conversations push the cache-reading
+  part past it.
+- **Compute**: up to a batch of about 153 on an A100, the GPU's math units mostly wait for memory. Past that
+  point, called the **ridge point**, math becomes the limit (see the
+  [roofline walkthrough](/system-design-labs/interviews/walkthroughs/roofline-sharded-matmul/)).
+
+Notice that at 59 × 8K, reading the caches (19.4 ms) already takes longer than reading the weights (17.3 ms).
+Batching shares the cost of the weights, but never the cost of the cache. That is why long conversations hurt
+throughput even when they fit.
+
+Say it like this: "Each step reads the weights once for the whole batch and every conversation's cache
+separately. Batching amortizes the weights, not the cache."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+step ≥ (weight bytes per GPU + B × context × KV bytes per token per GPU) ÷ bandwidth, where B is the batch.
+
+- **B = 1**: 141.1 GB ÷ 4 = 35.28 GB per GPU. 35.28 GB ÷ 2,039 GB/s = **17.3 ms**, so at most 57.8 tokens/s.
+- **B = 59 at 8K**: cache per GPU per step = 59 × 8,192 × 81,920 B = 39.6 GB. 39.6 ÷ 2,039 = 19.4 ms.
+  17.3 + 19.4 = **36.7 ms**. 59 ÷ 0.0367 s ≈ **1,607 tokens/s** in total; 1 ÷ 0.0367 ≈ **27 per stream**.
+- **Ridge point**: 312 TFLOPS ÷ 2,039 GB/s ≈ 153 operations per byte, which for bf16 weights means a batch of
+  about 153 (details in the roofline walkthrough).
+
+</details>
+
+### 6. Tensor parallelism of 2 or 4 on four A100s
+
+The 70B model doesn't fit on one 80 GB GPU in bf16, so it must be split. The usual way inside one server is
+**tensor parallelism** (**TP**): every layer's big matrix multiplications are cut into slices, and each GPU
+computes its slice. After each slice, the GPUs combine their partial results with an **all-reduce** (every GPU
+sends its piece and receives the sum). That happens twice per layer on every step, which is why TP needs the fast
+NVLink connection. "TP = 4" means one copy of the model spread over 4 GPUs.
+
+On four GPUs you have two real options. One **replica** (copy of the model) at TP = 4, or two replicas at
+TP = 2, each on two GPUs. The second option is like running two smaller instances behind a load balancer.
+
+| | One TP = 4 replica | Two TP = 2 replicas |
+|---|---|---|
+| bf16 cache room | 158.9 GB → 59 × 8K | 2 × 8.9 GB → 6 × 8K in total |
+| bf16 decode floor | 17.3 ms | 34.6 ms |
+| int8 cache room | 229.45 GB → 85 × 8K | 2 × 79.45 GB → 58 × 8K in total |
+| int8 decode floor | 8.65 ms | 17.3 ms |
+| Weights stored | once | twice |
+| Failure domain (what one GPU fault takes down) | all 4 GPUs | 2 GPUs each |
+| All-reduce per step | 2 per layer over 4 GPUs | 2 per layer over 2 GPUs |
+
+**In bf16, choose TP = 4.** Two GPUs hold 160 GB, and the weights alone take 141.1 GB. What's left is room for
+3 conversations per pair, and the floor of 34.6 ms uses most of a 50 ms budget before any batching.
+
+**In int8 it becomes a real trade.** The weights are half the size, so a pair of GPUs has plenty of room. TP = 4
+still halves the latency floor and stores the weights once. Two TP = 2 replicas give two independent failure
+domains, cheaper all-reduces, and a 17.3 ms floor that still meets a 50 ms budget. Pick TP = 4 for tight latency;
+pick two replicas when losing all four GPUs at once is the bigger risk.
+
+Two rules make an option legal. TP must divide both the 64 query heads and the 8 KV heads; 2 and 4 both do. And
+"8-bit" means int8 on an A100, because the A100 has no fp8 Tensor Cores (the math units that do the fast matrix
+work).
+
+Say it like this: "In bf16, TP = 2 leaves room for three conversations, so TP = 4. In int8 it's a real trade:
+TP = 4 for latency, two replicas for a smaller blast radius."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **TP = 2, bf16**: 2 × 80 − 141.1 − 2 × 5 = 8.9 GB → 27,146 tokens → 3 × 8K per replica, 6 in total.
+  Floor: 141.1 ÷ 2 = 70.55 GB per GPU ÷ 2,039 GB/s = **34.6 ms**.
+- **TP = 4, int8**: 320 − 70.55 − 20 = 229.45 GB → 85 × 8K. Floor: 70.55 ÷ 4 = 17.64 GB ÷ 2,039 = **8.65 ms**.
+- **TP = 2, int8**: 160 − 70.55 − 10 = 79.45 GB → 29 × 8K per replica, 58 in total; floor **17.3 ms**.
+- **All-reduce cost at TP = 4**: at a batch of 64, 160 all-reduces of 1 MiB add about 0.84 ms per step at
+  300 GB/s each way, plus a fixed latency per collective that you should measure.
+
+</details>
+
+### 7. Paged attention and block allocation
+
+So far every conversation reserved room for its full 8K tokens. That is wasteful, because most conversations
+end far shorter. The engine reserves the maximum because it can't know how long the reply will be.
+
+A backend engineer already knows the fix from operating systems: **paging**. Split the cache pool into small
+fixed-size **blocks**, each holding the keys and values for a fixed number of tokens (16 in the
+llm-inference lab). Each conversation gets a **block table** that maps its blocks, in order, to wherever they
+happen to sit in GPU memory. A new block is handed out only when the last one fills up. When the conversation
+ends, its blocks go back on a free list. Applied to attention, this is called **paged attention** (vLLM's
+name: PagedAttention).
+
+```
+Conversation A's block table        GPU cache pool (16 tokens per block)
+  logical 0 ──────────────────────▶ [ block 7  ]
+  logical 1 ──────────────────────▶ [ block 2  ]
+  logical 2 (partly full) ────────▶ [ block 11 ]
+Conversation B's block table
+  logical 0 ──────────────────────▶ [ block 4  ]
+  logical 1 ──────────────────────▶ [ block 9  ]
+                                    [ free list: 0, 1, 3, 5, 6, 8, 10, ... ]
+```
+
+The block table is the indirection, like a page table. The blocks don't need to be next to each other. The free
+list is where finished conversations return memory. The vLLM post describes exactly this: "The contiguous logical
+blocks of a sequence are mapped to non-contiguous physical blocks via a block table"
+([vLLM blog](https://vllm.ai/blog/2023-06-20-vllm)).
+
+Follow the example box with an assumed average conversation of 1,800 tokens (maximum 8,192). Reserving the
+maximum leaves **78%** of each reservation unused. With 16-token blocks, the only waste is the unfilled part of
+the last block, about 8 tokens, or **0.4%**. That is the mechanism behind vLLM's reported 60–80% waste for older
+systems and under 4% with paging. The same 484,910 free tokens now hold about **268 conversations** instead of
+59. At that point the compute ridge (about 153) and the latency budget limit the batch before memory does, which
+is the right place to be.
+
+Paging changes three more things:
+
+- **Running out becomes a scheduling event, not a crash.** When no free block is left, the engine pauses a
+  conversation and frees its blocks; this is called **preemption**. vLLM V1 recomputes it later. Frequent
+  preemption, visible as a warning and a counter, means the batch limit is too high for your conversation
+  lengths.
+- **Sharing.** Two block tables can point at the same physical block. The vLLM post describes reference counts
+  and copy-on-write for parallel sampling, where "the computation and memory for the prompt can be shared between
+  the output sequences". **Prefix caching** uses the same trick to store a common system prompt once for every
+  request that starts with it.
+- **A cost.** Attention now has to gather scattered blocks through the table. Engines ship that code; you don't
+  write it.
+
+Say it like this: "Paging removes reservation waste; it doesn't shrink the bytes per token. On this box it turns
+59 worst-case slots into about 268 at a 1,800-token average, and then compute or latency is the limit."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Block size**: 16 tokens × 327,680 B = **5 MiB** across all 80 layers (64 KiB per layer), **1.25 MiB per GPU**
+  at TP = 4.
+- **Contiguous waste**: (8,192 − 1,800) ÷ 8,192 = **78%** of the reservation unused.
+- **Paged waste**: about half a block (8 tokens) per conversation; 8 ÷ 1,800 = **0.4%**.
+- **Capacity**: 484,910 tokens ÷ 1,808 (1,800 plus half a block) ≈ **268 conversations**, against 59 reserved at 8K.
+
+</details>
+
+### 8. Walking an OOMKilled pod on an 80 GB GPU
+
+The debugging variant: "Your inference pod is getting OOMKilled on an 80 GB GPU. Walk me through it." The trap is
+that "out of memory" can mean three different memories. A model server on Kubernetes uses two kinds of memory,
+and the engine adds a third limit of its own:
+
+```
+Kubernetes node
+┌──────────────────────────────────────────────────────────────┐
+│ Pod (container memory limit, in host RAM)                    │
+│   Python process: loader, tokenizer, request buffers         │
+│        │ copies weights over PCIe at startup                 │
+│        ▼                                                     │
+│ GPU (80 GB HBM, not counted in the pod limit)                │
+│   weights │ activation peak │ KV cache pool (blocks)         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+The **pod limit** is host RAM, enforced by Kubernetes. The **GPU** has its own 80 GB, which Kubernetes doesn't
+count. The **KV pool** is the engine's slice of that GPU memory.
+
+| Symptom | Memory | Typical cause | Fix |
+|---|---|---|---|
+| `kubectl` shows `OOMKilled`, exit code 137 | Host RAM, against the container's memory limit | The process went over the pod limit, for example while staging weights in host memory, or a CPU offload setting | Raise the limit to cover what the loader holds in host RAM, or load in a way that streams to the GPU; check `--cpu-offload-gb`-style settings |
+| CUDA out-of-memory error, container exits with an error | GPU HBM | Weights + KV pool + activation peak + anything else on the GPU exceeds 80 GB | Lower the engine's memory fraction, max context or max batched tokens; quantize; add GPUs |
+| Engine warns about preemption; no crash | The KV pool, by design | More in-flight context than the pool holds | Lower max sequences or max context; fp8 cache; more cache room |
+
+(**CUDA** is NVIDIA's GPU programming layer; its out-of-memory error means GPU memory ran out.)
+
+The Kubernetes docs define the first case: a container that keeps using memory beyond its limit is terminated,
+shown as `OOMKilled` with exit code 137, and restarted
+([Kubernetes](https://kubernetes.io/docs/tasks/configure-pod-container/assign-memory-resource/), fetched
+2026-10-12). The CUDA prep guide's answer goes straight to the GPU side: the KV cache grows with sequence length and batch size, and the fixes are "paged attention, a
+smaller max batch, quantizing the cache, or spilling to host" (<Cite id="s-55d540eda9" />). A strong answer
+covers both, because the word `OOMKilled` points at the host and the fixes the interviewer expects point at the
+GPU.
+
+Then run the GPU budget. An engine like vLLM claims a fraction of the GPU at startup (`--gpu-memory-utilization`,
+0.92 by default in current docs), which is **73.6 GB** of an 80 GB card. It measures the activation peak, loads
+the weights, and turns the rest into the KV pool. After that, two things cause a GPU out-of-memory error:
+
+- **Something else on the GPU.** A second process, a sidecar or another replica scheduled on the same card takes
+  memory the engine already counted as its own.
+- **An activation peak bigger than the one measured at startup.** The peak grows with the tokens processed in
+  one step, so long prompts with a high batched-token limit can exceed it.
+
+The arithmetic also tells you how tight the box is. A 70B model in fp8 on one 80 GB GPU leaves **4.45 GB** under
+the 5 GB overhead assumption, or about **3 GB** inside vLLM's 73.6 GB before activations. Either way that is
+**one** 8K conversation (2.68 GB). Any long prompt or second user overflows it. The fix order, cheapest first:
+confirm which memory, check what else holds the GPU (`nvidia-smi` lists GPU processes), cap max context and max
+conversations, switch the cache to fp8, quantize the weights, and only then add GPUs or raise TP.
+
+Say it like this: "First I'd ask which memory ran out. `OOMKilled` with 137 is the pod's host-memory limit. A
+CUDA out-of-memory error is the GPU. Preemption warnings are the cache pool working as designed."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Engine budget**: 0.92 × 80 GB = **73.6 GB**. 73.6 − 70.55 (70B fp8 weights) = 3.05 GB before activations.
+- **8B in bf16** on the same card: 16.06 GB of weights; each 8K conversation needs 1.07 GB of cache.
+
+</details>
+
+### 9. VRAM for training, for contrast
+
+If "estimate VRAM" means training, the formula changes. Training keeps, for every parameter, the weight, its
+**gradient** (how much to change it), and the **optimizer's** state: Adam, the usual optimizer, keeps two running
+averages and a full-precision master copy. The ZeRO
+paper counts mixed-precision Adam at "2Ψ+2Ψ+KΨ=16Ψ bytes" of model state for Ψ parameters, with K = 12 for the
+optimizer ([Rajbhandari et al.](https://ar5iv.labs.arxiv.org/html/1910.02054), fetched 2026-10-12).
+
+That is **16 bytes per parameter**, against 2 for bf16 inference: **1.13 TB** for the 70B model, at least 15 ×
+80 GB GPUs before storing a single activation. Even the 8B model needs **128 GB**, more than one GPU, for a full
+fine-tune.
+
+The ways to split follow from what is too big. **Data parallelism with sharded state** (ZeRO or FSDP) gives
+each GPU different data and only a slice of the 16 bytes per parameter. Tensor parallelism splits each layer
+inside one server. **Pipeline parallelism** gives different layers to different servers. For inference, only the
+weights and the cache matter, and tensor parallelism inside one server is the usual first step. The [distributed-training walkthrough](/system-design-labs/interviews/walkthroughs/distributed-training/)
+covers the training side.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- 16 bytes = 2 (fp16 weights) + 2 (fp16 gradients) + 12 (fp32 master weights, momentum and variance).
+- **70B**: 16 × 70.55 × 10⁹ = **1.13 TB**. 1.13 TB ÷ 80 GB = 14.1, so at least **15** GPUs.
+- **8B**: 16 × 8.03 × 10⁹ = **128 GB**.
+
+</details>
+
+## Sanity checks
+
+Before you trust any of these numbers, check them against something independent:
+
+- **The head ratio matches the error.** Hidden-size form ÷ KV-head form = 2,621,440 ÷ 327,680 = 8 = 64 ÷ 8.
+- **A source agrees once units are fixed.** The serving guide's "about 0.31 MB per token" for the 70B is
+  0.3125 MiB = 320 KiB, and its "about 42 GB" at 128K matches 42.95 GB (<Cite id="s-75e82f8882" />).
+- **vLLM's own example reproduces.** The launch post says the cache "takes up to 1.7GB for a single sequence in
+  LLaMA-13B". LLaMA-13B ([config](https://huggingface.co/huggyllama/llama-13b/raw/main/config.json)) has 40
+  layers, 40 heads, no GQA, head_dim 128 and a 2,048-token context: 2 × 40 × 40 × 128 × 2 × 2,048 = 1.68 GB.
+- **A real startup log reproduces.** A vLLM issue from January 2025 logs Llama-3-8B on an A100 40GB with "model
+  weights take 14.96GiB" (16.06 GB is 14.96 GiB), "the rest of the memory reserved for KV Cache is 11.12GiB",
+  "# GPU blocks: 5691" and "Maximum concurrency for 8192 tokens per request: 11.12x"
+  ([issue 12330](https://github.com/vllm-project/vllm/issues/12330)). Check: 5,691 blocks × 16 tokens × 131,072 B =
+  11.12 GiB, and 91,056 tokens ÷ 8,192 = 11.12. The same log's "PyTorch activation peak memory takes 9.37GiB" is
+  why the 5 GB overhead is an assumption to replace with your own measurement.
+- **The lab's code agrees.** `kv_cache_size_formula(n_layers=80, n_heads=64, d_head=128, seq_len=1024,
+  bytes_per_element=2, n_kv_heads=8)` in the llm-inference lab returns 335,544,320 B = 327,680 × 1,024.
+- **The floors sit inside the target.** 17.3 ms per step on 4×A100 leaves about 2.9× room under a 50 ms
+  inter-token budget for batching to slow each step.
+
+## What changes the answer
+
+| Change | What moves | How |
+|---|---|---|
+| GQA group size | Cache per token | Fewer KV heads per query head means proportionally less cache. Older models with one KV head per query head (multi-head attention: GPT-2, LLaMA-1) cache every head |
+| Multi-head latent attention | Cache per token | DeepSeek-V3 caches a compressed vector per layer, not per-head keys and values: 61 × (512 + 64) × 2 B = 70,272 B per token in bf16 (derived from its config). Don't apply the GQA formula to it |
+| Cache precision | Concurrency | An fp8 cache doubles the conversations that fit. Check quality on your eval; it is a lossy change |
+| Conversation-length distribution | Paged capacity | The worst case sizes a reserving allocator; the average sizes a paged pool |
+| Shared prefixes | Effective cache | A long common system prompt cached once is shared by every request that uses it |
+| TP degree | Cache per GPU | Divides by TP up to the KV-head count (8), then stops |
+| Bigger GPU memory | Headroom | An H200's 141 GB holds the int4 70B with room for 35 × 8K, against 13 on an 80 GB card |
+| Engine reservation and batched-token limit | Usable cache | A higher memory fraction gives more cache, less margin; a bigger batched-token limit raises the activation peak |
+
+<AINative title="Let an agent do the arithmetic; you own the inputs and the check">
+An agent will produce the headroom table for any model in seconds, by reading its `config.json`. The mistakes it
+repeats are the ones on this page: query heads in the cache formula, sparse TFLOPS, GB written where GiB was
+meant, int4 with no scales, Llama-3 put at 128K context. Give it the formula with KV heads, make it print units on
+every intermediate value, and check one row by hand. Then verify against the engine: start the server and compare
+its logged cache size and maximum concurrency with your prediction. If they disagree by more than your overhead
+assumption, your inputs are wrong, not the engine.
+</AINative>
+
+## Small-team version
+
+You own AI at a 50–500 person company. This math decides whether you self-host at all, which GPU you rent, how
+many users one box serves, and when a smaller model beats more GPUs.
+
+### Start from a managed API
+
+For most small teams the default is a managed API. The middle path is an open-weight
+model on a serverless endpoint, where a provider runs the same Llama weights and bills per token. Self-hosting
+is for steady high volume, data-residency requirements, an API bill that threatens the business, or a narrow task
+where a small tuned model wins on your eval. Practitioners' advice from 2024 still applies: "Don't finetune until
+you've proven it's necessary" ([applied-llms.org](https://applied-llms.org/), 2024-06-08). Do the sizing below
+anyway; it tells you what you would be signing up for.
+
+### If you self-host, size before you rent
+
+Prices are the dated list prices in Constants (RunPod range unless noted; × 730 hours a month). Conversations
+are 8K worst case, with 5 GB per GPU of overhead assumed. "Slot" means room for one 8K conversation.
+
+| Setup | 8K slots | Decode floor, alone | $/hour | $/month | $ per slot-hour |
+|---|---|---|---|---|---|
+| 8B bf16, 1× L4 | 2 | 53.5 ms | 0.44–0.49 | 321–358 | 0.22–0.25 |
+| 8B bf16, 1× L40S | 25 | 18.6 ms | 0.79–1.09 | 577–796 | 0.032–0.044 |
+| 8B bf16, 1× H100 | 54 | 4.8 ms | 2.69–3.49 | 1,964–2,548 | 0.050–0.065 |
+| 70B int4 g32, 1× H100 | 13 | 11.8 ms | 2.69–3.49 (Lambda 4.29) | 1,964–2,548 (Lambda 3,132) | 0.21–0.27 |
+| 70B int4 g32, 1× H200 | 35 | 8.3 ms | 3.59–4.59 | 2,621–3,351 | 0.10–0.13 |
+| 70B fp8, 2× H100, TP = 2 | 29 (59 with fp8 cache) | 10.5 ms | 5.38–6.98 | 3,927–5,095 | 0.19–0.24 (0.09–0.12) |
+| 70B bf16, 4× A100, TP = 4 | 59 | 17.3 ms | 5.56–6.36 | 4,059–4,643 | 0.094–0.108 |
+
+Three readings:
+
+- **The smaller model is the big lever.** If an 8B model passes your eval, a slot costs about $0.03–$0.04 an hour
+  on an L40S, against about $0.09 or more for any 70B setup here.
+- **Quantization buys a smaller minimum bill, not cheaper slots.** int4 70B on one H100 starts at about $2,000 a
+  month instead of $4,000, but its 13 slots cost more each than the 4×A100 box's 59.
+- **The L4 is the wrong card for an 8B bf16 model:** 2 slots and a 53.5 ms floor. It needs int4 (13 slots,
+  15.1 ms).
+
+Measure the quality cost of every quantization step on your own eval before you count the savings.
+
+### How many users one box serves
+
+Use the capacity reasoning you already apply to any server: if each request occupies the box for S seconds,
+the box serves at most 1 ÷ S requests a second. Assume each request is 2,000 input tokens and 300 output tokens on the example 4×A100 box, using the floors
+above (peak compute for prefill, the 8K worst-case decode step).
+
+Each request occupies about **0.41 seconds** of box time, so the box serves at most about **209,000 requests a
+day**. If each active user sends one request a minute (assumed), that is about **145 active users at 100% of
+peak**. Reading the prompt takes 55% of that time: long prompts make a self-hosted box compute-bound.
+
+Now compare with the serverless price of the same weights. At 100% of peak the box costs $133–$153 a day, which
+is **$0.00064–$0.00073 per request**. Together's Llama 3.3 70B at $1.04 per 1M tokens costs **$0.0024 per
+request**. The box only wins when it is busy: above about **27–30% of peak throughput, around the clock**, which
+is about 56,000–64,000 requests of this shape every day.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Prefill rate**: GPUs × peak FLOP/s ÷ (2 × parameters) = 4 × 312 × 10¹² ÷ (2 × 70.55 × 10⁹) ≈ **8,845 tokens/s**.
+- **Decode rate**: 1,607 tokens/s in total at a batch of 59 (section 5).
+- **Box time per request**: 2,000 ÷ 8,845 + 300 ÷ 1,607 = 0.226 + 0.187 = **0.413 s**, so R ≤ 1 ÷ 0.413 =
+  **2.42 requests/s**, about 209,000 a day. At one request per user per minute: 2.42 × 60 ≈ 145 users.
+- **Box cost per request at full load**: $5.56–$6.36 × 24 = $133–$153 a day ÷ 209,000 = **$0.00064–$0.00073**.
+- **API cost per request**: 2,300 tokens × $1.04 ÷ 10⁶ = **$0.0024**.
+- **Break-even**: 0.00064–0.00073 ÷ 0.0024 = **27–30%** of peak, around the clock: 56,000–64,000 requests a day.
+
+</details>
+
+That is before labor, and before the gap between peak and achieved throughput. One published analysis finds
+that self-hosted cost per 1M output tokens swings from $0.30 at full load to $12.77 at 10%
+([Cohorte](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even), 2026-09-20). A consultant
+estimates that self-hosting breaks down below about 60–70% utilization
+([Zander](https://renezander.com/guides/self-hosted-llm-vs-api/)). Business-hours traffic rarely gets there unless
+you also run offline batch work on the box.
+
+Say it like this: "The 4×A100 box is about $4,000–$4,600 a month. It beats a serverless endpoint only if it is
+more than about 30% busy around the clock, so I'd start on the API."
+
+### What you still own
+
+- Set max context (`max_model_len` in vLLM) and max conversations from the headroom table, not the model card.
+- Alert on the engine's preemption counter and on host-memory use against the pod limit.
+- Keep per-tenant token limits, and re-run the headroom table whenever the model or context limit changes.
+
+Revisit the API default when volume nears the break-even, a contract requires data to stay on your hardware, or
+an eval shows a small self-hosted model matches the API on your task.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="KV and memory sizing"
+  senior={[
+    "Writes the KV formula with KV heads, gets 320 KiB per token for 70B, and states GB vs GiB.",
+    "Adds weights, overhead and KV to get requests per box, and knows paged allocation beats the worst case.",
+    "Walks an OOM by naming which memory ran out before proposing fixes.",
+  ]}
+  staff={[
+    "Turns the numbers into a decision: TP = 4 for bf16 70B on four A100s, a real trade at int8, failure domains included.",
+    "Separates the three batch limits (KV memory, latency, compute ridge) and says which binds for this traffic.",
+    "Prices the options, finds the break-even utilization, and names the measurement (activation peak, achieved bandwidth) that would change the plan.",
+  ]}
+/>
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="(Prep guide) How do you choose between TP = 2 and TP = 4 for a 70B model on four A100s?">
+    By the cache room each leaves. In bf16, TP = 2 leaves 3 conversations per pair, so TP = 4 (59, 17.3 ms floor)
+    wins. In int8, two TP = 2 replicas (58 at 17.3 ms, smaller failure domains) against TP = 4 (85 at 8.65 ms) is
+    a real trade (<Cite id="s-f07fcd5321" />).
+  </FollowUp>
+  <FollowUp q="(CUDA prep guide) Your inference pod is getting OOMKilled on an 80 GB GPU. Walk me through it.">
+    `OOMKilled` with exit code 137 is the host-memory limit, so check that first. If it is a CUDA out-of-memory
+    error, the fixes are paged attention, a smaller max batch, a quantized cache or spilling to host
+    (<Cite id="s-55d540eda9" />). fp8 70B on one 80 GB GPU leaves room for one 8K conversation.
+  </FollowUp>
+  <FollowUp q="(Reported, Blind commenter) In a Staff design round, how do KV-cache management and batching fit into the LLM design?">
+    The commenter lists "KV cache management, batching strategies, and eval design" as expected fluency
+    (<Cite id="s-fe60d2bf1f" />). Size slots per replica from headroom, set the batch from the latency budget,
+    use a paged pool with preemption, and gate any cache-precision change on an eval. The
+    [batcher walkthrough](/system-design-labs/interviews/walkthroughs/batcher-to-fleet/) covers the scheduler.
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) A user pastes a 100,000-token document. What happens to everyone else?">
+    Its cache is 100,000 × 327,680 B = 32.8 GB for the 70B, about a fifth of the 4×A100 box's 158.9 GB of free
+    cache in one request, the space of 12 worst-case 8K conversations. Reading it on 8×H100 takes about 3.4 s at
+    peak once attention work is counted (1.78 s from the weights alone), which stalls other streams unless the
+    engine reads long prompts in chunks between decode steps (chunked prefill). Cap context per tenant and chunk
+    prefill.
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) Would an fp8 KV cache help, and what does it cost?">
+    It halves bytes per token, so twice the conversations fit (59 → 118 at 8K on 4×A100) and each step reads half
+    the cache bytes. The cost is precision in the attention scores, so run your eval before and after. vLLM exposes
+    it as `--kv-cache-dtype fp8`.
+  </FollowUp>
+  <FollowUp q="(Not reported; a natural next push) Why is the hidden-size KV formula wrong for Llama-3.1-70B?">
+    It assumes one KV head per query head. Llama-3.1-70B shares 8 KV heads across 64 query heads, so it is 8×
+    too high (2,621,440 B against 327,680 B).
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Hidden size instead of KV heads.** It is 8× too high for Llama-3.1-70B; two prep pages do it
+  (<Cite id="s-d97e9a72e2" />, <Cite id="s-f440daaea4" />).
+- **Mixing GB and GiB.** 42.95 GB is 40 GiB; the serving guide's "0.31 MB" is really MiB (<Cite id="s-75e82f8882" />).
+- **int4 without scales.** It gives 35.3 GB instead of 39.7 GB at one scale per 32 weights.
+- **Llama-3 (not 3.1) at long context.** Its maximum is 8,192 tokens.
+- **Treating overhead as a constant.** A real vLLM log shows a 9.37 GiB activation peak.
+- **Reading `OOMKilled` as a GPU error.** It is the container's host-memory limit.
+- **Presenting worst-case reservation as capacity.** Paging holds about 4.5× more at a 1,800-token average.
+- **Quoting a continuous-batching multiplier.** Guides give about 2×, 3–5× and 10–20× (<Cite id="s-f440daaea4" />,
+  <Cite id="s-75e82f8882" />, <Cite id="s-c12521aa7d" />). Derive it from headroom and your length distribution.
+- **Calculating past the decision.** One Anthropic candidate describes being "too wordy and slower to land the
+  point" in a later round (<Cite id="s-4e04a1689c" />). State the number, then what it changes.
+
+## Prove it with a lab
+
+<LabRef lab="llm-inference" role="partial" note="Check the GQA formula in code and read the v2 paged allocator." />
+
+`kv_cache_size_formula` takes `n_kv_heads`; its docstring works the 70B example (320 MiB at 1,024 tokens). For
+GPT-2 it gives <LabNumber lab="llm-inference" metric="KV cache size" />. The v2 `PagedKVCache` allocates 16-token
+pages from a free list, frees them when a request finishes and reports fragmentation, but it only does the
+bookkeeping: each request still keeps its own Hugging Face `past_key_values`, and batching runs one forward pass
+per request. Its throughput rows are estimates from another machine, so don't quote them.
+
+<LabRef lab="transformer" role="proof" note="Its generate() re-runs the whole context with no cache: add one and count the work saved." />
+
+Adding a KV cache to the lab's `generate()` is the exercise behind section 1. Its attention is ordinary
+multi-head attention (no GQA), and its benchmark numbers are estimates.
+
+<LabRef lab="model-quantizer" role="partial" note="Group scales are what make int4 usable." />
+
+On GPT-2, one scale per 32 weights gives a mean weight error of
+<LabNumber lab="model-quantizer" metric="INT4 weight error, one scale per 32 weights" /> against
+<LabNumber lab="model-quantizer" metric="INT4 weight error, one scale per tensor" /> with one scale per tensor.
+That is weight error, not output quality.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-1b8091345c" />: Apple GenAI round snippet (r2a-017)
+- <Cite id="s-fdc0969e32" />: CentML snippet (r2a-026)
+- <Cite id="s-3650fe20d8" />: PracHub Anthropic list (infra-038, title only)
+- <Cite id="s-f07fcd5321" />: prep guide, 70B on 4×A100 and TP = 2 vs 4
+- <Cite id="s-55d540eda9" />: CUDA prep guide, the OOMKilled question (2026-07-23)
+- <Cite id="s-fe60d2bf1f" />: Blind thread, the eng-077 comment
+- <Cite id="s-75e82f8882" />: serving guide, KV formula and latency targets
+- <Cite id="s-9597947584" />: Together AI interview article
+- <Cite id="s-d97e9a72e2" />, <Cite id="s-f440daaea4" />, <Cite id="s-c12521aa7d" />: prep pages with the hidden-size form or batching multipliers
+- <Cite id="s-4e3dc29a95" />, <Cite id="s-4e04a1689c" />: Anthropic candidate reports
+- <Cite id="s-8e443a8b66" />: NVIDIA A100; [H100](https://www.nvidia.com/en-us/data-center/h100/), [H200](https://www.nvidia.com/en-us/data-center/h200/), [L40S](https://www.nvidia.com/en-us/data-center/l40s/), [L4](https://www.nvidia.com/en-us/data-center/l4/) spec pages (fetched 2026-10-11/12); [Hopper architecture blog](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/)
+- <Cite id="s-6fdd575dc5" />, <Cite id="s-20bffa9709" />: Llama-3.1 configs; [Llama-3.2-1B](https://huggingface.co/unsloth/Llama-3.2-1B-Instruct/raw/main/config.json), [Llama-3.3-70B](https://huggingface.co/unsloth/Llama-3.3-70B-Instruct/raw/main/config.json), [LLaMA-13B](https://huggingface.co/huggyllama/llama-13b/raw/main/config.json) configs
+- [vLLM launch post](https://vllm.ai/blog/2023-06-20-vllm) (2023-06-20); [PagedAttention paper](https://arxiv.org/abs/2309.06180) (2023-09); vLLM [engine arguments](https://docs.vllm.ai/en/latest/configuration/engine_args.html) and [tuning](https://docs.vllm.ai/en/latest/configuration/optimization.html) docs (fetched 2026-10-12); [vLLM issue 12330](https://github.com/vllm-project/vllm/issues/12330) (2025-01)
+- [Kubernetes: assign memory resources](https://kubernetes.io/docs/tasks/configure-pod-container/assign-memory-resource/) (fetched 2026-10-12)
+- [ZeRO paper](https://ar5iv.labs.arxiv.org/html/1910.02054) (Rajbhandari et al.)
+- Prices (fetched 2026-10-11): [RunPod](https://www.runpod.io/pricing), [Lambda](https://lambda.ai/pricing), [Together](https://www.together.ai/pricing); break-even analyses: [Cohorte](https://cohorte.co/blog/self-hosted-llm-cost-vs-api-break-even) (2026-09-20), [Zander](https://renezander.com/guides/self-hosted-llm-vs-api/); [applied-llms.org](https://applied-llms.org/) (2024-06-08)

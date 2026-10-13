@@ -1,0 +1,158 @@
+---
+question: eng-077
+family: kv-cache-memory-math
+status: published
+labs: [llm-inference, llm-eval]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "When I draw the model box, I can open it. Each conversation holds a KV cache on the GPU: for a 70B model,
+> 2.7 GB at 8K tokens, so four A100s hold about 59 at full length and far more with paged allocation. Batching
+> shares the cost of reading the weights across users, so I batch continuously and set the batch cap from the
+> latency budget, not just memory. And every one of those knobs, like a smaller cache format or quantized
+> weights, can quietly change answers, so each change goes through an eval gate and I watch tail latency and
+> preemptions in production."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+This isn't one question; it is a check that runs through a Staff design round. When you draw a box labelled
+"LLM", can you open it, size it, and say how you'd know a change to it made things worse? This card covers the
+cache and batching part with numbers and points to the eval family for the rest.
+
+A backend engineer designing a normal system treats a downstream service as a box with a latency and a rate
+limit. An LLM you serve yourself is different in three ways:
+
+1. **Its capacity is set by memory per user.** Each active conversation holds a cache on the GPU that grows
+   with every token, so the number of users per machine depends on how long their conversations are.
+2. **Batching is almost free, up to a point.** Every step reads all the model's weights once, whoever is in the
+   batch, so adding users costs little until their caches or the GPU's math speed become the limit.
+3. **Tuning changes the output.** Settings that save memory can change what the model says, so performance
+   changes need quality tests, not just load tests.
+
+(The source is one Blind commenter, unverified: "interviewers now expect fluency in LLM-specific tradeoffs like
+KV cache management, batching strategies, and eval design" <Cite id="s-fe60d2bf1f" />.)
+
+## Clarify first
+
+- **Hosted API or self-hosted?** "The cache and batching half only applies if we run the model."
+- **Model and context?** "I'll assume Llama-3.1-70B in bf16 on four A100 80 GB GPUs, with an 8K maximum context."
+- **Latency budget?** "I'll assume 50 ms between tokens and a few hundred ms to the first token."
+- **Traffic?** "Arrival rate and conversation lengths, measured if you have them, assumed if not."
+
+## Answer
+
+### Words you need first
+
+- **Token**: the unit the model reads and writes, roughly ¾ of a word. **Decode** is the phase where the model
+  writes the reply, one token per pass over its weights.
+- **KV cache**: per-token memory each active conversation keeps on the GPU, so the model doesn't re-read the
+  whole conversation for every new token.
+- **Batch**: the set of conversations that share one decode pass, each getting one new token from it.
+- **Eval**: a fixed set of test cases with pass/fail checks, used to catch quality regressions.
+
+### Part 1. Cache management
+
+Each conversation's cache costs **327,680 bytes per token** for this model, **2.68 GB at 8K**. After 141.1 GB of
+weights and an assumed 20 GB of overhead, the four GPUs have **158.9 GB** for the cache: room for **59**
+conversations if each reserves the full 8K, far more with a **paged allocator** that hands out small blocks as
+each conversation grows. The decisions to state:
+
+- **Paged allocation with prefix caching**, so a shared system prompt is stored once for every request.
+- **A context cap per tenant**, so one long document can't take the whole pool.
+- **A preemption policy**: when the pool is full, the engine pauses a conversation. Recompute is vLLM V1's
+  default. Alert on how often it happens.
+- **An fp8 cache** (1 byte per number instead of 2) to double capacity, gated on an eval.
+
+### Part 2. Batching strategy
+
+Here is one decode step on the example box:
+
+```
+one decode step (all 4 GPUs together)
+  read all weights once ............ 17.3 ms   shared by the whole batch
+  read each conversation's cache ... 19.4 ms   for 59 conversations at 8K
+  ───────────────────────────────────────────
+  step time ........................ 36.7 ms   → one new token for each of 59 users
+```
+
+The **weights** line is the same whether 1 user or 59 are in the batch; that is why batching is nearly free at
+first. The **cache** line grows with every user and every token; batching never shares it.
+
+| Batch | Step time | Per user | Total | What to say in the interview |
+|---|---|---|---|---|
+| 1 | **17.3 ms** | about 58 tokens/s | 58 tokens/s | "That's the floor: reading the weights." |
+| 59 at 8K | **36.7 ms** | about **27** tokens/s | about **1,607** tokens/s | "28× the throughput for about twice the step time." |
+
+So batching is nearly free until the batch reaches the GPU's compute limit (the **ridge point**, about 153 on an
+A100) or until cache reads dominate. Three practices follow:
+
+- **Continuous batching**: conversations join and leave between steps, so a finished one frees its slot at once.
+- **Chunked prefill**: read long new prompts in pieces between decode steps, so they don't stall everyone else.
+- **A batch cap from the latency budget**, not only from memory, with **admission control** in front of the engine
+  that rejects early instead of queueing past the deadline.
+
+Say it like this: "Batching amortizes the weights, not the cache. I cap the batch where the step time hits the
+latency budget, and reject at the door rather than queue past the deadline."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+step ≈ (weight bytes per GPU + B × context × KV bytes per GPU per token) ÷ bandwidth, at 2,039 GB/s per A100.
+
+- **KV per token**: 2 × 80 layers × 8 KV heads × 128 × 2 bytes = 327,680 B; at TP = 4 each GPU holds 81,920 B.
+- **Pool**: 320 − 141.1 − 20 = 158.9 GB → 484,910 tokens → 59 at 8K.
+- **Weights per GPU**: 141.1 ÷ 4 = 35.28 GB ÷ 2,039 GB/s = **17.3 ms**.
+- **Cache per GPU at B = 59, 8K**: 59 × 8,192 × 81,920 B = 39.6 GB ÷ 2,039 GB/s = **19.4 ms**.
+- **Step**: 36.7 ms. Total: 59 ÷ 0.0367 ≈ **1,607 tokens/s**; per stream ≈ **27**.
+
+</details>
+
+### Part 3. Eval design
+
+Every knob above can change outputs or tail latency: an fp8 cache, quantized weights, a new engine version. Gate
+each one on a regression set with pass/fail checks, and track p95 inter-token latency and preemptions in
+production. The [eval-system walkthrough](/system-design-labs/interviews/walkthroughs/eval-system/) covers how.
+
+Say it like this: "A memory saving is a model change. It ships through the same eval gate as a prompt change."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="LLM territory in a design round"
+  senior={["Sizes KV per request and per box, explains paged allocation and continuous batching, and names the latency metrics."]}
+  staff={["Connects the three: the batch cap from latency and KV, the cache-precision change gated by an eval, and the alert that would show the choice was wrong."]}
+/>
+
+## Small-team version
+
+Most small teams call a hosted model, where the provider owns the cache and batching. Your version of this answer
+is token budgets, prompt-prefix caching discounts, timeouts and an eval gate.
+
+If you do self-host, the numbers above decide the box. Compare its cost per request at your real load with a
+serverless endpoint for the same model before committing. The family walkthrough works one case, with requests of
+2,000 input and 300 output tokens:
+
+- **The box**: 4×A100 at RunPod's $5.56–$6.36 an hour (fetched 2026-10-11) serves at most about **209,000
+  requests a day** at 100% of peak, **$0.00064–$0.00073** each.
+- **The API**: Together's serverless Llama 3.3 70B at $1.04 per 1M tokens costs **$0.0024** per request.
+- **Break-even**: the box wins only above about **27–30% of peak throughput around the clock**, before labor.
+
+Default: the API. Revisit at that volume, or when data has to stay on your hardware.
+
+## Pitfalls
+
+- **Staying at boxes and arrows when the interviewer opens the model box.** The question is whether you can size
+  what's inside.
+- **Quoting a continuous-batching multiplier instead of deriving capacity.** Guides disagree; your headroom and
+  lengths decide it.
+- **Treating quantization or an fp8 cache as free.** Both are lossy and need an eval.
+- **Sizing at the worst case and calling it capacity.** With paging, real capacity depends on average length.
+
+## Go deeper
+
+- Family walkthrough: [KV cache and GPU memory math](/system-design-labs/interviews/walkthroughs/kv-cache-memory-math/).
+- The scheduler: [batcher to fleet](/system-design-labs/interviews/walkthroughs/batcher-to-fleet/). The gate: [eval system](/system-design-labs/interviews/walkthroughs/eval-system/).
+- Labs: <LabRef lab="llm-inference" inline /> for the cache, <LabRef lab="llm-eval" inline /> for paired regression tests.

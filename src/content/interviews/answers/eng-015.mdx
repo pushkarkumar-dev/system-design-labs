@@ -1,0 +1,208 @@
+---
+question: eng-015
+family: llm-cost-latency
+status: published
+labs: [rag, llm-inference, embedding-pipeline]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "An answer of a couple of hundred words can't be finished in 2 seconds, so I'd stream it and set the target on the first word: p95
+> time to first token under 2 seconds. 100 users at once is really about 28 requests in flight, because most users
+> are reading or typing. One 80 GB GPU holds that for an 8-billion-parameter open model. The design is retrieval over
+> the company's documents, a reranker, the model behind a serving engine, and a trace on every request. Running our
+> own GPUs here is paying for privacy, not saving money, and I'd say so in the cost estimate."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to see whether you can turn a vague product brief into a sized system with a cost. Two
+conversions decide the round: turning "100+ concurrent users" into the number of requests actually running, and
+turning "under 2 seconds" into something you can measure.
+
+This is different from sizing a normal web service. A normal request takes milliseconds, so 100 users at once is
+close to 100 requests and you size by requests per second. A request to a **large language model (LLM)** takes
+seconds, because the model writes its answer one **token** (a chunk of text, roughly ¾ of a word) at a time. That
+changes both conversions. The answer takes too long to finish in 2 seconds, so the target has to move to the first
+word. And each request occupies the GPU for seconds, so what you size for is requests in flight, not requests per
+second.
+
+The task comes from a candidate's write-up (DEV, 2025-05-26). It lists open-source models "to maintain data
+privacy", "100+ concurrent users", "Response latency should be under 2 seconds", answers grounded in company
+documents, analytics, and deliverables including a cost estimate and risks (<Cite id="s-ba9c761b13" />).
+
+## Clarify first
+
+Say each assumption out loud. Every one of them changes a number below.
+
+- **2 seconds to what?** The first word or the full answer, at which percentile? "I'll assume p95 time to first
+  token, with the answer streamed." A **p95** is the time 95% of requests beat. **Streaming** means each token is sent
+  to the screen as soon as it exists, so the user starts reading early.
+- **How often does a user send a message?** "I'll assume one message every 30 seconds while a user is active."
+- **How long are the prompt and the answer?** "I'll assume 3,000 prompt tokens (system instructions, five retrieved
+  document chunks, some history) and a 300-token answer."
+- **Why open models?** "I'll assume a data rule that forbids sending documents to an external API."
+- **What hours?** "I'll assume business-hours traffic, 8 hours a day."
+
+## Answer
+
+### Words you need first
+
+- **Prompt and output.** Everything sent to the model is the **prompt**; what it writes back is the **output**.
+- **Prefill.** The model reads the whole prompt in one big pass. This decides how long until the first word.
+- **Decode.** The model then writes the answer one token per step. This decides how long the full answer takes.
+- **Time to first token (TTFT).** The wait until the first word appears: everything before the model, any queue,
+  and prefill.
+
+### The system
+
+```
+User's browser
+   │
+   ▼
+Gateway ── login, per-user token quota
+   │
+   ▼
+Query path ── embed the question, search the documents, rerank, build the prompt
+   │
+   ▼
+Model server ── open model on a serving engine (prefill, then decode)
+   │
+   ▼
+Stream ── tokens go back to the browser as they are written
+   │
+   ▼
+Trace ── one record per request: stage times, tokens, cost (feeds analytics)
+```
+
+**Ingestion** runs ahead of time, off to the side: extract text from the company's documents, split it into short
+passages (**chunks**), and turn each chunk into an **embedding**, a list of numbers that places similar meanings
+close together. Store those in an index.
+
+**The query path** does the same to the user's question and finds the closest chunks, usually combined with keyword
+search. This is **retrieval-augmented generation (RAG)**. A **reranker**, a second and more careful model, then
+re-scores the candidates so only the best few go into the prompt, with instructions to cite them.
+
+**The model server** runs the open model. A **serving engine** is the software that loads the model on the GPU and
+runs many users' requests together.
+
+**The trace** records each stage's time and the tokens used. It gives you analytics and the cost per request for free.
+
+The candidate's own design used the Milvus vector database, BGE-M3 embeddings, and fine-tuned Llama-2 7B and 13B
+models, with a small classifier routing easy questions to the smaller model (<Cite id="s-ba9c761b13" />).
+
+### Follow one message through it
+
+A user asks *"Can I get a refund after 30 days?"*. Here is the clock (the retrieval numbers were measured in this
+site's rag lab on an Apple M1 Ultra; the rest are assumed or worked out in the box below):
+
+| Clock | Stage | What happens | What to say in the interview |
+|---|---|---|---|
+| 0 ms | Gateway, prompt build | Login, quota, joining the prompt (about 20 ms, assumed). | "My own code should cost milliseconds." |
+| ~20 ms | Retrieve | Hybrid search over the chunks: tens of milliseconds. | "Retrieval is cheap at this size." |
+| ~55 ms | Rerank | Re-scoring 20 candidates: hundreds of milliseconds on a CPU. | "The reranker is the biggest cost before the model; I'd check it earns its place." |
+| ~0.47 s | Queue | Waits for room on the GPU. | "Under load this is where the first-word delay grows." |
+| ~0.47 s | Prefill | Reads 3,000 tokens: about **0.32 s**. | "Prefill grows with prompt length." |
+| **~0.8 s** | First token | The first word appears. | "Inside the 2-second target." |
+| ~8.3 s | Last token | 299 more tokens at an assumed 25 ms each: about 7.5 s. | "The full answer can't fit 2 seconds at any GPU price, so we stream." |
+
+In the lab, the hybrid search over 5,852 chunks took
+<LabNumber lab="rag" metric="Hybrid retrieve() v1, 5,852 chunks (CPU / MPS)" />, and reranking 20 candidates took
+<LabNumber lab="rag" metric="Cross-encoder rerank, 20 candidates (CPU / MPS)" />.
+
+### How many requests are really in flight
+
+Use **Little's law**: the number of things in a system equals the rate they arrive times how long each one stays.
+Messages arrive at 100 users ÷ 30 s = 3.33 a second. Each stays about 8.3 seconds. So about **28 requests are in
+flight**, not 100.
+
+Say: "100 users is about 28 requests in flight. That is what I size the GPU for."
+
+### Does one GPU hold it?
+
+While the model writes an answer, it keeps a saved summary of every token so far in GPU memory, so it doesn't
+re-read the whole conversation for every new word. This is the **KV cache**. For Llama-3.1-8B it is 128 KiB (about 131 KB)
+per token. Each request holds about 3,300 tokens, so 28 requests hold about **12.1 GB**. The model's own numbers (its
+**weights**) take about **16 GB** at 2 bytes each. Together that is about **28 GB of an 80 GB A100**. It fits.
+
+Speed: each decode step reads all 28 GB from GPU memory, which moves about 2,039 GB a second. So one step takes at
+least **13.8 ms**, and each user can get at most about **72 tokens a second**. The assumed 40 is realistic. Prefill
+for 3,000 tokens is about **0.16 s** at the GPU's peak arithmetic speed and **0.32 s** at an assumed 50% of peak.
+
+Say: "One A100 holds it with room to spare. I'd run two for redundancy."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Requests in flight"
+  expr="L = λ × W"
+  vars={[
+    { sym: 'λ', meaning: '100 users ÷ 30 s = 3.33 requests/s (assumed)' },
+    { sym: 'W', meaning: '≈ 0.8 s to first token + 300 tokens at an assumed 40 tokens/s ≈ 8.3 s' },
+  ]}
+  example="L ≈ 28 in flight. KV for Llama-3.1-8B (131,072 B/token): 28 × 3,300 × 131,072 B = 12.1 GB; with 16.06 GB of bf16 weights that fits one 80 GB A100"
+/>
+
+- KV per token: 2 × 32 layers × 8 KV heads × 128 values × 2 bytes = 131,072 B.
+- Decode floor: (16.06 + 12.1) GB ÷ 2,039 GB/s ≈ 13.8 ms per step, so at most about 72 tokens/s per stream.
+- Prefill: 2 × 8.03 × 10⁹ × 3,000 ≈ 4.8 × 10¹³ operations plus about 5% for attention, at 312 × 10¹² per second
+  (A100 dense BF16) ≈ 0.16 s at peak, 0.32 s at an assumed 50%.
+- Use the KV-heads formula above. The older form that multiplies by the full hidden size is 8× too high for models
+  like Llama-3.1 that share KV heads.
+
+</details>
+
+### Cost
+
+Two A100 80GB GPUs for redundancy at RunPod's $1.39–$1.59 an hour, always on: about **$2,030–$2,320 a month**,
+before anyone's time ([RunPod pricing](https://www.runpod.io/pricing), fetched 2026-10-11).
+
+### Risks
+
+- **Made-up answers.** Ground every answer in retrieved text with citations, and refuse when retrieval finds nothing
+  good.
+- **Stale documents.** Re-index when a document changes.
+- **Instructions hidden in documents** (prompt injection). Treat retrieved text as data, not instructions.
+- **GPU failure.** The second replica takes the load.
+- **Idle GPUs at night.** You pay for them anyway.
+- **Quality drift after a model change.** Gate every model change on an **eval**: a fixed set of questions with
+  known good answers, scored before and after.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Open-model support chatbot"
+  senior={["Converts users to in-flight requests, sizes KV and decode, defines the 2 s target as streamed TTFT, and gives a cost and a risk list."]}
+  staff={["Separates the privacy requirement from the cost argument, names the measured traffic that would justify a third GPU or a managed endpoint, and sets the eval that gates model changes."]}
+/>
+
+In plain words: a Senior answer does the sizing and moves the target to the first word. A Staff answer also says
+out loud that the GPUs are bought for privacy, and names the traffic number that would change the plan.
+
+## Small-team version
+
+Self-hosting here is paying for privacy, not saving money. At the assumed traffic (8 hours a day, 22 days a month)
+the chatbot serves about **2.11 million requests a month**. An open-weight model on a **serverless endpoint**, where a
+provider runs the open model and bills per token, would cost about **$1,330 a month** (gpt-oss-120B on Together at
+$0.15 in and $0.60 out per million tokens, [pricing](https://www.together.ai/pricing), fetched 2026-10-11), if its
+data terms satisfy the rule. That is 3,000 × $0.15/M + 300 × $0.60/M = $0.00063 per request.
+
+If the data terms don't satisfy the rule, rent the two GPUs, use a serving engine that batches requests internally,
+and have an agent write the load and failure tests. Say: "If the rule allows a provider, I'd pay about $1,300 a month
+and skip the GPUs. If it doesn't, the GPUs cost about $2,000–$2,300 a month plus someone's time, and that is the price
+of privacy."
+
+## Pitfalls
+
+- **Treating 100 concurrent users as 100 concurrent requests.** Most users are reading or typing; Little's law gives about 28.
+- **Promising a full answer in under 2 seconds.** At 40 tokens a second, 300 tokens take 7.5 seconds.
+- **A cost estimate with no traffic assumptions behind it.** The interviewer will ask how you got the number.
+- **Using the hidden-size KV formula.** It is 8× too high for models that share KV heads, and makes one GPU look too small.
+
+## Go deeper
+
+- Family walkthrough: [Make an LLM feature fast and affordable](/system-design-labs/interviews/walkthroughs/llm-cost-latency/#back-of-envelope), the worked chatbot.
+- Second family: [Design a RAG system end to end](/system-design-labs/interviews/walkthroughs/rag-system-design/).
+- Labs: <LabRef lab="rag" inline />, <LabRef lab="llm-inference" inline />, <LabRef lab="embedding-pipeline" inline />.

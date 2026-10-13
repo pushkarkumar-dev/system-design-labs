@@ -1,0 +1,157 @@
+---
+question: infra-051
+family: multi-tenant-gpu-serving
+status: published
+labs: [llm-inference, load-balancer, rate-limiter]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Sharing GPUs between customers works because writing tokens is limited by reading the model from memory, and
+> one read serves the whole batch, so adding customers to a batch is nearly free. The danger is the other phase:
+> reading a long prompt is heavy arithmetic, and if it runs in one piece, every other customer's next word waits.
+> So I split long prompts into chunks between steps, cap and fair-queue each customer by tokens, give paying tiers
+> priority, and measure p99 latency per customer, not just for the fleet."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you can keep a per-word latency promise when the batch on every GPU contains
+other customers' requests.
+
+In a normal shared service, one customer's slow query rarely slows another's, because each request runs on its own
+thread. Here, every customer's request on a GPU runs in the **same** batch, step by step. If one step takes longer,
+everyone's next word is late. So the noisy-neighbour problem lives inside the GPU, not just at the load balancer.
+
+A prep site reports Fireworks design rounds on "serving large models with low delay, sharing GPUs across many
+customers, and keeping the service reliable" (<Cite id="s-81dd7e6306" />). The report is thin, so expect the
+interviewer to steer toward one place: where one customer's work slows another's.
+
+### Words you need first
+
+- **Token.** Models read and write text in small pieces called tokens, about ¾ of a word each.
+- **Prefill and decode.** The model first reads the whole prompt in one big pass (**prefill**), then writes the
+  reply one token per step (**decode**). Each decode step is shared by every request in the batch.
+- **TTFT and ITL.** Time to first token (how long until the first word appears) and inter-token latency (the gap
+  between later words). Users feel ITL as the reply "typing" smoothly or stuttering.
+- **Weights and HBM.** The model's learned numbers, held in the GPU's own fast memory (HBM, high-bandwidth memory).
+  A 70-billion-parameter model (70B) is about 141 GB at 2 bytes per number.
+
+## Clarify first
+
+- **Latency targets per tier.** "I'll assume a 50 ms inter-token budget for the top tier."
+- **Model size and GPUs.** "For the arithmetic, a 70B split across 4 A100 GPUs that compute every step together." Splitting one model
+  this way is called tensor parallelism; four GPUs is written TP = 4.
+- **Prompt lengths.** Are long prompts common?
+- **Tiers.** May lower tiers be slowed down or turned away?
+
+## Answer
+
+### 1. Know the floor
+
+Every decode step reads all the weights from GPU memory. So a step can't be faster than the weight bytes on each GPU
+divided by memory speed. For our 70B on 4 A100s that is **about 17.3 ms per token**
+(<Cite id="s-8e443a8b66" />).
+
+The useful part: that read happens once per step, whatever the batch size. Ten customers' requests in one batch
+cost almost the same read as one. So more customers per batch are nearly free in latency, until reading their KV
+caches (each request's saved summary of its tokens so far) and doing their arithmetic catch up. That is why sharing
+GPUs works at all. Against a 50 ms budget, there is room for batching to make each step nearly three times slower.
+
+### 2. Find the noisy neighbour inside the replica
+
+Prefill is heavy arithmetic. Follow one long prompt:
+
+| Clock | What happens | What to say in the interview |
+|---|---|---|
+| 0 ms | The batch is decoding smoothly: one token for every customer each ~17–50 ms. | "Everyone is inside the 50 ms budget." |
+| 0 ms | Customer X sends a 2,000-token prompt. | "This needs prefill." |
+| 0 → ~226 ms | If the engine reads the whole prompt in one piece, the batch waits. | "Every other customer's next token is late by about 13 decode steps." |
+| with chunking | The prompt is read in pieces between decode steps. Each step stays within budget. | "Chunked prefill keeps other customers' words flowing." |
+
+Two fixes:
+
+- **Chunked prefill.** Split long prompts across steps, so each step stays inside the inter-token budget.
+- **Separate prefill and decode pools** for large models: one set of GPUs reads prompts, another writes replies.
+
+### 3. Isolate customers from each other
+
+```
+Customers ──► Gateway: token budget + concurrency cap per customer
+                  │
+                  ▼
+              Fair queue (by tokens, weighted by tier)
+                  │
+                  ▼
+              Router: free KV memory, prefer a replica that already holds this customer's prompt prefix
+                  │
+                  ▼
+              Replicas (chunked prefill)        Dedicated replicas only when justified
+```
+
+- **Per-customer token budgets and concurrency caps** at the gateway, with a fair queue weighted by tokens behind
+  them.
+- **Route on free KV memory.** Prefer replicas that already hold a customer's prompt beginning (its **prefix**), so a
+  shared system prompt isn't read again.
+- **Priority tiers.** The top tier's requests join the next step first; lower tiers absorb bursts.
+- **Dedicated replicas** only for customers whose load or promise justifies them (see the dedicated-endpoint card).
+
+### 4. Reliability
+
+Retry requests that haven't started streaming. For replies already streaming, send an error or resume on another
+replica. Autoscale on queue depth and time to first token. Drain by starting the replacement first (**surge**).
+
+### 5. Measure per customer
+
+Track p99 time to first token and inter-token latency by tier and by customer. One fleet-wide p99 hides the one
+customer whose experience fell apart, and you want to see it before they report it.
+
+Say: "Batching makes sharing cheap. Long prompts are the noisy neighbour. Chunked prefill and per-customer budgets
+contain them, and per-customer p99 proves it."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Decode floor:** 141.1 GB of bf16 weights (exact 70.55B parameters) ÷ 4 GPUs = 35.28 GB per GPU. ÷ 2,039 GB/s
+  (A100 memory bandwidth) ≈ **17.3 ms per token** at batch 1.
+- **Room in the budget:** 50 ÷ 17.3 ≈ 2.9×.
+- **Prefill of 2,000 tokens:** 2 × 70.55 × 10⁹ × 2,000 ≈ 2.8 × 10¹⁴ operations. 4 A100s at 312 × 10¹² dense bf16
+  operations per second each = 1.25 × 10¹⁵ per second. 2.8 × 10¹⁴ ÷ 1.25 × 10¹⁵ ≈ **226 ms**.
+- **Stall in decode steps:** 226 ÷ 17.3 ≈ **13 steps**.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Low latency on shared GPUs"
+  senior={["Derives the decode floor and the prefill stall, then applies chunked prefill and per-customer caps."]}
+  staff={["Decides which tiers get latency guarantees and what each costs, and shows them per customer on a dashboard the account team can read."]}
+/>
+
+In plain words: Senior gets the mechanism right. Staff also turns latency into a product (which tier gets which
+promise, at what price) and makes it visible to the people who talk to customers.
+
+## Small-team version
+
+You're the customer. Pick a provider tier with a published latency target, measure your own p99 time to first token
+from your region, and stream the reply. If long prompts slow you down, use the provider's prompt caching for shared
+prefixes where it's offered. Self-hosting for latency rarely beats a dedicated endpoint at small volume.
+
+**Price the step up before you take it.** A dedicated H100 endpoint at $5.49 per GPU-hour on Together's page is
+about **$4,008 a month** always on (fetched 2026-10-12). Compare that with, for example, about **$1,020 a month**
+for 5.1 billion tokens at a $0.20-per-million per-token rate (the family walkthrough's sample workload).
+
+## Pitfalls
+
+- **Quoting a continuous-batching speedup.** A number from a blog post isn't an answer; derive where the latency
+  goes.
+- **Ignoring prefill stalls from other customers' long prompts.** That's the noisy neighbour this question is about.
+- **One fleet-wide p99.** It hides a single customer's pain.
+
+## Go deeper
+
+- Family walkthrough: [Run many models for many tenants](/system-design-labs/interviews/walkthroughs/multi-tenant-gpu-serving/).
+- Streaming and inter-token budgets: [chat serving and streaming](/system-design-labs/interviews/walkthroughs/chat-serving-streaming/).
+- Labs: <LabRef lab="llm-inference" inline />, <LabRef lab="rate-limiter" inline />.

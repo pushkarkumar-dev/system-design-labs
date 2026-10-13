@@ -1,0 +1,845 @@
+---
+title: "GPU cluster control plane: placement, topology, health and drain"
+summary: "Design the brain of a shared GPU cluster: track which machines are alive, hand out jobs safely, place GPU work so big jobs still fit, keep multi-machine jobs close together, and pull out and return bad GPUs."
+track: ai-infra
+format: design
+family: gpu-cluster-control-plane
+smallTeamFocus: "Mostly a GPU-cloud problem. A small team rents managed Kubernetes GPU node pools or serverless GPUs, learns the device plugin and drain, and builds a scheduler only past roughly 70 owned GPUs."
+rounds: [system-design, practical-coding, coding-dsa, domain-deep-dive]
+level: both
+timeboxMin: 45
+order: 344
+status: published
+basedOn: [infra-013, infra-014, infra-046, infra-047, infra-052, infra-053, r2b-019]
+askedAt: [coreweave, fireworks-ai, fluidstack, nvidia, together-ai, xai]
+labs:
+  - { lab: dist-lock, role: proof, note: "Leases and fencing tokens: the rule that stops a host whose lease expired from overwriting a job's result after the job was reassigned." }
+  - { lab: container-orchestrator, role: partial, note: "A level-triggered reconcile loop and a first-fit scheduler on CPU and memory. No GPU resource, no best-fit, no gang or topology placement and no drain; those are the exercise. Its informer test fails and the suite times out." }
+  - { lab: gossip, role: partial, note: "SWIM failure detection with a suspect state before dead, the shape of host liveness here. Its demo doesn't build and its revived-node test fails." }
+  - { lab: raft, role: partial, note: "Leader election and a replicated log for the control plane's desired state. Its re-election test panics." }
+  - { lab: service-discovery, role: partial, note: "TTL registrations and watches, a small version of host registration. Three tests fail, including watch expiry." }
+  - { lab: observability, role: partial, note: "Metrics, logs and traces in one middleware: where GPU health signals would land. The Go package doesn't compile as of 2026-10-11." }
+gapLabs: [gpu-scheduler]
+researchedAt: "2026-10-12"
+updatedAt: "2026-10-12"
+---
+
+## The prompt
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll keep two kinds of state apart. Fast-changing facts, like heartbeats and GPU health readings, go into a
+> sharded in-memory table that can afford to lose a few seconds. Decisions, like which job runs on which machine,
+> go into a small replicated store with a leader, and every job attempt carries a lease and a fencing token, so
+> a machine that lost contact can't overwrite a result after the job moved. A GPU can't be split across machines,
+> so I place work best-fit to keep whole machines free for big jobs, and I keep a multi-machine job under one
+> network switch. For bad GPUs I drain on trends, not single errors, with a threshold set by what a failure would
+> cost the job running there, and I cap how many machines the automation may drain per hour."
+>
+> The rest of this page explains each part of that answer.
+
+### What makes this different from the cluster you already run
+
+You have probably run Kubernetes. A pod asks for half a CPU and 512 MB of memory, the scheduler finds any node with
+room, and if the node dies the pod restarts somewhere else a few seconds later. Nodes are cheap and roughly
+interchangeable, and a pod rarely cares which other pods are its neighbours.
+
+A GPU cluster breaks those habits in four ways.
+
+1. **The unit can't be split, and it is expensive.** A GPU is a whole device. Work asks for 1, 2, 4 or 8 whole
+   GPUs, and a request for 8 must land on one machine. One NVIDIA H100 GPU rents for about $3–4 an hour, so a
+   fleet of 5,000 of them costs about $20,000 an hour (at the $3.99 on-demand price used later). An idle GPU
+   is money on fire.
+2. **Big jobs need all their GPUs at once.** A training job that uses 64 GPUs runs them in lockstep. It can't
+   start on 60 and wait for 4 more, and if one GPU fails, all 64 stop.
+3. **Where a GPU sits in the network matters.** GPUs inside one machine talk to each other about nine times faster
+   than GPUs in different machines (the numbers are in the back-of-envelope). Between machines, being under the
+   same network switch matters too. So "any free node" is the wrong answer for a big job.
+4. **Hardware fails partly and quietly.** A GPU's memory can throw errors that come and go for days before the GPU
+   dies. Pulling it out too early wastes capacity; too late, and it kills a job running on 1,000 GPUs.
+
+So the interview is a distributed-systems question you mostly know (a node table under heavy writes, safe job
+hand-off, bin-packing, a health pipeline), with GPU-specific rules about what can be split, what must be close
+together and what a wrong decision costs.
+
+### Words you need first
+
+- **Node**: one server. Here it holds **8 H100 GPUs** (the SXM version, wired together inside the box). Assume
+  every node is the same.
+- **Training job**: a program that teaches a model by running the same step over and over on many GPUs. Each step,
+  every GPU computes a **gradient** (a big array of numbers saying how to adjust the model) and then all GPUs
+  average their gradients before the next step. Because every GPU waits for every other GPU, the job is
+  **synchronous**: one slow or dead GPU stalls all of them.
+- **Checkpoint**: a training job's saved progress, written every so often (assume every 30 minutes). After a crash
+  the job restarts from its last checkpoint, so it loses whatever it did since then.
+- **Gang**: a group of pods or processes that must start together or not at all. A 64-GPU training job is a gang
+  of 8 whole nodes.
+- **Inference replica**: a copy of a model answering user requests. It usually fits on one node, and replicas are
+  independent, so losing one costs a few retried requests.
+- **ECC errors**: memory errors caught by the error-correcting check GPU memory runs on every read. The
+  back-of-envelope explains which ones are normal and which ones crash a job.
+- **InfiniBand**: the dedicated low-latency network that connects GPU nodes to each other. Its **topology** is how
+  its switches are arranged, which decides how fast any two nodes can talk.
+
+Versions of this were reported at Together AI, NVIDIA, CoreWeave, Fireworks AI, Fluidstack and xAI, mostly
+through PracHub and prep sites; each one is cited in the next section, and interviewers usually pick one.
+
+### The prompt as asked
+
+Design the control plane for a multi-tenant GPU cluster. It must know which hosts and GPUs are alive and healthy,
+dispatch jobs to them without losing or duplicating work, place pods that ask for whole GPUs so the cluster
+doesn't fragment, keep multi-node jobs inside a fast network domain, drain a node that still runs pods, and find
+GPUs that throw intermittent memory errors, pull them out and return them to service without a human.
+
+<QuestionRow id="infra-046" />
+<QuestionRow id="r2b-019" />
+<QuestionRow id="infra-047" />
+<QuestionRow id="infra-053" />
+<QuestionRow id="infra-052" />
+<QuestionRow id="infra-013" />
+<QuestionRow id="infra-014" />
+
+The serving layer that sits on top of this (which models live on which GPUs, adapters, dedicated endpoints) is its
+own family: [run many models for many tenants](/system-design-labs/interviews/walkthroughs/multi-tenant-gpu-serving/).
+
+## What is being tested
+
+### What each reported question asks
+
+- **Together AI: a GPU-aware pod scheduler** (PracHub, tech screen, 2025-08-07). Nodes have a GPU count, pods ask
+  for whole GPUs, a pod can't be split across nodes, and any GPU is as good as any other. The page asks for an
+  index that finds nodes by free GPUs, best-fit or first-fit with a reason, index updates on every operation,
+  concurrency control, idempotency, removing a node that still runs pods, per-API complexity, and the edge cases
+  of an oversized pod and fragmentation (<Cite id="s-3a3d9c8dba" />).
+- **NVIDIA: "Design the Control Plane for a Compute Cluster: Host Monitoring + Job Dispatch"** (PracHub, tech
+  screen, 2026-06-20). The visible summary says it tests tracking live host state across a large fleet "under
+  high write concurrency", storage schema, scaling with fleet size, and failure detection and availability when a
+  central coordinator goes down. The full text is locked (<Cite id="s-1f1d1ddaac" />).
+- **CoreWeave: a topology-aware scheduler.** A prep site says recent candidates were asked to design "a
+  multi-tenant GPU cluster scheduler aware of InfiniBand topology" and that interviewers are "less interested in
+  textbook answers". It names no candidate (<Cite id="s-1c022c73a6" />). A separate Glassdoor review, seen only
+  as a search snippet, mentions "design a Kubernetes platform that scales with load" in October 2025
+  (<Cite id="s-5e2c5b84e0" />).
+- **Fireworks AI: the GPU stack.** A prep site says "For AI infrastructure roles, candidates also report
+  questions about GPUs and inter-GPU communication", plus Kubernetes and NVIDIA's Kubernetes plugins
+  (<Cite id="s-81dd7e6306" />).
+- **Fluidstack: bad GPUs in a fleet** (prep guide, 2026-09-10). "You have 5,000 GPUs across several sites. A
+  subset starts throwing ECC errors intermittently." The guide calls it "a representative prompt" and says its
+  fleet-health emphasis is "a well-grounded prior, not gospel". Its strong answer: alert on trend and burst rate
+  rather than one correctable error, drain without killing running work, automated re-qualification with a
+  return-to-vendor path, and naming the blast radius (<Cite id="s-747377636a" />).
+- **xAI: find faulty nodes with group tests** (PracHub, MLE onsite, posted 2026-09-05). A test fails if any node
+  in it is bad, each test needs at least two nodes, and tests that run at the same time can't share nodes.
+  Follow-ups on the page: few bad nodes, flaky tests, test time that grows with group size, and running it
+  continuously in production (<Cite id="s-840d2c1a9e" />).
+
+### What it adds up to
+
+Your backend experience carries most of this. You already know heartbeats, leases, leader election and
+bin-packing. What the interviewer listens for is whether you can attach GPU facts to them:
+
+- that whole GPUs and whole nodes make fragmentation the central scheduling problem;
+- that network position is a second packing problem on top of the first;
+- that a health threshold is a cost trade-off that depends on the job running on the GPU;
+- and that the automation which drains bad machines can itself become the outage.
+
+Say it like this: "Most of this is a control plane I'd build for any fleet. The GPU parts are three: work can't
+be split, big jobs need to sit close together, and a bad GPU costs whatever job is on it, so thresholds depend on
+the job."
+
+## Clarify and scope
+
+Spend a minute pinning down the setup, out loud, so your numbers mean something.
+
+1. **Fleet shape.** "I'll assume 5,000 GPUs as 625 nodes of 8 H100s, in a few sites. Are there mixed GPU
+   generations?"
+2. **Workloads.** "Is this large synchronous training jobs, many single-node inference replicas, or both?" Ask this
+   early: it decides what a bad GPU costs.
+3. **Network.** "I'll assume a fast link inside each node, and an InfiniBand network between nodes built as a
+   tree of switches. How many nodes share one switch at the bottom of the tree, and do the links going
+   up carry less than the nodes below can send?" The back-of-envelope names these parts.
+4. **Orchestrator.** "Is this Kubernetes, Slurm (the batch scheduler common on research clusters) or a custom scheduler?" The answer changes the vocabulary, not the
+   structure.
+5. **Tenancy.** "Do tenants ever share a GPU, or always whole GPUs and whole nodes?"
+6. **Promises.** "How fast must we notice a dead host, and may a job ever run twice?"
+
+Out of scope unless asked: the inference engine, the training framework's checkpoint format, and billing.
+
+## Back-of-envelope
+
+Four numbers shape the design. For each, here is what it means first; the arithmetic is in the box at the end of
+the section.
+
+### How much the host table is written
+
+Every node sends a **heartbeat** (a small "I'm alive, here are my GPU readings" message) every few seconds. The
+NVIDIA prompt says "large fleet", so assume 20,000 hosts each reporting every 5 seconds. That is **4,000 writes a
+second**, about **8 MB/s** at an assumed 2 KB per heartbeat. If you call a host suspect after 3 missed heartbeats,
+you notice a dead host after about **15 seconds**. Halving the interval halves that time and doubles the writes.
+
+What it means: 4,000 small writes a second is easy for a sharded in-memory table, and far too much churn for a
+consensus log, where every write waits for a majority of replicas to agree. So the design splits state in two:
+**observed state** (what hosts report: heartbeats, metrics) in a fast, sharded table, and **desired state** (what
+the control plane decided: jobs, assignments, cordons) in a small replicated store. Only decisions go through
+consensus.
+
+Say it like this: "Heartbeats are 4,000 writes a second of churn. I don't want that in the store that holds
+decisions."
+
+### Fragmentation: free GPUs that nobody can use
+
+Take ten nodes, 80 GPUs, running 40 one-GPU pods.
+
+- **Packed tightly**, they fill five nodes and leave five nodes empty. Five 8-GPU pods still fit.
+- **After churn** (pods come and go, new ones land wherever there was a hole), the same 40 pods can end up four per
+  node on all ten nodes. There are still 40 free GPUs, and not one 8-GPU pod fits.
+
+That is **fragmentation**: free capacity in pieces too small for the work that is waiting. One way to measure it
+is **fragmentation = 1 − (GPUs usable by the largest waiting shape ÷ free GPUs)**. It is 0 when packed and 1.0
+after churn in this example. This is why "enough free GPUs in total" never means "it fits".
+
+### What a bad GPU costs, and what a drain costs
+
+**ECC** (error-correcting code) is the check the GPU's memory runs on every read. A **correctable** (single-bit)
+error is fixed on the fly and is normal in small numbers. An **uncorrectable** (double-bit) error is not, and it
+usually crashes whatever is running. **Draining** a node means moving its work off and testing it, which costs
+GPU time even when the node turns out to be healthy.
+
+So the question is: at what chance of failure is draining cheaper than waiting? Weigh the two costs.
+
+- **The cost of a miss.** If a GPU fails inside a 1,024-GPU synchronous training job that checkpoints every 30
+  minutes, all 1,024 GPUs lose on average 15 minutes of work plus an assumed 10-minute restart. That is about
+  **427 GPU-hours, roughly $853** at an assumed $2 per GPU-hour (an owned GPU; at rental prices it is about
+  double, which doesn't change the ratio below).
+- **The cost of a drain.** NVIDIA's health-check tool is **DCGM** (Data Center GPU Manager). Its long diagnostic
+  runs in under 35 minutes on an 8-GPU node, so testing one node costs about **4.7 GPU-hours, about $9**.
+
+Draining pays as soon as the chance of failure before the next check passes the ratio of the two: about **1.1%**
+under that big training job. Under a node running eight independent one-GPU inference replicas, a miss costs a few
+retried requests, so the threshold is far higher and you can wait for more evidence. This is the arithmetic behind
+the Fluidstack guide's "blast radius": the same error rate justifies an instant drain under a big training job
+and patience under single-GPU inference.
+
+Say it like this: "The drain threshold isn't a property of the GPU. It's a property of the job on it."
+
+### Network traffic between nodes
+
+At the end of every training step, the GPUs average their gradients. The standard way is a **ring all-reduce**:
+the GPUs form a ring, and each sends and receives pieces of the array until every GPU holds the average. Each GPU
+sends about twice the array's size, whatever the number of GPUs. This is the traffic that crosses the network
+between nodes.
+
+Two kinds of link carry it:
+
+- **Inside a node**, GPUs talk over **NVLink**, NVIDIA's direct GPU-to-GPU link, through a switch chip in the box
+  called **NVSwitch**. On an H100 that is **450 GB/s each way per GPU**. NVIDIA's own "900 GB/s" figure is both
+  directions added together ([Hopper architecture blog](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/),
+  2022-03-22, fetched 2026-10-11).
+- **Between nodes**, traffic goes through network cards (**NICs**) over **InfiniBand**, a low-latency data-center
+  network. Assume **50 GB/s per GPU**. The switches are arranged as a tree: each **leaf switch** connects a group of
+  nodes, and **spine switches** connect the leaves. If a leaf's links up to the spine carry less than the nodes
+  below it can send, the uplinks are **oversubscribed**, and traffic that crosses leaves gets less bandwidth.
+
+Now one example. A 64-GPU job training an 8-billion-parameter model has gradients of **16 GB** (2 bytes per number,
+a format called **bf16**). Each GPU sends about **31.5 GB per step**, which takes about **0.63 s** at 50 GB/s.
+Through an oversubscribed uplink at half the bandwidth, it takes **1.26 s**. Every step, for the whole run.
+
+What it means: the link inside a node is about **9× faster** than the link between nodes. So the work that
+talks most stays inside one node (splitting one model's layers across GPUs, called **tensor parallelism**), and
+only the lighter traffic, such as gradient averaging, crosses the network. And a job that spans two leaf switches
+can run measurably slower than one inside a leaf.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Heartbeat write rate and detection time"
+  expr="writes/s = hosts ÷ heartbeat interval;   detection time ≈ k × interval"
+  vars={[
+    { sym: 'hosts', meaning: 'machines reporting; 20,000 assumed for the NVIDIA-style prompt' },
+    { sym: 'interval', meaning: 'seconds between heartbeats; 5 s assumed' },
+    { sym: 'k', meaning: 'missed heartbeats before a host is suspected; 3 assumed' },
+  ]}
+  example={[
+    "20,000 ÷ 5 s = 4,000 writes per second; at an assumed 2 KB each, 8 MB/s",
+    "Detection: 3 × 5 s = 15 s before suspicion. Halving the interval halves detection time and doubles the writes",
+  ]}
+/>
+
+<Formula
+  title="Drain threshold"
+  expr="drain when p_fail × C_miss > C_drain, so p* = C_drain ÷ C_miss"
+  vars={[
+    { sym: 'p_fail', meaning: 'probability the GPU fails a job before the next health check' },
+    { sym: 'C_miss', meaning: 'GPU-hours lost if it fails inside a running job' },
+    { sym: 'C_drain', meaning: 'GPU-hours spent draining and re-testing a healthy node' },
+  ]}
+  example={[
+    "Miss: a 1,024-GPU synchronous training job that checkpoints every 30 min loses on average 15 min of work plus an assumed 10 min restart: 25 × 1,024 = 25,600 GPU-minutes ≈ 427 GPU-hours (≈ $853 at an assumed $2 per GPU-hour)",
+    "Drain: DCGM's long diagnostic runs in under 35 minutes on an 8-GPU system: 8 × 35 = 280 GPU-minutes ≈ 4.7 GPU-hours (≈ $9)",
+    "p* = 280 ÷ 25,600 ≈ 1.1%: drain as soon as the chance of failure in the next window passes about 1%",
+    "Same assumptions, the 64-GPU job in the worked example below: 25 × 64 = 1,600 GPU-minutes, so p* = 280 ÷ 1,600 ≈ 17.5%",
+  ]}
+  note="For a node running eight independent one-GPU inference replicas, C_miss is a few retried requests, p* is far higher, and you can afford to wait for more evidence."
+/>
+
+The DCGM durations come from NVIDIA's diagnostics page (r3 "under 35 minutes on 8-GPU systems", r1 under 2.5
+seconds; [DCGM Diagnostics](https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/dcgm-diagnostics.html),
+updated 2026-06-17, fetched 2026-10-12).
+
+<Formula
+  title="Ring all-reduce bytes per GPU"
+  expr="bytes sent per GPU = 2 × (N − 1) ÷ N × S"
+  vars={[
+    { sym: 'N', meaning: 'GPUs in the ring' },
+    { sym: 'S', meaning: 'bytes being reduced, for example a bf16 gradient' },
+  ]}
+  example={[
+    "8B-parameter gradients in bf16 (16 GB) across 64 GPUs: 2 × 63 ÷ 64 × 16 = 31.5 GB per GPU per step",
+    "At an assumed 50 GB/s per GPU across nodes: 0.63 s per step for bandwidth alone; halve the bandwidth through an oversubscribed uplink and it is 1.26 s",
+  ]}
+/>
+
+NVLink: NVIDIA's Hopper blog gives 18 links at "25 GB/sec effective bandwidth in each direction", so 18 × 25 =
+450 GB/s each way, 900 GB/s for both directions. Against the assumed 50 GB/s off the node, 450 ÷ 50 = 9×.
+
+</details>
+
+## High-level design
+
+### The picture
+
+```text
+           users / job submitters                operators
+                    │                                │
+            ┌───────▼─────────┐               ┌──────▼──────┐
+            │ API + admission │  quotas,      │ cordon /    │
+            │ (per-tenant)    │  priorities   │ drain / RMA │
+            └───────┬─────────┘               └──────┬──────┘
+                    │ desired state                  │
+         ┌──────────▼──────────────────────────────▼──────────┐
+         │ replicated store (leader-elected): jobs, bindings,   │
+         │ node conditions, cordons, topology map               │
+         └───┬─────────────────────┬──────────────────────┬────┘
+             │                     │                      │
+     ┌───────▼───────┐   ┌─────────▼────────┐   ┌─────────▼─────────┐
+     │ scheduler      │   │ health controller │   │ dispatcher         │
+     │ best-fit, gang,│   │ Xid / ECC trends, │   │ leases + fencing   │
+     │ topology       │   │ drain, requalify  │   │ tokens per attempt │
+     └───────┬───────┘   └─────────▲────────┘   └─────────┬─────────┘
+             │ bindings            │ signals              │ assignments
+         ┌───▼─────────────────────┴──────────────────────▼───┐
+         │ node agents (one per host): heartbeats, GPU metrics, │
+         │ run / stop workloads, local diagnostics              │
+         └──────────────────────────────────────────────────────┘
+          heartbeats → sharded observed-state table (last-writer-wins)
+```
+
+Read it top to bottom. Requests come in at the top, decisions are stored in the middle, three controllers act on
+them, and agents on the machines do the work.
+
+**API and admission.** Tenants submit jobs here. It checks each tenant's quota (how many GPUs they may hold) and
+priority before anything is stored, so one tenant's burst of 10,000 pods can't fill the queue for everyone.
+Operators use a second entry point to cordon, drain or send a part back to the vendor (an **RMA**, return
+merchandise authorization).
+
+**Replicated store.** The desired state: jobs, **bindings** (which pod or job attempt is placed on which node and
+GPUs), node conditions, cordons, and the topology map (which node sits under which switch). It is small,
+consistent and leader-elected (Raft, or etcd, which runs Raft). It never sees heartbeats.
+
+**Scheduler.** Decides where work goes: best-fit on free GPUs, whole gangs at once, and topology. It is the only
+writer of bindings, and each node record carries a version number so two scheduler threads can't both take the
+same GPUs (compare-and-set: "write only if the version is still 17").
+
+**Health controller.** Reads GPU error signals (ECC counts, and the driver's numbered error events, called **Xid
+errors**, covered in the deep dive), keeps a trend per GPU, and moves nodes through suspect, draining,
+re-testing and back. It also holds the automation budget that stops it from draining a whole site.
+
+**Dispatcher.** Hands a job attempt to a host under a **lease** (the host owns the attempt only while it keeps
+renewing) and a **fencing token** (a number that goes up with every new attempt; storage rejects writes carrying
+an older number). This is how a job moves without ever being committed twice.
+
+**Node agents.** One per machine. They send heartbeats and GPU readings, start and stop work, and run local
+diagnostics on command. If the control plane is unreachable they keep running what they already have. That
+property is called **static stability**: a control-plane outage stops new decisions, not running work.
+
+**Observed-state table.** Heartbeats land here, sharded by host id and held in memory. Each host's record keeps
+its latest **sequence number**, so an old heartbeat that arrives late can't overwrite a newer one
+(last-writer-wins). History goes to a time-series store. Losing a shard costs one heartbeat interval, because
+agents simply send again.
+
+### Follow one job through it
+
+Here is one job's day, with real-looking values. Assume the 625-node fleet from the clarify step, organised under
+leaf switches. The leaf names, times and token numbers are illustrative.
+
+Tenant **acme** submits **train-42**: a training job for an 8-billion-parameter model on **64 GPUs** (8 whole
+nodes), checkpointing every 30 minutes.
+
+| Clock | Step | What happens | What to say in the interview |
+|---|---|---|---|
+| 09:00:00 | **Admission** | acme's quota allows 64 more GPUs; the job is stored as pending. | "Quotas count GPUs per tenant, so one team's burst waits behind its own quota." |
+| 09:00:01 | **Gang + topology** | The job needs 8 whole free nodes under one leaf. Leaf L3 has 12 free nodes, leaf L7 has 9. Best-fit picks **L7**, the smallest leaf that fits. | "I keep L3's 12 free nodes together for the next bigger job." |
+| 09:00:02 | **Bind** | The scheduler writes 8 bindings with compare-and-set on each node's version. | "If another scheduler took one of those nodes first, my write fails and I try again." |
+| 09:00:03 | **Dispatch** | Attempt 1 goes out with **fencing token 41** and a lease the agents renew with every heartbeat. | "The token is what makes moving the job later safe." |
+| every 5 s | **Heartbeats** | 8 agents report GPU readings to the observed-state table. | "This never touches the replicated store." |
+| 11:40 | **Suspect** | Node L7-n5, GPU 3, reports a burst of high single-bit ECC errors. The node is marked **suspect**: no new work goes there. | "One correctable error is normal. A burst or a rising trend is a signal." |
+| 11:40 | **Decide** | Under this 64-GPU job the drain threshold is about 17%; under a 1,024-GPU job it would be about 1%. The controller's estimate for this GPU passes 17%, so it schedules a drain. | "Same error, different jobs, different answers." |
+| 12:00 | **Drain at checkpoint** | train-42 writes its 12:00 checkpoint and stops. L7-n5 is cordoned. The scheduler places **attempt 2** on the job's 7 healthy nodes plus L7's one remaining free node (it replaces n5), with **token 42**. | "The job leaves at its checkpoint, so it loses almost nothing." |
+| 12:00:20 | **Fencing** | A slow process on n5 tries to write output with token 41. Storage has seen 42 and rejects it. | "A host that lost the job can't commit stale output." |
+| 12:01 | **Re-qualify** | n5 gets a GPU reset, NVIDIA's long diagnostic (under 35 min on 8 GPUs) and a single-node communication test. | "The machine proves itself before it comes back." |
+| 12:36 | **Return** | n5 passes and returns on **probation** for a week with a tighter threshold. A second failure sends the GPU back to the vendor. | "Probation stops the same bad GPU from cycling." |
+
+Compare that with doing nothing. If GPU 3 had failed at 11:55, all 64 GPUs would have lost the work since the 11:30
+checkpoint plus a restart. Draining at the checkpoint cost one node about 35 minutes of testing instead.
+
+The arithmetic for "about 17%" is in the back-of-envelope box: 280 GPU-minutes of drain against 1,600 GPU-minutes
+of expected loss.
+
+### Where Kubernetes already has names for these boxes
+
+If the interviewer says "assume Kubernetes", most boxes already exist, and the design question is what they don't
+decide for you.
+
+- The **NVIDIA device plugin** is a DaemonSet (one pod per node) that tells Kubernetes how many GPUs each node has,
+  tracks their health and runs GPU containers
+  ([k8s-device-plugin](https://github.com/NVIDIA/k8s-device-plugin), v0.17.1, fetched 2026-10-12).
+- The **GPU Operator** installs everything a GPU node needs: driver, container toolkit, device plugin, GPU Feature
+  Discovery labels, DCGM monitoring and the MIG manager (all explained in the deep dives)
+  ([GPU Operator overview](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/overview.html),
+  fetched 2026-10-12).
+- `kubectl drain` evicts pods while respecting PodDisruptionBudgets
+  ([Kubernetes: safely drain a node](https://kubernetes.io/docs/tasks/administer-cluster/safely-drain-node/),
+  modified 2026-04-21).
+
+What none of these decide: best-fit against fragmentation, gangs under one leaf, a drain threshold per workload,
+and the limit on automated drains.
+
+## Deep dives
+
+Each reported question maps to one of these. Pick the one the interviewer leans into.
+
+### The GPU-aware pod scheduler (Together's screen)
+
+The question: nodes have up to 8 GPUs, pods ask for a whole number of GPUs, write the scheduler.
+
+Keep three structures:
+
+- `nodes[name]`: total GPUs, used GPUs, its pods, a version number, and whether it is schedulable.
+- `pods[name]`: how many GPUs it wants and which node it is on, if any.
+- `buckets[f]`: the set of schedulable nodes with exactly `f` free GPUs, for f = 0…8.
+
+The buckets are the trick. To place a pod that needs 3 GPUs, look in `buckets[3]`, then `buckets[4]`, and so on up
+to `buckets[8]`. The first non-empty bucket gives the node with the fewest free GPUs that still fits. That is
+**best-fit**, in at most nine lookups.
+
+- **schedule_pod(p).** If `pods[p].node` is already set, return it: a retried call is harmless (that is what
+  **idempotent** means here). Otherwise walk the buckets as above. Write the binding with compare-and-set on the
+  node's version; on conflict, re-read and continue. Move the node from bucket f to bucket f − p.gpus.
+- **remove_pod(p).** Free the GPUs, move the node up a bucket, clear the binding. An unknown pod returns success,
+  so a retry is harmless too.
+- **remove_node(n).** Mark it unschedulable (take it out of every bucket), try to reschedule each of its pods
+  elsewhere, and delete it when it is empty or a deadline passes. If a pod fits nowhere, leave it pending and say
+  so. Never drop it silently.
+- **Oversized pod.** Reject it at admission if no node's total GPUs could ever hold it.
+
+Why best-fit and not the others? **First-fit** (take the first node with room) does fine when every pod is the same
+size. With mixed sizes and churn, best-fit refills holes on half-used nodes and keeps empty nodes empty for large
+pods. **Spreading** (most free GPUs first) is the worst choice for large pods: it is exactly how you reach the
+"four per node on all ten nodes" picture from the back-of-envelope. The PracHub community answer reaches the same
+point: total free GPUs may suffice while no single node fits, and best-fit reduces this "but doesn't eliminate
+it" (<Cite id="s-3a3d9c8dba" />). For the remainder, reserve: when a large pod has waited past a bound, stop placing
+new work on the node that is cheapest to empty, and drain it.
+
+**Concurrency.** A single lock around the whole index is a fine first answer, and the right one to say first.
+Then show the production version: per-node versions with compare-and-set, and an index rebuilt from the store
+after a restart, because the store's bindings are the truth.
+
+Say it like this: "Best-fit in nine bucket lookups, idempotent schedule and remove, and a node removal that never
+drops a pod."
+
+### Topology: InfiniBand and NVLink domains (CoreWeave's question)
+
+Topology is the same packing problem one level up. A pod that needs 8 GPUs needs one whole node. A job that needs 8
+nodes wants them under one leaf switch. So placement becomes "find k free nodes in one network domain", where a
+**domain** is any group that shares a fast path: a node, a leaf, a rack.
+
+Keep a count of free whole nodes per domain. Apply best-fit to domains too: pick the smallest leaf that fits, as
+train-42 did with L7. And measure fragmentation per domain, the same way you do per node. A cluster with 40 free
+nodes spread five per leaf has no room for an 8-node job, just as ten half-full nodes have no room for an 8-GPU pod.
+
+Kueue, a Kubernetes job-queueing project, has a working version called Topology Aware Scheduling. Node labels
+describe the block and the rack, and a group of pods can **require** or **prefer** that all its pods land in one
+domain. If a preferred placement doesn't fit, Kueue tries the next level up
+([Kueue TAS](https://kueue.sigs.k8s.io/docs/concepts/topology_aware_scheduling/), beta since v0.14, modified
+2026-09-28).
+
+Two details show depth.
+
+- **GPU-to-NIC pairing inside a node.** **GPUDirect RDMA** lets a network card read GPU memory directly, without a
+  copy through the CPU. Its documentation says the two devices "must share the same upstream PCI Express root
+  complex" ([GPUDirect RDMA docs](https://docs.nvidia.com/cuda/gpudirect-rdma/index.html), v13.4, fetched
+  2026-10-12). The **root complex** is the part of the server's internal bus (PCIe) that a group of devices hangs
+  off. So "8 GPUs and 8 NICs free" is not enough: allocate each GPU with the network card next to it.
+- **Required is not always right.** A job that waits an hour for one leaf may finish sooner on two. Make
+  "required" versus "preferred" a per-job choice, with a wait bound after which preferred jobs take the
+  next-best placement.
+
+Say it like this: "Topology is a second level of packing. Best-fit at both levels, a free-node count per leaf,
+and a per-job choice between required and preferred with a wait bound."
+
+### How GPUs talk, and how Kubernetes sees them (Fireworks' deep dive)
+
+This deep dive is about knowing the stack below the scheduler well enough to debug it.
+
+**How GPUs talk.** Three layers, fastest first.
+
+- **Inside a node:** NVLink through NVSwitch, 450 GB/s each way per H100 GPU. The ordinary server bus, PCIe Gen 5,
+  gives "128 GB/sec total bandwidth (64 GB/sec in each direction)" (Hopper blog). That gap, about 7×, is why
+  tensor parallelism stays on NVLink.
+- **Across nodes:** InfiniBand, or **RoCE** (the same direct-memory style of transfer over Ethernet), through
+  network cards, with GPUDirect RDMA.
+- **In software:** **NCCL** (NVIDIA's collective communication library), "a library providing inter-GPU
+  communication primitives that are topology-aware". It implements all-reduce, all-gather and the rest over
+  PCIe, NVLink, InfiniBand and sockets
+  ([NCCL overview](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/overview.html), 2.32.3).
+  Training frameworks call NCCL; you rarely call it yourself, but its tests are the standard way to check that a
+  node's GPUs and links work.
+
+**How Kubernetes sees them.** GPUs are an **extended resource**: a countable thing Kubernetes doesn't understand
+itself, advertised by the device plugin as `nvidia.com/gpu`. A pod asks for GPUs in `limits`; requests may be
+omitted or must equal limits ([Kubernetes: schedule GPUs](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/)).
+One surprise worth saying out loud: with the NVIDIA device plugin, a container that requests no GPUs gets all of
+the node's GPUs exposed (device plugin README).
+
+**Sharing one GPU between pods.** There are three routes, and they differ in what they isolate:
+
+| Route | What you get | Caveat |
+|---|---|---|
+| Time-slicing | Several pods take turns on one GPU | "nothing special is done to isolate workloads": no memory or fault isolation (device plugin README) |
+| MPS (Multi-Process Service) | Memory and compute partitioned in space | Experimental as of device plugin v0.15.0; not on MIG devices |
+| MIG (Multi-Instance GPU) | Up to seven hardware instances with their own memory, cache and compute, and fault isolation | Fixed profiles, for example on H100 80 GB 7 × 1g.10gb, 3 × 2g.20gb, 2 × 3g.40gb or 1 × 7g.80gb ([MIG profiles](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/supported-mig-profiles.html), updated 2026-09-11) |
+
+A MIG profile name reads as "compute slices, then memory": 1g.10gb is one-seventh of the compute with 10 GB of
+memory. Only MIG isolates tenants from each other.
+
+**Where this is heading.** Dynamic Resource Allocation (DRA), stable since Kubernetes v1.35, lets a pod claim
+devices by attribute, filtered with CEL (Kubernetes' small expression language), and share a claim between pods
+([Kubernetes DRA](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/), modified
+2026-07-27). It is where per-device selection is heading; the count-based extended resource is what most clusters
+still run.
+
+Say it like this: "Tensor parallelism stays on NVLink, time-slicing isolates nothing, and a pod without a GPU
+request can see every GPU on the node."
+
+### Fleet health: intermittent ECC errors (Fluidstack's prompt)
+
+The GPU driver reports problems as numbered Xid errors. NVIDIA's catalog says what each one
+means and what to do ([Xid catalog](https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html), updated
+2026-09-09). The ones that matter for memory:
+
+- Xid 48, "Double Bit ECC Error": reset the GPU, or drain and reset with Xid 63 or 64.
+- Xid 63, "GPU memory remapping event": no action. (The GPU has swapped a bad memory row for a spare.) Xid 64,
+  "GPU memory remapping failure": reset and contact support.
+- Xid 92, "High single-bit ECC error rate": no immediate action, contact support.
+- Xid 94, "Contained memory error": restart the app. Xid 95, "Uncontained memory error": reset the GPU.
+- Xid 79, "GPU has fallen off the bus": restart the machine.
+
+So the pipeline is not "any error, drain". Several Xids need no action at all. It is a state machine per GPU and
+per node:
+
+1. **Healthy.** Count correctable errors per time window and keep a trend.
+2. **Suspect.** A burst, a rising trend, or one contained error. Stop placing new long jobs there; let short work
+   finish. Estimate the chance of failure from the error history and compare it with the threshold for what the
+   node is running (about 1% under a 1,024-GPU job, far higher under inference).
+3. **Draining.** Cordon, then move work. Let a checkpointed training job leave at its next checkpoint (the
+   Fluidstack guide's strong answer). For inference, start replacement replicas first, then stop the old ones.
+4. **Re-qualifying.** Reset the GPU, then run DCGM diagnostics: level r3
+   in under 35 minutes on 8 GPUs, or level r4 with a memory test in under 2.25 hours. Add a single-node NCCL test.
+5. **Returned or RMA.** Pass: back to schedulable, on probation with a tighter threshold for a week. Fail, or a
+   repeat offender: RMA, so the part goes back to the vendor.
+
+Put a **budget on automation**: never drain more than a set share of a site's nodes per hour without a human. A bad
+driver rollout or a telemetry bug looks exactly like a fleet-wide hardware failure, and an unbounded health
+controller will drain the cluster.
+
+Say it like this: "Drain on trend and burst rate, weighted by the job on the node; re-qualify automatically;
+return on probation; and never let the automation drain more than a set share of a site per hour."
+
+### Finding faulty nodes with group tests (xAI's coding question)
+
+This one is a coding question with an infrastructure story. Picture a test as a short multi-node communication
+burn-in: it passes only if every node in it is good.
+
+The rules: a test on a set of nodes fails if any node in it is bad; a test needs at least two nodes; and tests that
+run at the same time (one **round**) can't share nodes.
+
+**Key observation (one of the page's listed strong-answer topics):** once you know one good node g, the test on the
+pair (g, x) is a test of x alone. So the algorithm is: find good nodes quickly, then use them as probes.
+
+1. **Round 1:** split the n nodes into disjoint groups and test them. Every node in a passing group is good.
+2. **Round 2 onward:** test each suspect x as the pair (g, x), with a different known-good g for each test. Each
+   round resolves as many suspects as you have good nodes.
+
+Now follow one sweep: **1,024 nodes, 4 of them bad.**
+
+- **Pairs first:** 512 pair tests. At most 4 fail, leaving at most 8 suspects and at least 1,016 good nodes. Round
+  2 runs 8 probe tests. **520 tests in 2 rounds.**
+- **Groups of 32 first:** 32 tests. At most 4 fail, leaving 128 suspects and at least 896 good nodes. Round 2
+  probes all 128 at once. **160 tests in 2 rounds.**
+- **Binary splitting** (halve each failing group and retest) needs about **32 tests plus a few**, close to the
+  theoretical minimum of about 35, but takes about **10 rounds**.
+
+Which to pick depends on what a round costs. If each test is a multi-minute burn-in, wall-clock rounds dominate and
+the two-round schemes win. If tests are cheap and GPU time is the cost, binary splitting wins. When bad nodes are
+common, large groups mostly fail, so start with pairs.
+
+**When it can't be solved:** if fewer than two nodes are good, every test fails and you can't tell which nodes are
+bad. With at least two good nodes the bad set is always identifiable: find a passing pair, then probe everything
+else.
+
+**Flaky tests:** declare a node bad only after it fails several probe tests with different good partners. With a 5%
+chance that a test fails for no reason and three required failures, about **0.13 good nodes** per 1,024-node sweep
+are wrongly condemned. Rotate partners and switches, because a flaky link looks like a flaky node.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Binary splitting:** about d × log₂(n ÷ d) = 4 × log₂(256) = 4 × 8 = 32 tests plus a few, near the information
+  bound log₂ C(1,024, 4) ≈ 35.4, in about log₂ n = 10 rounds
+  ([group testing, Wikipedia](https://en.wikipedia.org/wiki/Group_testing), fetched 2026-10-12).
+- **Flaky tests:** with an independent false-failure rate q = 0.05 and m = 3 required failures, a good node is
+  wrongly condemned with probability 0.05³ = 1.25 × 10⁻⁴; × 1,024 nodes ≈ 0.13 per sweep.
+
+</details>
+
+## Failure modes and overload
+
+Go through these in order of how often they happen.
+
+- **Control-plane leader dies.** A new leader is elected from the replicated store. Node agents keep running their
+  workloads. The scheduler pauses for the election and rebuilds its index from the store.
+- **An observed-state shard dies.** Its hosts look silent. Don't mark them dead because one shard went quiet: the
+  failure detector should move them to "unknown", not "dead", and only page. Confirm a host is dead by asking other
+  hosts to probe it (the SWIM approach) before acting.
+- **Host partitioned but alive.** It keeps running a job the dispatcher has reassigned. Fencing tokens stop the old
+  attempt from committing output, exactly as at 12:00:20 in the worked example.
+- **Mass false positives.** A telemetry bug makes half a site look broken. The automation budget bounds the
+  damage.
+- **A drain that never finishes.** A PodDisruptionBudget blocks eviction forever. Give drains a deadline and
+  escalate to a human, rather than force-deleting a training job's pods.
+- **Scheduler overload.** A burst of thousands of pods: batch scheduling decisions, use the bucket index, and
+  admit by tenant quota so one tenant's burst can't hold the scheduler.
+
+<Pitfall title="Draining on the first error">
+A single correctable ECC error is normal and NVIDIA's catalog lists no action for several Xids. Drain on
+trend and burst rate, weighted by what the node is running, or you will burn capacity faster than the
+hardware fails.
+</Pitfall>
+
+## Evals and observability
+
+For a control plane, "evals" means proving each decision rule is right before and after you change it.
+
+- **Placement:** fragmentation per node and per topology domain, how long large pods and multi-node jobs wait, and
+  GPUs allocated versus actually busy.
+- **Health:** errors per GPU by Xid, time from first signal to drain, drains per site per hour, re-qualification
+  pass rate. Two numbers tell you the threshold is wrong: nodes returned and then failing again within a week (the
+  threshold is too loose), and drained nodes that pass every test (too tight).
+- **Dispatch:** attempts per job, fenced writes rejected (each one is a near-miss worth reading), heartbeat lag per
+  shard.
+- **Invariants that page:** no GPU bound twice; bindings never exceed a node's healthy GPUs; no schedulable node
+  with an open RMA.
+- **Before changing a threshold:** replay a month of error telemetry and job history, and count drains and lost
+  GPU-hours under the old and new rule.
+
+Say it like this: "I'd never ship a new drain threshold without replaying last month through it."
+
+## Trade-offs
+
+| Decision | You gain | You give up | Choose differently when |
+|---|---|---|---|
+| Split observed and desired state | Cheap writes for heartbeats, consistency for decisions | Two stores to run | Fleet small enough for one store |
+| Best-fit | Room for large pods | More tenants per node, larger blast radius | Uniform small pods: spread for isolation |
+| Required topology | Fast collectives | Longer waits | Short jobs: preferred, with a wait bound |
+| Drain threshold by workload | Cost-weighted decisions | A more complex controller | One workload type: one threshold |
+| Two-round group tests | Few rounds, short sweeps | More tests | Cheap tests, scarce GPUs: binary splitting |
+
+<AINative title="Agents write the scheduler; you write the properties">
+The bucket index, compare-and-set and group-testing loop are minutes of agent work. Your job is the
+properties: a randomized test that runs thousands of add, remove, schedule and drain operations and checks
+that no GPU is double-bound and no pod is lost; a group-testing checker that compares the output with a
+brute-force answer on small n, including the "fewer than two good nodes" case; and a replay that shows a
+new drain threshold wouldn't have drained a whole site last month. Check what the agent assumes about
+Kubernetes semantics too; for example, the device plugin README warns that a container that requests no
+GPUs gets all of them exposed.
+</AINative>
+
+## Small-team version
+
+A company of 50–500 people almost never runs a GPU cluster control plane. The decision is how little of one to own.
+
+### Rent
+
+- **Managed Kubernetes GPU node pools.** GKE "manages the entire lifecycle of the GPU nodes, including automatic
+  GPU driver installation" and offers MIG (up to seven instances), time-sharing and MPS
+  ([GKE GPUs](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/gpus), updated 2026-10-09).
+  Hyperscaler GPU prices weren't fetched for this guide; check them for your region.
+- **Serverless GPUs** for bursty or batch work: Modal bills per second, about $3.95 an hour for an H100; RunPod
+  serverless lists an H100 at $4.79 an hour (pricing pages fetched 2026-10-11).
+- **Reserved clusters** if you train regularly: Together lists H100 clusters at $3.99 an hour on demand and $3.19
+  reserved for 91–180 days (pricing page fetched 2026-10-11).
+
+### Learn, don't build
+
+Learn the device plugin and `limits`, node labels for GPU types, one drain runbook with PodDisruptionBudgets, and a
+short DCGM health check before a node takes work. That is the "node pools, device plugin and drain basics" a small
+team actually needs.
+
+### When building pays
+
+A custom scheduler pays for itself when the GPU-hours it recovers cost more than the engineer who owns it. With one
+loaded engineer at about **$16,190 a month**, an assumed 10% of GPU-hours lost to fragmentation, idle reservations
+and slow drains, and reserved H100s at $3.19 an hour, the break-even is about **70 GPUs**. Put another way: 64
+reserved GPUs cost about **$149,000 a month**, and 10% of that is about one engineer.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="GPUs at which a scheduler pays for an engineer"
+  expr="N* = engineering cost per month ÷ (waste share × GPU $/hour × 730)"
+  vars={[
+    { sym: 'engineering cost', meaning: 'one loaded engineer ≈ $16,190/month (BLS median software developer wage $135,980 ÷ an assumed 0.70 ÷ 12)' },
+    { sym: 'waste share', meaning: 'GPU-hours lost to fragmentation, idle reservations and slow drains; 10% assumed' },
+    { sym: 'GPU $/hour', meaning: '$3.19 reserved H100 (Together pricing page, fetched 2026-10-11)' },
+  ]}
+  example={[
+    "N* = 16,190 ÷ (0.10 × 3.19 × 730) = 16,190 ÷ 232.9 ≈ 70 GPUs for a full-time owner",
+    "At 15% of one engineer (≈ $2,430/month): ≈ 10 GPUs, enough for runbooks and health checks, not a custom scheduler",
+    "64 reserved GPUs: 64 × 3.19 × 730 ≈ $149,000/month, so 10% waste ≈ $14,900, about one engineer",
+  ]}
+/>
+
+</details>
+
+Below a few dozen GPUs, use stock Kubernetes or Kueue, or the provider's scheduler, and spend the engineer on the product.
+What you still own at any size: quotas per team, a cost alert per namespace, and the drain runbook.
+
+Say it like this: "Below about 70 GPUs I'd rent and use the stock scheduler. A custom one costs an engineer, and
+it only pays when it recovers a tenth of a bill that size."
+
+### Revisit when
+
+You own or reserve more than about 70 GPUs, run multi-node training regularly (topology then matters), GPUs sit idle
+while jobs wait, or a provider's maintenance drains keep killing your jobs.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="GPU cluster control plane"
+  senior={[
+    "Builds the bucket index with best-fit, idempotent schedule and remove, and a drain that never drops a pod.",
+    "Splits observed and desired state, uses leases with fencing tokens for dispatch, and sizes heartbeat load and detection time.",
+    "Knows the device plugin, MIG, time-slicing and drain semantics, and the Xid errors that matter.",
+    "Solves group testing with known-good probes and counts both tests and rounds.",
+  ]}
+  staff={[
+    "Sets drain thresholds from the cost of a miss versus a drain, per workload, and bounds automation per site.",
+    "Treats topology as a second packing level with per-domain fragmentation and a per-job required-or-preferred choice.",
+    "Designs re-qualification and probation so returned nodes are tracked and repeat offenders go to RMA.",
+    "Decides how much of this to build versus rent, with a GPU-count break-even.",
+  ]}
+/>
+
+In plain words: a Senior answer gets each mechanism right. A Staff answer also sets the thresholds from money,
+puts limits on its own automation, and knows when not to build it at all.
+
+## Follow-ups
+
+<FollowUps>
+  <FollowUp q="Listed on the PracHub page (Together AI): remove a node that still has running pods.">
+    Mark it unschedulable, reschedule its pods elsewhere, remove it when empty or at a deadline. A second
+    call sees it already cordoned. If a pod fits nowhere, leave it pending and report it.
+  </FollowUp>
+  <FollowUp q="Listed on the PracHub page (Together AI): what breaks first at 10× traffic?">
+    The single lock and full scans. Move to per-node compare-and-set and the bucket index, batch scheduling
+    decisions, and shard the observed-state table by host.
+  </FollowUp>
+  <FollowUp q="Listed on the PracHub page (xAI): tests are flaky. How do you adapt?">
+    Condemn a node only after m failures with different known-good partners: q^m false-bad rate per node.
+    Rotate partners and switches, and retest passing groups only if a false pass is possible.
+  </FollowUp>
+  <FollowUp q="Listed on the PracHub page (xAI): run this continuously in production.">
+    Test nodes when they are idle or between jobs, never the ones running work; keep a health score with
+    decay; send repeat suspects to re-qualification. Nodes joining and leaving just change who is eligible
+    for the next round.
+  </FollowUp>
+  <FollowUp q="Fluidstack prep guide: how do you return a drained node without a human?">
+    Reset, run DCGM diagnostics and a single-node NCCL test, then return it on probation with a tighter
+    threshold. A second failure in the window sends it to RMA.
+  </FollowUp>
+  <FollowUp q="Not reported; a natural next push: the coordinator goes down. What still works?">
+    Running workloads keep running; agents keep heartbeating and buffer. New placements and drains pause
+    until a new leader is elected and has rebuilt its index from the replicated store.
+  </FollowUp>
+</FollowUps>
+
+## Common mistakes
+
+- **Counting free GPUs, not fits.** Forty free GPUs in pieces of four can't hold one 8-GPU pod. Fragmentation is the
+  key edge case in the PracHub community answer (<Cite id="s-3a3d9c8dba" />).
+- **Draining on any error.** It burns capacity faster than the hardware fails. The Fluidstack guide's strong answer
+  alerts on trend and burst rate and warns that pulling healthy nodes "too eagerly" wastes capacity
+  (<Cite id="s-747377636a" />).
+- **Putting heartbeats through consensus.** 4,000 writes a second of churn doesn't belong in the store that holds
+  decisions.
+- **Assuming a pod without a GPU request gets no GPU.** With the NVIDIA device plugin it gets all of them.
+- **Time-slicing for tenant isolation.** It gives none; use MIG or whole GPUs.
+- **No automation budget.** A telemetry bug becomes a site-wide drain.
+
+## Prove it with a lab
+
+No lab here places GPUs. One proof lab covers dispatch safety; the rest only partly cover their piece and need
+their tests fixed first.
+
+<LabRef lab="dist-lock" role="proof" note="Leases plus fencing tokens: use the same rule for job attempts so a partitioned host can't commit after reassignment." />
+
+<LabRef lab="container-orchestrator" role="partial" note="Add a GPU resource, the free-GPU bucket index, best-fit, gangs and a drain with a deadline to its reconcile loop." />
+
+<LabRef lab="gossip" role="partial" note="Its suspect-before-dead states model host liveness; fix the demo and revived-node test first." />
+
+<LabRef lab="raft" role="partial" note="Leader election for the desired-state store; its re-election test panics today." />
+
+<LabRef lab="service-discovery" role="partial" note="TTL registration and watches for host membership; three tests fail." />
+
+<LabRef lab="observability" role="partial" note="Where Xid and ECC metrics would land; the package doesn't compile yet." />
+
+The planned GPU-scheduler lab would close the gap: gangs, fragmentation, topology domains and drain.
+
+## My take
+
+<MyTake pending />
+
+## Sources
+
+- <Cite id="s-3a3d9c8dba" />
+- <Cite id="s-8b84fedc37" />
+- <Cite id="s-1f1d1ddaac" />
+- <Cite id="s-1c022c73a6" />
+- <Cite id="s-5e2c5b84e0" />
+- <Cite id="s-81dd7e6306" />
+- <Cite id="s-747377636a" />
+- <Cite id="s-840d2c1a9e" />
+- [NVIDIA k8s-device-plugin README](https://github.com/NVIDIA/k8s-device-plugin) (official, v0.17.1, fetched 2026-10-12)
+- [NVIDIA GPU Operator overview](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/overview.html) (official, fetched 2026-10-12)
+- [NVIDIA Xid catalog](https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html) (official, updated 2026-09-09)
+- [NVIDIA DCGM Diagnostics](https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/dcgm-diagnostics.html) (official, updated 2026-06-17)
+- [NVIDIA MIG supported profiles](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/supported-mig-profiles.html) (official, updated 2026-09-11)
+- [NVIDIA Hopper architecture blog](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/) (official, 2022-03-22)
+- [GPUDirect RDMA documentation](https://docs.nvidia.com/cuda/gpudirect-rdma/index.html) (official, v13.4)
+- [NCCL overview](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/overview.html) (official, 2.32.3)
+- [Kubernetes: schedule GPUs](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/), [safely drain a node](https://kubernetes.io/docs/tasks/administer-cluster/safely-drain-node/), [Dynamic Resource Allocation](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/), [large clusters](https://kubernetes.io/docs/setup/best-practices/cluster-large/) (official, fetched 2026-10-12)
+- [Kueue Topology Aware Scheduling](https://kueue.sigs.k8s.io/docs/concepts/topology_aware_scheduling/) (official, modified 2026-09-28)
+- [GKE: about GPUs](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/gpus) (official, updated 2026-10-09)
+- [Group testing, Wikipedia](https://en.wikipedia.org/wiki/Group_testing) (fetched 2026-10-12)
+- Prices: from [Modal](https://modal.com/pricing), [RunPod](https://www.runpod.io/pricing) and [Together](https://www.together.ai/pricing) pricing pages fetched 2026-10-11

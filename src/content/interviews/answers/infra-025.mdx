@@ -1,0 +1,192 @@
+---
+question: infra-025
+family: kv-store-durable-log
+status: published
+labs: [wal, kv-cache]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I won't separate fields with a character, because keys can contain any character. I'll write each key and
+> value with its length in front, put a version tag at the start of the file and a checksum at the end. To save,
+> I write a temporary file, force it to disk, rename it over the old one and force the directory too, so a crash
+> leaves the old file or the new one, never half. And shutdown is a state: once the store is closed, every call
+> raises."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+Writing a dictionary to a file sounds like `json.dump`. The interviewer wants more than that, and three things
+make it harder than the everyday version:
+
+1. **The contents can fool the format.** If you write `key:value` lines, a key containing `:` or a newline
+   breaks the file. Keys and values are arbitrary strings, so the format must not depend on any character being
+   absent.
+2. **A crash can happen halfway through the save.** If you overwrite the file in place and the process dies
+   after half the bytes, you have lost the old data *and* the new data.
+3. **Restart is part of the design.** A first-hand account had this in a final round, with the follow-ups "How
+   would you store the state of the system and restore it correctly after shutdown?" and what should happen if
+   the state is queried while the system is shut down. The candidate's summary was that "the real challenge was
+   modeling the state and its transitions cleanly" (<Cite id="s-7fa103b073" />).
+
+## Clarify first
+
+Spend a minute on the rules. Say your assumptions out loud:
+
+- **Data type.** "Strings or arbitrary bytes? I'll assume UTF-8 strings, stored as bytes."
+- **Readability.** "Must the file be human-readable? I'll assume not; correctness beats readability."
+- **Crashes.** "Can the process crash during a save, or only shut down cleanly? I'll assume a crash at any
+  point."
+- **Recent writes.** "Must writes made after the last save survive a crash? If yes, a snapshot alone isn't
+  enough; that's the write-ahead log follow-up. For this part I'll save snapshots only."
+- **Closed store.** "What does a call do while the store is closed? I'll raise an error."
+
+## Answer
+
+### Words you need first
+
+- A **length prefix** is a number written before a piece of data saying how many bytes it is. The reader takes
+  exactly that many bytes, whatever they contain.
+- A **checksum** is a short number computed from all the other bytes. **CRC32** is a common 4-byte one: if any
+  byte changes, the number almost certainly no longer matches, so damage is caught on load.
+- When you `write()` to a file, the bytes first land in the **page cache**, memory the operating system uses
+  for file data. **fsync** forces them onto the drive and waits until they are there.
+- A **snapshot** is the whole store written out at one moment.
+
+### The format
+
+Put a fixed 4-byte tag at the front (`KVS1`: it says "this is our file, version 1"), then a sequence number and
+the number of keys, then each key and value with their lengths, then the checksum. The sequence number (**LSN**,
+log sequence number) is not needed yet. It records the last change this snapshot includes, and the next part of
+the problem, a write-ahead log, uses it to know what to replay.
+
+```python
+MAGIC = b"KVS1"
+
+def encode(data, lsn=0):
+    out = [MAGIC, struct.pack("<QI", lsn, len(data))]
+    for k, v in data.items():
+        kb, vb = k.encode(), v.encode()
+        out += [struct.pack("<II", len(kb), len(vb)), kb, vb]
+    body = b"".join(out)
+    return body + struct.pack("<I", zlib.crc32(body))
+
+def decode(buf):
+    if len(buf) < 20 or buf[:4] != MAGIC:
+        raise CorruptSnapshot()
+    body, (crc,) = buf[:-4], struct.unpack("<I", buf[-4:])
+    if zlib.crc32(body) != crc:
+        raise CorruptSnapshot()
+    lsn, n = struct.unpack_from("<QI", body, 4)
+    pos, data = 16, {}
+    for _ in range(n):
+        kl, vl = struct.unpack_from("<II", body, pos); pos += 8
+        k = body[pos:pos + kl].decode(); pos += kl
+        data[k] = body[pos:pos + vl].decode(); pos += vl
+    if pos != len(body):
+        raise CorruptSnapshot()
+    return data, lsn
+```
+
+### Follow one store through it
+
+Picture a credit-tracking service with two accounts after a transfer: `alice → "70"` and `bob → "130"`, saved
+with LSN 42. The file is 49 bytes:
+
+| Bytes | Contents | What to say in the interview |
+|---|---|---|
+| 0–3 | `KVS1` | "A tag, so loading the wrong file fails fast, and a version for later format changes." |
+| 4–15 | LSN 42 (8 bytes), key count 2 (4 bytes) | "The sequence number lets a log replay only what's newer." |
+| 16–30 | lengths 5 and 2, then `alice`, `70` | "Lengths first, so a key can contain any character." |
+| 31–44 | lengths 3 and 3, then `bob`, `130` | "No delimiters anywhere." |
+| 45–48 | CRC32 of bytes 0–44 | "Flip any byte and the load raises instead of returning a wrong balance." |
+
+The checks in `decode` each catch one kind of damage: a wrong tag or a too-short file, a checksum mismatch, and
+leftover bytes after the last key.
+
+### The save
+
+The save is where the crash question lives. The goal: whenever the crash comes, the file on disk is either the
+complete old snapshot or the complete new one.
+
+```
+ 1. write new bytes to snapshot.tmp       crash here → old snapshot untouched
+ 2. fsync snapshot.tmp                    crash here → old snapshot untouched
+ 3. rename snapshot.tmp → snapshot        atomic: readers see old or new, never a mix
+ 4. fsync the directory                   makes the rename itself survive power loss
+```
+
+Step 3 works because a rename within one directory is **atomic**: there is no moment when the name points at
+half a file. Step 4 is the one people forget. A rename changes the directory, not the file, so forcing the file
+does not force the rename. The Linux `fsync(2)` page says a file's `fsync` does not ensure its directory entry
+reached disk ([man-pages 6.19](https://man.archlinux.org/man/fsync.2.en)). Redis writes its RDB snapshot files
+the same way, renaming "atomically using rename(2) only when the new snapshot is complete"
+([Redis docs](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/), read 2026-10-12).
+
+Say: "Temp file, fsync, rename, fsync the directory. Every crash point leaves one complete snapshot."
+
+### Shutdown as a state
+
+The follow-up about queries during shutdown is a question about state, not files. Give the store a lifecycle:
+**opening → open → closing → closed**.
+
+- **Opening** loads the snapshot and checks it before accepting any call.
+- **Closing** refuses new calls, waits for calls already running, saves only committed data (never an open
+  transaction's uncommitted writes) and marks the store closed.
+- **Closed** makes every method raise.
+
+Why raise instead of answering from memory? After `close`, writes are no longer accepted. If reads still worked,
+a caller could see a value that disagrees with what the next start-up loads. Say: "A closed store raises. It
+doesn't serve memory that a restart won't reproduce."
+
+### Test it
+
+Round-trip a few hundred random keys and values built from delimiters, quotes, newlines, a NUL byte and
+non-ASCII characters (accents, CJK, an emoji). Then flip one byte and truncate the file, and check that both
+raise. That test passed in the family walkthrough's run on 2026-10-12, with 500 random keys and values.
+
+### What this does not cover
+
+A snapshot alone loses every write since the last save. If the service saves once a minute and crashes 50
+seconds after the transfer, the transfer is gone. Say that plainly, because it is the next requirement: a
+write-ahead log that records each change before it is acknowledged.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Serialize and restore"
+  senior={["Length-prefixed format with a checksum, atomic temp-file-and-rename save, and a closed state that raises."]}
+  staff={["Adds a version tag for format changes, the directory fsync, the sequence number a later log will need, and says plainly that a snapshot alone loses every write since the last save."]}
+/>
+
+In plain words: a Senior candidate builds a format and a save that cannot be broken by contents or by a crash.
+A Staff candidate also plans for the next version of the format and the next requirement, and names the gap a
+snapshot leaves.
+
+## Small-team version
+
+Don't invent a format for state you need to keep. Use SQLite or Postgres, or a well-known encoding (JSON,
+Protocol Buffers) written with the same temp-file, fsync and rename sequence. Both databases are free to run,
+and inventing a format costs you the debugging later.
+
+What does carry over daily is the atomic-save pattern. Model checkpoints, eval result files and cached
+embeddings (stored lists of numbers that stand for texts) all get corrupted by a job killed halfway through a
+direct overwrite. Write them the same four-step way.
+
+Practise the round without AI first. Afterwards, an agent is good at writing the randomized round-trip test;
+read it before you trust it.
+
+## Pitfalls
+
+- **A delimiter format.** It breaks on the first key that contains the delimiter.
+- **Overwriting the snapshot in place.** A crash halfway leaves half a file and no old copy.
+- **No checksum.** Corruption loads as wrong data instead of an error.
+- **Saving uncommitted transaction state.** A restart would make writes permanent that were never committed.
+- **Serving reads after shutdown.** Answers then disagree with what the next start-up loads.
+
+## Go deeper
+
+- Family walkthrough: [Key-value store to durable log](/system-design-labs/interviews/walkthroughs/kv-store-durable-log/), stage 3.
+- What comes next: [a crash-consistent store with a write-ahead log](/system-design-labs/interviews/questions/infra-031/).
+- Labs: <LabRef lab="kv-cache" inline /> (append-only file persistence) and <LabRef lab="wal" inline />.

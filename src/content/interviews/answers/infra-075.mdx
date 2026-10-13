@@ -1,0 +1,184 @@
+---
+question: infra-075
+family: llm-cost-latency
+status: published
+labs: [llm-inference, observability]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'd walk the timeline in order: network, admission, queue wait, tokenising and the cache lookup, prefill, then the
+> first decode step and the flush to the client. Each segment has one main cause. Prefill grows with the prompt tokens
+> that weren't already cached. Queue wait grows with load and with how admission is bounded. CPU segments that are
+> slow while the GPU sits idle mean the host is starved. And decode after the first token doesn't belong in this
+> number at all."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer shows you one request's timeline on a server that runs a **large language model (LLM)** and asks
+where the time went and why. The test is naming each segment and the mechanism behind it.
+
+If you have read a trace waterfall for a web request, you already have the skill. What is new is the model server
+in the middle, which works differently from an application server in three ways:
+
+1. **Requests share the GPU in steps.** The server doesn't run one request at a time. It runs many requests
+   together in repeated steps, and a part of the server called the **scheduler** decides which requests join the next
+   step. A request that arrives may wait for a place.
+2. **The model call has two phases.** First the model reads the whole prompt in one pass (**prefill**). Then it writes
+   the answer one **token** (a chunk of text, roughly ¾ of a word) per step (**decode**). The **time to first token
+   (TTFT)** covers everything up to and including prefill and the first decode step. Later decode steps don't count.
+3. **GPU memory is the scarce resource.** While a request runs, the server keeps a saved summary of its tokens in GPU
+   memory so it doesn't have to re-read the conversation for every new word. This is the **KV cache**. How many
+   requests fit at once depends on that memory, not on how many requests there are.
+
+This topic is listed in a Fireworks prep guide on PracHub, an interview-question aggregator (not a candidate report; low confidence) as a
+technical-review topic (<Cite id="s-b6632d5df9" />). The guide stresses where the clock starts and stops, that
+"Device utilization alone cannot distinguish a busy queue from CPU starvation", and that "Later decode does not
+belong in TTFT".
+
+## Clarify first
+
+- **Where does the clock start?** "Client send, load balancer, or server receive? I'll assume server receive."
+- **What is in the timeline?** "I'll assume spans for admission, queue, tokenising, prefill pieces, first decode
+  step and flush."
+- **Prompt length and cache state.** "How many input tokens, and was part of the prompt already cached?"
+- **Load.** "How many requests were running and waiting at the time?"
+
+## Answer
+
+### The segments, in order
+
+```
+Request arrives at the server
+   │
+   ▼
+1. Network and TLS ── depends on distance and connection reuse
+   │
+   ▼
+2. Admission ── auth, rate limits, token budget check (milliseconds)
+   │
+   ▼
+3. Queue wait ── until the scheduler gives this request a place in a step
+   │
+   ▼
+4. Tokenise + prefix-cache lookup ── CPU work: text → tokens, check what's cached
+   │
+   ▼
+5. Prefill ── model reads the uncached prompt tokens (maybe in pieces)
+   │
+   ▼
+6. First decode step, detokenise, flush ── first token reaches the client
+                                           (TTFT stops here)
+```
+
+**1. Network and TLS.** Depends on where the client is and whether the connection is reused.
+
+**2. Admission.** Authentication, rate limits and token budget checks. It should take milliseconds.
+
+**3. Queue wait.** Time until the scheduler gives the request a place. It depends on load, and on whether admission
+counts tokens and GPU memory or only requests. Under load, this is usually the culprit.
+
+**4. Tokenise and prefix-cache lookup.** **Tokenising** turns text into tokens. The **prefix cache** keeps the KV
+cache of recent prompt starts, so a new prompt that begins with the same text (the same system instructions, say)
+can skip reading that part. Both are CPU work. If they are slow while the GPU is idle, the host CPU is the problem.
+
+**5. Prefill.** Proportional to the prompt tokens that were not in the prefix cache. With **chunked prefill**, a long
+prompt is read in pieces, slotted between other requests' decode steps. This request's TTFT goes up a little, but
+the requests already running keep producing words smoothly. The gap between one word and the next for a running
+request is its **inter-token latency**.
+
+**6. First decode step, detokenise, flush.** One decode step, the token turned back into text, and the first write
+to the client.
+
+### Follow one request
+
+Take a 70-billion-parameter model running across four NVIDIA A100 GPUs, and a request with a 2,000-token prompt.
+The prefill times are worked out in the box below; the other segment times are illustrative assumptions.
+
+| Segment | Cold prompt | 1,600 tokens cached | What to say in the interview |
+|---|---|---|---|
+| Admission | a few ms | a few ms | "Should be noise. If it isn't, check the budget lookup." |
+| Queue wait | depends on load | depends on load | "This is the first segment I check under load." |
+| Tokenise + lookup | a few ms | a few ms | "Slow here with an idle GPU means CPU starvation." |
+| Prefill | **≈ 226 ms** | **≈ 45 ms** | "The cache saved 80% of the tokens, so about 80% of prefill." |
+| First decode, flush | one step | one step | "Everything after this is decode, not TTFT." |
+
+Say: "Two requests with near-identical prompts can have very different prefill times. Before comparing them, I'd
+check how many tokens each got from the prefix cache."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Prefill floor, and what a prefix cache saves"
+  expr="prefill ≥ 2 × params × n_uncached ÷ (GPUs × peak FLOP/s)   (attention adds a term in n²; small at a few thousand tokens)"
+  vars={[
+    { sym: 'n_uncached', meaning: 'prompt tokens not already in the prefix cache' },
+    { sym: 'peak', meaning: 'A100 dense BF16: 312 TFLOPS' },
+  ]}
+  example={[
+    "70B (70.55 B params) on 4×A100, 2,000 tokens: 2 × 70.55 × 10⁹ × 2,000 ÷ (4 × 312 × 10¹²) ≈ 226 ms at peak",
+    "With 1,600 tokens cached, 400 are prefilled: about 45 ms",
+  ]}
+/>
+
+- Reading a prompt costs about 2 arithmetic operations per model parameter per token, so prefill is limited by the
+  GPUs' arithmetic speed, not their memory speed.
+- 226 ms × 400 ÷ 2,000 ≈ 45 ms. At this prompt length the attention term is small, so the time is close to
+  proportional to the number of uncached tokens.
+- These are floors at 100% of peak. Real prefill is slower.
+
+</details>
+
+### Reading patterns
+
+Each pattern points at one cause and one fix:
+
+- **TTFT high, prefill short, queue long:** not enough capacity, or admission that lets in too much. Bound admission
+  by a token budget, add replicas, or turn away low-priority work when the queue is long.
+- **TTFT high, prefill long, prompt long:** trim the prompt, or improve prefix-cache hits by putting stable content
+  first.
+- **TTFT high, GPU idle, CPU segments long:** the host CPU is starved, for example tokenising or the scheduler loop
+  running on a busy CPU.
+- **A long prompt that waits and waits:** if the scheduler groups requests by length, a long prompt can wait
+  indefinitely. The guide suggests a maximum wait, and measuring by input-length cohort (a group of requests with
+  similar prompt lengths) and tenant (<Cite id="s-b6632d5df9" />).
+
+Say: "A busy GPU graph doesn't prove the GPU is the bottleneck. Queue time and CPU time can hide behind it."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="TTFT timeline"
+  senior={["Names each segment, ties prefill to uncached tokens, and spots queueing versus host starvation."]}
+  staff={["Sets admission and chunk size from the inter-token-latency target for everyone else, and defines the per-cohort metrics that would catch the regression next time."]}
+/>
+
+In plain words: a Senior answer reads the timeline correctly. A Staff answer also tunes the server for everyone
+else's experience, not just this request, and adds the dashboards that would catch the problem next time.
+
+## Small-team version
+
+On a hosted API you don't see these segments. Network, queue and model time arrive as one TTFT number. So log TTFT
+for every call next to its input tokens and its cached input tokens, and look at the slope: if TTFT climbs with
+uncached tokens, prefill is the cost; if it climbs with time of day but not with tokens, you are waiting in the
+provider's queue.
+
+If you run your own model, the serving software reports queue time and prefill time. Put them on a dashboard,
+grouped by prompt length, before you tune anything. Say: "I can't tune what I can't see, so the dashboard comes
+first."
+
+## Pitfalls
+
+- **Including decode time in TTFT.** Later decode steps measure answer length, not the wait for the first word.
+- **Reading GPU utilisation as proof the GPU is the bottleneck.** It can't tell a busy queue from a starved CPU.
+- **Ignoring the prefix cache when comparing two requests.** Similar prompts can differ hugely in uncached tokens.
+- **Summing per-segment p95s into a request p95.** A **p95** is the time 95% of requests beat; the slow tails of different segments usually belong to different requests.
+
+## Go deeper
+
+- Family walkthrough: [Make an LLM feature fast and affordable](/system-design-labs/interviews/walkthroughs/llm-cost-latency/#deep-dives), the TTFT timeline deep dive.
+- Labs: <LabRef lab="llm-inference" inline /> (add timing spans), <LabRef lab="observability" inline />.
+- Related: [continuous batching](/system-design-labs/interviews/walkthroughs/continuous-batching/) for how prefill and decode share steps.

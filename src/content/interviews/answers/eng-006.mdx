@@ -1,0 +1,181 @@
+---
+question: eng-006
+family: rag-system-design
+status: published
+labs: [rag, embedding-pipeline]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "First I'd count tokens. A 200-page PDF is about 80,000 tokens, which fits in a current model's input, so the
+> simplest design sends the whole document with every question and uses prompt caching to make repeats cheap:
+> about 2 cents a question on a warm cache. If questions are sparse, or there are many documents, I'd retrieve
+> instead: parse once with structure, cut the document into passages along its headings, search them by keywords
+> and by meaning, and give the best few to the model with page numbers it must cite. Questions about the whole
+> document go to a summarise-each-section-then-combine step, not to search."
+>
+> The rest of this page explains each part of that answer.
+
+The question sounds like "recite the pipeline". It is really testing whether you notice that this document may
+not need a pipeline at all.
+
+If you have built search, you think of a big index and a query. With a large language model (**LLM**, such as
+Claude or GPT), there is another option: paste the whole document into the request. The model reads text in
+**tokens** (pieces of words, about ¾ of a word each), and its input limit, the **context window**, is now large
+enough to hold a long PDF. So the first decision is a cost and quality trade, not an architecture.
+
+What makes this different from normal search:
+
+1. **The reader is the model, not the user.** Whatever you hand it, it turns into one fluent answer. If the right
+   passage is missing, the answer is confidently wrong.
+2. **Input is billed per token.** Sending the whole document with every question costs more per question than
+   sending a few passages. Caching narrows that gap a lot.
+3. **"The second layer" is the test.** A 2026 applied-AI prep guide (its example, not a candidate report) says
+   "Within about ninety seconds the interviewer knows whether you've shipped a retrieval system or only read
+   about one", and "The interviewer is waiting for the second layer." For one PDF, its line is "you don't need a
+   vector store, you need the whole doc in the context window" (<Cite id="s-7d03a572e0" />).
+
+## Clarify first
+
+- **One PDF per user session (an upload), or a fixed document many people query?** This changes how often the
+  cache is warm.
+- **Made by software, or scanned?** Scans need **OCR** (software that reads text from an image). Ask about tables
+  and figures too.
+- **What kind of questions?** One fact, one section, or the whole document ("summarise the risks")?
+- **Latency target, and how often questions arrive.**
+
+## Answer
+
+### Words you need first
+
+- **Prompt caching**: the provider keeps the processed start of your prompt for a few minutes (five, on
+  Anthropic's default cache). Requests that start with the same text pay about a tenth of the normal input price
+  for it. The first request pays a little extra to write the cache.
+- **RAG** (retrieval-augmented generation): search the document first, and put only the best passages in the
+  prompt.
+- **Chunk**: one passage cut from the document. Chunks are what you search and cite.
+- **Embedding**: a list of numbers computed from text by a small model, so that passages with similar meaning get
+  similar numbers. It lets you search by meaning.
+
+### Step 1: count the tokens
+
+Anthropic's contextual-retrieval post treats "200,000 tokens" as about 500 pages, which is about 400 tokens a
+page. So 200 pages is about **80,000 tokens**. It fits.
+
+Now price one question three ways, at Claude Sonnet 5 list prices fetched 2026-10-11:
+
+| Approach | Cost per question | What to say in the interview |
+|---|---|---|
+| Whole PDF, cache cold | **$0.164** (or $0.204 on the request that writes the cache) | "Fine for a demo, painful at volume." |
+| Whole PDF, cache warm | **$0.020** | "Simple, and the model sees every page." |
+| RAG: 8 passages plus instructions | **$0.012** | "Cheaper, but now I run a search system." |
+
+So: send the whole document, with caching, when questions are frequent or need the whole document. Retrieve when
+questions are sparse, the document is one of many, or latency matters. Say it like this: "For one document I'd
+start without a vector store; I'd add retrieval when the cache keeps going cold or the documents stop fitting."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Cost = input tokens × input price + output tokens × output price. Claude Sonnet 5 list, fetched 2026-10-11, per 1M
+tokens: $2 input, $0.20 cache hit, $2.50 cache write, $10 output. Every case has 400 output tokens: 400 × $10 ÷ 1M
+= $0.004.
+
+- Whole PDF, uncached: 80,000 × $2 ÷ 1M + $0.004 = **$0.164**.
+- Whole PDF, cache write: 80,000 × $2.50 ÷ 1M + $0.004 = **$0.204**.
+- Whole PDF, cache hit: 80,000 × $0.20 ÷ 1M + $0.004 = **$0.020**.
+- RAG, 8 chunks of 400 tokens + 800 tokens of instructions = 4,000 input: 4,000 × $2 ÷ 1M + $0.004 = **$0.012**.
+- Chunk count: 80,000 ÷ 350 new tokens per chunk ≈ **230 chunks**.
+
+</details>
+
+### Step 2: if you retrieve, walk the path with the details
+
+```
+PDF upload
+   │  parse once: text + page numbers + headings; tables as markdown; OCR if scanned
+   ▼
+Chunker ── split on headings, heading path on each chunk, sized for the questions
+   │
+   ▼
+~230 chunks ── embedded, plus a keyword index; scan them all, no special index
+   │
+   ▼  (per question)
+Rewrite follow-up → keyword + meaning search → merge → (rerank 20) → pack the top few
+   │
+   ▼
+LLM answers with chunk ids and page numbers ── code checks the citations
+   │
+   ▼
+Answer, or "the document doesn't cover this"
+```
+
+1. **Parse once at upload.** Extract text with page numbers and headings, and turn tables into markdown. Read the
+   output: two-column layouts often come out with the columns interleaved.
+2. **Chunk on structure**, with the heading path at the top of each chunk, sized for the questions: a paragraph
+   for facts, a section for procedures. Keep chunks within the embedder's input limit. The small open model
+   all-MiniLM-L6-v2 reads only 256 word pieces (its own tokens), so longer chunks are silently cut short.
+3. **Embed and index** about 230 chunks. At this size, comparing the question against every chunk is instant.
+   You don't need an approximate nearest-neighbour index, the special structure big vector stores use.
+4. **At query time**, rewrite the question if it is a follow-up. Run keyword search (**BM25**, the standard
+   keyword-ranking formula) and embedding search, and merge the two lists with **reciprocal rank fusion** (RRF),
+   which scores each chunk by its positions in both. Optionally **rerank**: a slower model rereads 20 candidates
+   together with the question and reorders them. The rag lab's reranker took
+   <LabNumber lab="rag" metric="Cross-encoder rerank, 20 candidates" /> (CPU / Apple GPU). Then pack the top
+   chunks into a token budget.
+5. **Generate** with chunk ids and page numbers, verify the citations in code, and say "the document doesn't cover
+   this" when nothing supports an answer.
+6. **Whole-document questions** ("summarise the risks") go to **map-reduce**: summarise or extract per section,
+   then combine. Top-k search returns a few passages, not the whole document.
+
+### Follow one question through it
+
+Say the PDF is an employee handbook (an invented example) and the user asks *"What is the notice period for
+contractors?"*
+
+- **Long context:** the whole 80,000-token handbook plus the question goes to the model. With a warm cache this
+  costs about 2 cents, and the model can see the contractor section and any exceptions elsewhere.
+- **RAG:** search finds the "Contractors > Ending a contract" chunk, the model answers "14 days' written notice"
+  and cites that chunk and its page. This costs about 1.2 cents, but if the exception sits in an appendix the
+  search didn't return, the answer misses it.
+
+That difference is the whole trade-off in one question.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="One PDF"
+  senior={["Walks every step with concrete details: parsing, structure-aware chunks, embedder limits, hybrid, citations, refusal."]}
+  staff={["Opens with the token count and the long-context comparison, then routes by question type: retrieval for lookups, map-reduce for whole-document questions."]}
+/>
+
+## Small-team version
+
+For a "chat with this PDF" feature, ship long context with prompt caching on a managed API first: no index, no
+chunking, one API call, and a cost you can compute.
+
+**What it costs.** At an assumed 1,000 questions a day on a warm cache: 1,000 × $0.020 × 30 ≈ **$600 a month** on
+Claude Sonnet 5, against about **$360** for RAG ($0.012 per question). The simplicity costs about **$240 a month**.
+
+**The catch.** With Anthropic's 5-minute cache, the warm-cache price holds only if questions on the same document
+arrive more often than that. A cold cache costs $0.164 to $0.204 per question.
+
+**When to change.** Add retrieval when traffic is that sparse, when users upload many documents, or when a
+document passes about 200,000 tokens. Either way, own the parsing check and a 30-question eval with page-level
+answers.
+
+## Pitfalls
+
+- **Reciting "chunk, embed, retrieve, generate" with no numbers.** That is the first layer; the interviewer is
+  waiting for the second.
+- **Never computing the document's token count.** It decides whether you need retrieval at all.
+- **Ignoring tables and scanned pages.** Bad text in means wrong answers out, and nothing reports the error.
+- **Top-k retrieval for "summarise the whole document".** Search returns a few passages; whole-document questions
+  need map-reduce or long context.
+
+## Go deeper
+
+- Family walkthrough: [Design a RAG system end to end](/system-design-labs/interviews/walkthroughs/rag-system-design/#back-of-envelope).
+- Build the path and see truncation for yourself: <LabRef lab="rag" inline />.

@@ -1,0 +1,203 @@
+---
+question: eng-073
+family: llm-cost-latency
+status: published
+labs: [rag, agent-framework]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Most of a claims decision is a fixed workflow: read the claim, find the policy clauses that apply, check the
+> rules in code, then ask the model for a decision with citations. I'd only use an open-ended agent loop for the
+> part that needs it, like asking for a missing document. An agent's cost grows with the square of its steps,
+> because every step resends everything so far, so I'd cap steps and tokens per claim, cache the repeated part of
+> the prompt, and send uncertain or high-value claims to a human. That makes the cost per claim a number we agree on
+> up front, not a surprise."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you can design an AI system whose cost per task is bounded and known, and
+who decides when the model is unsure.
+
+This differs from a normal backend workflow in one way that drives the whole answer. In a normal service, a
+five-step workflow costs about five times one step. An **agent** is different. It is a loop: a **large language
+model (LLM)** reads the task, decides to call a **tool** (a function your code runs, such as "look up this
+customer's claim history"), reads the result, and decides again until it is done. Each time round the loop, the
+whole conversation so far is sent back to the model, and you pay for every **token** (a chunk of text, roughly ¾ of
+a word) it reads. So step 8 pays for everything steps 1 to 7 produced. The cost grows much faster than the number of
+steps.
+
+The question comes from a list entry tagged Scale AI on Aced, a question-list aggregator (low confidence; it is a list entry, not a
+candidate report): an insurance-claims agent that ingests claims, outputs an approval decision, and controls
+"LLM/token cost" (<Cite id="s-d7a8e88bf0" />). The page's model answer ends: "The strong move is treating cost and
+guardrails as first-class design constraints rather than afterthoughts."
+
+## Clarify first
+
+- **What is the output?** "I'll assume approve, deny or escalate, with a reason and the policy clauses it relied on.
+  A human reviews every escalation."
+- **Volume?** "I'll assume 1,000 claims a day."
+- **What comes with a claim?** "A claim form plus a few attachments, and a library of policy documents to look things
+  up in."
+- **Risk threshold?** "Claims above some dollar amount always go to a human."
+- **Budget?** Ask for a per-claim token or dollar budget. If there is none, propose one: "I'd like to agree a cost
+  per claim with the business owner, like a latency target."
+
+## Answer
+
+### Workflow first, agent only where needed
+
+Most of the path is fixed, so write it as ordinary code:
+
+```
+Claim arrives
+   │
+   ▼
+Extract fields ── model reads the form into a fixed schema (amount, dates, type)
+   │
+   ▼
+Retrieve clauses ── search the policy library, keep the best few after reranking
+   │
+   ▼
+Rule checks ── coverage rules written as code, where they are rules
+   │
+   ▼
+Decision ── model returns approve / deny / escalate + reason + cited clauses
+   │
+   ├── high value or low confidence ──▶ Human reviewer
+   │
+   ▼
+Open questions only ── a small tool loop with a step cap
+                       (request a missing document, check claim history)
+```
+
+**Extract fields.** The model turns a messy form into fixed fields. A schema keeps the output short and checkable.
+
+**Retrieve clauses.** Search the policy library for the passages that apply. This is **retrieval-augmented generation
+(RAG)**: the model answers from text you looked up, not from memory. A **reranker** (a second, more careful scoring
+model) keeps only the best few passages, so the prompt stays short.
+
+**Rule checks.** Anything that is a rule ("claims after 30 days are not covered") belongs in code. Code is free,
+fast and never wrong in a new way.
+
+**Decision.** One model call with the claim, the clauses and the rule results, returning a structured decision.
+
+**Tool loop.** Only for the open-ended part, with a hard step cap.
+
+Say: "I'd build a workflow with one small agent loop inside it, not an agent that does everything."
+
+### Why the cost grows with the square of the steps
+
+Follow one claim through the tool loop. Assume each step resends 4,000 tokens (instructions, tool descriptions and
+the claim) and adds 1,500 more (a tool result plus the model's reply).
+
+| Step | Prompt size at this step | Running input total | What to say in the interview |
+|---|---|---|---|
+| 1 | 5,500 | 5,500 | "The first step is cheap." |
+| 2 | 7,000 | 12,500 | "Each step resends everything before it." |
+| 4 | 10,000 | 31,000 | "The total is already more than five times step 1." |
+| 8 | 16,000 | **86,000** | "Eight steps cost 86,000 input tokens, not 8 × 5,500 = 44,000." |
+| 16 | 28,000 | **268,000** | "Doubling the steps makes it 3.1× more, not 2×. That's why I cap steps." |
+
+On Claude Sonnet 5 ($2 per million input tokens, $10 per million output tokens), with 300 output tokens per step,
+eight steps cost about **$0.196 per claim**.
+
+Now the fix. Most of each step's prompt is identical to the previous step's prompt. Providers offer **prompt
+caching**: if the start of a prompt matches a recent one, those tokens are billed as cheap **cached input** ($0.20 per
+million on Sonnet 5, a tenth of the normal price). With caching, only about 16,000 of the 86,000 tokens are new. The
+claim costs about **$0.070**. At 1,000 claims a day, that is about **$5,880 a month without caching and $2,100 with
+it**.
+
+Say: "Caching cuts the bill by almost two thirds. The step cap matters more than the price, because one runaway claim
+at 16 steps costs about three times a normal one."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+<Formula
+  title="Agent-loop input tokens, no caching"
+  expr="total_input = N × C₀ + Δ × N(N + 1) ÷ 2"
+  vars={[
+    { sym: 'N', meaning: 'steps (assumed 8)' },
+    { sym: 'C₀', meaning: 'resent every step: instructions, tools, claim (assumed 4,000)' },
+    { sym: 'Δ', meaning: 'added per step (assumed 1,500)' },
+  ]}
+  example={[
+    "8 × 4,000 + 1,500 × 36 = 86,000 input tokens; Claude Sonnet 5 at $2 in / $10 out per M, 2,400 output: $0.196 per claim",
+    "With prompt caching, 16,000 new tokens and 70,000 cache reads at $0.20/M: $0.070 per claim",
+    "At 1,000 claims a day: about $5,880 versus $2,100 a month",
+  ]}
+/>
+
+- Uncached: 86,000 × $2/M + 2,400 × $10/M = $0.172 + $0.024 = $0.196.
+- Cached: new tokens are C₀ + N × Δ = 4,000 + 8 × 1,500 = 16,000; 16,000 × $2/M + 70,000 × $0.20/M + $0.024 = $0.070.
+- 16 steps: 16 × 4,000 + 1,500 × 136 = 268,000 tokens, 3.1× the 8-step total.
+- Monthly: $0.196 × 1,000 × 30 = $5,880; $0.070 × 1,000 × 30 = $2,100.
+
+</details>
+
+Prices are Anthropic's list prices fetched 2026-10-11
+([pricing](https://platform.claude.com/docs/en/about-claude/pricing)). The small extra charge for writing to the cache
+is ignored.
+
+### The levers
+
+- **Stable content first.** Put instructions, tool descriptions and the policy summary at the start of the prompt so
+  they cache. Anything that changes per claim goes after them.
+- **A tight set of clauses.** Retrieve a few clauses after reranking, not a long list.
+- **A cheaper model for simple claims,** if the eval allows it. Providers sell models in sizes, called **tiers**; the
+  small ones cost many times less.
+- **A schema for the output,** so the model can't ramble.
+- **Caps on steps and tokens per claim,** with escalation to a human when the budget runs out.
+
+The Aced answer suggests the same set, and stating the per-claim token budget as a service-level agreement
+(<Cite id="s-d7a8e88bf0" />).
+
+### Guardrails
+
+Decisions above the dollar threshold, or below a confidence threshold, go to a human. Log every decision with its
+citations so an auditor can see why. Check retrieval and decisions separately against a set of claims with known
+correct outcomes (an **eval**), and track how often humans overturn the model in production. A rising override rate
+is the signal to pull automation back.
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Claims agent under a token budget"
+  senior={["Prices a claim in tokens with the loop formula, uses caching and step caps, and escalates uncertain or high-value claims."]}
+  staff={["Turns the budget into a contract with the business owner, reports cost per correctly decided claim, and sets the override rate that would pull automation back."]}
+/>
+
+In plain words: a Senior answer knows why the agent is expensive and caps it. A Staff answer also agrees the cost per
+claim with the business, measures cost per *correct* decision, and names the human-override rate that would stop
+the automation.
+
+## Small-team version
+
+Build the workflow with direct API calls, not a framework, and put a step cap and a dollar cap on every run from the
+first commit. Tag each model call with the claim id, so cost per claim is a database query, not an estimate.
+
+Use the provider's **batch API** for any claims that can wait overnight. It takes many requests at once, returns the
+answers within hours, and halves their cost. With the numbers above, caching takes the monthly bill from about
+$5,880 to $2,100. If half the claims can wait overnight, batch pricing takes that half from about $1,050 to $525
+(assuming the batch discount stacks with cache reads; check your provider's terms).
+
+Revisit the managed API only if a residency rule forbids it or volume grows by orders of magnitude. Say: "At this
+volume the whole thing costs about $2,000 a month. The engineering effort should go into the eval and the human
+review path, not into infrastructure."
+
+## Pitfalls
+
+- **An open-ended agent where a fixed workflow would do.** It costs more, is harder to test, and fails in new ways.
+- **No step cap.** One confused run can cost as much as hundreds of normal ones.
+- **A timestamp or claim id at the top of the prompt.** It makes every prompt start differently, so prompt caching
+  never hits.
+- **Auto-approving high-value claims with no human path.** A wrong approval is a real payout, not a retry.
+
+## Go deeper
+
+- Family walkthrough: [Make an LLM feature fast and affordable](/system-design-labs/interviews/walkthroughs/llm-cost-latency/#back-of-envelope), the claims-agent formula.
+- Labs: <LabRef lab="rag" inline /> for retrieval and reranking; <LabRef lab="agent-framework" inline /> for a tool loop (read its status caveat first).
+- Related: [Agent or workflow?](/system-design-labs/interviews/walkthroughs/agentic-workflow-design/)

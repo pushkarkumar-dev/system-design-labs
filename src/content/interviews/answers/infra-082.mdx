@@ -1,0 +1,182 @@
+---
+question: infra-082
+family: design-doc-critique
+status: published
+labs: [rate-limiter, message-queue, load-balancer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Under a burst, this design turns overload into an outage, and a dead GPU loses work silently. Three changes fix
+> most of it. Bound the queue by how long a request would wait, and reject early with a 'retry later'. Retry at one
+> layer only, inside a budget. And lease each batch, so a dead GPU's work goes back on the queue. For each one I'd
+> attach a test: replay at twice peak, inject GPU errors, kill a worker mid-batch."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer hands you someone else's design for a service that runs a model on GPUs (graphics processors
+used for a model's heavy math), and asks what breaks. The first few issues are the warm-up. The real question is
+how deep you can go on **overload** (more traffic than the system can serve) and **failure** (a part dies).
+
+Why is this harder than overload in a normal web service? A web request is cheap, and when traffic grows you add
+servers in seconds. Here each request is expensive and the GPUs can't be added quickly, so the design must decide
+who waits and who is turned away. Also, the service groups requests into a **batch** (a group the GPU processes in
+one go, here 32 requests every 100 ms). That's efficient, but if a GPU dies mid-batch, every request in the
+batch goes down together.
+
+A Staff candidate at Anthropic reported a phone-screen round that "asked me to review an existing design doc and
+give feedback" on a "Batch Sampling Service". After the first issues, "it becomes a typical deep dive session on
+failure handling, overload protection". The candidate's advice: "Have a deep understanding of the LLM inference
+stack and the failure scenarios" (<Cite id="s-eab681003c" />). (An LLM is a large language model; inference is
+running it to get an answer; sampling is generating its output.)
+
+## Clarify first
+
+- **Who calls the service, and do they wait?** Interactive callers need a deadline; assume a 1 s timeout if the
+  doc doesn't say.
+- **Traffic, peak and tenant mix?** A **tenant** is one customer sharing the service. These decide how much the
+  overload problem matters.
+- **Latency target, and is the batch time inside it?**
+- **Is a request safe to retry?** If it has side effects, retries and leases need more care.
+- **Several models on the fleet?**
+
+Missing answers in the doc are findings in their own right. Say it like this: "The doc doesn't say how long a
+caller waits. That means nobody has designed the timeout, so I'll assume 1 second and note it."
+
+## Answer
+
+Picture the design as submitted (an invented example with the usual flaws):
+
+```
+Clients (1 s timeout)
+   │
+   ▼
+Load balancer ──── up to 3 attempts per call
+   │
+   ▼
+API pods ───────── also up to 3 attempts
+   │
+   ▼
+In-memory queue ── no size limit, inside one dispatcher process
+   │  every 100 ms, up to 32
+   ▼
+GPU workers ────── fleet sized for about 10,000 requests/s
+```
+
+**Walk the flow** once for a request that succeeds and once for a request that fails at each hop, naming each
+timeout. Then replay it on a bad day. That is where the findings come from.
+
+### Follow one burst through it
+
+Suppose traffic suddenly doubles to 20,000 requests per second. The fleet can serve about 10,000, so roughly
+10,000 extra requests a second pile into the queue. Wait time is queue length divided by how fast the queue
+drains (about 10,000 a second). Illustrative numbers for the invented doc:
+
+| Time into the burst | Queue length | How long a new request waits | What callers see |
+|---|---|---|---|
+| 0 s | about 0 | about 100 ms | Normal |
+| 0.5 s | about 5,000 | about 0.5 s | Slow but working |
+| 1 s | about 10,000 | about 1 s | New requests hit the 1 s timeout |
+| 2 s | about 20,000 | about 2 s | Every caller times out; GPUs compute answers nobody waits for |
+
+Then the retries start, and each timeout comes back as more traffic. That's the outage.
+
+### Overload
+
+Four flaws compound in that table:
+
+- **Unbounded queue.** "Absorbs bursts" really means "turns a burst into latency, then into timeouts". Fix: bound
+  the queue by *estimated wait* (queue length ÷ drain rate), not by count. Past the budget, reject at once with
+  `503` and a `Retry-After` header telling the caller when to come back. A 200 ms budget at this drain rate is
+  about 2,000 queued requests.
+- **Retries at several layers.** Three attempts at the load balancer times three at the API tier is up to **9**
+  attempts,
+  exactly when GPUs are overloaded. Fix: retry at one layer, inside a **retry budget** (a cap on retries as a share
+  of all traffic). The load-balancer lab caps retries at 20% of traffic, and Google's SRE book recommends retrying
+  only at the layer immediately above ([Handling Overload](https://sre.google/sre-book/handling-overload/)). With
+  a 20% budget, total load stays at most 1.2× the base instead of up to 9×.
+- **No admission control.** **Admission control** means deciding at the door whether to accept a request. Fix:
+  per-tenant **token buckets** (a counter per tenant that refills at their agreed rate; empty means reject),
+  priority classes for interactive work, and shed the lowest class first.
+- **No deadlines.** Fix: carry each request's deadline with it, and drop expired work before it reaches a GPU.
+
+Say it like this: "The queue doesn't absorb bursts; it converts them into timeouts, and then the stacked retries
+multiply the load by up to nine."
+
+### Failure
+
+Now a normal day, but the GPU running our batch of 32 dies halfway through.
+
+- **GPU dies mid-batch.** Without leases, the batch's 32 callers simply time out. A **lease** gives the worker the
+  batch for a limited time; if it doesn't report success in time, the batch returns to the queue. Fix: lease
+  batches, requeue with an attempt count, and retry once if the deadline allows.
+- **Poison input.** One input that crashes the worker will crash worker after worker as the batch is retried.
+  Fix: if a batch fails twice, split it in half and retry each half (**bisect**) until the bad input is alone, then
+  move it to a **dead-letter queue** (a side queue for messages that keep failing).
+- **Single dispatcher with an in-memory queue.** One crash loses everything queued. Fix: replicate the queue, or
+  state the loss contract explicitly so callers know to retry.
+
+Say it like this: "Today a dead GPU loses 32 requests with no trace. With leases, they go back on the queue and
+run once more if their deadline allows."
+
+### Ranked summary
+
+Close with the outcome, not a list: "Under a burst this design turns overload into an outage. Three changes fix
+most of it: a time-bounded queue, one retry layer with a budget, and leased batches." Attach a test to each:
+
+- **Time-bounded queue:** replay traffic at 2× peak; accepted requests keep a bounded p99, and rejections rise.
+- **One retry layer:** inject GPU errors; attempts per request stay within the budget.
+- **Leases:** kill a worker mid-batch in staging; no accepted request is lost.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Burst growth:** arrivals 20,000/s − service about 10,000/s = about 10,000 extra per second. After t seconds
+  the queue holds about 10,000 × t requests, and a new arrival waits about (10,000 × t) ÷ 10,000 = t seconds.
+- **Queue bound from a time budget:** 0.2 s × 10,000/s = about **2,000** requests.
+- **Retry amplification:** 3 attempts at the load balancer × 3 at the API tier = **9** attempts. With one layer
+  and a 20% retry budget, load is at most 1 + 0.2 = **1.2×**.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Batch Sampling Service review"
+  senior={["Finds the unbounded queue, compound retries and missing leases, and proposes concrete fixes."]}
+  staff={["Ranks findings by incident risk, ties each fix to a verification test, and asks what the author knows that the doc doesn't say."]}
+/>
+
+In plain terms: a Senior reviewer finds the right problems. A Staff reviewer also decides which ones matter most,
+proves each fix with a test, and treats the author as someone who may know a constraint the doc left out.
+
+## Small-team version
+
+At a small company the documents differ but the review is the same. A teammate's plan to run a model on your own
+GPUs, a vendor's architecture or an agent pipeline gets the same lenses: timeouts, retries, queue bounds, what
+happens when a part dies.
+
+Add one finding small teams often miss: the provider's **spend cap**, a monthly limit on what your account can
+spend. Anthropic's docs say that at the monthly cap the API returns 429 (too many requests) without a
+`retry-after` header, so an SDK's automatic retries keep failing until the month resets. This guide's small-team
+research lists caps of $500 a month on the Start tier and $1,000 on Build
+([rate-limits docs](https://platform.claude.com/docs/en/api/rate-limits), fetched 2026-10-11).
+
+Say it like this: "What happens on the day we hit the provider's spend cap? Our retries won't help, so we need
+an alert well before it and a clear error for users."
+
+## Pitfalls
+
+- **Redesigning from scratch instead of reviewing.** The round asks you to improve the author's design, not
+  replace it.
+- **A flat list of twenty findings with no ranking.** It hides your judgment; lead with three.
+- **Missing that retries multiply across layers.** Three times three is nine attempts, at the worst moment.
+- **Pushing back on the interviewer rather than the design.** Ask what they know before asserting they're wrong.
+
+## Go deeper
+
+- Family walkthrough: [Critique a batch-inference design doc](/system-design-labs/interviews/walkthroughs/design-doc-critique/), especially the ranked findings table.
+- <LabRef lab="rate-limiter" inline />, <LabRef lab="message-queue" inline />, <LabRef lab="load-balancer" inline /> (its v2 retry bug is a ready-made review exercise).
+- The design behind the doc: [From one GPU batcher to a fleet](/system-design-labs/interviews/walkthroughs/batcher-to-fleet/).

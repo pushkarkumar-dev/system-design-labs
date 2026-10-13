@@ -1,0 +1,189 @@
+---
+question: infra-074
+family: gpu-kernel-perf
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'll give each long row one thread block. Thread t reads elements t, t plus the block size, and so on, so
+> neighbouring threads read neighbouring addresses. Each thread keeps a running maximum and a running sum in one
+> pass, rescaling the sum whenever the maximum grows. I combine those pairs inside each warp with shuffles, then
+> across warps through a small shared array. A second pass writes e to the power of (x minus the max), divided by
+> the sum. Subtracting the max keeps the exponentials from overflowing."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The interviewer wants to see one specific GPU skill: combining many values into one (a **reduction**) and then
+doing a simple step on every value (an **element-wise pass**), in one program, with fast memory access and
+arithmetic that can't overflow.
+
+A **softmax** is the perfect test of that. It takes a row of numbers and turns them into probabilities that add
+up to 1: raise *e* to each number, then divide each result by the total. Language models use it to turn their
+raw scores for every possible next word (the **logits**) into probabilities. To compute it you need the row's
+maximum and its sum, which are reductions, and then the division, which is element-wise.
+
+If you have written a sum over an array in Java, the logic is easy. What makes the GPU version different is
+that thousands of threads do it at once, and how they read memory decides the speed. A GPU program, called a
+**kernel**, is usually limited by how fast it reads memory, not by its arithmetic: it is **memory-bound**.
+Its **bandwidth floor** is the time it would take just to move its bytes at the memory's top speed. So the interviewer cares as
+much about *how* your threads read the row as about the maths.
+
+(techinterview.org's Together AI guide says softmax "is a favorite because it forces a reduction and an
+element-wise pass in one kernel", with follow-ups on coalescing, shared-memory reductions and warp divergence.
+That is the site's guidance, not a candidate report <Cite id="s-0457784328" />.)
+
+## Clarify first
+
+- **How long are the rows, and how many?** 64-wide attention rows and 128,256-wide vocabulary rows need different
+  layouts of threads.
+- **fp32 or fp16 input, and accumulate in fp32?** fp32 numbers take 4 bytes, fp16 take 2. Assume you accumulate
+  in fp32 for accuracy.
+- **Can entries be masked (−∞)?** Assume yes: language models hide some positions this way.
+- **What tolerance against a reference?** A parallel sum adds in a different order, so the last digits differ.
+
+## Answer
+
+### Words you need first
+
+- Threads run in groups of 32 called **warps**, which execute the same instruction together. Warps are grouped
+  into **thread blocks**; the threads of one block share a small, fast **shared memory** and can wait for each
+  other.
+- A **coalesced** read is one where the 32 threads of a warp read addresses that sit next to each other, so the
+  GPU fetches them in a few wide transactions instead of many.
+- A **shuffle** (`__shfl_down_sync`) lets a thread read a value straight from another thread's register in the
+  same warp, with no memory involved.
+
+### The worked example: one row of 128,256 logits
+
+Take a row of 128,256 fp32 logits, the vocabulary size of Llama 3.1 <Cite id="s-6fdd575dc5" />, and a block of
+1,024 threads. Follow the row through the kernel:
+
+| Stage | What the threads do | What to say in the interview |
+|---|---|---|
+| 1. Read | Thread t reads elements t, t + 1,024, t + 2,048… about 125 numbers each | "Neighbouring threads read neighbouring addresses, so each warp's read is coalesced." |
+| 2. Running pair | Each thread keeps (max m, sum d) and updates both per number | "One read gives me both statistics." |
+| 3. Warp combine | 5 shuffle rounds merge 32 pairs into 1 | "Inside a warp, shuffles need no shared memory." |
+| 4. Block combine | 32 warp results go into a 32-slot shared array; warp 0 merges them | "Shared memory only joins the warps, one slot each, so no bank conflicts." |
+| 5. Write | Every thread re-reads its numbers and writes e^(x − m) ÷ d | "That's two reads and one write of the row." |
+
+### The online update, in plain words
+
+The safe softmax subtracts the row's maximum before exponentiating. Softmax doesn't change when every number
+shifts by the same amount, and the shift keeps the exponentials small. Without it, any logit above about 88
+overflows fp32's `exp`, and the row turns into infinities.
+
+But you don't know the maximum until you've read the whole row. **Online softmax** solves this. Each thread
+keeps a running maximum m and a running sum d, where d is always "the sum of exponentials, measured against the
+current m". When a bigger number arrives, multiply d by e^(old m − new m), a number below 1, and add the new term:
+m' = max(m, x), d' = d × e^(m − m') + e^(x − m')
+([Milakov and Gimelshein](https://arxiv.org/abs/1805.02867)). Two pairs from different threads merge with the
+same rule, which is why it parallelizes.
+
+### The kernel
+
+```cuda
+__device__ void combine(float &m, float &d, float m2, float d2) {
+    float mn = fmaxf(m, m2);
+    d = (m == -INFINITY ? 0.f : d * __expf(m - mn)) + (m2 == -INFINITY ? 0.f : d2 * __expf(m2 - mn));
+    m = mn;
+}
+__global__ void softmax_rows(const float* __restrict__ x, float* __restrict__ y, int cols) {
+    const float* xr = x + (size_t)blockIdx.x * cols;  float* yr = y + (size_t)blockIdx.x * cols;
+    float m = -INFINITY, d = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) combine(m, d, xr[i], 1.f);
+    for (int o = 16; o > 0; o >>= 1)
+        combine(m, d, __shfl_down_sync(0xffffffff, m, o), __shfl_down_sync(0xffffffff, d, o));
+    __shared__ float sm[32], sd[32];
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    if (lane == 0) { sm[warp] = m; sd[warp] = d; }
+    __syncthreads();
+    if (warp == 0) {
+        int nw = blockDim.x / 32;
+        m = lane < nw ? sm[lane] : -INFINITY;  d = lane < nw ? sd[lane] : 0.f;
+        for (int o = 16; o > 0; o >>= 1)
+            combine(m, d, __shfl_down_sync(0xffffffff, m, o), __shfl_down_sync(0xffffffff, d, o));
+        if (lane == 0) { sm[0] = m; sd[0] = d; }
+    }
+    __syncthreads();
+    float mx = sm[0], inv = 1.f / sd[0];
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) yr[i] = __expf(xr[i] - mx) * inv;
+}
+```
+
+How to read it. `combine` is the online rule for merging two (max, sum) pairs. A single number x enters as the
+pair (x, 1), because e^(x − x) = 1. The `-INFINITY` checks handle masked entries and empty slots, so no thread
+computes infinity minus infinity. `lane` is a thread's position inside its warp (0–31) and `warp` is its warp's
+number. `__syncthreads()` makes every thread in the block wait at that line, so the shared array is complete
+before anyone reads it.
+
+This kernel was not compiled for the guide (no NVIDIA GPU on the machine used). Its reduction logic matches a
+NumPy online softmax that was run on 2026-10-12 and agreed with a three-pass softmax to 7.8 × 10⁻¹⁶.
+
+### Answers to the follow-ups
+
+- **Max subtraction**: without it, a logit above about 88 overflows fp32 `exp`. The guide says candidates often
+  skip it.
+- **Passes**: this reads each row twice and writes once (3 passes), against 4 for the textbook max, sum,
+  normalize. If the row fits in registers or shared memory, cache it and reach 2 passes. For a memory-bound
+  kernel, time follows passes.
+- **Shared-memory reduction**: shuffles inside a warp need no shared memory. Shared memory only joins warps, with
+  one slot per warp, so there are no **bank conflicts** (several threads hitting the same section of shared
+  memory and being served one after another).
+- **Divergence**: when threads in one warp take different sides of an `if`, the warp runs both sides in turn.
+  Here only the final reduction branches, and on whole-warp conditions, so it costs nothing.
+- **Short rows**: for a 64-wide row, one warp per row, or several rows per block. One block per 64 numbers
+  would leave most threads idle.
+- **Testing**: compare with a float64 reference on random rows, rows with large logits, a row of identical
+  values, lengths that aren't multiples of the block size, and rows with `-inf` entries.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Why 88:** fp32's largest value is about 3.4 × 10³⁸, and ln(3.4 × 10³⁸) ≈ 88.7, so e^x overflows just above 88.
+- **Elements per thread:** 128,256 ÷ 1,024 ≈ 125.
+- **Bandwidth floor for the whole batch:** 4,096 rows × 128,256 × 4 B, read once and written once, is **4.20 GB**.
+  At an A100's 2,039 GB/s (<Cite id="s-8e443a8b66" />) that is **2.06 ms**. This kernel makes 3 passes, so its floor
+  is about 3.09 ms; the textbook 4-pass version's is about 4.12 ms.
+- **Shuffle rounds:** 32 → 16 → 8 → 4 → 2 → 1 is 5 rounds (offsets 16, 8, 4, 2, 1).
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Softmax kernel"
+  senior={["Coalesced strided loop, online or two-pass max and sum, warp shuffles, max subtraction and a test plan."]}
+  staff={["Chooses the mapping by row length, counts passes against the bandwidth floor, and fuses softmax with its producer or consumer when that removes a round trip."]}
+/>
+
+In plain words: a Senior answer writes a correct, fast kernel. A Staff answer also asks whether softmax should be
+its own kernel at all, since merging it into the step before or after saves a full write and read of the data.
+
+## Small-team version
+
+Use the framework's fused softmax and attention. Know this kernel well enough to read a profile: a softmax that
+takes several times its bandwidth floor points at a library or shape problem worth reporting, not at writing
+your own.
+
+The floor is quick to compute. 4,096 rows × 128,256 fp32 logits, read and written once, is 4.20 GB. At an A100's
+2,039 GB/s that takes 2.06 ms, so a 13.7 ms softmax is running at **15%**. Buy (use the library kernel) by
+default. A custom kernel costs weeks of engineer time, about $14,900 for an assumed four weeks of a senior engineer, and pays
+back only when GPU spend spans several nodes (the family walkthrough's small-team arithmetic works it through).
+
+## Pitfalls
+
+- **Thread i reading a contiguous chunk of the row.** Then a warp's 32 addresses are far apart and every read is
+  uncoalesced.
+- **No max subtraction.** One large logit overflows to infinity and the whole row becomes NaN.
+- **A `__syncthreads()` inside a branch that only some threads reach.** The threads that skip it never arrive,
+  and the block hangs or misbehaves.
+- **Testing only lengths that are multiples of the block size.** The ragged last stretch is where index bugs live.
+
+## Go deeper
+
+- Family walkthrough: [GPU kernel performance](/system-design-labs/interviews/walkthroughs/gpu-kernel-perf/), worked example 2.
+- Compare the online softmax with the softmax inside <LabRef lab="transformer" inline />.

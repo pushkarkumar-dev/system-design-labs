@@ -1,0 +1,191 @@
+---
+question: infra-010
+family: continuous-batching
+status: published
+labs: [llm-inference, websocket-gateway]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Slots aren't what runs out first; GPU memory is. So I admit the next request only if there's memory for its
+> prompt plus one more token, and I reject at submit anything that couldn't fit even alone. Each step, running
+> requests grow oldest first. If one can't grow, I evict the newest request, keep the tokens it already wrote, and
+> put it back at the front of the queue to be re-read later. A disconnect just records the request's id; the loop
+> frees its slot and memory before the next model call, so the GPU never waits on it and nobody's memory is
+> wasted on a reader who left."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The interviewer wants to know one thing: can you schedule text generation when **memory**, not the number of
+slots, is the limit?
+
+Start with the basic loop. A language model writes a reply one **token** at a time (roughly ¾ of a word). Many
+requests share each model call, called a **step**: the model gets one prefix per request and returns one next
+token for each. Each place in the batch is a **slot**. **Continuous batching** means that when one request
+finishes, a new one takes its slot at the very next step, instead of waiting for the whole batch to end.
+
+Now add memory, which is what makes this different from any job queue you've built. While the model writes a
+reply, the GPU keeps a saved summary of every token so far, so it doesn't have to re-read the whole conversation
+at each step. That saved data is called the **KV cache** (key-value cache, after the two kinds of numbers it
+stores for each token). It belongs to one request, it **grows by a fixed amount with every token**, and it is
+freed only when the request ends. So a request's memory need isn't known at admission: it keeps growing until it
+stops. For a model the size of Llama-3.1-8B it is 128 KiB per token, so one 4,096-token conversation holds about
+half a gigabyte of GPU memory.
+
+That gives a scheduling problem you haven't met with web requests: you can admit work that fits now and still run
+out of memory halfway through. You need a policy for what happens then.
+
+(This comes from a Together AI prep guide rather than a candidate report. It lists continuous batching and
+"deciding how to preempt or queue when KV-cache memory runs short", plus a separate item on "propagating a client
+disconnect back to the scheduler" <Cite id="s-0457784328" />. Streaming tokens back to the client isn't part of
+the scheduler item.)
+
+## Clarify first
+
+Spend a minute on these, and say your assumption for each:
+
+- **How is memory modelled?** Say: "I'll treat it as a fixed pool of blocks of 16 tokens each, like pages in an
+  operating system. A request holds just enough blocks for the tokens it has." (16 is an assumption.)
+- **May I evict a running request?** Say: "I'll assume yes, by recomputing it later. If running requests must
+  never be evicted, I have to reserve their maximum memory up front, which wastes most of it."
+- **Fairness.** Say: "Strict first-in, first-out, unless you'd rather let short requests skip past a large one."
+- **How do disconnects arrive?** Say: "I'll assume the connection handler calls a thread-safe `cancel(id)`."
+
+## Answer
+
+### Words you need first
+
+- A **block** is a fixed-size piece of KV memory, here 16 tokens' worth. A request with `n` tokens needs
+  `ceil(n ÷ 16)` blocks. Handing out memory in blocks, as the open-source vLLM serving engine does, is called **paged
+  attention**.
+- **Preemption** means taking a running request out of the batch to free its memory, and running it again later.
+- **Re-prefill** is the cost of that: when the request comes back, the model must read its prompt and the tokens
+  it already wrote, all over again, before it can continue.
+
+### The four policies
+
+```
+ submit(r) ──▶ never fits? ──yes──▶ "rejected"
+                  │ no
+                  ▼
+        waiting queue (FIFO) ◀──────────── evicted request goes back to the FRONT,
+                  │                         with its tokens kept
+   admit head only if: free slot AND blocks for prefix + 1
+                  ▼
+          running requests ──grow oldest first──▶ out of blocks? evict the NEWEST
+                  │
+   cancel(id) ──▶ freed at the top of the next step
+```
+
+**Admission.** Admit the queue head only if a slot is free *and* enough blocks exist for its prompt plus one new
+token. Under strict FIFO, if the head doesn't fit, stop admitting rather than skipping it, so a long prompt can't
+be starved by a stream of short ones.
+
+**Never-fit rejection.** At submit, reject any request whose prompt plus `max_tokens` needs more blocks than the
+whole pool. Without this, it would eventually sit alone in the batch, unable to grow, with nothing left to evict:
+the loop would hang.
+
+**Growth.** Each step, every running request needs room for one more token. When it crosses a block boundary it
+takes another block. Serve requests oldest first, because they have the most work invested.
+
+**Preemption.** If a request can't grow, evict the newest admission. Free its blocks and put it back at the
+*front* of the queue, keeping its generated tokens. On readmission it re-prefills prompt plus output. Choose the
+newest because it has the least work to redo. vLLM documents recompute as its default and warns that preemption
+"can adversely affect end-to-end latency" ([docs](https://docs.vllm.ai/en/latest/configuration/optimization.html),
+dated 2026-08-20). The alternative is to copy the evicted request's cache out to ordinary server memory and back,
+which is better only when that transfer is cheaper than recomputing.
+
+**Cancellation.** The connection handler (an HTTP or WebSocket server) notices the close and calls `cancel(id)`,
+which only records the id under a lock. At the top of the next step, the loop removes the request from the queue,
+or frees its slot and blocks, and another request can take that slot in the same step. The model call runs outside
+the lock, so a disconnect never waits on a GPU step.
+
+Say it like this: "I admit on memory, grow oldest first, and evict the newest, keeping its tokens. Nothing a
+request produced is ever thrown away; we only pay to re-read it."
+
+### Follow one small workload through it
+
+Use a toy model that returns the last token plus one, modulo 10, so you can check it by hand. Use 2 slots and,
+to keep numbers small, toy memory: blocks of **2 tokens** and a pool of only **3 blocks**. Four requests arrive in
+order: A (prompt `[3]`, stop token 6), B (prompt `[1]`, up to 2 tokens), C (up to 0 tokens, so it finishes at
+submit) and D (prompt `[0]`, stop sequence `3, 4`). This trace comes from running the family walkthrough's tested
+scheduler with those settings.
+
+| Step | What happens | Blocks in use | What to say in the interview |
+|---|---|---|---|
+| 1 | A and B each need 1 block (1 prompt token + 1 new). Both admitted; D waits. | A 1, B 1 (2 of 3) | "Admission checks memory, not only slots." |
+| 2 | Each needs a 2nd block for its 3rd token; only 1 is free. A is older and gets it. B can't grow, so B, the newest, is evicted to the front of the queue, keeping its token `2`. | A 2 (2 of 3) | "Grow oldest first, evict newest, keep its tokens." |
+| 3 | B needs 2 blocks to come back; only 1 is free. Strict FIFO, so nothing is admitted. A writes `6` and stops. | A 2, then freed | "A slot sits empty because memory, not slots, is the limit." |
+| 4 | B is readmitted and re-reads `[1, 2]`, writes `3` and finishes. D is admitted too. | B 2, D 1 (3 of 3) | "B re-prefilled; its output didn't change." |
+| 5–7 | D runs alone and stops on `3, 4`. | D up to 2 | "Tight memory costs extra steps, never wrong answers." |
+
+Every output is identical to a run with plenty of memory: A `4, 5, 6`, B `2, 3`, C empty, D `1, 2, 3, 4`. The tight
+pool cost one extra model call (7 instead of 6) and some re-reading. That is exactly the trade preemption makes.
+
+### How to prove it works
+
+Check these invariants after **every** step, on random workloads where the pool is just above the largest single
+request, so preemption happens often:
+
+- **No leaked memory:** free blocks plus held blocks always equal the pool.
+- **No mapping drift:** the record of which request sits in which slot agrees with the slots.
+- **Same answers:** outputs match a one-request-at-a-time reference run (an **oracle**), even under forced
+  preemption.
+- **Cancel means stop:** a cancelled request gets no more tokens, and its blocks come back.
+
+The family walkthrough's implementation passed all of these in a run on 2026-10-12, over 300 random workloads, more
+than 20 of which forced preemption.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **KV per token** for Llama-3.1-8B: 2 (key and value) × 32 layers × 8 KV heads × 128 values × 2 bytes =
+  **131,072 bytes (128 KiB)**.
+- **One 4,096-token request:** 131,072 × 4,096 ≈ **0.537 GB**.
+- **Blocks for a request:** `ceil((prompt + output so far + 1) ÷ block size)`. In the toy trace, A at step 2 has
+  2 tokens plus 1 new = 3 tokens, so `ceil(3 ÷ 2)` = 2 blocks.
+- **Never-fit test:** `ceil((prompt + max_tokens) ÷ block size) > pool` → reject at submit.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Scheduler under KV pressure"
+  senior={["Admits on memory, grows each request a block at a time, evicts with a stated rule (newest first) and frees memory on cancel."]}
+  staff={["Shows the loop can't hang (rejects never-fit requests), keeps cancellation off the model-call path, and states the fairness trade-off between strict first-in, first-out and letting small requests skip ahead."]}
+/>
+
+## Small-team version
+
+With a self-hosted engine such as vLLM, this is configuration plus monitoring, not code.
+
+- **Size concurrency from the memory math.** Llama-3.1-8B on one 80 GB GPU, with an assumed 8 GB of other
+  overhead, fits **about 104 requests of 4,096 tokens** at once in the worst case: (80 GB − 16 GB of weights − 8 GB) ÷
+  0.537 GB per request ≈ 104. Real concurrency is usually higher, because blocks are only taken as tokens appear.
+- **Alert on the engine's preemption warnings.** They mean you admitted more than memory can hold. Lower the
+  concurrency limit or add memory.
+- **Confirm disconnects stop generation.** Close a client mid-stream and check that the engine stops, because a
+  stream nobody reads still holds KV memory.
+
+The batching gain only becomes money if slots stay full. One A100 80GB GPU (an NVIDIA data-centre GPU) at RunPod's
+$1.39 an hour, serving an assumed 1,300 tokens a second, costs **about $0.30 per million tokens at 100%
+utilization and $0.99 at 30%** (1,300 × 3,600 = 4.68M tokens an hour; $1.39 ÷ 4.68 ≈ $0.30; family walkthrough,
+price fetched 2026-10-11).
+
+## Pitfalls
+
+- **Admitting by slot count alone.** You find out memory is exhausted halfway through generation, when the only
+  fix is eviction.
+- **Evicting the oldest request.** It has done the most work, so it costs the most to redo.
+- **Dropping a preempted request's tokens.** The user's reply restarts or changes; keep them and re-read them.
+- **Admitting a request that can never fit.** It eventually runs alone, can't grow, and hangs the loop.
+- **Cancelling only queued requests.** Running streams with no reader keep generating and holding memory.
+
+## Go deeper
+
+- Family walkthrough: [Continuous batching](/system-design-labs/interviews/walkthroughs/continuous-batching/), stage 2 and the small-team sizing formula.
+- <LabRef lab="llm-inference" inline /> (its admission ignores the allocator's out-of-memory return); <LabRef lab="websocket-gateway" inline /> for connection-close detection.
+- Streaming and disconnects at the product layer: [eng-074](/system-design-labs/interviews/questions/eng-074/).

@@ -1,0 +1,172 @@
+---
+question: infra-063
+family: llm-from-scratch
+status: published
+labs: [transformer, llm-inference]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I won't hunt the bugs by reading line by line. I'll write the shape on each line, then run three checks:
+> compare the attention with PyTorch's built-in version, change the last token and confirm no earlier output
+> moves, and compare the heads against a known-good module with the same weights. For the KV cache, the
+> answer to 'what has to change' is four things: the attention layer stores and reads past keys and values,
+> the mask lines up with the newest token, positions keep counting from where the cache ends, and generation
+> splits into reading the prompt once and then one token per step. I prove it with a test that cached
+> generation equals one full pass."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants two things: can you find planted bugs in model code you didn't write, and can you then
+make an open-ended change without being told which lines to touch?
+
+Debugging model code is unlike debugging a service. In a service, a bug usually leaves a trace: an exception,
+a wrong status code, a failing assertion. In model code, everything is an array of numbers. A missing scale
+factor or a transpose in the wrong place still gives an array of the right size, full of believable values.
+Reading harder doesn't help much, because the wrong line looks almost the same as the right one. What helps is
+a check that compares the output with something you trust. The interview rewards the candidate who builds
+those checks first.
+
+(This comes from a first-hand OpenAI Research Engineer account: "roughly a few hundred lines of transformer
+code", a bug in each of four annotated chunks, then "Now implement KV caching in this transformer"; the
+candidate found the open-endedness "the tricky part" <Cite id="s-7fa103b073" />.) The account doesn't say what
+the bugs were, so prepare a method, not a list.
+
+## Clarify first
+
+Ask before you touch the code:
+
+- **Can I run it?** "Can I execute cells, and is there a reference, such as a known-good output or PyTorch's
+  built-in attention? I'll assume I can run things."
+- **How many bugs?** "Is it exactly one bug per annotated region? Then I'll move on once a region's check
+  passes."
+- **For the cache:** "What batch size and maximum length, and does generation sample or always take the most
+  likely token?"
+- **Positions:** "Learned position vectors or RoPE (rotating vectors by position)? It changes where the
+  position offset goes."
+
+## Answer
+
+### Words you need first
+
+- **Attention**: each token scores itself and every earlier token (its **query** against their **keys**),
+  turns the scores into weights with a **softmax**, and takes a weighted average of their **values**. A
+  **causal mask** hides later tokens.
+- **Heads**: attention runs several times side by side, each on a slice of the vector, and the slices are
+  joined back at the end.
+- **Logits**: the model's raw scores for every possible next token.
+- **Prefill and decode**: reading the prompt in one pass, then writing one token per pass.
+- **KV cache**: stored keys and values for every past token, so decode steps don't recompute them.
+- **Oracle**: something you trust to compare against.
+
+### Part 1: hunt by symptom
+
+Annotate each region with shapes first. Then run three checks. Each check catches a different family of bugs:
+
+| Check | Bugs it catches | What to say in the interview |
+|---|---|---|
+| Compare attention with `F.scaled_dot_product_attention(..., is_causal=True)` | missing `1/√d`, softmax over the wrong axis, mask off the diagonal, mask after softmax | "This one check covers most of the attention maths." |
+| Change the last token; earlier outputs must not move | upper-triangle (future-seeing) mask | "A decoder must never see the future, so I perturb the future and watch the past." |
+| Same weights, known-good module | heads merged with `reshape` and no transpose back | "The shape is right but tokens get mixed, so only a same-weights comparison shows it." |
+
+Also read for the usual suspects: the normalization layer placed on the wrong side of the residual add (the
+`x = x + f(x)` line), a missing residual add, dropout (random zeroing used only in training) left on at
+inference, and a wrong `contiguous()` or `view` when reshaping.
+
+A short example of the method. Say region 2 is attention, and the reference comparison fails. You check the
+row sums of the attention weights. They sum to 1 down the columns instead of across the rows. That points
+straight at a softmax over `dim=-2` instead of `dim=-1`. One check, one symptom, one line.
+
+### Part 2: the KV cache
+
+Answer the interviewer's question explicitly. Say: "Four things change."
+
+1. **The attention layer takes a cache.** It appends the new keys and values and attends over everything
+   stored.
+2. **The mask becomes `T × S`, aligned bottom-right.** `T` is the number of new tokens and `S` the number
+   visible. In a decode step `T` is 1, and that one query sits at the last position, so it may see every key.
+3. **Positions continue from the cache length.** If the prompt had 4 tokens, the first new token is position
+   4, not 0.
+4. **Generation splits into a prefill and one-token decode steps.**
+
+Then prove it. Cached generation must give exactly the same logits as one full pass:
+
+```python
+def cache_matches_full(net, ids):
+    full = net(ids)                                   # (B, T, V): one pass, no cache
+    caches = net.new_caches(batch=ids.shape[0])
+    parts = [net(ids[:, :3], caches)]                 # prefill
+    parts += [net(ids[:, i:i + 1], caches) for i in range(3, ids.shape[1])]
+    return torch.allclose(full, torch.cat(parts, 1), atol=1e-5)
+```
+
+Follow one case through it. Say the input has 6 tokens. The full pass computes logits for all 6 at once. The
+cached path reads the first 3 in one prefill, then feeds tokens 4, 5 and 6 one at a time. If the mask is
+aligned top-left, token 4 sees only token 1 and its logits differ. If positions restart at zero, token 4 is
+treated as position 0 and its logits differ. Both bugs pass every full-sequence check from Part 1. This test is
+the only one that catches them.
+
+### Part 3: the optimizations
+
+Then list the optimizations in the order they pay off, each with its reason:
+
+- **Preallocate instead of `torch.cat`.** Concatenating copies the whole cache every step.
+- **Cache only the KV heads (GQA).** Several query heads share one set of keys and values, so the cache shrinks
+  by the group size.
+- **A bf16 or fp8 cache.** Two bytes or one byte per number instead of four.
+- **Paged memory for batches.** Many requests share GPU memory without each reserving its maximum length.
+- **Reorder or share rows for beam search.** Beams that share a prompt shouldn't each store a copy of it.
+
+Say: "Each of these is about bytes moved per step, because a decode step is limited by how fast the GPU can
+read memory, not by arithmetic."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Debug, then cache"
+  senior={["Finds the bugs with a reference check and a causality test, and adds a working cache."]}
+  staff={["Names the bugs that only show up with a cache (top-left mask, positions restarting at zero), writes the equivalence test first, and ranks the optimizations by bytes moved per step."]}
+/>
+
+## Small-team version
+
+Debugging model code is rare at a small company. Debugging a self-hosted model's behavior isn't. The same
+habit applies: find an oracle and compare. The oracle can be a reference implementation, the hosted version of
+the same open model, or a known-good output.
+
+If your own serving path disagrees with the reference on the same prompt, suspect the cheap things first. The
+**chat template** (the exact text format that wraps each message) may differ. The **tokenizer** may differ.
+The **sampling settings** may differ. Check those before you suspect the weights.
+
+The oracle is cheap. Run 200 eval prompts of 3,000 input and 400 output tokens against gpt-oss-120B on
+Together ($0.15 per 1M input tokens, $0.60 per 1M output tokens, fetched 2026-10-11). That costs about **$0.14**
+for the whole set.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- Per prompt: 3,000 × $0.15/M + 400 × $0.60/M = $0.00045 + $0.00024 = $0.00069.
+- 200 prompts: 200 × $0.00069 ≈ $0.14.
+
+</details>
+
+Default: keep a hosted reference of the same open model in your eval runs. Revisit if the hosted version stops
+matching your weights or your quantization (a smaller number format for the weights).
+
+## Pitfalls
+
+- **Reading line by line without running anything.** The wrong line looks almost like the right one; checks
+  find it faster.
+- **Testing the cache only with full-sequence inputs.** That hides both cache-only bugs, the top-left mask and
+  the restarting positions.
+- **Leaving dropout on during the equivalence test.** Random zeroing makes the two paths differ, so the test
+  never passes.
+- **Listing optimizations without the arithmetic.** The interviewer wants to hear why each one helps, in bytes
+  per step.
+
+## Go deeper
+
+- Family walkthrough: [The debugging variant](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#the-debugging-variant) (bug, symptom, check) and [Verification](/system-design-labs/interviews/walkthroughs/llm-from-scratch/#verification).
+- Practise on real code: <LabRef lab="transformer" inline /> (no cache yet) and <LabRef lab="llm-inference" inline />.

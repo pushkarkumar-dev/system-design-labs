@@ -1,0 +1,178 @@
+---
+question: infra-066
+family: gpu-kernel-perf
+status: published
+labs: [transformer]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "Attention compares every token with every other token, so its cost grows with the square of the sequence
+> length. There are two kinds of fix. FlashAttention keeps the exact same maths but never writes the huge table
+> of scores to GPU memory, so it moves far fewer bytes and uses far less memory. The other families, such as
+> sliding windows, approximations and state-space layers, change the maths to get below quadratic cost, and pay
+> for it in long-range quality. For serving, the cost is reading the saved keys and values each step, so I'd
+> shrink that cache."
+>
+> The rest of this page explains each part of that answer, so you can say it with understanding.
+
+The interviewer wants to know whether you can tell apart two very different things: **changing the maths of
+attention**, and **changing how exact attention moves data**. Candidates often lump them together.
+
+Start with what attention is. A language model reads text as **tokens** (chunks of roughly ¾ of a word). In each
+layer, **attention** lets every token look at the other tokens and decide which matter to it. Each token has a
+**query** vector ("what am I looking for"), a **key** vector ("what do I contain") and a **value** vector ("what
+I pass on"), usually 64 or 128 numbers long. Attention scores every query against every key, turns each row of
+scores into weights with a **softmax** (exponentiate, then divide by the row's sum), and mixes the values with
+those weights. A model runs many of these side by side, called **heads**.
+
+What makes this different from scaling a normal backend job: for a sequence of N tokens, the score table is
+N × N per head. Double the document, and the table is four times bigger. A backend engineer would reach for
+"use a smaller table". The surprising answer is that the best-known fix, FlashAttention, keeps the full maths and
+wins by not *storing* the table.
+
+(The PracHub entry is tagged Amazon, technical screen, posted July 2025. It lists four families to compare and
+asks why FlashAttention helps, citing "IO-aware tiling to reduce HBM traffic, fused kernels, selective
+recomputation". Only the title is certainly candidate-reported <Cite id="s-1ef8611e61" />.)
+
+## Clarify first
+
+- **Training, prefill or decode?** **Prefill** is reading a whole prompt in one pass; **decode** is writing the
+  reply one token at a time. The bottleneck differs: the N² table in training and prefill, reading saved keys
+  and values in decode.
+- **How long?** 8K, 128K, a million tokens?
+- **Must the model stay exact, or can you retrain with a different attention?** Most families need training.
+- **Head size and GPU,** for the memory arithmetic.
+
+## Answer
+
+### Words you need first
+
+- **HBM** is the GPU's main memory: 80 GB on the GPUs here, large but slow to reach. **SRAM** (shared memory)
+  is a small memory on the chip, around 100 KB per compute unit, that is much faster.
+- A **kernel** is one program that runs on the GPU. A **fused kernel** does several steps in one program, so
+  the data in between never goes back to HBM.
+- The **KV cache** is the keys and values saved from earlier tokens, so decode doesn't recompute them each step.
+
+### The worked example: one long document on Llama-3.1-70B
+
+Use one model so the numbers are concrete: Llama-3.1-70B, which has 64 query heads with 128 numbers each
+<Cite id="s-6fdd575dc5" />. Standard attention writes the full N × N score table for every head, in fp16 (2
+bytes per number). For one layer of one sequence:
+
+| Document length N | Score tables, standard attention | What it means |
+|---|---|---|
+| 8,192 tokens | **8.6 GB** | Already a tenth of an 80 GB GPU, for one layer |
+| 32,768 tokens | **137.4 GB** | More than an 80 GB GPU holds |
+
+Now walk the options against this document:
+
+| Option | What it changes | What to say in the interview |
+|---|---|---|
+| FlashAttention | How data moves; the maths is exact | "Same answer, far fewer bytes, memory grows with N not N²." |
+| Sliding-window, sparse | Each token looks only at a window or a pattern | "Linear in N for a fixed window; distant tokens are lost." |
+| Low-rank, kernelized | Approximates the softmax | "Linear in N, with quality loss on some tasks." |
+| Recurrent, state-space | A fixed-size memory instead of a growing one | "Constant memory per step; needs a model trained that way." |
+| KV-cache optimizations (decode) | Fewer or smaller saved keys and values | "This is what each decode step reads, so shrink it." |
+
+### Families that change the computation
+
+These trade some long-range quality for less than quadratic cost, and usually need the model to be trained
+with them.
+
+- **Sliding-window and sparse.** Each token attends to a window of nearby tokens, or a fixed pattern. With a
+  fixed window, cost is linear in N.
+- **Low-rank and kernelized.** These approximate the softmax so the N × N table never has to exist. Linear in N,
+  with quality loss on some tasks.
+- **Recurrent and state-space layers.** A fixed-size state carries the past forward, instead of a cache that
+  grows with every token.
+
+### Optimizations for decoding
+
+During decode, each new token reads the whole KV cache. Three ways to shrink what it reads: **grouped-query
+attention** (several query heads share one key-value head; Llama-3.1-70B has 8 key-value heads for 64 query
+heads), a **quantized** cache (stored in fewer bits), and **paged** allocation (the cache is stored in
+fixed-size blocks, like virtual-memory pages, so little memory is wasted).
+
+### FlashAttention keeps exact attention and changes data movement
+
+Standard attention computes the score table, writes it to HBM, reads it back for the softmax, writes the
+weights, and reads them again to mix the values. FlashAttention loads small tiles of queries, keys and values
+into SRAM, computes one tile of scores, and keeps a running maximum, running sum and running output for each
+query row. When a later tile brings a bigger maximum, it rescales what it has so far (the **online softmax**
+trick). The full table never goes to HBM.
+
+The paper says it "uses tiling to reduce the number of memory reads/writes between GPU high bandwidth memory
+(HBM) and GPU on-chip SRAM". Standard attention needs Θ(Nd + N²) HBM accesses, FlashAttention Θ(N²d²M⁻¹), with
+M the SRAM size and d the head size ([Dao et al., arXiv 2205.14135](https://arxiv.org/abs/2205.14135)). In plain
+words, the traffic falls by a factor of about M ÷ d².
+
+It stores only the output and two numbers per row, so its extra memory grows with N, not N². For our example at
+N = 8,192 that is about **4.2 MB** instead of 8.6 GB. In training, the **backward pass** (the step that works out
+how to adjust the model) recomputes the scores from those two numbers instead of reading a stored table. That is
+more arithmetic (more **FLOPs**, floating-point operations) but less time, because attention outside the matrix multiplies is limited by memory speed, not
+arithmetic. The paper reports 3× on GPT-2 at 1K tokens and 15% end to end on BERT-large.
+
+**Constraints.** Head size matters (the d²/M term: bigger heads leave less room for tiles). And it is one fused
+kernel, so custom masks or attention variants need support in the kernel.
+
+Say it like this: "FlashAttention isn't an approximation. It does a bit more arithmetic so it can move far fewer
+bytes, and on a GPU that trade wins."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **Score tables:** 64 heads × N² × 2 B. At 8,192: 64 × 8,192² × 2 = **8.6 GB**. At 32,768: **137.4 GB**.
+- **FlashAttention statistics:** 64 heads × N × 2 numbers × 4 B (fp32). At 8,192: **4.2 MB**.
+- **The I/O ratio:** standard ≈ N² accesses for the table; FlashAttention ≈ N²d² ÷ M. With d = 128 (d² =
+  16,384) and M around 100 KB, the paper's point is that d² is many times smaller than M, so the second is far
+  smaller.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Long-sequence attention"
+  senior={["Separates exact-but-IO-aware (FlashAttention) from approximate families, with the memory arithmetic."]}
+  staff={["Chooses by phase and requirement: FlashAttention always, GQA and a quantized cache for decode, and an approximate family only with an eval showing long-range quality holds."]}
+/>
+
+In plain words: a Senior answer sorts the options correctly. A Staff answer picks one for each phase, and won't
+accept an approximate attention without a test (an **eval**) showing the model still handles long-range
+questions.
+
+## Small-team version
+
+FlashAttention-style kernels come with PyTorch's `scaled_dot_product_attention` and with serving engines. Your
+long-context decisions are which model (its attention design is fixed), how long a context you allow, and what
+the KV cache costs per request.
+
+Default to a managed API for long-context work. If you self-host, the cap on context is the cost lever. On a
+4×A100 80 GB machine running Llama-3.1-70B, there is room for about **59** requests at 8K tokens but only **3** at
+128K, on a box costing about **$4,060–$4,640 a month** at RunPod list prices (fetched 2026-10-11). Allow 128K only
+for the requests that need it, or route them to an API.
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **KV cache per token** (bf16, 2 bytes per number): 327,680 B. Per 8K request: **2.68 GB**. Per 128K request: **42.95 GB**.
+- **Room:** 4 × 80 GB = 320 GB, minus 141.1 GB of bf16 weights, minus 20 GB of overhead (assumed) = 158.9 GB.
+  158.9 ÷ 2.68 ≈ 59.2 → **59** requests; 158.9 ÷ 42.95 ≈ 3.7 → **3** requests.
+- **Cost:** 4 GPUs × 730 hours × $1.39–$1.59 ≈ **$4,060–$4,640 a month**.
+
+</details>
+
+## Pitfalls
+
+- **Calling FlashAttention approximate.** It computes exactly the same result; only the data movement changes.
+- **Saying it reduces FLOPs.** It adds arithmetic in the backward pass; it saves memory traffic and memory.
+- **Ignoring decode.** When serving, reading the KV cache each step, not the N² table, is the cost.
+
+## Go deeper
+
+- Family walkthrough: [GPU kernel performance](/system-design-labs/interviews/walkthroughs/gpu-kernel-perf/), worked example 3.
+- The source-depth version: [infra-067](/system-design-labs/interviews/questions/infra-067/).
+- Baseline attention to compare against: <LabRef lab="transformer" inline />.

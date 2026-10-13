@@ -1,0 +1,221 @@
+---
+question: eng-026
+family: agent-memory-context
+status: published
+labs: [agent-framework, llm-eval]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "The model remembers nothing between calls, so every turn resends the whole chat, and eventually it doesn't fit
+> or costs too much. I'll trigger on a token count, not a turn count. First I clear old tool outputs, because
+> that's cheap and safe. Only if that isn't enough do I summarize the older turns into one summary. I never drop
+> the system prompt, never split a tool call from its result, and I keep promises and order ids in a separate
+> state object the summary can't touch. Then I prove it works with questions the shortened chat must still
+> answer."
+>
+> The rest of this page explains each part of that answer.
+
+This is a practical coding task: keep a long chat inside a size budget without losing what matters.
+
+### Why this is not just "truncate the log"
+
+In a normal backend, trimming an old log is harmless. Nobody reads line 1 of last week's log to serve today's
+request.
+
+A chat with a large language model (LLM) is different. The model keeps nothing between calls. Your code sends
+the entire conversation on every call, and the model can only "know" what is in that call. So if you cut the
+oldest messages, the model really forgets them. The first message is often the user's actual goal. A message in
+the middle may hold a promise your company made. Compaction is a **lossy** function, like image compression: it
+must throw things away, and the skill being tested is choosing what.
+
+The report lists the task as "Implement chatbot compaction logic" with no more detail (<Cite id="s-985967885e" />).
+It is graded on the edges: what you never drop, when you trigger, and how you show the lossy part still works.
+
+### Words you need first
+
+- **Token:** the unit an LLM reads and writes, roughly ¾ of an English word. Budgets and prices are in tokens.
+- **Context window:** the most tokens the model can read in one call.
+- **System prompt:** the fixed instructions at the start of every call.
+- **Tool call and tool result:** the model asks your code to run a function ("look up order A-17"); your code
+  adds the output to the chat as a tool result, linked to the call by an id.
+- **Compaction:** shrinking the history so it fits a budget while keeping what matters.
+
+## Clarify first
+
+Ask these, and say your assumption for each:
+
+- **What is in the history?** User and assistant turns only, or tool calls and results too? "I'll assume tool
+  calls, because they are the hard part."
+- **Budget and window?** "I'll assume a working budget of 30,000 tokens inside a larger window."
+- **Is a summarizer available?** A summarizer is a model (usually a small, cheap one) that rewrites old turns as a
+  short summary. "I'll assume one is available, passed in as a function so tests can fake it."
+- **Which facts are authoritative elsewhere?** "Orders and refunds live in backend systems. The transcript is
+  never the source of truth for an action."
+- **Can I use the provider's token counter?** "I'll use a stand-in and replace it in production."
+
+## Answer
+
+### The example to keep in mind
+
+A customer, Maya, writes to a support bot: "My order A-17 is late." In turn 2 the bot calls `lookup_order` and
+gets back a large JSON record. In turn 5 it promises: "I'll email you the tracking number when the replacement
+ships." The conversation goes on for 40 turns. Assume each turn adds about 600 tokens and the system prompt is
+3,000 tokens. By turn 40, an uncompacted call sends **27,000 tokens** (3,000 + 40 × 600) to write a short reply.
+
+Two facts must survive anything you do: the order id A-17 and the promise. That is what your design protects.
+
+### The plan, before any code
+
+Say this plan out loud before you type:
+
+1. **Trigger on tokens, not turns,** with room left for the reply. One turn with a 30,000-token tool result
+   matters more than ten short turns.
+2. **Lightest step first: clear old tool payloads.** Replace an old tool result with a stub like "[cleared tool
+   result 7]" that keeps the call id. Maya's order JSON from turn 2 becomes one line. Often this alone is enough.
+3. **Then summarize the middle.** Keep the system prompt and the last few messages word for word. Fold everything
+   older, including any earlier summary, into one summary. That way summaries never nest. A summary of a summary
+   loses detail on every pass.
+4. **Never split a tool result from its call.** If the cut point lands on a tool result, move it back. Many model
+   APIs reject a history where a result appears without its call.
+5. **Pinned state lives outside the transcript.** Verified identity, order ids, amounts and promises go in a
+   typed state object. Compaction never touches it. Actions read the backend, never the summary.
+6. **If still over budget,** keep fewer verbatim messages, down to zero.
+
+### What the pieces look like
+
+```
+Full history ──► over token budget? ── no ──► send as is
+                        │ yes
+                        ▼
+              Step 1: clear old tool results (keep call ids)
+                        │ still over?
+                        ▼
+              Step 2: summarize everything before the cut
+                      (cut never splits a tool pair;
+                       old summary folded in)
+                        │
+                        ▼
+[system prompt] + [state object] + [one summary] + [recent turns]
+```
+
+**The budget check** counts tokens across the history and the rendered state object. **Step 1** is cheap and
+calls no model. **Step 2** calls the summarizer once, on everything older than the recent tail. **The output**
+always starts with the system prompt, carries the state object unchanged, has at most one summary, and ends with
+the most recent turns verbatim.
+
+The family walkthrough has the full function (about 50 lines of Python). It and five tests were run on
+2026-10-12, and all pass:
+
+- a history under budget is returned untouched;
+- a 40-turn history fits a 3,000-token budget with the state's promise intact;
+- no tool result appears without its call;
+- clearing alone is enough for a short history, so the summarizer is not called;
+- compacting twice leaves exactly one summary.
+
+### Follow Maya's chat through it
+
+To make compaction happen often, set the history budget very low in this example: 6,000 tokens.
+
+| Turn | What happens | History size (approx.) | What to say in the interview |
+|---|---|---|---|
+| 2 | Order lookup returns a big JSON result | 1,200 | "Facts the bot needs from this go into the state object now." |
+| 5 | Bot promises to email the tracking number | 3,000 | "The promise goes into the state object, not only into the chat." |
+| 11 | History passes 6,000; compaction runs | 6,600 → 1,000 | "Clear tool payloads first; summarize only if needed." |
+| 20, 29, 38 | Compaction again; old summary folded in | back to 1,000 | "There is only ever one summary." |
+| 40 | Maya says thanks | 2,200 | "The promise is still there; it was never in the summarized part." |
+
+Notice that compaction drops history from 6,600 to 1,000 tokens, far below the trigger. That gap matters for
+cost, as the next section explains.
+
+### Testing the lossy part
+
+You cannot unit-test a summary for exact output. Test it like a lossy codec instead. Build long transcripts with
+known facts, compact them, and ask questions the result must still answer: which order, what amount, what was
+promised, what the customer refused. This set of transcripts and questions is called a **probe set**. Anthropic
+suggests tuning the summarizer prompt for recall first ("maximizing recall to ensure your compaction prompt
+captures every relevant piece of information"), then precision
+([2025-09-29](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)).
+
+Say it like this: "The function is easy to get almost right. The probe set is how I find the edge cases, like a
+promise phrased casually that the summarizer dropped."
+
+### Why compact at all, if the window is big?
+
+There are two reasons: cost and quality.
+
+**Cost.** Because every turn resends everything, the total input over a conversation grows with the *square* of
+its length. Maya's 40-turn conversation costs about **$1.34** without compaction and about **$0.67** with it, at
+Claude Sonnet 5 list prices (fetched 2026-10-11).
+
+But there is a catch. Providers offer a **prompt cache**: if the start of a call's input matches a recent call,
+that part is billed at a much lower rate. With a warm cache, the same conversation costs about **$0.30**
+uncompacted and **$0.27** compacted. The gap nearly closes. Compaction also rewrites the start of the history,
+which makes the next call miss the cache, so you want it to happen rarely. That is why it drops far below the
+trigger (a high-water and a low-water mark).
+
+**Quality.** Models recall facts less reliably as the input grows, so a shorter context is often a more
+accurate one.
+
+Say it like this: "With caching on, I compact mainly for quality and to fit the window. The savings show up on
+long sessions or when the cache goes cold."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+Assumed: T = 40 turns, S = 3,000 fixed prefix tokens, m = 600 tokens added per turn, 300 output tokens per turn.
+Prices: Sonnet 5 at $2 per 1M input and $10 per 1M output; the summarizer is Claude Haiku 4.5 at $1 in and $5
+out (list prices fetched 2026-10-11).
+
+- **Uncompacted input:** input ≈ T × S + m × T × (T + 1) ÷ 2 = 120,000 + 492,000 = **612,000 tokens**, which is
+  $1.224, plus 12,000 output tokens ($0.12): **$1.34**.
+- **Compacted** at a 6,000-token history budget with 1,000-token summaries: 4 summaries, 249,600 main-model input
+  tokens and 25,800 summarizer input tokens, about **$0.67** in total.
+- **With a warm cache** (cache reads $0.20 per 1M, an assumed 1.25× price for writing new tokens to the cache):
+  about **$0.30** uncompacted vs **$0.27** compacted.
+
+</details>
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Compaction"
+  senior={["Token trigger, tool-result clearing, no split pairs, pinned state and probe tests."]}
+  staff={["Explains the caching interaction (compact rarely, keep the fixed prefix first) and makes the probe set the release gate for summarizer changes."]}
+/>
+
+## Small-team version
+
+You own this code even if you use a provider feature. Anthropic, for example, offers server-side compaction and
+beta tool-result clearing; its context-editing feature by default triggers at 100,000 input tokens and keeps the
+3 most recent tool uses ([docs](https://platform.claude.com/docs/en/build-with-claude/context-editing), fetched
+2026-10-12).
+
+In money and actions:
+
+- **Turn the provider feature on, then run your probe set against it.** It costs nothing to try.
+- **Build the state object and the rule that actions read the backend yourself.** These are your product's
+  rules; no provider knows that a refund promise must never be lost.
+- **Write about 30 probe transcripts in the first week.** They are the release gate for any change to the
+  summarizer prompt.
+- **Budget it:** compaction roughly halves the bill for a 40-turn conversation without caching ($1.34 to $0.67),
+  and changes it little with a warm cache ($0.30 to $0.27).
+
+A coding agent writes the compactor quickly. You write the probes, and keep them out of its view so it can't tune
+the summarizer to the test.
+
+## Pitfalls
+
+- **Dropping the oldest messages.** The first message is often the user's goal, and the cut splits tool pairs.
+- **Triggering on turn count.** One huge tool result can blow the budget in a single turn.
+- **Splitting a tool call from its result.** Many APIs reject the history, and the model loses the link.
+- **Summaries of summaries.** Each pass loses more detail; fold the old summary into one new one.
+- **Using the summary as the source of truth for a refund.** A summary is lossy; the refund tool must read the
+  backend.
+
+## Go deeper
+
+- Family walkthrough: [Agent memory and context management](/system-design-labs/interviews/walkthroughs/agent-memory-context/), worked examples 1 and 2 (the full function and the cost tables).
+- Spot the lab's turn-count trigger and growing summary: <LabRef lab="agent-framework" inline />. Compare summarizer prompts: <LabRef lab="llm-eval" inline />.

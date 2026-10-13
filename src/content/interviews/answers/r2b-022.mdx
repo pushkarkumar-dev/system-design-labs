@@ -1,0 +1,201 @@
+---
+question: r2b-022
+family: cache-coding
+status: published
+labs: [cdn-edge]
+updatedAt: "2026-10-12"
+---
+
+## What they're really asking
+
+> **If you only remember one thing, say this in the first minute:**
+> "I'd cache the remote file in fixed-size blocks. A read of offset and length maps to a range of block numbers,
+> and each block is fetched once and reused by every later read. When several readers miss the same block at once,
+> only one fetch runs and the others wait for it, with no lock held during the network call and no error cached.
+> On top of that: prefetch the next block on sequential reads, cap parallel fetches, and evict by bytes. For
+> writes, I'd make files immutable and put the version in the block key, so nothing needs invalidating."
+>
+> The rest of this page explains each part of that answer.
+
+The interviewer wants to know whether you can design concurrent, partial access to remote data, not just a
+key-value cache.
+
+A normal cache maps a key to a whole value: ask for user 42, get user 42's record. Here the callers don't ask for
+whole things. They ask for a slice of a remote file: "give me 100 bytes starting at byte 4,000". Two readers may
+want overlapping slices. The file may be gigabytes and the remote store slow and priced per request. So the
+questions change: what unit do you cache, how do you stop two readers fetching the same bytes, and what happens at
+the edges of a block and the end of the file?
+
+The candidate (below Senior, at Databricks) describes a `cacheFile` class whose method "fetches a file remotely,
+taking filename and size as input". There was also an API client that takes offset and length, and the question was
+how the client should read and write efficiently, in concurrency pseudocode (<Cite id="s-7e1349c451" />). They had
+prepared data-writer topics, felt lost, and think this round cost the offer.
+
+### Words you need first
+
+- A **block** is a fixed-size piece of a file (say 1 MiB). Block `b` covers bytes `b × B` up to `(b + 1) × B`,
+  where `B` is the block size.
+- **Coalescing** (also called single flight) means that when many readers miss the same block at once, only one
+  fetch runs and the rest wait for its result.
+- To **prefetch** is to start fetching the next block before anyone asks for it, because a reader moving
+  sequentially will want it next.
+- **Immutable** files never change once written. A "write" creates a new version with a new name.
+
+## Clarify first
+
+Spend one minute on the setup. Say your assumptions out loud:
+
+- **Do remote files change?** "I'll assume they're immutable once written, and a write creates a new version."
+- **What do reads look like?** "Small random reads, large sequential scans, or both? I'll assume both."
+- **Is the store priced or limited per request?** "I'll assume yes, so fewer, larger fetches are better."
+- **Memory or disk budget?** "I'll assume a fixed budget, evicting by bytes."
+- **What must the pseudocode show?** "I'll show locking, waiting and error handling."
+
+## Answer
+
+### Fetch fixed-size blocks, not whole files and not exact ranges
+
+There are three choices of what to cache, and only one works well:
+
+- **Exact ranges** (cache by `(offset, length)`): two overlapping reads have different keys, so they fetch the
+  same bytes twice and never hit each other's entries.
+- **Whole files**: a 4 KB read downloads the entire file.
+- **Fixed blocks**: a read of `(offset, length)` maps to block numbers `offset / B` through
+  `(offset + length − 1) / B`. Each block is fetched once and cached, and every read that touches it reuses it.
+
+Say: "I cache blocks, because blocks are shared by every read that overlaps them."
+
+### Follow one read across a block boundary
+
+Assume a block size of 1,000 bytes to keep the arithmetic visible. A reader asks for 100 bytes at offset 950.
+
+| Step | What happens | What to say in the interview |
+|---|---|---|
+| 1 | `950 / 1000 = 0`, start 950. Fetch or reuse block 0, take bytes 950–999 (50 bytes). | "Integer division gives the block, the remainder gives the start inside it." |
+| 2 | Offset is now 1,000: block 1, start 0. Take bytes 0–49 of block 1 (50 bytes). | "A read across a boundary touches two blocks." |
+| 3 | 63 other readers ask for the same range at the same moment. | "Each block has one in-flight fetch. Everyone else waits on it." |
+| 4 | Result: 100 bytes returned to all 64 readers, and exactly two fetches. | "One fetch per block, no matter how many readers." |
+| 5 | A read at offset 1,980 of a 2,000-byte file asks for 100 bytes. | "Block 1 has only 20 bytes left. Return 20, not an error and not padding." |
+
+### Coalesce concurrent misses per block
+
+Keep one in-flight call per block key; later readers wait on it. No lock is held during the fetch, and errors go to
+every waiter without being cached, so the next reader retries.
+
+```go
+func (c *FileCache) block(name string, b int64) ([]byte, error) {
+	key := name + "#" + itoa(b)
+	c.mu.Lock()
+	if data, ok := c.blocks[key]; ok {
+		c.mu.Unlock()
+		return data, nil
+	}
+	if cl, ok := c.inflight[key]; ok { // someone is already fetching: wait
+		c.mu.Unlock()
+		<-cl.done
+		return cl.data, cl.err
+	}
+	cl := &call{done: make(chan struct{})}
+	c.inflight[key] = cl
+	c.mu.Unlock()
+
+	cl.data, cl.err = c.Fetch(name, b, c.BlockSize) // no lock held during I/O
+
+	c.mu.Lock()
+	delete(c.inflight, key)
+	if cl.err == nil {
+		c.blocks[key] = cl.data // errors are not cached
+	}
+	c.mu.Unlock()
+	close(cl.done)
+	return cl.data, cl.err
+}
+
+func (c *FileCache) ReadAt(name string, off, n int64) ([]byte, error) {
+	out := make([]byte, 0, n)
+	for end := off + n; off < end; {
+		b, start := off/c.BlockSize, off%c.BlockSize
+		data, err := c.block(name, b)
+		if err != nil {
+			return nil, err
+		}
+		if start >= int64(len(data)) { // past end of file
+			break
+		}
+		take := min(end-off, int64(len(data))-start)
+		out = append(out, data[start:start+take]...)
+		off += take
+	}
+	return out, nil
+}
+```
+
+`block` is the coalescing part: a hit returns at once, a reader who finds a fetch already in progress waits on its
+`done` channel, and only the first reader fetches. `ReadAt` is the range part: it walks from block to block,
+copying the slice it needs from each.
+
+In a scratch run on 2026-10-12 (Go 1.26.9, `-race`, three runs), 64 goroutines reading 100 bytes across a block
+boundary caused exactly two fetches, one per block. A read past the end of the file returned only the bytes that
+exist. (`-race` is Go's race detector, which reports unsynchronized memory access while the program runs.)
+
+### Efficiency beyond that
+
+- **Prefetch block `b + 1`** when a reader moves sequentially, so the next fetch overlaps with the current copy.
+- **Fetch a reader's missing blocks in parallel**, with a cap on concurrent fetches so one big read can't flood
+  the store.
+- **Evict by bytes, and pin blocks while a read copies from them.** Pinning marks a block as in use so eviction
+  skips it.
+- **Writes.** If files are immutable, a write uploads a new version, and the version goes into the block key, so no
+  invalidation is needed. If files are mutable, you need a version or ETag check on every block (an ETag is a tag
+  the store returns that changes whenever the content changes). That is a much harder question, so ask about it
+  first.
+
+Say: "If I can make files immutable, cache invalidation disappears. That's the first thing I'd ask for."
+
+## Senior vs Staff
+
+<LevelContrast
+  title="Remote file cache"
+  senior={["Chooses block-aligned caching, coalesces misses correctly, and handles boundary-spanning and end-of-file reads."]}
+  staff={["Picks the block size from request cost against wasted bytes, adds prefetch and bounded parallelism, and makes immutability (versioned keys) the answer to writes."]}
+/>
+
+In plain terms: a Senior candidate gets the blocks, the coalescing and the edge cases right. A Staff candidate also
+chooses the block size from cost, adds prefetch and limits, and removes the write problem by making files
+immutable.
+
+## Small-team version
+
+The same problem appears when an AI team reads model weights (the large files that hold a trained model), Parquet
+files or document archives from object storage. Use the storage client's range reads and a local disk cache before
+writing anything custom.
+
+The design point you still own is block size. Bigger blocks mean fewer paid requests but more wasted bytes on small
+reads. For example, a sequential scan of a 1 GiB file is **262,144 requests** at 4 KiB each, but only **128** with 8
+MiB blocks. A single 4 KiB random read with 8 MiB blocks, though, downloads **2,048 times** the bytes it needs. Check
+your store's per-request price before picking a size. Say: "Block size is a trade between request count and wasted
+bytes, and the price list decides it."
+
+<details>
+<summary>The arithmetic behind the numbers (for a Staff-level follow-up)</summary>
+
+- **1 GiB** = 2³⁰ bytes = 1,073,741,824 bytes.
+- **At 4 KiB per request:** 2³⁰ ÷ 2¹² = 2¹⁸ = **262,144** requests.
+- **At 8 MiB per block:** 2³⁰ ÷ 2²³ = 2⁷ = **128** requests.
+- **Waste on a 4 KiB read with 8 MiB blocks:** 2²³ ÷ 2¹² = 2¹¹ = **2,048×** the bytes needed.
+
+</details>
+
+## Pitfalls
+
+- **Caching by exact `(offset, length)`.** Overlapping reads have different keys, so they never hit.
+- **Holding the mutex across the remote fetch.** Every reader of every block then waits on one network call.
+- **Mishandling the last partial block.** A read past the end of the file must return the bytes that exist, not
+  fail or pad.
+- **Preparing only queue and writer patterns.** The candidate names this as their own lesson.
+
+## Go deeper
+
+- Family walkthrough: [Caches in coding rounds](/system-design-labs/interviews/walkthroughs/cache-coding/), stage 6 and its memory formula.
+- Bounded worker pools for the parallel fetches: [concurrent I/O workers](/system-design-labs/interviews/walkthroughs/concurrent-io-workers/).
+- Lab: <LabRef lab="cdn-edge" inline /> (request coalescing in Go).
