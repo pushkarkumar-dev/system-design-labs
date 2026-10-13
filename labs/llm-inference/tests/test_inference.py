@@ -88,14 +88,14 @@ class TestV0Naive:
 # ---------------------------------------------------------------------------
 
 class TestV1KVCache:
-    """4 tests for v1 KV cache."""
+    """5 tests for v1 KV cache."""
 
     def test_kv_cache_size_formula_gpt2_1024(self):
         """
         KV cache formula for GPT-2 at seq_len=1024 = exactly 75,497,472 bytes.
 
         2 (K+V) * 12 (layers) * 12 (heads) * 64 (d_head) * 1024 (seq) * 4 (float32)
-        = 75,497,472 bytes = ~72 MB
+        = 75,497,472 bytes = ~75.5 MB (72 MiB)
         """
         from src.v1_kv_cache import kv_cache_size_formula
 
@@ -105,6 +105,25 @@ class TestV1KVCache:
         expected = 2 * 12 * 12 * 64 * 1024 * 4   # 75,497,472
         assert result == expected, f"Got {result}, expected {expected}"
         assert result == 75_497_472
+
+    def test_kv_cache_size_formula_llama3_70b_gqa(self):
+        """
+        With grouped-query attention only the KV heads are cached.
+
+        Llama 3 70B: 2 * 80 (layers) * 8 (KV heads) * 128 (d_head) * 1024 (seq) * 2 (bf16)
+        = 335,544,320 bytes = 320 MiB, not the 2.5 GiB you get from all 64 query heads.
+        """
+        from src.v1_kv_cache import kv_cache_size_formula
+
+        gqa = kv_cache_size_formula(
+            n_layers=80, n_heads=64, n_kv_heads=8, d_head=128,
+            seq_len=1024, bytes_per_element=2,
+        )
+        all_heads = kv_cache_size_formula(
+            n_layers=80, n_heads=64, d_head=128, seq_len=1024, bytes_per_element=2,
+        )
+        assert gqa == 335_544_320
+        assert all_heads == 8 * gqa
 
     def test_kv_cache_grows_linearly_with_seq_len(self):
         """KV cache memory scales linearly with sequence length."""

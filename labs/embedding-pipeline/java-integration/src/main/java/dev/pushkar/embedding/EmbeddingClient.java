@@ -1,5 +1,6 @@
 package dev.pushkar.embedding;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import org.springframework.http.MediaType;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
@@ -66,7 +67,8 @@ public class EmbeddingClient {
 
     // ── Request / response record types ──────────────────────────────────────
 
-    record EmbedRequest(List<String> texts, String version, String callerId) {}
+    // The Python server uses snake_case JSON; @JsonProperty maps it to Java names.
+    record EmbedRequest(List<String> texts, String version, @JsonProperty("caller_id") String callerId) {}
 
     public record EmbedResponse(
             List<List<Double>> embeddings,
@@ -85,7 +87,7 @@ public class EmbeddingClient {
 
     public record HealthStatus(Object v0, Object v1, Object v2) {}
 
-    public record ModelInfo(String name, int dimension, double loadedAt) {}
+    public record ModelInfo(String name, int dimension, @JsonProperty("loaded_at") double loadedAt) {}
 
     public static class EmbeddingException extends RuntimeException {
         public EmbeddingException(String msg) { super(msg); }

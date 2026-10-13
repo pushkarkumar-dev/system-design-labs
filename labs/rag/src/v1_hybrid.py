@@ -60,11 +60,14 @@ CANDIDATES_PER_RETRIEVER = 20
 
 def tokenize_for_bm25(text: str) -> list[str]:
     """
-    Simple whitespace + punctuation tokenizer for BM25.
+    Simple whitespace tokenizer for BM25.
 
-    BM25Okapi expects pre-tokenized lists of strings. We lowercase and split
-    on non-word characters. This is deliberately simple — production systems
-    use stemming (Porter/Snowball) and stopword removal.
+    BM25Okapi expects pre-tokenized lists of strings. We lowercase, split on
+    whitespace and drop 1-character tokens. Punctuation stays attached, so
+    "fsync," and "fsync" are different terms. That costs real recall:
+    scripts/bench.py measures BM25-only nDCG@10 on BEIR SciFact at 0.566 with
+    this tokenizer and 0.650 with re.findall(r"\\w+", text.lower()).
+    Production systems also use stemming (Porter/Snowball) and stopword removal.
     """
     return [t.lower() for t in text.split() if len(t) > 1]
 
@@ -111,9 +114,10 @@ class HybridRag:
     """
     v1: BM25 sparse retrieval + dense bi-encoder retrieval, fused with RRF.
 
-    Recall@3 improvement over naive dense retrieval: ~62% → ~74% on standard benchmarks.
-    The improvement is largest for exact-keyword queries ("what is RRF?") where BM25
-    finds the answer that dense retrieval ranks poorly.
+    Measured (scripts/bench.py, hit@3 = a gold document among the top 3 chunks):
+    BEIR SciFact 69.3% dense -> 68.3% hybrid; NFCorpus 57.6% -> 58.8% (neither
+    gap is outside its 95% CI). With a \\w+ BM25 tokenizer, SciFact hybrid reaches
+    73.7%. Hybrid helps when BM25 is good at its job.
     """
 
     def __init__(

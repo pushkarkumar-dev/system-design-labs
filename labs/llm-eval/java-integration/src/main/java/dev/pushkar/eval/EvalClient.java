@@ -1,5 +1,6 @@
 package dev.pushkar.eval;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import org.springframework.http.MediaType;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
@@ -70,20 +71,23 @@ public class EvalClient {
 
     // ── Request / response records ──────────────────────────────────────────
 
-    record EvalRequest(String taskName, int nShot, String model) {}
+    // The Python server uses snake_case JSON; @JsonProperty maps it to Java names.
+    record EvalRequest(@JsonProperty("task_name") String taskName,
+                       @JsonProperty("n_shot") int nShot,
+                       String model) {}
 
     public record EvalResponse(
             String task,
-            int nShot,
+            @JsonProperty("n_shot") int nShot,
             double accuracy,
-            int numCorrect,
-            int numTotal,
-            double ci95Lower,
-            double ci95Upper,
+            @JsonProperty("num_correct") int numCorrect,
+            @JsonProperty("num_total") int numTotal,
+            @JsonProperty("ci_95_lower") double ci95Lower,
+            @JsonProperty("ci_95_upper") double ci95Upper,
             String model
     ) {}
 
-    public record TaskInfo(String name, String metric, int numExamples) {}
+    public record TaskInfo(String name, String metric, @JsonProperty("num_examples") int numExamples) {}
 
     public record HealthResponse(String status, String version) {}
 

@@ -122,7 +122,7 @@ class McpServer:
         except ImportError as exc:
             raise ImportError("uvicorn is required for HTTP transport: pip install uvicorn") from exc
 
-        app, _ = create_app(self._server)
+        app, _ = create_app(self._server, auth_middleware=self._auth_middleware)
         uvicorn.run(app, host="0.0.0.0", port=self.port, log_level="info")
 
     @property

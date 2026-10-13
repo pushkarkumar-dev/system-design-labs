@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import time
@@ -99,7 +100,8 @@ class AuthMiddleware(McpMiddleware):
         if req.method in ("initialize", "ping"):
             return None
 
-        if self._current_token != self._token:
+        # Constant-time comparison so the token can't be guessed byte by byte.
+        if self._current_token is None or not hmac.compare_digest(self._current_token, self._token):
             return make_error_response(
                 req.id, ErrorCode.UNAUTHORIZED,
                 "Invalid or missing Authorization: Bearer token"
@@ -357,12 +359,70 @@ class McpServer:
                 "isError": True,
             }
 
+        outside = self._path_outside_roots(arguments, tool_def.input_schema)
+        if outside is not None:
+            return {
+                "content": [{"type": "text", "text": f"Error: {outside!r} is outside the server's declared roots"}],
+                "isError": True,
+            }
+
         try:
             result = fn(**arguments)
             text = result if isinstance(result, str) else _json.dumps(result, indent=2)
             return {"content": [{"type": "text", "text": text}], "isError": False}
         except Exception as exc:
             return {"content": [{"type": "text", "text": f"Error: {exc}"}], "isError": True}
+
+    # Schema-driven path detection: a property is a filesystem path if its
+    # JSON Schema says so ("format": "path" or one of the variants below, or
+    # the "x-mcp-path": true annotation). Names below are a fallback for tools
+    # whose schema doesn't annotate paths. Matching is case-insensitive.
+    _PATH_FORMATS = frozenset({"path", "file-path", "filepath", "directory-path", "dir-path", "uri-reference"})
+    _PATH_ARGUMENTS = frozenset({
+        "path", "paths", "file", "files", "filename", "filenames", "filepath", "file_path",
+        "directory", "dir", "dirname", "folder",
+    })
+
+    @classmethod
+    def _is_path_property(cls, name: str, prop_schema: dict | None) -> bool:
+        if isinstance(prop_schema, dict):
+            if prop_schema.get("x-mcp-path") is True:
+                return True
+            if prop_schema.get("format") in cls._PATH_FORMATS:
+                return True
+            items = prop_schema.get("items")
+            if isinstance(items, dict) and (
+                items.get("x-mcp-path") is True or items.get("format") in cls._PATH_FORMATS
+            ):
+                return True
+        return name.lower() in cls._PATH_ARGUMENTS
+
+    def _path_outside_roots(self, arguments: dict, input_schema: dict | None = None) -> Optional[str]:
+        """
+        Return the first path-like argument that resolves outside every
+        declared root, or None if all are inside. An argument is path-like if
+        the tool's input schema marks it as a path (see _is_path_property) or
+        its name is a common path name. Every argument the caller sent is
+        checked, not just the ones the schema declares. String values and
+        lists of strings are checked; "file://" URIs are unwrapped. Paths are
+        resolved first, so "../" segments and symlinks can't escape a root.
+        With no roots declared, nothing is restricted.
+        """
+        if not self._roots:
+            return None
+        properties = (input_schema or {}).get("properties", {}) or {}
+        for key, value in arguments.items():
+            if not self._is_path_property(key, properties.get(key)):
+                continue
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                if not isinstance(item, str):
+                    continue
+                raw = item[len("file://"):] if item.startswith("file://") else item
+                resolved = Path(raw).expanduser().resolve()
+                if not any(resolved.is_relative_to(root) for root in self._roots):
+                    return item
+        return None
 
     def _handle_resources_list(self, req: JsonRpcRequest) -> dict:
         resources = [defn.to_dict() for defn, _ in self._resource_registry.values()]

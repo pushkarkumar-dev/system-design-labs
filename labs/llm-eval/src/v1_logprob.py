@@ -175,8 +175,9 @@ class LogprobEvaluator:
       "normalized" — log probability / token count
       "calibrated" — log probability - prior log probability
 
-    The evaluator falls back to exact-match for exact_match tasks (log-likelihood
-    scoring requires discrete choices).
+    Only multiple_choice tasks are supported. Log-likelihood scoring needs a list of
+    candidate answers to compare; an exact_match task has none, so evaluate() raises
+    ValueError for it -- use FewShotEvaluator (generate + compare) instead.
     """
 
     def __init__(
@@ -222,8 +223,9 @@ class LogprobEvaluator:
         Evaluate task using log-likelihood scoring.
 
         For multiple_choice tasks: score each choice and pick the best.
-        For exact_match tasks: falls back to normalized string comparison
-        (log-likelihood doesn't directly apply to open-ended generation).
+        For exact_match tasks: raises ValueError. There are no candidates to score,
+        and an earlier fallback here marked every example correct (100% accuracy
+        for any model).
 
         Args:
             model_fn_logprob: Callable (context, continuation) -> float (log prob).
@@ -252,15 +254,10 @@ class LogprobEvaluator:
                 expected = test_example["answer"]
 
             elif task.metric == "exact_match":
-                # Fallback: score the expected answer vs common wrong answers
-                # For open-ended tasks, logprob can be used to rank candidate answers
-                # but we don't have a predefined choice list — just compare normalized
-                context = f"Question: {test_example['question']}\nAnswer:"
-                expected = _normalize_string(test_example["answer"])
-                # Score a dummy completion just to validate model_fn_logprob works
-                _ = score_logprob(model_fn_logprob, context, test_example["answer"])
-                # Return the expected answer as predicted (logprob doesn't help without candidates)
-                predicted = expected
+                raise ValueError(
+                    f"LogprobEvaluator scores multiple_choice tasks only; {task.name!r} is "
+                    "exact_match (no candidate answers to score). Use FewShotEvaluator."
+                )
 
             else:
                 raise ValueError(f"Unknown metric: {task.metric!r}")

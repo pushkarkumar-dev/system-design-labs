@@ -97,6 +97,18 @@ class TestChunking:
         assert any(word in start_of_chunk1 for word in end_of_chunk0.split()), \
             "Adjacent chunks should share content due to overlap"
 
+    def test_no_chunk_is_contained_in_the_previous_one(self):
+        """The final chunk must not be a duplicate fragment of the one before it."""
+        for n_sentences in range(25, 45):          # lengths around one chunk window
+            # Numbered sentences so the text never repeats (repeats would make any
+            # later chunk trivially "contained" in an earlier one).
+            doc = "".join(f"Record {i:03d} is replayed from the log after a crash. " for i in range(n_sentences))
+            chunks = chunk_document(doc, doc_index=0)
+            for prev, nxt in zip(chunks, chunks[1:]):
+                assert nxt.text not in prev.text, (
+                    f"{len(doc)}-char doc: chunk {nxt.chunk_index} is contained in chunk {prev.chunk_index}"
+                )
+
     def test_empty_doc_produces_no_chunks(self):
         chunks = chunk_document("", doc_index=0)
         assert chunks == []

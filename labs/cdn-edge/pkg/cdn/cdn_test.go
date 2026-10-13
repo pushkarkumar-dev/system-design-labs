@@ -293,6 +293,112 @@ func TestCoalescing_StaleIfError(t *testing.T) {
 	}
 }
 
+// Regression: an origin 5xx with no stale copy is passed through but never
+// cached, so the next request goes back to origin.
+func TestCoalescing_5xxNotCached(t *testing.T) {
+	var calls atomic.Int64
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "max-age=300")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		io.WriteString(w, "down")
+	}))
+	defer origin.Close()
+
+	cp := NewCoalescingProxy(origin.URL, 10, DefaultMaxBytes)
+	for i := 1; i <= 2; i++ {
+		r := get(t, cp, "/broken")
+		if r.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("request %d: want origin's 503 passed through, got %d", i, r.StatusCode)
+		}
+		if got := r.Header.Get("X-Cache"); got != "MISS" {
+			t.Fatalf("request %d: want X-Cache=MISS, got %s", i, got)
+		}
+	}
+	if _, ok := cp.Cache().Get("/broken"); ok {
+		t.Fatal("want 5xx response not cached")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("want 2 origin calls (5xx not cached), got %d", calls.Load())
+	}
+}
+
+// Regression: when a coalesced fetch gets a 5xx and a stale copy exists, the
+// leader and every waiter serve the stale copy, and the cache keeps it.
+func TestCoalescing_5xxCoalescedWaitersServeStale(t *testing.T) {
+	var fail atomic.Bool
+	var failCalls atomic.Int64
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() {
+			failCalls.Add(1)
+			time.Sleep(50 * time.Millisecond) // let waiters queue on the in-flight fetch
+			w.WriteHeader(http.StatusInternalServerError)
+			io.WriteString(w, "boom")
+			return
+		}
+		w.Header().Set("Cache-Control", "max-age=60, stale-if-error=300")
+		io.WriteString(w, "good response")
+	}))
+	defer origin.Close()
+
+	cp := NewCoalescingProxy(origin.URL, 10, DefaultMaxBytes)
+	get(t, cp, "/sie-herd")
+	entry, _ := cp.Cache().Get("/sie-herd")
+	entry.ExpiresAt = time.Now().Add(-1 * time.Second)
+	fail.Store(true)
+
+	const concurrency = 50
+	type result struct {
+		status int
+		cache  string
+		body   string
+	}
+	results := make([]result, concurrency)
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func(i int) {
+			defer wg.Done()
+			r := get(t, cp, "/sie-herd")
+			b, _ := io.ReadAll(r.Body)
+			results[i] = result{r.StatusCode, r.Header.Get("X-Cache"), string(b)}
+		}(i)
+	}
+	wg.Wait()
+
+	for i, res := range results {
+		if res.status != http.StatusOK || res.cache != "STALE-IF-ERROR" || res.body != "good response" {
+			t.Fatalf("request %d: want 200 STALE-IF-ERROR %q, got %d %s %q",
+				i, "good response", res.status, res.cache, res.body)
+		}
+	}
+	if n := failCalls.Load(); n >= concurrency {
+		t.Fatalf("want coalesced origin calls during the outage, got %d for %d requests", n, concurrency)
+	}
+	cached, ok := cp.Cache().Get("/sie-herd")
+	if !ok || cached.StatusCode != http.StatusOK || string(cached.Body) != "good response" {
+		t.Fatal("want the good stale entry to remain cached, not be replaced by the 5xx")
+	}
+}
+
+// Regression: the tiered proxy must not store 5xx responses in L1/L2 either.
+func TestTiered_5xxNotCached(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=300")
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer origin.Close()
+
+	tp := NewTieredProxy(origin.URL, DefaultMaxBytes)
+	r := get(t, tp, "/err")
+	if r.StatusCode != http.StatusBadGateway {
+		t.Fatalf("want 502 passed through, got %d", r.StatusCode)
+	}
+	if tp.L1().Len() != 0 || tp.L2().Len() != 0 {
+		t.Fatalf("want 5xx not cached, got L1=%d L2=%d", tp.L1().Len(), tp.L2().Len())
+	}
+}
+
 // Test 10: coalescing makes one origin request for N concurrent misses.
 func TestCoalescing_RequestCoalescing(t *testing.T) {
 	var calls atomic.Int64
@@ -386,32 +492,32 @@ func TestTiered_L2HitPromotesToL1(t *testing.T) {
 
 	tp := NewTieredProxy(origin.URL, DefaultMaxBytes)
 
-	// Fill L1 to capacity so /victim gets evicted to L2.
-	// We need L1MaxSize + 1 entries.
-	for i := 0; i < L1MaxSize; i++ {
+	// Insert L1MaxSize + 1 entries: the last insert evicts the LRU entry
+	// (/fill/0, never re-accessed) from L1 and demotes it to L2.
+	for i := 0; i <= L1MaxSize; i++ {
 		get(t, tp, "/fill/"+strconv.Itoa(i))
 	}
-	// /fill/0 should have been evicted from L1 to L2 (it was the first inserted,
-	// and subsequent inserts make it LRU).
-	// Confirm /fill/0 is in L2.
 	if _, ok := tp.L2().Get("/fill/0"); !ok {
-		// If the test is checking eviction, this is expected.
-		// Depending on access order, /fill/0 may or may not be LRU.
-		// We just confirm L2 has some entries and L2 hit promotes to L1.
+		t.Fatal("want /fill/0 demoted to L2 after L1 overflow")
+	}
+	if _, ok := tp.L1().Get("/fill/0"); ok {
+		t.Fatal("want /fill/0 evicted from L1")
 	}
 
-	// Now request /fill/0 — should be served from L2 and promoted to L1.
-	statsBefore := tp.Stats().L2Hits.Load()
-	get(t, tp, "/fill/0")
-	statsAfter := tp.Stats().L2Hits.Load()
-
-	// If /fill/0 ended up in L2, L2Hits should have increased.
-	// (It might be in origin if L1 still had it; this is an ordering-dependent test.)
-	_ = statsBefore
-	_ = statsAfter
-	// Verify L2 is not empty (we did fill L1 past capacity).
-	if tp.L2().Len() == 0 {
-		t.Fatal("want L2 to have entries after L1 evictions")
+	// Requesting /fill/0 must be an L2 hit and promote it back into L1.
+	r := get(t, tp, "/fill/0")
+	if got := r.Header.Get("X-Cache"); got != "HIT-L2" {
+		t.Fatalf("want X-Cache=HIT-L2, got %s", got)
+	}
+	if tp.Stats().L2Hits.Load() != 1 {
+		t.Fatalf("want 1 L2 hit, got %d", tp.Stats().L2Hits.Load())
+	}
+	if _, ok := tp.L1().Get("/fill/0"); !ok {
+		t.Fatal("want /fill/0 promoted to L1 after L2 hit")
+	}
+	r = get(t, tp, "/fill/0")
+	if got := r.Header.Get("X-Cache"); got != "HIT-L1" {
+		t.Fatalf("want X-Cache=HIT-L1 after promotion, got %s", got)
 	}
 }
 

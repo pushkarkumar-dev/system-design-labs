@@ -248,3 +248,30 @@ class TestGPT2BPETokenizer:
         tok.train(TRAIN_TEXT, vocab_size=400)
         result = tok.decode([])
         assert result == ""
+
+    @pytest.mark.parametrize("text", [
+        "hello world",
+        " leading space",
+        "trailing space ",
+        "  two leading and two trailing  ",
+        "multiple   spaces    between",
+        "tabs\tand\nnewlines\r\n\n",
+        "   ",
+        "don't log the catalog, it's 2026!",
+        "café naïve résumé",
+        "日本語のテキスト と 中文 混合",
+        "emoji 🙂 and   symbols ©®™ — ok",
+    ])
+    def test_roundtrip_preserves_whitespace_and_unicode(self, text):
+        """decode(encode(text)) == text for every kind of whitespace and non-ASCII text."""
+        tok = GPT2BPETokenizer()
+        tok.train(TRAIN_TEXT, vocab_size=400)
+        assert tok.decode(tok.encode(text)) == text
+
+    def test_pretokens_cover_every_character(self):
+        """The pre-tokenizer must not drop characters: its pieces join back to the input."""
+        tok = GPT2BPETokenizer()
+        text = "  hello  world , 42 ünïcode\t\n"
+        pieces = tok._pattern.findall(text)
+        assert "".join(pieces) == text
+        assert tok._pattern.findall("hello world") == ["hello", " world"]

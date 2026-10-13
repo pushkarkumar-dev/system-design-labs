@@ -11,17 +11,18 @@
 #   - INT8 quantized perplexity
 #   - Q4 grouped (Q4_K_M style) perplexity
 #
-# Typical results on wikitext-2 with GPT-2:
-#   fp32   : ~29.0 pp
-#   INT8   : ~29.4 pp  (+0.4 pp delta)
-#   Q4_K_M : ~30.1 pp  (+1.1 pp delta)
-#   Q4_0   : ~32.8 pp  (+3.8 pp delta -- no grouping, worse)
-#   Q2_K   : ~37.0 pp  (+8.0 pp delta -- extreme compression kills quality)
+# ILLUSTRATIVE values used by the comparison table (hard-coded in
+# simulate_perplexity_from_scheme; this lab does not measure them):
+#   fp32               : 29.0
+#   INT8               : 29.4  (+0.4)
+#   INT4, g=32 scales  : 30.1  (+1.1)
+#   INT4, per-tensor   : 32.8  (+3.8)
+#   2-bit              : 37.0  (+8.0)
+# They only show the ordering people usually see. To measure real deltas, run
+# compute_perplexity() on a model whose weights were dequantized from each scheme.
 #
-# Mixed precision: embedding layers are more sensitive to quantization than FFN
-# layers because each token position is represented by exactly one embedding
-# vector. Quantizing embeddings to INT8 instead of INT4 reduces the perplexity
-# delta by about 0.3 pp with minimal increase in model size.
+# Mixed precision keeps the most sensitive tensors (embeddings) at higher
+# precision. We don't measure its quality effect here either.
 
 from __future__ import annotations
 
@@ -80,15 +81,21 @@ def simulate_perplexity_from_scheme(
     base_perplexity: float = 29.0,
 ) -> float:
     """
-    Return a realistic perplexity for a named quantization scheme relative
-    to a given fp32 baseline.
+    ILLUSTRATIVE ONLY: return a hard-coded perplexity for a named scheme.
 
-    Deltas are based on published benchmarks for GPT-2 on wikitext-2:
-      - Q4_0  (per-tensor INT4)  : +3.8 pp
-      - Q4_K_M (grouped INT4, g=32): +1.1 pp
-      - INT8  (per-tensor INT8)  : +0.4 pp
-      - Q2_K  (2-bit grouped)    : +8.0 pp
-      - fp32  (baseline)         : +0.0 pp
+    These deltas are not measured by this lab and do not come from a specific
+    benchmark. They only show the usual ordering: INT8 < grouped INT4 <
+    per-tensor INT4 < 2-bit.
+
+      - "q4_0"   here = per-tensor INT4                   : +3.8
+      - "q4_k_m" here = INT4 with one scale per 32 weights : +1.1
+      - "int8"   (per-tensor INT8)                        : +0.4
+      - "q2_k"   (2-bit)                                  : +8.0
+      - "fp32"   (baseline)                               : +0.0
+
+    The names borrow llama.cpp's labels loosely. llama.cpp's real Q4_0 is
+    block-wise too (32 weights per fp16 scale), and Q4_K_M uses 256-weight
+    super-blocks with 6-bit sub-block scales and keeps some tensors at 6 bits.
     """
     deltas: Dict[str, float] = {
         "fp32":    0.0,
@@ -144,30 +151,33 @@ class QuantizationReport:
         print(separator)
         print(header)
         print(separator)
-        for r in sorted(self.results, key=lambda x: x.bits, reverse=True):
+        for r in sorted(self.results, key=lambda x: (x.bits, x.scheme), reverse=True):
             print(
                 f"{r.scheme:<12} {r.bits:>5.1f} {r.size_mb:>10.1f} "
                 f"{r.compression_ratio:>6.1f}x {r.perplexity:>12.2f} "
                 f"{r.perplexity_delta:>+8.2f}"
             )
         print(separator)
+        print("Perplexity values are illustrative (hard-coded), not measured.")
 
 
 class QuantizationComparison:
     """
     Compare multiple quantization schemes for a given model size.
 
-    Uses simulated perplexity deltas based on published benchmarks.
-    In production, you would pass actual measured perplexity values.
+    Sizes are exact arithmetic from bits per weight. Perplexities are the
+    illustrative, hard-coded values from simulate_perplexity_from_scheme();
+    in production you would pass measured values.
     """
 
-    # (scheme, bits_per_weight, compression_ratio)
+    # (scheme, bits_per_weight); compression ratio = 32 / bits
     SCHEMES = [
-        ("fp32",    32.0,  1.0),
-        ("int8",     8.0,  4.0),
-        ("q4_k_m",   4.5,  7.1),  # INT4 + scales overhead
-        ("q4_0",     4.5,  7.1),  # Same size, worse quality
-        ("q2_k",     2.5, 12.0),
+        ("fp32",    32.0),
+        ("int8",     8.0),   # one scale per tensor (negligible)
+        ("q4_k_m",   4.5),   # 4-bit weights + one fp16 scale per 32 weights
+                             # (this lab's v1 stores fp32 scales: 5.0 bits, 6.4x)
+        ("q4_0",     4.0),   # per-tensor INT4: smaller, but one outlier sets the scale
+        ("q2_k",     2.5),
     ]
 
     def __init__(self, model_name: str, fp32_size_mb: float, base_perplexity: float = 29.0):
@@ -181,7 +191,8 @@ class QuantizationComparison:
             fp32_size_mb=self.fp32_size_mb,
             fp32_perplexity=self.base_perplexity,
         )
-        for scheme, bits, ratio in self.SCHEMES:
+        for scheme, bits in self.SCHEMES:
+            ratio = 32.0 / bits
             ppl = simulate_perplexity_from_scheme(scheme, self.base_perplexity)
             size_mb = self.fp32_size_mb / ratio
             result = SchemeResult(
@@ -206,13 +217,12 @@ class MixedPrecisionConfig:
     """
     Per-layer quantization configuration.
 
-    Typical strategy (GGUF Q4_K_M):
-      - embed_tokens:          INT8  (embedding table, very sensitive)
-      - attn.q_proj, k_proj:   INT4 group=64 (Q projections have tight distributions)
-      - attn.v_proj, o_proj:   INT4 group=32
-      - mlp.gate_proj, up_proj: INT4 group=32
-      - mlp.down_proj:          INT4 group=32
-      - ln (layer norms):       fp32 (tiny tensors, negligible size)
+    This lab's simplified mix (inspired by, but not the same as, GGUF Q4_K_M):
+      - embeddings (wte, wpe):  INT8  (embedding table, very sensitive)
+      - layer norms and biases: fp32  (tiny tensors, negligible size)
+      - everything else:        INT4, one scale per 32 weights
+    GGUF's real Q4_K_M instead uses Q4_K blocks for most tensors and keeps
+    some attention-value and FFN down-projection tensors at 6 bits (Q6_K).
     """
 
     layer_config: Dict[str, str] = field(default_factory=dict)
@@ -301,7 +311,7 @@ def _demo() -> None:
 
     comp = QuantizationComparison(
         model_name="GPT-2 (124M params)",
-        fp32_size_mb=488.0,
+        fp32_size_mb=497.8,  # GPT-2: 124,439,808 params x 4 bytes
         base_perplexity=29.0,
     )
     report = comp.run()
@@ -314,7 +324,10 @@ def _demo() -> None:
     logits = rng.normal(0, 1, (seq_len, vocab_size)).astype(np.float32)
     targets = rng.integers(0, vocab_size, (seq_len,))
     ppl = compute_perplexity(logits, targets)
-    print(f"\nRandom logits perplexity: {ppl:.1f} (expected ~vocab_size = {vocab_size})")
+    print(f"\nRandom N(0,1) logits perplexity: {ppl:.1f} "
+          f"(about vocab_size x e^0.5 = {vocab_size * math.exp(0.5):.0f} on average; 20 tokens is a noisy sample)")
+    flat_ppl = compute_perplexity(np.zeros((seq_len, vocab_size), dtype=np.float32), targets)
+    print(f"Uniform logits perplexity:      {flat_ppl:.1f} (exactly vocab_size = {vocab_size})")
 
     # Mixed precision
     weights = {

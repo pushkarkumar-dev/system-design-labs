@@ -1,7 +1,7 @@
 # test_speculative.py — Tests for all three speculative decoding stages.
 #
 # Stage v0: 5 tests (core algorithm correctness)
-# Stage v1: 4 tests (batched decoding + speedup stats)
+# Stage v1: 6 tests (batched decoding + speedup stats)
 # Stage v2: 3 tests (tree draft + self-speculative)
 #
 # Run: pytest tests/ -v
@@ -275,6 +275,52 @@ class TestV1Batched:
                 f"tokens/calls={computed_speedup:.3f}, "
                 f"reported={stats.speedup_vs_standard:.3f}"
             )
+
+    def test_expected_speedup_closed_form(self):
+        """
+        E[tokens per target call] = (1 - alpha^(K+1)) / (1 - alpha).
+
+        At alpha=0.82, K=5 that is 3.867. K=1 with alpha=0 is standard decoding (1 token),
+        and alpha=1 accepts every draft plus the bonus (K+1 tokens).
+        """
+        from src.v1_batched import expected_speedup, expected_net_speedup, implied_alpha
+
+        assert expected_speedup(0.82, 5) == pytest.approx(3.8667, abs=1e-3)
+        assert expected_speedup(0.82, 5) == pytest.approx(sum(0.82 ** i for i in range(6)))
+        assert expected_speedup(0.0, 1) == pytest.approx(1.0)
+        assert expected_speedup(1.0, 5) == 6.0
+        assert expected_net_speedup(0.82, 5, 0.10) == pytest.approx(3.8667 / 1.5, abs=1e-3)
+        assert implied_alpha(expected_speedup(0.82, 5), 5) == pytest.approx(0.82, abs=1e-6)
+
+    def test_simulated_tokens_per_call_matches_closed_form(self):
+        """
+        Over many steps, measured tokens per target call matches the closed form
+        evaluated at the per-token acceptance rate observed in the same run.
+
+        Note acceptance_rate (accepted / proposed) is a different quantity: it equals
+        (tokens_per_call - 1) / K, not the per-token alpha.
+        """
+        from src.v0_basic import speculative_step, AcceptanceRate
+        from src.v1_batched import expected_speedup
+
+        torch.manual_seed(0)
+        target = make_target()
+        draft = make_draft(target)
+        K = 5
+        tracker = AcceptanceRate()
+        n_accepted = []
+        for _ in range(3000):
+            r = speculative_step([1, 2, 3, 4, 5], draft, target, K=K)
+            tracker.update(r)
+            n_accepted.append(r.n_accepted)
+
+        # Per-position acceptance: P(accept draft i | drafts 0..i-1 accepted)
+        reached = [sum(1 for n in n_accepted if n >= i) for i in range(K + 1)]
+        alpha = sum(reached[i + 1] / reached[i] for i in range(K)) / K
+
+        measured = tracker.speedup_vs_standard
+        assert measured == pytest.approx(expected_speedup(alpha, K), rel=0.02)
+        assert tracker.acceptance_rate == pytest.approx((measured - 1) / K, rel=1e-9)
 
     def test_acceptance_rate_computation_correct(self):
         """

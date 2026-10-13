@@ -113,6 +113,13 @@ def chunk_document(text: str, doc_index: int) -> list[Chunk]:
             chunks.append(Chunk(text=chunk_text, doc_index=doc_index, chunk_index=chunk_idx))
             chunk_idx += 1
 
+        # This chunk reached the end of the document: stop. Without this check the
+        # overlap step starts one more "chunk" inside the text we just emitted, a
+        # fragment wholly contained in this chunk (on BEIR SciFact that was 556 of
+        # 6,408 chunks: pure duplicates competing for top-k slots).
+        if end >= len(text):
+            break
+
         # Advance by (chunk_size - overlap) so the next chunk starts before the
         # sentence boundary we just found, giving overlap with the current chunk.
         stride = max(1, (end - start) - OVERLAP_CHARS)

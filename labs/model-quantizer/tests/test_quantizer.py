@@ -67,18 +67,25 @@ def make_weight(shape, std=0.02):
 
 
 class TestSymmetricINT8:
-    def test_roundtrip_error_under_half_percent(self):
+    def test_roundtrip_error_within_half_step(self):
         """
-        Quantize + dequantize relative error must be under 0.5%.
-        INT8 has 256 levels; for a symmetric distribution the max error
-        per element is scale/2 = max(|tensor|) / 254, giving
-        max relative error ~ 1/254 ~ 0.4%.
+        Rounding to the nearest INT8 level moves each value by at most half a
+        quantization step: |x - dequant(quant(x))| <= scale / 2, where
+        scale = max(|x|) / 127. Relative to the largest weight that is
+        1/254 ~ 0.4%.
+
+        Per-element relative error is not bounded this way: a weight near zero
+        can round to zero and show ~100% relative error, so the mean of
+        per-element relative errors is several percent even for INT8.
         """
         tensor = make_weight((512, 512))
         q, scale = quantize_symmetric_int8(tensor)
         recovered = dequantize_symmetric_int8(q, scale)
-        err = relative_error(tensor, recovered)
-        assert err < 0.005, f"Relative error {err*100:.3f}% exceeds 0.5%"
+        max_abs_err = float(np.max(np.abs(tensor - recovered)))
+        assert max_abs_err <= scale / 2 + 1e-7, (
+            f"max error {max_abs_err:.3e} exceeds half a step ({scale / 2:.3e})"
+        )
+        assert max_abs_err / float(np.max(np.abs(tensor))) <= 1 / 254 + 1e-6
 
     def test_scale_factor_correct(self):
         """

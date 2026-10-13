@@ -151,7 +151,7 @@ def embed_v0(req: EmbedRequest):
     """
     v0: single-model embed, no batching, no cache.
 
-    Used to benchmark the baseline throughput (~100 texts/sec on CPU).
+    Baseline for comparison with /embed/v1 (see scripts/bench.py --server).
     """
     pipeline = get_pipeline()
     if not req.texts:

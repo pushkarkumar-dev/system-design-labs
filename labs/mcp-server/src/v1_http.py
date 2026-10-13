@@ -27,6 +27,16 @@ from pathlib import Path
 from string import Template
 from typing import Any, AsyncGenerator, Callable
 
+# FastAPI is optional (only the HTTP transport needs it). It's imported at module
+# level because this file uses postponed annotations: FastAPI resolves the
+# `request: Request` hint against module globals, and a Request imported inside
+# create_app() is invisible to it, so every POST /messages failed with 422.
+try:
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse, StreamingResponse
+except ImportError:  # pragma: no cover - exercised only without fastapi installed
+    FastAPI = Request = JSONResponse = StreamingResponse = None  # type: ignore[assignment,misc]
+
 from .protocol import (
     Capabilities,
     ErrorCode,
@@ -375,6 +385,12 @@ class McpHttpServer:
     # SSE notification broadcasting
     # ------------------------------------------------------------------
 
+    # Seconds between keepalive comments on an idle SSE stream.
+    sse_keepalive_sec: float = 30.0
+    # Close the stream after this many events (None = stream forever). Tests use
+    # it because Starlette's TestClient buffers a whole response before returning.
+    sse_max_events: int | None = None
+
     async def broadcast_notification(self, method: str, params: dict) -> None:
         """Send a notification to all connected SSE clients."""
         notification = {"jsonrpc": "2.0", "method": method, "params": params}
@@ -394,9 +410,11 @@ class McpHttpServer:
         try:
             # Send initial connected event
             yield f"data: {json.dumps({'type': 'connected', 'server': self.server_info.name})}\n\n"
-            while True:
+            sent = 1
+            while self.sse_max_events is None or sent < self.sse_max_events:
+                sent += 1
                 try:
-                    message = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    message = await asyncio.wait_for(queue.get(), timeout=self.sse_keepalive_sec)
                     yield f"data: {message}\n\n"
                 except asyncio.TimeoutError:
                     # Keepalive ping
@@ -409,7 +427,16 @@ class McpHttpServer:
 # FastAPI app factory
 # ---------------------------------------------------------------------------
 
-def create_app(server: McpHttpServer | None = None):
+class _SseAuthProbe:
+    """Stand-in request so AuthMiddleware.pre() can check the /sse token."""
+    method = "sse/subscribe"
+    id = None
+
+
+_SSE_AUTH_PROBE = _SseAuthProbe()
+
+
+def create_app(server: McpHttpServer | None = None, auth_middleware=None):
     """
     Create a FastAPI application exposing the MCP HTTP transport.
 
@@ -417,18 +444,24 @@ def create_app(server: McpHttpServer | None = None):
       POST /messages  — synchronous JSON-RPC (request → response)
       GET  /sse       — SSE stream for server-initiated notifications
 
+    If auth_middleware (a v2 AuthMiddleware) is given, the Bearer token from
+    each request's Authorization header is handed to it before the message is
+    processed, and /sse requires the same token.
+
     Import FastAPI lazily so the module can be loaded without fastapi installed.
     """
-    try:
-        from fastapi import FastAPI, Request
-        from fastapi.responses import JSONResponse, StreamingResponse
-    except ImportError as exc:
-        raise ImportError("fastapi is required for HTTP transport: pip install fastapi") from exc
+    if FastAPI is None:
+        raise ImportError("fastapi is required for HTTP transport: pip install fastapi")
 
     if server is None:
         server = McpHttpServer()
 
     app = FastAPI(title="MCP Server", version="0.1.0")
+
+    def bearer_token(request: Request) -> str | None:
+        header = request.headers.get("authorization", "")
+        scheme, _, token = header.partition(" ")
+        return token.strip() if scheme.lower() == "bearer" and token.strip() else None
 
     @app.post("/messages")
     async def handle_message(request: Request) -> JSONResponse:
@@ -441,7 +474,16 @@ def create_app(server: McpHttpServer | None = None):
                 content={"error": "Invalid JSON body"},
             )
 
-        response = server.handle(body)
+        if auth_middleware is not None:
+            # handle() is synchronous, so no other request can run between
+            # setting and clearing the token on this event loop.
+            auth_middleware.set_request_token(bearer_token(request))
+            try:
+                response = server.handle(body)
+            finally:
+                auth_middleware.set_request_token(None)
+        else:
+            response = server.handle(body)
         if response is None:
             # Notification — no response body
             return JSONResponse(status_code=202, content={})
@@ -451,8 +493,22 @@ def create_app(server: McpHttpServer | None = None):
     @app.get("/sse")
     async def sse_stream(request: Request) -> StreamingResponse:
         """GET /sse — Server-Sent Events stream for notifications."""
+        if auth_middleware is not None:
+            auth_middleware.set_request_token(bearer_token(request))
+            try:
+                if auth_middleware.pre(_SSE_AUTH_PROBE) is not None:
+                    return JSONResponse(status_code=401, content={"error": "Invalid or missing Authorization: Bearer token"})
+            finally:
+                auth_middleware.set_request_token(None)
+        async def events():
+            # Stop producing events once the client has gone away.
+            async for event in server.sse_generator():
+                if await request.is_disconnected():
+                    break
+                yield event
+
         return StreamingResponse(
-            server.sse_generator(),
+            events(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

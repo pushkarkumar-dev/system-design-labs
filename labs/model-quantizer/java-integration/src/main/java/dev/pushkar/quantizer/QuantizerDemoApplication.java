@@ -63,6 +63,7 @@ public class QuantizerDemoApplication {
 
         // ---- 3. Scheme comparison ----
         System.out.println("\n--- Quantization Scheme Comparison (GPT-2 124M params) ---");
+        System.out.println("  (sizes are exact; perplexity values are illustrative, not measured)");
         var compare = client.compare();
         System.out.printf("  fp32 baseline: %.1f pp perplexity, %.0f MB%n",
                 compare.fp32_perplexity(), compare.fp32_size_mb());
@@ -95,17 +96,17 @@ public class QuantizerDemoApplication {
         System.out.println("\n--- Quantization Memory Reference ---");
 
         // GPT-2 (124M params)
-        long gpt2Fp32 = 124_000_000L * 4;      // 4 bytes/param
-        long gpt2Int8  = 124_000_000L * 1;      // 1 byte/param
-        long gpt2Int4  = 124_000_000L / 2;      // 0.5 bytes/param (packed)
+        long gpt2Fp32 = 124_439_808L * 4;      // 4 bytes/param
+        long gpt2Int8  = 124_439_808L * 1;      // 1 byte/param
+        long gpt2Int4  = 124_439_808L / 2;      // 0.5 bytes/param (packed)
 
         System.out.printf("  GPT-2 (124M params):%n");
         System.out.printf("    fp32:  %d bytes = %.0f MB%n",
-                gpt2Fp32, gpt2Fp32 / 1024.0 / 1024.0);
+                gpt2Fp32, gpt2Fp32 / 1e6);
         System.out.printf("    INT8:  %d bytes = %.0f MB (%.1fx)%n",
-                gpt2Int8, gpt2Int8 / 1024.0 / 1024.0, (double) gpt2Fp32 / gpt2Int8);
+                gpt2Int8, gpt2Int8 / 1e6, (double) gpt2Fp32 / gpt2Int8);
         System.out.printf("    INT4:  %d bytes = %.0f MB (%.1fx)%n",
-                gpt2Int4, gpt2Int4 / 1024.0 / 1024.0, (double) gpt2Fp32 / gpt2Int4);
+                gpt2Int4, gpt2Int4 / 1e6, (double) gpt2Fp32 / gpt2Int4);
 
         // Group quantization scale overhead
         // group_size=32 -> 1 float32 per 32 params -> 4/32 = 0.125 bytes/param overhead
@@ -121,8 +122,8 @@ public class QuantizerDemoApplication {
         long llama3Int4 = 70_000_000_000L / 2;
         System.out.printf("%n  Llama 3 70B (70B params):%n");
         System.out.printf("    bfloat16: %.0f GB%n",
-                llama3Fp16 / 1024.0 / 1024.0 / 1024.0);
-        System.out.printf("    INT4:     %.0f GB  (fits on a single A100 80GB)%n",
-                llama3Int4 / 1024.0 / 1024.0 / 1024.0);
+                llama3Fp16 / 1e9);
+        System.out.printf("    INT4:     %.0f GB  (weights fit on a single A100 80GB)%n",
+                llama3Int4 / 1e9);
     }
 }

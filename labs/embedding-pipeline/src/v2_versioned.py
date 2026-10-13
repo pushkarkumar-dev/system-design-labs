@@ -7,20 +7,29 @@
 #      A "canary" or "next" alias can be added before the swap.
 #      No restart required to add a new version.
 #
-#   2. EmbeddingDrift: measure cosine distance between same texts embedded by
-#      two model versions. High drift means the models live in different vector
-#      spaces — swapping would invalidate every cached and indexed embedding.
-#      is_compatible(v1, v2, threshold=0.9) returns False if drift > 1-threshold.
+#   2. EmbeddingDrift: compare two model versions on the same probe texts.
+#      - measure_drift(): average cosine distance between matched embeddings.
+#        Only meaningful when both versions are the same model (e.g. a new
+#        runtime, precision, or library version), where it should be ~0.
+#      - neighbour_overlap(): how many of each text's k nearest neighbours the
+#        two versions agree on. Compares rankings, never raw vectors, so it
+#        works across different models.
+#      - is_compatible(): can vectors from both versions share one index? Never
+#        for two different models; for the same model, only if drift is ~0.
 #
 #   3. PinningPolicy: pin a caller to a specific model version until a datetime.
 #      Used during gradual migration: new callers get "next", existing callers
 #      stay on "stable" until their pinning expires.
 #
 # Real-world example:
-#   You're running all-MiniLM-L6-v2 (stable). A new model comes out.
-#   You register it as "canary", measure drift(stable, canary) = 0.08 avg cosine distance.
-#   is_compatible() returns True (drift < 0.10). You pin important services to "stable"
-#   for 7 days and gradually shift traffic to "canary". After 7 days, promote "canary" to "stable".
+#   You're running all-MiniLM-L6-v2 (stable) and want to try all-MiniLM-L12-v2.
+#   You register it as "canary". It's a different model, so is_compatible() is
+#   False: its vectors can't be queried against the stable index. On this lab's
+#   434-text probe set (data/probe_texts.txt), matched-pair cosine distance is
+#   0.49 and neighbour_overlap(k=10) is 0.65, so a third of each text's nearest
+#   neighbours change (scripts/compare_models.py). Re-embed into a shadow index,
+#   evaluate retrieval on labelled queries, pin important services to "stable"
+#   while you migrate, then switch the live pointer.
 
 from __future__ import annotations
 
@@ -150,26 +159,28 @@ class ModelRegistry:
 
 class EmbeddingDrift:
     """
-    Measures cosine distance between two model versions on the same texts.
+    Compares two model versions on the same probe texts.
 
-    Cosine distance = 1 - cosine_similarity. Range [0, 2].
-    - 0.0: identical embeddings (same model, same input)
-    - ~0.05-0.10: same model family, different size (MiniLM-L6 vs MiniLM-L12)
-    - ~0.3-0.5: different model families (MiniLM vs E5-large)
-    - 2.0: perfectly anti-correlated (opposite directions)
+    Why it matters: when you replace the embedding model, every vector in your
+    index becomes stale. Different models embed into different vector spaces, so
+    querying a model-v2 vector against a model-v1 index gives degraded or
+    meaningless similarity scores.
 
-    Why does drift matter?
-    When you replace the embedding model in a production system, every embedding
-    in your vector index becomes stale. An embedding from model-v1 and an embedding
-    from model-v2 live in different vector spaces — querying model-v2 against a
-    model-v1 index produces nonsense similarity scores.
+    Two different questions, two different metrics:
+    - "Are these the same embeddings?" — measure_drift(), the average cosine
+      distance between matched embeddings. ~0 for the same model. Between
+      different models it reflects shared training lineage, not compatibility:
+      all-MiniLM-L6-v2 vs all-MiniLM-L12-v2 measure 0.49 on data/probe_texts.txt
+      (unrelated text pairs would measure ~0.92).
+    - "Will retrieval behave the same?" — neighbour_overlap(), the fraction of
+      each text's k nearest neighbours that both versions agree on. Valid across
+      models because it only compares rankings: L6 vs L12 measure 0.65 at k=10.
 
-    The safe upgrade path:
-    1. Measure drift. If drift < 0.10, the models are close enough — the index
-       degrades gracefully and can be re-indexed offline.
-    2. If drift >= 0.10, plan a full re-index before swapping.
-    3. Use blue-green indexes: re-index with model-v2 into a shadow index,
-       then atomically swap the live pointer.
+    The safe upgrade path for a new model:
+    1. Re-embed the corpus into a shadow index with the new model.
+    2. Compare retrieval quality on labelled queries (neighbour_overlap tells you
+       how much will change, not whether it's better).
+    3. Atomically swap the live pointer (blue-green), pinning callers as needed.
     """
 
     def __init__(self, registry: ModelRegistry) -> None:
@@ -179,7 +190,9 @@ class EmbeddingDrift:
         """
         Average cosine distance between embeddings from version_a and version_b.
 
-        Higher = more drift. If 0.0, the two models produce identical embeddings.
+        Higher = more drift. 0.0 means identical embeddings. Use it to confirm
+        that a re-deployed copy of the same model (new runtime, precision, or
+        library version) still produces the same vectors.
 
         Args:
             texts: representative corpus sample (ideally 100-1000 texts)
@@ -199,9 +212,36 @@ class EmbeddingDrift:
         # Shape: (N,) — one similarity per text
         similarities = np.einsum("ij,ij->i", emb_a, emb_b)
 
-        # Cosine distance = 1 - cosine_similarity
-        distances = 1.0 - similarities
+        # Cosine distance = 1 - cosine_similarity; clip float noise (-4e-8 for
+        # identical vectors) back into the valid range.
+        distances = np.clip(1.0 - similarities, 0.0, 2.0)
         return float(np.mean(distances))
+
+    def neighbour_overlap(
+        self,
+        texts: list[str],
+        version_a: str,
+        version_b: str,
+        k: int = 10,
+    ) -> float:
+        """
+        Average fraction of each text's k nearest neighbours (within `texts`)
+        that both versions agree on. 1.0 = identical neighbourhoods.
+
+        Works across different models: it compares rankings within each model's
+        own space, never vectors from one space against the other.
+        """
+        if len(texts) <= k:
+            raise ValueError(f"need more than k={k} texts, got {len(texts)}")
+
+        def top_k(emb: np.ndarray) -> np.ndarray:
+            sims = emb @ emb.T
+            np.fill_diagonal(sims, -np.inf)  # a text is not its own neighbour
+            return np.argsort(-sims, axis=1)[:, :k]
+
+        nbrs_a = top_k(self._registry.embed(texts, version=version_a))
+        nbrs_b = top_k(self._registry.embed(texts, version=version_b))
+        return float(np.mean([len(set(a) & set(b)) / k for a, b in zip(nbrs_a, nbrs_b)]))
 
     def is_compatible(
         self,
@@ -211,15 +251,12 @@ class EmbeddingDrift:
         threshold: float = 0.9,
     ) -> bool:
         """
-        Return True if the two model versions are compatible for a live swap.
+        Return True if vectors from both versions can share one index.
 
-        "Compatible" means the average cosine similarity between same-text embeddings
-        from both models is at least `threshold` (default 0.9). Equivalently, average
-        cosine distance is at most 1 - threshold = 0.10.
-
-        The threshold=0.9 default was chosen empirically: at similarity >= 0.9,
-        the top-10 retrieved documents from a hybrid BM25+dense index change by
-        less than 5% — acceptable degradation for a live migration.
+        Two different models never can: their vector spaces differ, whatever the
+        cosine between matched embeddings says. For two versions of the same
+        model, require average cosine similarity of at least `threshold` between
+        same-text embeddings (a check that the copies really match).
 
         Args:
             version_a: first version alias
@@ -230,6 +267,10 @@ class EmbeddingDrift:
         Returns:
             True if compatible (safe to swap), False otherwise.
         """
+        meta_a = self._registry.get_version_meta(version_a)
+        meta_b = self._registry.get_version_meta(version_b)
+        if meta_a.name != meta_b.name or meta_a.dimension != meta_b.dimension:
+            return False
         drift = self.measure_drift(probe_texts, version_a, version_b)
         avg_similarity = 1.0 - drift
         return avg_similarity >= threshold

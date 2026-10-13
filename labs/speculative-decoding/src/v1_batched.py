@@ -15,24 +15,33 @@
 #
 # EXPECTED SPEEDUP FORMULA:
 #
-#   With acceptance rate α and speculation width K:
-#     E[accepted tokens per target call] = sum(α^i for i in range(K)) + 1 bonus
-#                                        = (1 - α^K)/(1 - α) + 1
+#   With per-token acceptance probability α and speculation width K, the
+#   number of accepted draft tokens N is a truncated geometric variable:
+#   P(N >= i) = α^i for i <= K. Every step also emits exactly one more token
+#   (the corrected resample on rejection, or the bonus token when all K are
+#   accepted), so
+#     E[tokens per target call] = 1 + α + α^2 + ... + α^K
+#                               = (1 - α^(K+1)) / (1 - α)
 #
 #   At α=0.82, K=5:
-#     sum(0.82^i for i in 0..4) = 1 + 0.82 + 0.6724 + 0.5514 + 0.4521 = 3.496
-#     Plus 1 bonus token = 4.496 total tokens per target call
+#     1 + 0.82 + 0.6724 + 0.5514 + 0.4521 + 0.3707 = 3.867 tokens per target call
 #
-#   speedup_vs_standard = (tokens_generated) / (target_calls)
-#   Standard decoding: speedup = 1.0 (1 target call → 1 token, always)
+#   (Leviathan et al. 2023, "Fast Inference from Transformers via
+#   Speculative Decoding", https://arxiv.org/abs/2211.17192)
+#
+#   speedup_vs_standard = tokens per sequence per target call
+#   Standard decoding: speedup = 1.0 (1 target call → 1 token per sequence)
 #
 # HOW TO READ SpeedupStats:
 #
 #   tokens_generated    = total output tokens across all sequences in the batch
 #   draft_tokens_proposed = K × steps × batch_size (all proposals, including rejected)
 #   acceptance_rate     = accepted_draft_tokens / draft_tokens_proposed
+#                         (NOT the per-token α in the formula: it equals
+#                          (tokens_per_call - 1) / K, about 0.61 at α=0.82, K=5)
 #   target_calls        = steps (one call per step, not per token per sequence)
-#   speedup_vs_standard = tokens_generated / target_calls
+#   speedup_vs_standard = tokens_generated / sequence_steps
+#                         (tokens per sequence per target call)
 #
 # Note: "target_calls" counts steps, not per-sequence calls. A single
 # speculative step processes the whole batch — one forward pass.
@@ -60,13 +69,16 @@ class SpeedupStats:
 
     speedup_vs_standard is the headline metric:
       - 1.0 = same as standard decoding
-      - 3.2 = 3.2× more tokens generated per target forward pass
-              (the expected value for α=0.82, K=5)
+      - 3.87 = 3.87× more tokens generated per target forward pass
+               (the expected value for α=0.82, K=5)
+    It counts target calls only; wall-clock speedup also pays for the
+    draft model (see expected_net_speedup).
     """
     tokens_generated: int = 0           # total output tokens across batch
     draft_tokens_proposed: int = 0      # K × steps × batch_size
     draft_tokens_accepted: int = 0      # tokens accepted before first rejection
     target_calls: int = 0               # number of target forward passes (= steps)
+    sequence_steps: int = 0             # one per active sequence per step
     total_time_sec: float = 0.0
 
     @property
@@ -78,14 +90,18 @@ class SpeedupStats:
     @property
     def speedup_vs_standard(self) -> float:
         """
-        tokens_generated / target_calls.
+        Tokens per sequence per target call: tokens_generated / sequence_steps.
 
-        Standard decoding = 1.0 (one target call per output token).
-        Speculative at α=0.82, K=5 = approx 3.2.
+        Standard decoding = 1.0: each target forward pass emits one token per
+        sequence, whether it runs 1 sequence or a batch of B. Dividing by
+        target_calls instead would credit batching to speculation (B sequences
+        x ~4 tokens each would look like a ~16x "speedup").
+        Speculative at α=0.82, K=5 = approx 3.87. With batch_size=1,
+        sequence_steps == target_calls.
         """
-        if self.target_calls == 0:
+        if self.sequence_steps == 0:
             return 0.0
-        return self.tokens_generated / self.target_calls
+        return self.tokens_generated / self.sequence_steps
 
     @property
     def tokens_per_sec(self) -> float:
@@ -196,6 +212,7 @@ class BatchedSpeculativeDecoder:
                 )
 
                 # Update aggregate statistics
+                stats.sequence_steps += 1
                 stats.draft_tokens_proposed += result.n_draft_proposed
                 stats.draft_tokens_accepted += result.n_accepted
                 stats.tokens_generated += result.total_tokens
@@ -230,41 +247,59 @@ class BatchedSpeculativeDecoder:
 
 def expected_speedup(acceptance_rate: float, K: int) -> float:
     """
-    Theoretical expected speedup from speculative decoding.
+    Expected tokens per target call — the speedup measured in target calls.
 
-    E[tokens per target call] = sum(alpha^i for i in range(K)) + 1 bonus
-                               = geometric series + 1
+      E[tokens per target call] = sum(alpha^i for i in range(K + 1))
+                                = (1 - alpha^(K+1)) / (1 - alpha)
 
-    speedup = E[tokens per target call] / 1 token per standard call
-            = E[tokens per target call]
+    The i=0 term is the token every step emits regardless (corrected
+    resample or bonus); the i>=1 terms are the accepted draft tokens.
 
     Args:
-        acceptance_rate: α — probability that each draft token is accepted
+        acceptance_rate: alpha — per-token probability that a draft token is
+                         accepted, given the previous one was accepted
         K: speculation width — number of draft tokens proposed per step
 
     Returns:
-        theoretical speedup factor (e.g., 3.2 for α=0.82, K=5)
+        expected tokens per target call (3.867 for alpha=0.82, K=5)
 
-    Example:
-        At α=0.82, K=5:
-        sum = 1 + 0.82 + 0.82^2 + 0.82^3 + 0.82^4 = 3.496
-        Speedup from draft tokens = 3.496
-        Plus 1 bonus token: total per call = 4.496 tokens
-        But speedup_vs_standard = tokens_generated / target_calls
-        If we always get the bonus + accepted drafts:
-          E[accepted_draft] = 3.496 at perfect α
-          + 1 bonus = 4.496 tokens per target call
-        Standard = 1 token per target call
-        Speedup = 4.496... but in practice the floor/integer nature
-        and the resampling on rejection brings it to ~3.2.
-
-    The formula below computes the geometric series for accepted drafts
-    (not including bonus), since the bonus is always 1:
+    This ignores the draft model's cost; see expected_net_speedup().
     """
     if acceptance_rate >= 1.0:
         return float(K + 1)  # all K accepted + 1 bonus
-    geo = (1.0 - acceptance_rate ** K) / (1.0 - acceptance_rate)
-    return geo  # expected accepted draft tokens; +1 bonus per step
+    return (1.0 - acceptance_rate ** (K + 1)) / (1.0 - acceptance_rate)
+
+
+def expected_net_speedup(acceptance_rate: float, K: int, draft_cost_ratio: float) -> float:
+    """
+    Expected wall-clock speedup once the draft model's cost is included.
+
+      net = expected_speedup(alpha, K) / (1 + K * draft_cost_ratio)
+
+    draft_cost_ratio is the cost of one draft forward pass relative to one
+    target forward pass. At alpha=0.82, K=5, ratio=0.10: 3.867 / 1.5 = 2.58x.
+    """
+    return expected_speedup(acceptance_rate, K) / (1.0 + K * draft_cost_ratio)
+
+
+def implied_alpha(tokens_per_call: float, K: int) -> float:
+    """
+    Invert expected_speedup(): the per-token alpha that would produce the
+    measured tokens per target call. Useful because SpeedupStats.acceptance_rate
+    (accepted / proposed) is not the alpha the formula takes.
+    """
+    if tokens_per_call >= K + 1:
+        return 1.0
+    if tokens_per_call <= 1.0:
+        return 0.0
+    lo, hi = 0.0, 1.0
+    for _ in range(60):  # bisection; expected_speedup is increasing in alpha
+        mid = (lo + hi) / 2
+        if expected_speedup(mid, K) < tokens_per_call:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
 
 
 def optimal_K(acceptance_rate: float, draft_cost_ratio: float) -> int:
@@ -277,18 +312,17 @@ def optimal_K(acceptance_rate: float, draft_cost_ratio: float) -> int:
     Break-even condition: speedup > (1 + K * draft_cost_ratio)
     This means we gain more tokens than the draft overhead costs.
 
-    For draft_cost_ratio=0.1 (draft 10× faster than target):
-      K=5: speedup ≈ 3.2, overhead = 1 + 5*0.1 = 1.5 → net gain = 3.2/1.5 = 2.1
-      K=10: speedup ≈ 4.1 (α^10 diminishes), overhead = 2.0 → net gain = 2.05
+    For α=0.82 and draft_cost_ratio=0.1 (draft 10× cheaper than target):
+      K=5:  3.867 tokens/call, overhead = 1 + 5*0.1 = 1.5 → net = 2.58
+      K=6:  4.171 tokens/call, overhead = 1.6            → net = 2.61 (best)
+      K=10: 4.929 tokens/call, overhead = 2.0            → net = 2.46
 
     Returns: suggested K (1-20)
     """
     best_k = 1
     best_net = 0.0
     for k in range(1, 21):
-        tokens = expected_speedup(acceptance_rate, k)
-        overhead = 1.0 + k * draft_cost_ratio
-        net = tokens / overhead
+        net = expected_net_speedup(acceptance_rate, k, draft_cost_ratio)
         if net > best_net:
             best_net = net
             best_k = k
@@ -332,12 +366,13 @@ if __name__ == "__main__":
     print(f"  Speedup vs std:    {stats.speedup_vs_standard:.2f}x")
     print()
 
-    # Theoretical comparison
-    alpha = stats.acceptance_rate
-    print(f"Theoretical speedup at α={alpha:.2f}, K=5:")
-    geo = expected_speedup(alpha, K=5)
-    print(f"  Geometric series sum(α^i, i=0..4) = {geo:.3f}")
-    print(f"  Expected tokens per target call   = {geo + 1:.3f} (incl. bonus)")
+    # Theoretical comparison. acceptance_rate above is accepted / proposed,
+    # not the per-token alpha the formula takes, so infer alpha instead.
+    alpha = implied_alpha(stats.speedup_vs_standard, K=5)
+    print(f"Implied per-token α (from tokens per call): {alpha:.3f}")
+    for a in (0.6, 0.7, 0.8, 0.82, 0.9):
+        print(f"  α={a:.2f}: {expected_speedup(a, K=5):.3f} tokens/call, "
+              f"net {expected_net_speedup(a, 5, 0.10):.2f}x with a draft at 10% cost")
     print()
 
     print(f"Optimal K for draft_cost_ratio=0.10: {optimal_K(alpha, 0.10)}")

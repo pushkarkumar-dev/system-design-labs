@@ -33,9 +33,12 @@
 //! ```
 //!
 //! **Durability tradeoff**: we do not call `fsync` after every write (that would
-//! cap us at ~3k writes/sec, the same as the WAL lab). Instead we rely on the
-//! OS page cache to eventually flush. This matches Redis's default
-//! `appendfsync everysec` mode — at most one second of data loss on a crash.
+//! cap us at ~3k writes/sec, the same as the WAL lab). Instead each write checks
+//! when the AOF was last synced and calls `sync_data()` once at least one second
+//! has passed, plus once more on `sync()` / drop. This approximates Redis's
+//! default `appendfsync everysec`. One difference: Redis syncs from a background
+//! thread on a timer, while we sync on the first write after the second is up,
+//! so the writes in a quiet tail stay unsynced until the next write or shutdown.
 //!
 //! **Compaction**: the AOF grows forever in our implementation. Real Redis
 //! periodically rewrites the AOF (BGREWRITEAOF) to a minimal form — just the
@@ -69,12 +72,29 @@ pub struct Cache {
     max_keys: usize,
     aof:      Option<File>,
     aof_path: Option<PathBuf>,
+    /// When the AOF was last fsynced (`sync_data`).
+    last_sync: Instant,
+    /// Minimum time between fsyncs on the write path (1 s = `everysec`).
+    sync_interval: Duration,
+    /// Number of AOF fsyncs performed (observability + tests).
+    sync_count: u64,
 }
+
+/// Redis `appendfsync everysec`: fsync the AOF at most about once per second.
+const AOF_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Cache {
     /// Create an in-memory-only cache with LRU eviction (no persistence).
     pub fn new_in_memory(max_keys: usize) -> Self {
-        Self { store: HashMap::new(), max_keys, aof: None, aof_path: None }
+        Self {
+            store: HashMap::new(),
+            max_keys,
+            aof: None,
+            aof_path: None,
+            last_sync: Instant::now(),
+            sync_interval: AOF_SYNC_INTERVAL,
+            sync_count: 0,
+        }
     }
 
     /// Open (or create) a persistent cache backed by the AOF file at `path`.
@@ -117,6 +137,9 @@ impl Cache {
             max_keys,
             aof: Some(aof),
             aof_path: Some(path.to_path_buf()),
+            last_sync: Instant::now(),
+            sync_interval: AOF_SYNC_INTERVAL,
+            sync_count: 0,
         })
     }
 
@@ -212,15 +235,52 @@ impl Cache {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             line.push('\n');
             f.write_all(line.as_bytes())?;
-            // Note: no fsync here — matches Redis appendfsync=everysec semantics.
-            // The OS will flush to disk within ~1 second under normal conditions.
+            // appendfsync everysec: fsync only if a second has passed since the
+            // last one. At most ~1 s of acknowledged writes can be lost on a
+            // power failure (a process crash loses nothing: the bytes are
+            // already in the kernel page cache).
+            if self.last_sync.elapsed() >= self.sync_interval {
+                f.sync_data()?;
+                self.last_sync = Instant::now();
+                self.sync_count += 1;
+            }
         }
         Ok(())
+    }
+
+    /// Force an fsync of the AOF now (e.g. on shutdown). No-op without an AOF.
+    pub fn sync(&mut self) -> io::Result<()> {
+        if let Some(ref f) = self.aof {
+            f.sync_data()?;
+            self.last_sync = Instant::now();
+            self.sync_count += 1;
+        }
+        Ok(())
+    }
+
+    /// Change the minimum interval between write-path fsyncs (default 1 s).
+    /// `Duration::ZERO` behaves like `appendfsync always`.
+    pub fn set_sync_interval(&mut self, interval: Duration) {
+        self.sync_interval = interval;
+    }
+
+    /// Number of AOF fsyncs performed so far.
+    pub fn sync_count(&self) -> u64 {
+        self.sync_count
     }
 
     /// Path of the AOF file, if persistence is enabled.
     pub fn aof_path(&self) -> Option<&Path> {
         self.aof_path.as_deref()
+    }
+}
+
+impl Drop for Cache {
+    /// Final fsync on shutdown so a clean exit never loses the last second.
+    fn drop(&mut self) {
+        if let Err(e) = self.sync() {
+            tracing::warn!("AOF fsync on drop failed: {}", e);
+        }
     }
 }
 
@@ -268,6 +328,41 @@ mod tests {
             assert_eq!(c.get("x"), None);
             assert_eq!(c.get("y"), Some("world"));
         }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn aof_fsyncs_about_once_per_interval() {
+        let path = std::env::temp_dir()
+            .join(format!("kv-cache-test-aof-sync-{}.log", std::process::id()));
+        let _ = fs::remove_file(&path);
+
+        {
+            let mut c = Cache::open(&path, 100).unwrap();
+
+            // Within the 1 s window: writes do not fsync.
+            for i in 0..100 {
+                c.set(format!("k{}", i), "v".into(), None).unwrap();
+            }
+            assert_eq!(c.sync_count(), 0, "no fsync before the interval elapses");
+
+            // Once the interval has elapsed, the next write fsyncs exactly once.
+            c.set_sync_interval(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(30));
+            c.set("a".into(), "1".into(), None).unwrap();
+            c.set("b".into(), "2".into(), None).unwrap();
+            assert_eq!(c.sync_count(), 1, "one fsync per elapsed interval");
+
+            // Explicit sync (also what Drop does) always fsyncs.
+            c.sync().unwrap();
+            assert_eq!(c.sync_count(), 2);
+        }
+
+        // In-memory caches never touch a file.
+        let mut m = Cache::new_in_memory(10);
+        m.sync().unwrap();
+        assert_eq!(m.sync_count(), 0);
 
         let _ = fs::remove_file(&path);
     }

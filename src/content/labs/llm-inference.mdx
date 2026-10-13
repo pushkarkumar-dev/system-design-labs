@@ -24,7 +24,7 @@ stages:
     title: "KV Cache"
     learningGoals:
       - "Cache past key/value tensors so each new token only needs one attention column"
-      - "KV cache for GPT-2 at seq_len=1024 costs exactly 75 MB"
+      - "KV cache for GPT-2 at seq_len=1024 costs exactly 75,497,472 bytes (~75.5 MB)"
     approxLoc: 500
     branchOrTag: "llm-inference-v1"
   - id: v2
@@ -56,10 +56,10 @@ benchmarks:
     measuredOn: "M2 MacBook Pro, 16GB RAM, CPU-only"
     note: "estimated — amortizes forward pass overhead"
   - metric: "KV cache size (GPT-2, seq_len=1024)"
-    value: "75"
+    value: "75.5"
     unit: "MB"
     measuredOn: "calculated"
-    note: "2 x 12 layers x 12 heads x 64 d_head x 1024 seq x 4 bytes"
+    note: "2 x 12 layers x 12 heads x 64 d_head x 1024 seq x 4 bytes = 75,497,472 bytes (72 MiB)"
 whatTheToyMisses:
   - thing: "GPU kernel fusion"
     why: "Real inference engines (vLLM, TGI) fuse attention, softmax, and projection into a single CUDA kernel (FlashAttention). This avoids 3x HBM reads/writes and is the dominant speedup on GPU hardware. Our implementation materializes intermediate tensors to RAM on every forward pass."
@@ -208,8 +208,8 @@ The test for v0 that matters most: `test_greedy_decoding_is_deterministic`. If t
   goals={[
     "Implement KVCache dataclass with update(), get(), memory_bytes(), clear()",
     "Implement generate_with_kv_cache() using HuggingFace past_key_values",
-    "Implement kv_cache_size_formula(n_layers, n_heads, d_head, seq_len) — the exact formula",
-    "Write 4 tests: formula at seq=1024 = 75,497,472 bytes, linear scaling, manual cache memory, identical output to naive",
+    "Implement kv_cache_size_formula(n_layers, n_heads, d_head, seq_len, n_kv_heads) — the exact formula, GQA-aware",
+    "Write 5 tests: formula at seq=1024 = 75,497,472 bytes, the GQA case (Llama 3 70B = 335,544,320 bytes), linear scaling, manual cache memory, identical output to naive",
   ]}
   loc={300}
 >
@@ -240,18 +240,18 @@ For GPT-2 (12 layers, 12 heads, d_head=64):
     12 layers * 2 * 307,200 = 7,372,800 bytes ~ 7 MB
 
   After 1024 tokens:
-    2 * 12 * 12 * 64 * 1024 * 4 = 75,497,472 bytes ~ 72 MB
+    2 * 12 * 12 * 64 * 1024 * 4 = 75,497,472 bytes ~ 75.5 MB (72 MiB)
 ```
 
 **The exact formula:**
 
 ```
-kv_cache_bytes = 2 * n_layers * n_heads * d_head * seq_len * bytes_per_element
+kv_cache_bytes = 2 * n_layers * n_kv_heads * d_head * seq_len * bytes_per_element
 ```
 
-For GPT-2 at seq_len=1024: `2 * 12 * 12 * 64 * 1024 * 4 = 75,497,472 bytes`.
+`n_kv_heads` is the number of key/value heads that are actually cached. In GPT-2's multi-head attention every query head has its own K and V, so `n_kv_heads = n_heads = 12`. For GPT-2 at seq_len=1024: `2 * 12 * 12 * 64 * 1024 * 4 = 75,497,472 bytes`.
 
-This formula is worth memorizing. It tells you immediately how much memory any model's KV cache will consume at a given sequence length. For a 70B Llama 3 model (80 layers, 64 heads, d_head=128, bfloat16): `2 * 80 * 64 * 128 * 1024 * 2 = 4 GB per request at seq_len=1024`.
+This formula is worth memorizing. It tells you immediately how much memory any model's KV cache will consume at a given sequence length. The trap is using the query-head count for modern models. Llama 3 70B has 64 query heads, but grouped-query attention (GQA) shares each K/V head across 8 query heads, so only 8 KV heads are cached. At 80 layers, d_head=128 and bfloat16: `2 * 80 * 8 * 128 * 1024 * 2 = 335,544,320 bytes = 320 MiB per request at seq_len=1024`, or 320 KiB per token. Plugging in all 64 heads gives 2.5 GiB, 8x too high.
 
 **Protocol with HuggingFace:**
 
@@ -381,6 +381,7 @@ The critical design: `paged_cache.free_request()` returns pages immediately. Ano
 tests/test_inference.py::TestV0Naive::test_generation_result_fields PASSED
 tests/test_inference.py::TestV0Naive::test_activation_memory_formula PASSED
 tests/test_inference.py::TestV1KVCache::test_kv_cache_size_formula_gpt2_1024 PASSED
+tests/test_inference.py::TestV1KVCache::test_kv_cache_size_formula_llama3_70b_gqa PASSED
 tests/test_inference.py::TestV1KVCache::test_kv_cache_grows_linearly_with_seq_len PASSED
 tests/test_inference.py::TestV1KVCache::test_manual_kv_cache_dataclass PASSED
 tests/test_inference.py::TestV2Batched::test_paged_cache_allocates_correct_page_count PASSED
@@ -521,11 +522,12 @@ No Java code changes. This is the correct abstraction for AI in Java services: w
 ```java
 // In InferenceDemoApplication.java
 long gpt2Bytes = 2L * 12 * 12 * 64 * 1024 * 4;
-// 75,497,472 bytes = ~72 MB
+// 75,497,472 bytes = ~75.5 MB (72 MiB)
 
-long llamaBytes = 2L * 80 * 64 * 128 * 1024 * 2;   // bfloat16 = 2 bytes
-// 4,294,967,296 bytes = 4 GB per request at seq_len=1024
-// An A100 (80 GB) can hold at most ~20 such requests in KV cache
+// Llama 3 70B uses grouped-query attention: only its 8 KV heads are cached
+long llamaBytes = 2L * 80 * 8 * 128 * 1024 * 2;   // bfloat16 = 2 bytes
+// 335,544,320 bytes = 320 MiB per request at seq_len=1024
+// The 140 GB of bf16 weights need at least two 80 GB GPUs on their own
 ```
 
 This is a useful back-of-envelope calculation that any Java service engineer should be able to do when sizing inference infrastructure.
@@ -565,10 +567,11 @@ Expected output:
 
 --- KV Cache Memory Reference ---
   GPT-2 (12 layers, 12 heads, d_head=64) at seq_len=1024:
-    2 * 12 * 12 * 64 * 1024 * 4 = 75,497,472 bytes = 72.0 MB
-  Llama 3 70B (80 layers, 64 heads, d_head=128, bfloat16) at seq_len=1024:
-    2 * 80 * 64 * 128 * 1024 * 2 = 4,294,967,296 bytes = 4.0 GB
-    An A100 (80 GB HBM) can hold at most ~20 such requests in KV cache.
+    2 * 12 * 12 * 64 * 1024 * 4 = 75,497,472 bytes = 72.0 MiB
+  Llama 3 70B (80 layers, 8 KV heads, d_head=128, bfloat16) at seq_len=1024:
+    2 * 80 * 8 * 128 * 1024 * 2 = 335,544,320 bytes = 320 MiB
+    Weights alone are 70B * 2 bytes = 140 GB, so this model needs at least
+    two 80 GB GPUs before the first token is cached.
 Done.
 ```
 
@@ -576,7 +579,7 @@ Done.
 
 ## What surprised me
 
-<WhatSurprisedMe insight="The KV cache memory formula surprised me with its concreteness. GPT-2's KV cache at seq_len=1024 costs exactly 2 x 12 x 12 x 64 x 1024 x 4 = 75,497,472 bytes — about 72 MB. For a 70B-parameter model (Llama 3) with 80 layers, 64 heads, and d_head=128: 2 x 80 x 64 x 128 x 1024 x 2 (bfloat16) = 4 GB — for one request at seq_len=1024. A single A100 with 80 GB HBM can hold at most 20 such requests in their KV cache. The paged attention paper showed that naive contiguous KV allocation wastes 60-80% of that due to fragmentation — meaning the effective capacity drops to 4 to 8 concurrent requests. Paged attention recovers that wasted memory, which is why vLLM reported 24x throughput improvement over naive serving. The math is entirely deterministic once you know n_layers, n_heads, d_head, and seq_len. No approximation needed." />
+<WhatSurprisedMe insight="The KV cache memory formula surprised me with its concreteness. GPT-2's KV cache at seq_len=1024 costs exactly 2 x 12 x 12 x 64 x 1024 x 4 = 75,497,472 bytes — about 75.5 MB (72 MiB). What surprised me more was how easy the formula is to get wrong for modern models. Llama 3 70B has 64 attention heads, but grouped-query attention means only 8 KV heads are cached: 2 x 80 x 8 x 128 x 1024 x 2 (bfloat16) = 335,544,320 bytes, or 320 MiB per 1024-token request. Plug in all 64 heads and you get 2.5 GiB, 8x too high. At that size the weights are the bigger constraint: 70B x 2 bytes = 140 GB, so the model needs at least two 80 GB GPUs before a single token is cached, and on exactly two GPUs the roughly 20 GB left over fits about 60 such requests before activations and runtime overhead. The vLLM authors found that contiguous KV allocation wastes 60-80% of KV memory to fragmentation and over-reservation; paged attention recovers it, which is a large part of why vLLM reported up to 24x higher throughput than HuggingFace Transformers. The math is deterministic once you know n_layers, n_kv_heads, d_head, and seq_len. No approximation needed." />
 
 ## Where to go deeper
 

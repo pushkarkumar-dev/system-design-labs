@@ -68,6 +68,10 @@ class ContaminationDetector:
 
     def __init__(self) -> None:
         self._training_ngrams: set[tuple[str, ...]] = set()
+        # Normalized training text, kept only for examples shorter than NGRAM_SIZE
+        # words: those have no 13-gram, so we look for the whole word sequence instead.
+        # (Fine for a toy; at corpus scale you would index shorter n-grams instead.)
+        self._training_texts: list[str] = []
 
     def add_training_shard(self, texts: list[str]) -> None:
         """
@@ -83,6 +87,7 @@ class ContaminationDetector:
         for text in texts:
             ngrams = _make_ngrams(text, n=self.NGRAM_SIZE)
             self._training_ngrams.update(ngrams)
+            self._training_texts.append(" " + " ".join(text.lower().split()) + " ")
 
     def check_contamination(self, example_text: str) -> float:
         """
@@ -94,7 +99,14 @@ class ContaminationDetector:
         Returns:
             A float in [0, 1]. 0.0 = no contamination. 1.0 = fully contaminated.
             Examples returning > 0.10 (10%) are considered contaminated.
+
+        An example shorter than 13 words has no 13-gram. It scores 1.0 if its whole
+        word sequence appears in a training text, else 0.0.
         """
+        words = example_text.lower().split()
+        if 0 < len(words) < self.NGRAM_SIZE:
+            needle = " " + " ".join(words) + " "
+            return 1.0 if any(needle in t for t in self._training_texts) else 0.0
         example_ngrams = _make_ngrams(example_text, n=self.NGRAM_SIZE)
         if not example_ngrams:
             return 0.0

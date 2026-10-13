@@ -1,6 +1,7 @@
 package cdn
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -14,6 +15,19 @@ type inflightReq struct {
 	done  chan struct{}
 	entry *CacheEntry
 	err   error
+}
+
+// OriginStatusError is returned by coalescedFetch when the origin answered
+// with a 5xx. A 5xx is an origin failure, not a cacheable success: it is never
+// stored, it triggers stale-if-error, and every coalesced waiter sees the same
+// error. Entry holds the origin's response so it can be passed through when no
+// stale copy is available.
+type OriginStatusError struct {
+	Entry *CacheEntry
+}
+
+func (e *OriginStatusError) Error() string {
+	return fmt.Sprintf("origin returned %d", e.Entry.StatusCode)
 }
 
 // CoalescingProxy wraps EdgeProxy with:
@@ -73,6 +87,12 @@ func (cp *CoalescingProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			serveFromCache(w, stale, "STALE-IF-ERROR")
 			return
 		}
+		// No usable stale copy: pass the origin's own 5xx through (uncached).
+		var se *OriginStatusError
+		if errors.As(err, &se) {
+			serveFromCache(w, se.Entry, "MISS")
+			return
+		}
 		http.Error(w, "origin error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -90,8 +110,9 @@ func (cp *CoalescingProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // coalescedFetch ensures exactly one origin request is made for a given key,
 // even if N goroutines all arrive at a cache miss simultaneously. It returns:
 //   - (entry, stale, nil) on a successful fetch
-//   - (nil, stale, err) when the origin returns an error; stale may be non-nil
-//     if a stale-if-error candidate exists in cache
+//   - (nil, stale, err) when the origin fails (transport error or a 5xx, the
+//     latter as *OriginStatusError); stale may be non-nil if a stale-if-error
+//     candidate exists in cache. Waiters receive the leader's exact error.
 func (cp *CoalescingProxy) coalescedFetch(r *http.Request, key string) (*CacheEntry, *CacheEntry, error) {
 	// Retrieve any stale entry before locking (for stale-if-error fallback).
 	var staleEntry *CacheEntry
@@ -123,6 +144,14 @@ func (cp *CoalescingProxy) coalescedFetch(r *http.Request, key string) (*CacheEn
 
 	// Fetch from origin (outside the lock).
 	entry, err := cp.base.fetchFromOrigin(r, key)
+	if err != nil {
+		err = fmt.Errorf("origin fetch: %w", err)
+	} else if entry.StatusCode >= 500 {
+		// fetchFromOrigin did not cache it; surface it as a failure so
+		// stale-if-error applies and waiters do not treat it as a success.
+		err = &OriginStatusError{Entry: entry}
+		entry = nil
+	}
 
 	// Populate the inflight result and broadcast to waiters.
 	cp.mu.Lock()
@@ -133,7 +162,7 @@ func (cp *CoalescingProxy) coalescedFetch(r *http.Request, key string) (*CacheEn
 	close(req.done)
 
 	if err != nil {
-		return nil, staleEntry, fmt.Errorf("origin fetch: %w", err)
+		return nil, staleEntry, err
 	}
 	return entry, nil, nil
 }

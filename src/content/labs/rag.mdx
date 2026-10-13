@@ -24,44 +24,44 @@ stages:
     learningGoals:
       - "Dense retrieval misses exact keyword matches; BM25 misses semantic equivalents"
       - "RRF fusion: rank(1/(k+rank_i)) combines rankings without knowing score distributions"
-      - "Hybrid beats either alone: 62% recall@3 (dense) vs 74% (hybrid) on standard benchmarks"
+      - "Hybrid only helps when BM25 is good: measured on BEIR SciFact, the lab's whitespace tokenizer gives no gain over dense (68.3% vs 69.3% hit@3); a \\w+ tokenizer gives 73.7%"
     approxLoc: 200
   - id: v2
     title: "Reranking — cross-encoder for precision"
     learningGoals:
       - "Bi-encoder: embed query and doc independently — fast but misses interaction"
-      - "Cross-encoder: process (query, doc) together — accurate but 100x slower"
+      - "Cross-encoder: process (query, doc) together — more accurate, but one forward pass per pair at query time"
       - "Two-stage: retrieve 20 with bi-encoder, rerank with cross-encoder, send top-3 to LLM"
     approxLoc: 180
 benchmarks:
-  - metric: "Dense retrieval (numpy cosine, 1000 chunks)"
-    value: "8,000"
-    unit: "queries/sec"
-    measuredOn: "M2 MacBook Pro"
-    note: "estimated"
-  - metric: "Recall@3 — naive dense retrieval"
-    value: "62"
+  - metric: "hit@3 on BEIR SciFact, dense v0 / hybrid v1 / rerank v2"
+    value: "69.3 / 68.3 / 72.7"
     unit: "%"
-    measuredOn: "BEIR benchmark subset"
-    note: "estimated"
-  - metric: "Recall@3 — hybrid BM25 + dense"
-    value: "74"
+    measuredOn: "Apple M1 Ultra, 64 GB RAM, torch 2.14.1, sentence-transformers 6.1.0 (MPS), 2026-10-11"
+    note: "measured — 300 test queries; v2 vs v1 +4.3pp, paired 95% CI [+0.7, +8.3]; scripts/bench.py"
+  - metric: "hit@3 on BEIR NFCorpus, dense v0 / hybrid v1 / rerank v2"
+    value: "57.6 / 58.8 / 61.3"
     unit: "%"
-    measuredOn: "BEIR benchmark subset"
-    note: "estimated"
-  - metric: "Recall@3 — hybrid + cross-encoder reranking"
-    value: "81"
+    measuredOn: "Apple M1 Ultra, 64 GB RAM, torch 2.14.1, sentence-transformers 6.1.0 (MPS), 2026-10-11"
+    note: "measured — 323 test queries; v2 vs v1 +2.5pp, CI [-0.9, +5.9]"
+  - metric: "hit@3, hybrid with a \\w+ BM25 tokenizer (SciFact)"
+    value: "73.7"
     unit: "%"
-    measuredOn: "BEIR benchmark subset"
-    note: "estimated"
-  - metric: "Cross-encoder reranking (20 candidates, CPU)"
-    value: "50"
-    unit: "queries/sec"
-    measuredOn: "M2 MacBook Pro"
-    note: "estimated"
+    measuredOn: "Apple M1 Ultra, 64 GB RAM, torch 2.14.1, sentence-transformers 6.1.0 (MPS), 2026-10-11"
+    note: "measured — ablation, not lab code; the lab's whitespace tokenizer gives 68.3"
+  - metric: "Cross-encoder rerank, 20 candidates (CPU / MPS)"
+    value: "412 / 173"
+    unit: "ms"
+    measuredOn: "Apple M1 Ultra, 64 GB RAM, torch 2.14.1, sentence-transformers 6.1.0, 2026-10-11"
+    note: "measured — median of 5 rounds on a shared machine; 163-519 / 53-333 ms across three runs; 8-12x the hybrid retrieve()"
+  - metric: "Hybrid retrieve() v1, 5,852 chunks (CPU / MPS)"
+    value: "34 / 21"
+    unit: "ms"
+    measuredOn: "Apple M1 Ultra, 64 GB RAM, torch 2.14.1, sentence-transformers 6.1.0, 2026-10-11"
+    note: "measured — query embedding + numpy matmul + pure-Python BM25 (28 ms on its own) + RRF"
 whatTheToyMisses:
   - thing: "Vector database for large corpora"
-    why: "Our numpy cosine similarity is O(N) per query. At 1M chunks, this is too slow. Vector databases (FAISS, Pinecone, Weaviate) use HNSW or IVF for approximate nearest neighbor search — O(log N) or O(sqrt N)."
+    why: "Our numpy cosine similarity is O(N) per query (48 ms at 1M chunks measured on an M1 Ultra) and our pure-Python BM25 is far slower per chunk. Vector databases (FAISS, Pinecone, Weaviate) use HNSW or IVF for approximate nearest neighbor search — O(log N) or O(sqrt N)."
   - thing: "Chunking strategy"
     why: "Fixed-size chunking splits mid-sentence. Semantic chunking (split on paragraph/section boundaries) and recursive splitting (try sentence, then paragraph, then larger) produce better chunks. Our fixed-size approach is a baseline."
   - thing: "Contextual compression"
@@ -93,7 +93,7 @@ summary: "Build a RAG system from naive dense retrieval to hybrid BM25+dense wit
 
 Every AI assistant that "knows about your documents" is a RAG system. Notion AI, GitHub Copilot's codebase context, customer support bots that answer from internal wikis — they all share the same fundamental architecture: retrieve relevant context, then generate an answer conditioned on that context.
 
-You've read that RAG stands for Retrieval-Augmented Generation. You've seen the diagram: embed the query, find similar chunks, stuff them into the prompt. But until you've *implemented* the chunking overlap and watched a query that matched the end of chunk N only appear in chunk N+1's results, until you've seen BM25 find the exact-match chunk that dense retrieval missed, until you've measured the recall jump from 74% to 81% after adding a cross-encoder reranker — you don't *know* it.
+You've read that RAG stands for Retrieval-Augmented Generation. You've seen the diagram: embed the query, find similar chunks, stuff them into the prompt. But until you've *implemented* the chunking overlap, until you've watched hybrid retrieval fail to beat dense retrieval because of a one-line tokenizer, until you've measured a cross-encoder reranker lift hit@3 from 68% to 73% on a real benchmark and paid for it in latency — you don't *know* it.
 
 This lab builds RAG from the simplest possible baseline to the two-stage retrieval pattern used in production. Each version is a targeted fix for a measured weakness of the previous one.
 
@@ -109,12 +109,13 @@ A RAG system in Python, implemented across three stages. Each stage adds one lay
 - Cross-encoder reranking (`cross-encoder/ms-marco-MiniLM-L-6-v2`)
 - FastAPI server with `/ingest`, `/query`, `/stats`, and `/health` endpoints
 - A simple Recall@3 evaluator to measure retrieval quality
+- `scripts/bench.py`, which runs all three versions on two public BEIR datasets with human relevance labels and times every stage
 
 **We explicitly skip (and why):**
 - Vector databases (FAISS, Pinecone) — covered in "What the Toy Misses"; our numpy approach is O(N) which is fine for demonstration but won't scale to 1M chunks
 - Document parsing (PDF, HTML) — we take plain text; real ingestion pipelines need structure-aware parsers
 - Persistent storage — the index lives in memory; restart wipes it
-- Fine-tuned embeddings — `all-MiniLM-L6-v2` is a general model; domain-specific fine-tuning can add 5-10% recall on narrow corpora
+- Fine-tuned embeddings — `all-MiniLM-L6-v2` is a general model; domain-specific fine-tuning can help on narrow corpora, but this lab doesn't measure it
 
 ## Mental model
 
@@ -192,13 +193,17 @@ The core insight of dense retrieval: convert both documents and queries to the s
 
 **Why 512 tokens?**
 
-LLMs have a context window limit. GPT-4o's is 128k tokens; a local model might be 4k. You need to fit the top-k chunks plus the question plus the answer in that window. With 512-token chunks and top-3 retrieval, you're using about 1,500 tokens for context — comfortable even for a 4k context model.
+LLMs have a context window limit. GPT-4o's is 128k tokens; a local model might be 4k. You need to fit the top-k chunks plus the question plus the answer in that window. With 512-token chunks and top-3 retrieval, you're using about 1,500 tokens for context — comfortable even for a 4k context model. (We chunk by characters: 2,048 characters ≈ 512 tokens at ~4 characters per token.)
+
+**The embedder doesn't read the whole chunk.** `all-MiniLM-L6-v2` has `max_seq_length = 256` word pieces and silently truncates the rest. On BEIR SciFact our chunker produces 5,852 chunks with a median of 302 tokens; 65% of them are longer than 256, and 24% of all chunk tokens are never embedded (NFCorpus: 71% and 28%). The text past the cut still goes to BM25, the reranker (`max_length` 512) and the LLM, but dense retrieval can't match on it. Chunk size is a property of the *embedder*, not just the LLM's context window.
 
 **Why 50-token overlap?**
 
-This is the most counterintuitive part of chunking. Consider a document where the answer to a query appears at characters 1800–2100. If you chunk at 2048 characters with no overlap, the relevant passage might straddle the boundary: characters 1800–2048 go into chunk N, characters 2048–2100 go into chunk N+1. When you embed chunk N, the answer is only partially there — the embedding may not match the query. Chunk N+1 starts in the middle of a sentence and also won't match well.
+This is the most counterintuitive part of chunking. Consider a document where the answer to a query appears at characters 1900–2100. If you chunk at 2048 characters with no overlap, the relevant passage straddles the boundary: characters 1900–2048 go into chunk N, characters 2048–2100 go into chunk N+1. When you embed chunk N, the answer is only partially there — the embedding may not match the query. Chunk N+1 starts in the middle of a sentence and also won't match well.
 
-With 200-character overlap, chunk N goes from 0 to 2048. Chunk N+1 goes from 1848 to 3896. The relevant passage (1800–2100) is now fully contained in chunk N+1's first 250 characters — the most salient part of the chunk for embedding purposes. The overlap ensures that whatever the query is about, there's a chunk where that content appears near the start.
+With 200-character overlap, chunk N goes from 0 to 2048. Chunk N+1 goes from 1848 to 3896. The relevant passage (1900–2100) is now fully contained in chunk N+1's first ~250 characters. The overlap ensures that a passage shorter than the overlap always lands whole in at least one chunk.
+
+Two details in our `chunk_document()` change this picture. First, it snaps each chunk end back to the last sentence boundary in the final 20% of the window, so a single sentence is rarely cut even without overlap; overlap matters for answers that span sentences. Second, the embedding model doesn't read the whole chunk (next section).
 
 **Dense retrieval is O(N):**
 
@@ -208,7 +213,7 @@ For each query, we embed it (once) and compute dot products with all N chunk emb
 scores = chunk_vecs @ query_vec   # (N,) — one dot product per chunk
 ```
 
-This is fast at N=1,000 (microseconds) and slow at N=1,000,000 (seconds). The "What the Toy Misses" section covers HNSW and IVF for the large-N case.
+Measured on the M1 Ultra (numpy, top-20): 0.035 ms per query at 1,000 chunks, 0.38 ms at 10,000, 4.8 ms at 100,000 and 48 ms at 1,000,000 (a 1.5 GB matrix). At this lab's scale the matmul is noise; embedding the query (6–17 ms depending on device and load) is what you wait for. The "What the Toy Misses" section covers HNSW and IVF for the large-N case.
 
 **Why L2-normalize embeddings?**
 
@@ -227,9 +232,11 @@ def embed_texts(model, texts):
     return (embeddings / norms).astype(np.float32)
 ```
 
-**v0 limitation — measured:**
+**v0 on a real benchmark — measured:**
 
-Run `eval.py --version v0 --k 3` on the sample corpus. You'll see approximately 60% Recall@3. About 40% of queries fail to retrieve the relevant chunk in the top 3. The next two versions fix this, each adding a different mechanism.
+Run `python -m src.eval --version v0 --k 3` on the bundled sample corpus and you get 5/5 hits. That says nothing: five short documents become five chunks, so top-3 retrieval can barely miss (v1 and v2 also score 5/5, and v0 scores 5/5 even at k=1).
+
+To see real differences you need a real benchmark. `scripts/bench.py` runs the lab's own classes on two BEIR datasets with human relevance labels: SciFact (300 test queries over 5,183 paper abstracts) and NFCorpus (323 queries over 3,633 medical documents). It reports **hit@3**, the lab's "Recall@3": the share of queries where at least one of the top-3 chunks comes from a relevant document. Dense v0 scores **69.3%** on SciFact and **57.6%** on NFCorpus; a third or more of queries send the LLM no relevant chunk at all. As a sanity check, v0's nDCG@10 is 0.649 on SciFact and 0.312 on NFCorpus, against 0.645 and 0.316 for the same model in the [MTEB results repository](https://github.com/embeddings-benchmark/results), so the harness isn't broken.
 
 </LabStage>
 
@@ -241,7 +248,7 @@ Run `eval.py --version v0 --k 3` on the sample corpus. You'll see approximately 
     "Build BM25Okapi index from chunk corpus using rank-bm25",
     "Implement reciprocal_rank_fusion(ranked_lists, k=60)",
     "Run both retrievers, fuse with RRF, return top-3",
-    "Verify recall@3 improvement: run eval.py --version v1",
+    "Measure the change on a real benchmark: python scripts/bench.py --only quality (the 5-document sample can't show it)",
   ]}
   loc={200}
 >
@@ -281,9 +288,9 @@ Where:
 - `rank_s(d)` is the 1-indexed rank of document d in system s
 - `k = 60` prevents the top-ranked document from completely dominating
 
-Example: document X is ranked 1st by dense (score: `1/61 = 0.016`) and 2nd by BM25 (score: `1/62 = 0.016`). Its total RRF score is `0.032`. Document Y is ranked 1st by BM25 (score: `1/61`) and not in dense's top results (score: 0). Its RRF score is `0.016`. Document X wins.
+Example: document X is ranked 1st by dense (score: `1/61 = 0.0164`) and 2nd by BM25 (score: `1/62 = 0.0161`). Its total RRF score is `0.0325`. Document Y is ranked 1st by BM25 (score: `1/61`) and not in dense's top results (score: 0). Its RRF score is `0.0164`. Document X wins.
 
-The constant k=60 was found empirically in the original RRF paper (Cormack et al., 2009). It prevents the case where a document ranked 1st by one system gets an overwhelming advantage: `1/(60+1) = 0.016` vs `1/(60+20) = 0.012` for rank 20. The difference is only 40%, not 20x. This makes the fusion more robust to outliers.
+The constant k=60 was found empirically in the original RRF paper (Cormack et al., 2009). It prevents the case where a document ranked 1st by one system gets an overwhelming advantage: `1/(60+1) = 0.0164` vs `1/(60+20) = 0.0125` for rank 20. Rank 1 is worth only about 31% more than rank 20, not 20x (which is what k=0 would give). This makes the fusion more robust to outliers.
 
 **Implementation note on BM25 index updates:**
 
@@ -294,9 +301,20 @@ The constant k=60 was found empirically in the original RRF paper (Cormack et al
 self.bm25 = BM25Okapi(self._tokenized_chunks)  # rebuild from all chunks
 ```
 
-**v1 recall improvement:**
+**v1 vs v0 — measured:**
 
-Recall@3 goes from approximately 62% (v0 naive dense) to approximately 74% (v1 hybrid). The gain is largest on keyword-specific queries — "RRF", "memtable", "fsync" — where dense retrieval's embeddings diverge from the query embedding despite semantic relevance.
+| hit@3 | SciFact (300 q) | NFCorpus (323 q) |
+|---|---|---|
+| v0 dense | 69.3% | 57.6% |
+| BM25 alone (lab tokenizer) | 58.3% | 50.5% |
+| v1 hybrid RRF | 68.3% | 58.8% |
+| v1 − v0, paired 95% CI | −1.0pp [−5.0, +3.0] | +1.2pp [−2.5, +5.0] |
+
+Hybrid didn't measurably help on either dataset. The reason is the BM25 half. `tokenize_for_bm25()` splits on whitespace, so punctuation stays attached: "cells," and "cells" are different terms, and so are "(RRF)" and "RRF". Change that one line to `re.findall(r"\w+", text.lower())` and BM25-only nDCG@10 on SciFact goes from 0.566 to 0.650, and hybrid hit@3 from 68.3% to **73.7%** (+4.3pp over dense, CI [+0.7, +8.0]); on NFCorpus, 61.0% (+3.4pp, CI [−0.3, +7.1]). The bench runs this as an ablation; the lab code keeps the naive tokenizer so you can make the change and watch the number move.
+
+Hybrid retrieval only pays when both retrievers are decent and fail on different queries. A weak BM25 mostly adds noise to the fused ranking.
+
+The intervals come from a paired bootstrap over queries (10,000 resamples). With ~300 queries, differences under ~4 points are within noise; don't read the decimals.
 
 </LabStage>
 
@@ -308,7 +326,7 @@ Recall@3 goes from approximately 62% (v0 naive dense) to approximately 74% (v1 h
     "Stage 1: hybrid retrieval for top-20 candidates",
     "Stage 2: cross-encoder reranking — reranker.predict([(query, chunk), ...])",
     "Return top-3 from reranked candidates to LLM",
-    "Verify recall@3 improvement: run eval.py --version v2",
+    "Measure the change on a real benchmark: python scripts/bench.py --only quality (the 5-document sample can't show it)",
   ]}
   loc={180}
 >
@@ -328,7 +346,7 @@ Because the transformer can attend from every query token to every document toke
 
 A bi-encoder embeds each document once (offline) and stores the embeddings. At query time, you embed the query once and compute N dot products. This is fast: the document embeddings are cached; you only compute one embedding per query.
 
-A cross-encoder must process each (query, document) pair at query time. For N=1,000,000 chunks, that's 1,000,000 forward passes per query. At 500 queries/sec per forward pass, one query would take 2,000 seconds. This is completely infeasible.
+A cross-encoder must process each (query, document) pair at query time. For N=1,000,000 chunks, that's 1,000,000 forward passes per query. Our reranker scored 40–120 (query, chunk) pairs per second on this machine's CPU across three runs (up to ~380 on MPS when the GPU was quiet), so one query over 1M chunks would take hours: 2–7 on CPU. This is completely infeasible.
 
 **Two-stage retrieval:**
 
@@ -340,7 +358,7 @@ Stage 2 (accurate, cross-encoder):  rerank those 20 candidates
 Final:  top-3 → LLM
 ```
 
-Stage 1 is O(N) but parallelized via numpy and BM25's fast scoring. Stage 2 is O(k) where k=20. The cross-encoder only scores 20 pairs per query, not N.
+Stage 1 is O(N). The dense half is a numpy matmul (0.36 ms at 5,852 chunks). The BM25 half is the slower one by far: `rank-bm25` loops over documents in Python for every query term, 28 ms at the same size, roughly 80x the matmul, and linear in corpus size. Stage 2 is O(k) where k=20. The cross-encoder only scores 20 pairs per query, not N.
 
 The 20 candidates from stage 1 define the recall ceiling: if the relevant chunk isn't in the top-20, the cross-encoder can't rescue it. This is why stage 1 retrieves more than the final k=3 — we're trading a bit of stage-1 cost for a bigger candidate pool for stage 2.
 
@@ -362,11 +380,17 @@ top_3 = [candidates[i] for i in ranked[:3]]
 
 The model was fine-tuned on MS MARCO (a large passage ranking dataset from Bing search). The logits it outputs are not calibrated probabilities — only their relative ordering matters.
 
-**v2 recall improvement:**
+**v2 vs v1 — measured:**
 
-Recall@3 goes from approximately 74% (v1 hybrid) to approximately 81% (v2 with reranking). The improvement is concentrated in cases where the relevant chunk was in the hybrid retriever's top-20 but not top-3. The cross-encoder surfaces it.
+| | SciFact hit@3 | SciFact hit@20 | NFCorpus hit@3 | NFCorpus hit@20 |
+|---|---|---|---|---|
+| v1 hybrid RRF | 68.3% | 86.3% | 58.8% | 76.2% |
+| v2 hybrid + rerank | 72.7% | 86.3% | 61.3% | 76.2% |
+| v2 − v1 (hit@3), paired 95% CI | +4.3pp [+0.7, +8.3] | | +2.5pp [−0.9, +5.9] | |
 
-The cost: latency increases from ~5ms (v1 hybrid at 1000 chunks) to ~20ms (v2 with reranking). For a RAG system that's already waiting on an LLM (100ms-2000ms), 20ms for retrieval is negligible.
+Reranking is the lab's change that helps most reliably: clearly on SciFact, and in the same direction (within noise) on NFCorpus. Hit@20 doesn't move at all, which is the recall ceiling in action: the cross-encoder only reorders the 20 candidates, so every gain is a relevant chunk promoted from rank 4–20 into the top 3. Hit@1 moves more (SciFact 52.7% → 58.3%, NFCorpus 44.6% → 48.6%).
+
+The cost is latency. Scoring 20 candidates of ~1,360 characters each took a median 412 ms on CPU and 173 ms on MPS in the final run (163–519 ms and 53–333 ms across three runs on a shared machine), against 21–34 ms for the whole hybrid `retrieve()`. Reranking costs 8–12x everything else in retrieval combined. Next to an LLM call of a second or more that may still be acceptable, but it isn't negligible, and it's the first thing to batch, cache or move to a GPU.
 
 </LabStage>
 
@@ -385,8 +409,12 @@ The cost: latency increases from ~5ms (v1 hybrid at 1000 chunks) to ~20ms (v2 wi
       cmd: "python -m pytest tests/test_rag.py -v",
     },
     {
-      label: "Evaluate Recall@3 (v0 → v1 → v2)",
+      label: "Evaluate Recall@3 on the 5-document sample (v0 → v1 → v2; all score 5/5)",
       cmd: "python -m src.eval --version v0 --k 3\npython -m src.eval --version v1 --k 3\npython -m src.eval --version v2 --k 3",
+    },
+    {
+      label: "Measure v0/v1/v2 on BEIR SciFact (downloads 3 MB; about a minute on an M1)",
+      cmd: "python scripts/bench.py --only quality --datasets scifact",
     },
     {
       label: "Start the RAG server (v1 hybrid)",
@@ -401,7 +429,11 @@ The cost: latency increases from ~5ms (v1 hybrid at 1000 chunks) to ~20ms (v2 wi
       cmd: "curl -s -X POST http://localhost:8000/query \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"question\": \"What is WAL?\", \"top_k\": 3}' | python -m json.tool",
     },
   ]}
-  expectedOutput={`=== Recall@3 Evaluation Report ===
+  expectedOutput={`$ python -m src.eval --version v2 --k 3
+Ingesting 5 documents...
+Indexed 5 chunks.
+
+=== Recall@3 Evaluation Report ===
 
 Overall Recall@3: 100.0%  (5/5 hits)
 
@@ -423,42 +455,57 @@ Overall Recall@3: 100.0%  (5/5 hits)
 
 [5] [HIT] Q: 'How does Raft handle leader failure?'
      Expected: 'elections'
-     Result:   rank 1`}
+     Result:   rank 1
+
+{
+  "version": "v2",
+  "k": 3,
+  "recall": 1.0,
+  "hits": 5,
+  "total": 5
+}`}
 />
 
 ## Benchmarks
 
 <Benchmark
-  hardware="M2 MacBook Pro, 16GB RAM"
+  hardware="Apple M1 Ultra, 64 GB RAM, macOS 27, Python 3.13.7, torch 2.14.1, sentence-transformers 6.1.0, rank-bm25 0.2.2 — quality on MPS, latency on CPU and MPS as labelled, 2026-10-11"
   rows={[
-    { metric: "Dense retrieval (numpy cosine, 1000 chunks)", value: "8,000",  unit: "queries/sec", note: "estimated — vectorized numpy matmul" },
-    { metric: "BM25 retrieval (1000 chunks)",                value: "50,000", unit: "queries/sec", note: "estimated — pure Python, no embedding overhead" },
-    { metric: "Cross-encoder reranking (20 candidates)",     value: "50",     unit: "queries/sec", note: "estimated — CPU, ms-marco-MiniLM-L-6-v2" },
-    { metric: "Recall@3 — naive dense retrieval",            value: "62",     unit: "%",           note: "estimated — all-MiniLM-L6-v2 on BEIR subset" },
-    { metric: "Recall@3 — hybrid BM25 + dense",              value: "74",     unit: "%",           note: "estimated — +12pp over dense alone" },
-    { metric: "Recall@3 — hybrid + cross-encoder reranking", value: "81",     unit: "%",           note: "estimated — +7pp over hybrid alone" },
+    { metric: "hit@3 SciFact — dense v0",                        value: "69.3",       unit: "%",  note: "measured — 300 queries; nDCG@10 0.649 (MTEB lists 0.645 for this model)" },
+    { metric: "hit@3 SciFact — hybrid RRF v1",                   value: "68.3",       unit: "%",  note: "measured — −1.0pp vs dense, CI [−5.0, +3.0]" },
+    { metric: "hit@3 SciFact — hybrid + rerank v2",              value: "72.7",       unit: "%",  note: "measured — +4.3pp vs hybrid, CI [+0.7, +8.3]" },
+    { metric: "hit@3 SciFact — hybrid, \\w+ BM25 tokenizer",      value: "73.7",       unit: "%",  note: "measured — ablation; +4.3pp vs dense, CI [+0.7, +8.0]" },
+    { metric: "hit@3 NFCorpus — dense / hybrid / rerank",        value: "57.6 / 58.8 / 61.3", unit: "%", note: "measured — 323 queries; no step clears its CI on its own" },
+    { metric: "Chunks truncated by the embedder (SciFact)",      value: "65",         unit: "%",  note: "measured — 24.5% of chunk tokens never embedded (256-token window)" },
+    { metric: "Query embedding, 1 query (CPU / MPS)",            value: "11.8 / 8.6", unit: "ms", note: "measured — 7.4–17 / 5.9–11 ms across three runs" },
+    { metric: "Dense scoring, numpy, 5,852 chunks / 1M vectors", value: "0.36 / 48",  unit: "ms", note: "measured — top-20 via argpartition; 1M × 384 float32 = 1.5 GB" },
+    { metric: "BM25 scoring, rank-bm25, 5,852 chunks",           value: "28",         unit: "ms", note: "measured — 11–28 ms across runs; pure Python, linear in N" },
+    { metric: "Cross-encoder rerank, 20 candidates (CPU / MPS)", value: "412 / 173",  unit: "ms", note: "measured — 163–519 / 53–333 ms across three runs" },
+    { metric: "retrieve() v1 hybrid / v2 rerank (MPS)",          value: "21 / 176",   unit: "ms", note: "measured — CPU: 34 / 446 ms" },
   ]}
 />
 
-The benchmark numbers are estimates based on published results for these models and the BEIR benchmark. Run `eval.py` on your corpus to measure actual recall. The throughput numbers reflect the vectorized operations on a CPU — GPU inference on sentence-transformers can be 5-10x faster.
+Quality rows come from `scripts/bench.py` running the lab's own classes on two public BEIR test sets with human relevance labels. They're small (300 and 323 queries), so every difference is reported with a paired-bootstrap 95% CI over queries; differences under ~4 points are within noise. They are also specific to these corpora: short scientific and medical abstracts, where most documents fit in one chunk.
+
+Latency rows are medians of 5 rounds of 50 queries, with the stages interleaved within each round. The machine was shared with other workloads (the raw JSON records the load average), and absolute numbers moved up to 2–3x between three runs of the script on the same day; the notes give the range. The ratios held steadier: reranking 20 candidates cost 8–12x the whole hybrid retrieval in every run, and pure-Python BM25 cost 70–80x the numpy matmul.
 
 ## Stress tests
 
-**Corpus size scaling**: at 1,000 chunks, all three versions respond in under 50ms. At 100,000 chunks, the numpy cosine similarity becomes the bottleneck: (100,000 x 384) float32 array is 150MB; the matrix multiply takes ~50ms per query. At 1,000,000 chunks, response time would be ~500ms — unacceptable for interactive use. This is the exact point where a vector database (FAISS, Weaviate) becomes necessary.
+**Corpus size scaling**: numpy dense scoring on random 384-dim vectors took 0.035 ms per query at 1,000 vectors, 0.38 ms at 10,000, 4.8 ms at 100,000 and 48 ms at 1,000,000 (a 1.5 GB matrix): linear, as expected, and still fine for a toy at a million. BM25 is the real scaling problem here: `rank-bm25` went from 3.4 ms at 1,000 chunks to 28 ms at 5,852, and it is linear in N in pure Python, so a million chunks would be seconds per query. That, more than the matmul, is where Elasticsearch/Lucene and a vector index (FAISS, HNSW) take over.
 
-**Chunk boundary pathology**: generate a document where the answer always appears at character 1900 of a 2000-character document. Chunk at 2048 with no overlap — the answer is always in the same chunk and easy to retrieve. Reduce the overlap to 0 and shift the answer to character 2050 — it's now split across a chunk boundary and neither chunk retrieves it reliably. Restore the 200-character overlap — the problem disappears. This is the empirical validation of why overlap matters.
+**Chunk size and overlap**: `scripts/bench.py` re-chunks the corpora with the lab's `chunk_document()` at four settings and measures dense hit@3. At 2,048 characters, 200 characters of overlap vs none changed hit@3 by +0.3pp on SciFact (CI [−1.0, +1.7]) and +0.9pp on NFCorpus (CI [−0.9, +2.8]): no measurable effect, because most abstracts fit in one chunk and the chunker already ends chunks on sentence boundaries. Halving the chunks to 1,024 characters, so that nearly all of each chunk fits the embedder's 256-token window, didn't help either: hit@3 fell 1.5–3.4 points (CIs reaching zero), probably because more, smaller chunks per document crowd the top 3 with fragments. On long documents with answers that span sentences you may see the opposite; measure on your own corpus.
 
-**Cross-encoder latency under load**: at 10 concurrent queries (each needing 20 cross-encoder inferences), CPU-bound inference becomes a bottleneck. The cross-encoder is not parallelized across queries — Python's GIL prevents true concurrency. A production deployment would use Triton Inference Server or FastAPI's process pool to parallelize.
+**Cross-encoder latency under load**: `scripts/bench.py --server` starts the FastAPI server with v2 and a 1,000-chunk index and sends 100 queries. One client at a time: p50 217 ms, 4.6 requests/s. Ten concurrent clients: p50 2,014 ms, 4.1 requests/s, the same throughput with ten times the latency. The `/query` handler is `async def` but calls the blocking pipeline directly, so the event loop runs one query at a time and everyone else waits. A production deployment would make the handler a plain `def` (FastAPI then runs it in a thread pool), batch rerank requests, or move the models behind an inference server such as Triton.
 
-**BM25 exact-match edge case**: BM25 with no query terms in the corpus returns all-zero scores. `rank-bm25` handles this gracefully (returns uniform scores), but the ranked order will be deterministic-but-meaningless. The RRF fusion blends this with the dense ranking, so the degradation is bounded.
+**BM25 exact-match edge case**: BM25 with no query terms in the corpus returns all-zero scores. `rank-bm25` handles this gracefully (every score is 0), but the ranked order will be deterministic-but-meaningless. The RRF fusion blends this with the dense ranking, so the degradation is bounded.
 
 ## What the toy misses
 
 <WhatTheToyMisses
   items={[
-    { thing: "Vector database for large corpora",  why: "Our numpy cosine similarity is O(N) per query. At 1M chunks, this is too slow. Vector databases (FAISS, Pinecone, Weaviate) use HNSW or IVF for approximate nearest neighbor search — O(log N) or O(sqrt N). The tradeoff: approximate recall (HNSW might miss 5% of true nearest neighbors) vs exact recall (numpy never misses)." },
+    { thing: "Vector database for large corpora",  why: "Our numpy cosine similarity is O(N) per query: 48 ms at 1M chunks on the M1 Ultra, and our pure-Python BM25 grows the same way from a much higher base (28 ms at 5,852 chunks). At millions of chunks and real QPS, that's too slow. Vector databases (FAISS, Pinecone, Weaviate) use HNSW or IVF for approximate nearest neighbor search — O(log N) or O(sqrt N). The tradeoff: approximate recall (HNSW misses some true nearest neighbours; how many depends on its parameters) vs exact recall (numpy never misses)." },
     { thing: "Chunking strategy",                  why: "Fixed-size chunking splits mid-sentence. Semantic chunking (split on paragraph/section boundaries) and recursive splitting (try sentence, then paragraph, then larger) produce better chunks. LangChain's RecursiveCharacterTextSplitter and LlamaIndex's SentenceSplitter implement production-grade chunking. Our fixed-size approach is a transparent baseline." },
-    { thing: "Contextual compression",             why: "Large chunks contain relevant sentences buried in irrelevant context. LLM Lingua and similar compression methods extract only the relevant sentences from each retrieved chunk before sending to the LLM — reducing token cost by 4-5x. Our chunks are sent verbatim." },
+    { thing: "Contextual compression",             why: "Large chunks contain relevant sentences buried in irrelevant context. LLM Lingua and similar compression methods extract only the relevant sentences from each retrieved chunk before sending to the LLM, cutting the tokens you pay for. Our chunks are sent verbatim." },
     { thing: "Contamination detection",            why: "Eval datasets can be contaminated if the model was trained on the test questions. Our eval harness does not check for contamination. The MMLU contamination problem (models memorizing eval sets) is real and makes published RAG numbers hard to compare." },
     { thing: "Multi-hop retrieval",                why: "Some questions require chaining retrievals. 'Who founded the company that made the product?' needs: retrieve about the product, then retrieve about the founder. Our RAG does a single retrieval. FLARE and IRCoT do iterative retrieval guided by the LLM's intermediate reasoning steps." },
     { thing: "Document structure awareness",       why: "Chunking a PDF loses table structure, figure captions, and section hierarchy. Production RAG systems parse document structure (headings, tables, lists) and use it to create semantically coherent chunks. A chunk that splits a table in half produces misleading context." },
@@ -507,6 +554,8 @@ public class RagClient {
     public record RagResult(String answer, List<String> sources, String version) {}
 }
 ```
+
+The Python server speaks snake_case JSON (`top_k`, `chunks_added`, `total_chunks`), so the request and response records in `RagClient.java` map those fields with `@JsonProperty`. Without that, Jackson silently sends `topK` (ignored, so you always get the default 3) and reads `chunksAdded` as 0.
 
 ### Part B — OurRetriever: the LangChain4j plug-in
 
@@ -595,14 +644,14 @@ cd labs/rag/java-integration
 mvn spring-boot:run
 ```
 
-Expected output:
+Expected output (the answers come from whatever LLM you point it at, so yours will be worded differently; each of the five demo documents is shorter than one chunk, so they index as 5 chunks):
 
 ```
 === RAG Spring Integration Demo ===
 
 RAG backend health: ok (chunks indexed: 0, version: v1-hybrid)
 
-Ingested 5 documents → N chunks indexed.
+Ingested 5 documents → 5 chunks indexed.
 
 Answering questions (retrieval: Python RAG, generation: LLM):
 
@@ -619,13 +668,14 @@ A3: Consistent hashing distributes data across nodes using a hash ring,
     minimizing reorganization when nodes are added or removed.
 
 Done. The Python RAG backend acted as a LangChain4j ContentRetriever.
+Any Java AI application can use it identically.
 ```
 
 </JavaIntegration>
 
 ## What surprised me
 
-<WhatSurprisedMe insight="The 50-token overlap in chunking seems wasteful — you're storing 10% duplicate content. But without it, a query that semantically matches the end of chunk N never retrieves chunk N — it retrieves chunk N+1 which starts in the middle of the relevant paragraph. The overlap ensures relevant context is always at the start of at least one chunk. I tested this empirically: setting overlap to 0 dropped Recall@3 from 62% to 51% on queries whose target passages appeared in the last 20% of a chunk. The 10% storage overhead buys an 11 percentage point recall improvement on a targeted class of queries." />
+<WhatSurprisedMe insight="The biggest recall bug in this lab wasn't in retrieval. When a chunk reached the end of a document, chunk_document() still stepped back 200 characters for the overlap and emitted one more 'chunk': a fragment, median 84 characters, wholly contained in the chunk before it. That was 556 of 6,408 chunks on SciFact and 494 of 4,627 on NFCorpus, and those fragments competed for the top-3 slots. Two runs of the same benchmark before and after the one-line fix: dense hit@3 on NFCorpus went from 53.9% to 57.6%, and nDCG@10 from 0.290 to 0.312, next to the 0.316 MTEB reports for this model (SciFact: 68.3% to 69.3%). Meanwhile the overlap itself, which I had been told matters, measured as noise on both datasets (+0.3 and +0.9 points). The other surprise: changing the BM25 tokenizer from whitespace to \w+ made hybrid retrieval as good as cross-encoder reranking on SciFact (73.7% vs 72.7% hit@3) at none of the reranker's 170-410 ms. Before tuning the clever stage, measure the boring ones." />
 
 ## Where to go deeper
 

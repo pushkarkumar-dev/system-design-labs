@@ -8,9 +8,9 @@
 # that's significantly more accurate.
 #
 # Why not use a cross-encoder for all retrieval?
-# Cross-encoders are 100–1000× slower than bi-encoders. Encoding 1M documents
-# offline with a bi-encoder takes hours. Encoding (query, doc) pairs with a cross-
-# encoder at query time is O(N) — for N=1M chunks, that's infeasible.
+# A bi-encoder embeds every document once, offline; at query time it embeds only
+# the query. A cross-encoder needs one forward pass per (query, doc) pair at query
+# time — O(N) model calls per query, infeasible for N=1M chunks.
 #
 # The production solution: two stages.
 #   Stage 1 (fast): BM25 + dense → retrieve 20 candidates.    O(N), offline-indexed.
@@ -20,11 +20,12 @@
 # Cross-encoder model: cross-encoder/ms-marco-MiniLM-L-6-v2
 #   - Trained on MS MARCO passage ranking dataset
 #   - Outputs a logit (not a probability) — higher = more relevant
-#   - 6-layer MiniLM: fast enough for k=20 on CPU (~50 queries/sec)
+#   - 6-layer MiniLM; scoring 20 (query, chunk) pairs is the slowest step of the
+#     pipeline (see scripts/bench.py for measured latency on CPU and MPS)
 #
-# Recall@3 improvement: ~74% (v1 hybrid) → ~81% (v2 with reranking)
-# The improvement is concentrated in queries where the right chunk is ranked
-# 4–15 by the hybrid retriever — reranking surfaces it to the top 3.
+# Measured hit@3 (scripts/bench.py): BEIR SciFact 68.3% (v1) -> 72.7% (v2),
+# NFCorpus 58.8% -> 61.3%. Hit@20 does not change: the reranker only reorders
+# the 20 candidates, so it can only help when the right chunk is already in them.
 
 from __future__ import annotations
 

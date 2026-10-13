@@ -23,6 +23,11 @@
 //! Records before the stop point are good. Records at or after it are lost.
 //! This is correct: WAL only guarantees durability of fsynced records.
 //!
+//! Before reopening for append, `open()` truncates the file to the end of the
+//! last valid record (`set_len` + fsync). Without this, the next append would
+//! land *after* the torn bytes, and the following recovery would stop at the
+//! torn record and never reach it: an acknowledged write would be lost.
+//!
 //! ## Durability
 //!
 //! `append()` calls `sync_all()` (fsync) before returning. This is expensive
@@ -52,12 +57,15 @@ impl Wal {
     /// records recovered from disk.
     pub fn open(path: &Path) -> io::Result<(Self, Vec<LogRecord>)> {
         let recovered = if path.exists() {
-            recover(path)?
+            recover_and_truncate(path)?
         } else {
             Vec::new()
         };
 
         let next_offset = recovered.len() as u64;
+
+        // Append mode: every write goes to the current end of file, which is
+        // now the end of the last valid record.
 
         let file = OpenOptions::new()
             .create(true)
@@ -100,7 +108,7 @@ impl Wal {
     }
 
     pub fn replay(&self, from_offset: u64) -> io::Result<Vec<LogRecord>> {
-        let mut records = recover(&self.path)?;
+        let (mut records, _) = recover(&self.path)?;
         records.retain(|r| r.offset >= from_offset);
         Ok(records)
     }
@@ -116,10 +124,33 @@ fn checksum(data: &[u8]) -> u32 {
     h.finalize()
 }
 
-fn recover(path: &Path) -> io::Result<Vec<LogRecord>> {
+/// Recover all valid records, then cut off any torn tail so the next append
+/// starts exactly where the last valid record ends. Shared with v2.
+pub(crate) fn recover_and_truncate(path: &Path) -> io::Result<Vec<LogRecord>> {
+    let (records, valid_len) = recover(path)?;
+    let file_len = std::fs::metadata(path)?.len();
+    if file_len > valid_len {
+        tracing::warn!(
+            "truncating torn tail: {} garbage bytes after offset {} (byte {})",
+            file_len - valid_len,
+            records.len(),
+            valid_len
+        );
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(valid_len)?;
+        file.sync_all()?;
+    }
+    Ok(records)
+}
+
+/// Scan the file and return the valid records plus the byte length of the
+/// valid prefix (the end of the last good record).
+fn recover(path: &Path) -> io::Result<(Vec<LogRecord>, u64)> {
     let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
     let mut reader = BufReader::new(file);
     let mut records = Vec::new();
+    let mut valid_len: u64 = 0;
 
     loop {
         let mut header = [0u8; HEADER_LEN];
@@ -142,6 +173,12 @@ fn recover(path: &Path) -> io::Result<Vec<LogRecord>> {
         let stored_crc = u32::from_le_bytes(header[1..5].try_into().unwrap());
         let length = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
 
+        // A torn header can carry a garbage length; don't allocate past EOF.
+        if valid_len + HEADER_LEN as u64 + length as u64 > file_len {
+            tracing::warn!("truncated record at offset {} — stopping recovery", records.len());
+            break;
+        }
+
         let mut data = vec![0u8; length];
         match reader.read_exact(&mut data) {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -163,10 +200,11 @@ fn recover(path: &Path) -> io::Result<Vec<LogRecord>> {
 
         let offset = records.len() as u64;
         records.push(LogRecord::new(offset, &data));
+        valid_len += (HEADER_LEN + length) as u64;
     }
 
     tracing::info!("recovered {} records from {:?}", records.len(), path);
-    Ok(records)
+    Ok((records, valid_len))
 }
 
 #[cfg(test)]
@@ -224,5 +262,45 @@ mod tests {
         // Should recover only the good record, ignore the garbage
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].decode_data(), b"good");
+    }
+
+    /// Regression: a torn tail must be truncated on open, or the next
+    /// acknowledged append lands after the garbage and is lost on the
+    /// following recovery.
+    #[test]
+    fn append_after_torn_tail_is_recovered() {
+        let f = NamedTempFile::new().unwrap();
+        {
+            let (mut wal, _) = Wal::open(f.path()).unwrap();
+            wal.append(b"one").unwrap();
+            wal.append(b"two").unwrap();
+        }
+        let good_len = std::fs::metadata(f.path()).unwrap().len();
+
+        // Simulate a crash mid-append: a full header claiming 100 bytes of
+        // data, followed by only 3 of them.
+        {
+            use std::io::Write;
+            let mut file = OpenOptions::new().append(true).open(f.path()).unwrap();
+            file.write_all(&[MAGIC]).unwrap();
+            file.write_all(&0xDEADBEEFu32.to_le_bytes()).unwrap();
+            file.write_all(&100u32.to_le_bytes()).unwrap();
+            file.write_all(b"par").unwrap();
+        }
+
+        {
+            let (mut wal, recovered) = Wal::open(f.path()).unwrap();
+            assert_eq!(recovered.len(), 2);
+            // The torn bytes are gone before anything new is written.
+            assert_eq!(std::fs::metadata(f.path()).unwrap().len(), good_len);
+            let offset = wal.append(b"three").unwrap();
+            assert_eq!(offset, 2);
+        }
+
+        let (_, recovered) = Wal::open(f.path()).unwrap();
+        assert_eq!(recovered.len(), 3);
+        assert_eq!(recovered[0].decode_data(), b"one");
+        assert_eq!(recovered[1].decode_data(), b"two");
+        assert_eq!(recovered[2].decode_data(), b"three");
     }
 }

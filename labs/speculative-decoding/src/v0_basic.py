@@ -1,4 +1,4 @@
-# v0_basic.py — Core speculative decoding: draft-then-verify algorithm.
+# v0_basic.py — Core speculative decoding algorithm (draft-then-verify).
 #
 # Speculative decoding (Chen et al. 2023) achieves 2-4x LLM throughput
 # without changing output distribution. The key insight:
@@ -28,12 +28,15 @@
 #
 # EXPECTED SPEEDUP:
 #
-#   If the acceptance rate is α and we propose K tokens:
-#     Expected accepted tokens = sum(α^i for i in 0..K-1) + 1 (bonus)
-#     = (1 - α^K) / (1 - α) + 1
+#   If each draft token is accepted with probability α (given the previous
+#   one was) and we propose K tokens, each target call emits on average
+#     E[tokens per target call] = 1 + α + α^2 + ... + α^K
+#                               = (1 - α^(K+1)) / (1 - α)
+#   The leading 1 is the corrected resample on rejection, or the bonus token
+#   when all K drafts are accepted.
 #
-#   At α=0.82, K=5: (1-0.82^5)/(1-0.82) + 1 ≈ 3.49 + 1 bonus in the formula
-#   but we count it as 1 call getting multiple tokens, so speedup ≈ 3.2x.
+#   At α=0.82, K=5: (1 - 0.82^6) / 0.18 ≈ 3.87 tokens per target call.
+#   That counts target calls only; the draft model's cost comes on top.
 #
 # REFERENCE:
 #   Chen et al. (2023) "Accelerating Large Language Model Decoding with
@@ -120,7 +123,8 @@ class AcceptanceRate:
         """
         tokens_generated / target_calls.
         Standard decoding = 1 token per target call → speedup = 1.0.
-        With acceptance_rate=0.82, K=5 → speedup ≈ 3.2.
+        With per-token α=0.82, K=5 → ≈3.87 tokens per target call.
+        Note acceptance_rate (accepted / proposed) is not that α.
         """
         if self.total_target_calls == 0:
             return 0.0

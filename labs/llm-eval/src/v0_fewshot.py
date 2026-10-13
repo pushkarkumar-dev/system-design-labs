@@ -249,8 +249,9 @@ def _extract_multiple_choice(completion: str) -> str:
     if match:
         return match.group(1).upper()
 
-    # Pattern 3: "The answer is A" / "is (A)"
-    match = re.search(r"is\s+\(?([ABCD])\)?", completion, re.IGNORECASE)
+    # Pattern 3: "The answer is A" / "is (A)". Case-sensitive and word-bounded:
+    # with IGNORECASE and no \b, "Option A is correct" matched "is c" and returned C.
+    match = re.search(r"\bis\s+\(?([ABCD])\b", completion)
     if match:
         return match.group(1).upper()
 

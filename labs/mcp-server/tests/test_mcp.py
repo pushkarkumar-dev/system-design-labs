@@ -263,6 +263,9 @@ class TestV1Http:
             pytest.skip("fastapi not installed")
 
         app, server = create_app()
+        # Starlette's TestClient reads the whole response before returning, so
+        # bound the otherwise endless stream to its first event.
+        server.sse_max_events = 1
         client = TestClient(app)
 
         # Connect to SSE — read the first event then disconnect
@@ -354,6 +357,116 @@ class TestV2Advanced:
         auth_mw.set_request_token("secret-token-abc")
         resp = server.handle(make_request("tools/list"))
         assert resp.error is None
+
+    def test_tools_call_rejects_paths_outside_roots(self, tmp_path):
+        """File tools may only touch paths inside the declared roots, after resolving ../ and symlinks."""
+        inside = tmp_path / "notes.txt"
+        inside.write_text("hello")
+        server = McpServer(name="roots-test-server", roots=[str(tmp_path)])
+        init_server(server)
+
+        def call(path):
+            return server.handle(make_request("tools/call", {"name": "read_file", "arguments": {"path": path}}))
+
+        ok = call(str(inside))
+        assert ok.result["isError"] is False
+        assert ok.result["content"][0]["text"] == "hello"
+
+        for escape in ("/etc/hosts", str(tmp_path / ".." / "outside.txt")):
+            resp = call(escape)
+            assert resp.result["isError"] is True
+            assert "outside the server's declared roots" in resp.result["content"][0]["text"]
+
+        (tmp_path / "link").symlink_to("/etc")
+        resp = call(str(tmp_path / "link" / "hosts"))
+        assert resp.result["isError"] is True
+
+    def test_tools_call_checks_every_path_like_argument(self, tmp_path):
+        """
+        Roots apply to any path-like argument, not just `path`/`directory`:
+        a schema-annotated path (format or x-mcp-path) under any name, a list
+        of paths, and the common fallback names (filename, file, dir, ...).
+        """
+        from src.v0_stdio import _TOOL_REGISTRY, mcp_tool
+
+        inside = tmp_path / "notes.txt"
+        inside.write_text("hello")
+
+        def read_any(**kwargs):
+            values = []
+            for v in kwargs.values():
+                values.extend(v if isinstance(v, list) else [v])
+            return "|".join(Path(v).read_text() for v in values)
+
+        tools = {
+            "t_filename": {"filename": {"type": "string"}},
+            "t_file": {"file": {"type": "string"}},
+            "t_dir": {"dir": {"type": "string"}},
+            "t_format": {"target": {"type": "string", "format": "path"}},
+            "t_annotated": {"source": {"type": "string", "x-mcp-path": True}},
+            "t_list": {"inputs": {"type": "array", "items": {"type": "string", "format": "path"}}},
+        }
+        for name, props in tools.items():
+            mcp_tool(name=name, description="test", input_schema={
+                "type": "object", "properties": props, "required": list(props),
+            })(read_any)
+        try:
+            server = McpServer(name="roots-test-server", roots=[str(tmp_path)])
+            init_server(server)
+
+            def call(tool, arg, value):
+                return server.handle(make_request(
+                    "tools/call", {"name": tool, "arguments": {arg: value}}
+                ))
+
+            for tool, props in tools.items():
+                (arg,) = props
+                is_list = props[arg]["type"] == "array"
+                ok = call(tool, arg, [str(inside)] if is_list else str(inside))
+                if tool != "t_dir":
+                    assert ok.result["isError"] is False, (tool, ok.result)
+                    assert ok.result["content"][0]["text"] == "hello"
+                escape = "/etc/hosts"
+                bad = [str(inside), escape] if is_list else escape
+                resp = call(tool, arg, bad)
+                assert resp.result["isError"] is True, tool
+                assert "outside the server's declared roots" in resp.result["content"][0]["text"], tool
+
+            # Non-path arguments are left alone.
+            mcp_tool(name="t_plain", description="test", input_schema={
+                "type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"],
+            })(lambda text: text)
+            tools["t_plain"] = {}
+            resp = call("t_plain", "text", "/etc/hosts")
+            assert resp.result["isError"] is False
+        finally:
+            for name in tools:
+                _TOOL_REGISTRY.pop(name, None)
+
+    def test_http_transport_passes_bearer_token_to_auth(self):
+        """Over HTTP, the Authorization header reaches AuthMiddleware; /sse needs the token too."""
+        from fastapi.testclient import TestClient
+        from src.server import McpServer as PublicServer
+
+        server = PublicServer(name="http-auth", transport="http", auth_token="tok-123")
+        app, _ = create_app(server._server, auth_middleware=server._auth_middleware)
+        client = TestClient(app)
+
+        init = client.post("/messages", json=make_request("initialize", {
+            "protocolVersion": MCP_PROTOCOL_VERSION, "clientInfo": {"name": "t", "version": "0"},
+        }))
+        assert init.json().get("error") is None
+
+        no_token = client.post("/messages", json=make_request("tools/list", req_id=2)).json()
+        assert no_token["error"]["code"] == ErrorCode.UNAUTHORIZED
+        wrong = client.post("/messages", json=make_request("tools/list", req_id=3),
+                            headers={"Authorization": "Bearer nope"}).json()
+        assert wrong["error"]["code"] == ErrorCode.UNAUTHORIZED
+        right = client.post("/messages", json=make_request("tools/list", req_id=4),
+                            headers={"Authorization": "Bearer tok-123"}).json()
+        assert right.get("error") is None and right["result"]["tools"]
+
+        assert client.get("/sse").status_code == 401
 
     def test_logging_middleware_captures_all_requests(self):
         """LoggingMiddleware logs every request/response pair."""

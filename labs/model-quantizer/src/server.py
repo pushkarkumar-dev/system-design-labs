@@ -166,14 +166,14 @@ def quantize(req: QuantizeRequest) -> QuantizeResponse:
 @app.get("/compare", response_model=CompareResponse)
 def compare(
     model: str = "GPT-2 (124M params)",
-    fp32_size_mb: float = 488.0,
+    fp32_size_mb: float = 497.8,  # GPT-2: 124,439,808 params x 4 bytes
     base_perplexity: float = 29.0,
 ) -> CompareResponse:
     """
     Compare all quantization schemes for the given model configuration.
 
     Returns a table of scheme -> (bits, size, perplexity) for easy comparison.
-    Perplexity deltas are based on published benchmarks for GPT-2 on wikitext-2.
+    Sizes are exact arithmetic; perplexity values are illustrative (hard-coded), not measured.
     """
     comp = QuantizationComparison(
         model_name=model,

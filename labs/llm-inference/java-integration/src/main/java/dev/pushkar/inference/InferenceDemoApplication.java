@@ -124,15 +124,17 @@ public class InferenceDemoApplication {
             System.out.println("--- KV Cache Memory Reference ---");
             System.out.println("  GPT-2 (12 layers, 12 heads, d_head=64) at seq_len=1024:");
             long gpt2Bytes = 2L * 12 * 12 * 64 * 1024 * 4;
-            System.out.printf("    2 * 12 * 12 * 64 * 1024 * 4 = %,d bytes = %.1f MB%n",
+            System.out.printf("    2 * 12 * 12 * 64 * 1024 * 4 = %,d bytes = %.1f MiB%n",
                     gpt2Bytes, gpt2Bytes / 1024.0 / 1024.0);
             System.out.println();
-            System.out.println("  Llama 3 70B (80 layers, 64 heads, d_head=128, bfloat16) at seq_len=1024:");
-            long llamaBytes = 2L * 80 * 64 * 128 * 1024 * 2;
-            System.out.printf("    2 * 80 * 64 * 128 * 1024 * 2 = %,d bytes = %.1f GB%n",
-                    llamaBytes, llamaBytes / 1024.0 / 1024.0 / 1024.0);
-            System.out.printf("    An A100 (80 GB HBM) can hold at most ~%d such requests in KV cache.%n",
-                    (int)(80L * 1024 * 1024 * 1024 / llamaBytes));
+            // Llama 3 uses grouped-query attention: 64 query heads share 8 KV heads,
+            // and only the KV heads are cached.
+            System.out.println("  Llama 3 70B (80 layers, 8 KV heads, d_head=128, bfloat16) at seq_len=1024:");
+            long llamaBytes = 2L * 80 * 8 * 128 * 1024 * 2;
+            System.out.printf("    2 * 80 * 8 * 128 * 1024 * 2 = %,d bytes = %.0f MiB%n",
+                    llamaBytes, llamaBytes / 1024.0 / 1024.0);
+            System.out.println("    Weights alone are 70B * 2 bytes = 140 GB, so this model needs at least");
+            System.out.println("    two 80 GB GPUs before the first token is cached.");
             System.out.println();
             System.out.println("Done.");
         };

@@ -12,7 +12,8 @@ import java.util.List;
  * <p>Wraps {@code POST /generate} and {@code GET /stats} on our FastAPI server.
  * The caller never needs to know whether the server uses speculative decoding
  * internally — the output quality is identical to standard greedy decoding.
- * Only throughput changes: 3.2x more tokens per second with acceptance_rate=0.82.
+ * Only throughput changes: ~3.87 tokens per target forward pass at per-token
+ * acceptance 0.82 and K=5, before paying for the draft model.
  *
  * <p>This transparency is a key property of speculative decoding:
  * it is a serving optimization, not a model change. The output distribution

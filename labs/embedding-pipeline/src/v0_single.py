@@ -8,9 +8,10 @@
 #   2. sentence-transformers wraps the HuggingFace Transformers library — one line to load a model.
 #   3. FastAPI makes the embeddings available to any HTTP client (Java, Go, Ruby, ...).
 #
-# Limitation measured in v1:
-#   Calling model.encode() with a single text is 18x slower per text than batch=32.
-#   The forward pass time is nearly constant regardless of batch size up to ~32.
+# Limitation measured in v1 (scripts/bench.py, M1 Ultra, short texts):
+#   One text per model.encode() call gives 120 texts/sec on CPU and 160 on MPS;
+#   32 texts per call give 695 and 1,930. Per-call time grows with the batch
+#   (8.3 ms -> 46 ms on CPU), just much more slowly than the batch does.
 
 from __future__ import annotations
 
@@ -131,10 +132,10 @@ class SingleModelServer:
     - One SentenceTransformer loaded at startup.
     - encode() is called per-request — no caching, no batching.
 
-    Measured limitation (v1 fixes this):
-    - At 100 texts/sec (single-item), 32-item batches yield 1,800 texts/sec.
-    - The model's forward pass takes ~10ms whether you send 1 text or 32 texts.
-    - Single-item encoding wastes 31/32 of each forward pass's capacity.
+    Measured limitation (v1 fixes this), short texts on an M1 Ultra:
+    - One text per call: 120 texts/sec (CPU), 160 (MPS).
+    - 32 texts per call: 695 texts/sec (CPU), 1,930 (MPS) -- 6x / 12x.
+    - Single-item calls leave most of the hardware idle; per-call overhead dominates.
     """
 
     def __init__(self, model_name: str = DEFAULT_MODEL) -> None:

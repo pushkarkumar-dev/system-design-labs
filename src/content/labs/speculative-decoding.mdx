@@ -23,8 +23,8 @@ stages:
   - id: v1
     title: "Batched Decoding + Speedup Stats"
     learningGoals:
-      - "Expected speedup = geometric series: sum of acceptance_rate^i for i=0..K"
-      - "acceptance_rate=0.82 and K=5 gives 3.2x speedup"
+      - "Expected tokens per target call = geometric series: sum of alpha^i for i=0..K, where alpha is the per-token acceptance probability"
+      - "alpha=0.82 and K=5 gives 3.87 tokens per target call (about 2.6x net with a draft at 10% of target cost)"
     approxLoc: 460
     branchOrTag: "speculative-decoding-v1"
   - id: v2
@@ -35,26 +35,26 @@ stages:
     approxLoc: 710
     branchOrTag: "speculative-decoding-v2"
 benchmarks:
-  - metric: "Acceptance rate (similar draft/target models)"
-    value: "0.82"
-    unit: "tokens/draft token"
-    measuredOn: "M2 MacBook Pro, 16GB RAM, CPU-only simulation"
-    note: "estimated — high-quality draft model, same domain"
-  - metric: "Speedup vs standard decoding (acceptance=0.82, K=5)"
-    value: "3.2"
+  - metric: "Expected tokens per target call (per-token acceptance 0.82, K=5)"
+    value: "3.87"
+    unit: "tokens"
+    measuredOn: "calculated"
+    note: "(1 - 0.82^6) / (1 - 0.82)"
+  - metric: "Net speedup with a draft at 10% of target cost (acceptance 0.82, K=5)"
+    value: "2.58"
     unit: "x"
-    measuredOn: "M2 MacBook Pro, 16GB RAM, CPU-only simulation"
-    note: "estimated — geometric series: sum(0.82^i, i=0..4)"
-  - metric: "Target model calls per 100 tokens"
-    value: "31"
+    measuredOn: "calculated"
+    note: "3.87 / (1 + 5 x 0.10)"
+  - metric: "Target model calls per 100 tokens (acceptance 0.82, K=5)"
+    value: "26"
     unit: "calls"
-    measuredOn: "M2 MacBook Pro, 16GB RAM, CPU-only simulation"
-    note: "estimated — 100 tokens / 3.2 speedup"
-  - metric: "Draft model overhead (K=5 tokens)"
-    value: "12"
-    unit: "% of target call time"
-    measuredOn: "M2 MacBook Pro, 16GB RAM, CPU-only simulation"
-    note: "estimated — draft 10x faster than target"
+    measuredOn: "calculated"
+    note: "100 / 3.87"
+  - metric: "Tokens per target call, mock draft (epsilon=0.18), 5,000 steps"
+    value: "4.64"
+    unit: "tokens"
+    measuredOn: "Apple M1 Ultra, 64 GB, Python 3.13.7, torch 2.14.1 (CPU), 2026-10-11"
+    note: "simulated with the lab's mock models; observed per-token acceptance 0.895, closed form gives 4.63"
 whatTheToyMisses:
   - thing: "GPU kernel implementation"
     why: "Real speculative decoding requires custom CUDA kernels for tree attention masking — standard FlashAttention does not support tree-structured attention patterns. Our simulation uses CPU torch operations."
@@ -81,7 +81,7 @@ javaIntegration:
   springModule: "spring-ai"
 publishedAt: "2026-05-08"
 updatedAt: "2026-05-08"
-summary: "Build speculative decoding from draft-then-verify to batched speedup computation to tree attention — understanding how 3.2x throughput improvement comes from a mathematically provable quality-preserving trick."
+summary: "Build speculative decoding from draft-then-verify to batched speedup computation to tree attention — understanding how a provably quality-preserving trick turns one target forward pass into about 3.9 tokens at 82% per-token acceptance."
 ---
 
 ## Why this lab exists
@@ -224,8 +224,8 @@ The key test: when `draft_model` and `target_model` return identical distributio
   goals={[
     "Implement BatchedSpeculativeDecoder: decode_batch(prompts, max_tokens) -> (list[list[int]], SpeedupStats)",
     "Implement SpeedupStats: tokens_generated, draft_tokens_proposed, acceptance_rate, target_calls, speedup_vs_standard",
-    "Implement expected_speedup(alpha, K) -> geometric series formula",
-    "Write 4 tests: batch output count matches prompts, speedup > 1.0, target_calls <= tokens_generated, acceptance_rate==1 when draft==target",
+    "Implement expected_speedup(alpha, K) -> (1 - alpha^(K+1)) / (1 - alpha), plus expected_net_speedup and implied_alpha",
+    "Write 6 tests: batch output count matches prompts, speedup > 1.0, target_calls <= tokens_generated, closed form = 3.867 at alpha=0.82 K=5, simulation matches the closed form, acceptance_rate==1 when draft==target",
   ]}
   loc={280}
 >
@@ -234,33 +234,35 @@ v1 extends the core algorithm to handle a batch of B prompts simultaneously and 
 
 **Why batching matters:**
 
-In GPU inference, the fixed overhead of a target model forward pass (loading weights from HBM, dispatch overhead) is the same whether you run 1 sequence or B sequences in parallel. If each sequence contributes K+1 tokens per forward pass, B sequences contribute B*(K+1) tokens per forward pass. Standard decoding of B sequences: B target calls per step. Batched speculative: 1 target call for all B sequences — ideally.
+In GPU inference, the fixed overhead of a target model forward pass (loading weights from HBM, dispatch overhead) is roughly the same whether you run 1 sequence or B sequences in parallel. Standard decoding already exploits this: one batched forward pass emits one token for each of B sequences. Speculative decoding multiplies on top of that: one batched verification pass emits about E[tokens per call] tokens for each sequence. Batching and speculation are separate gains, so measure them separately.
 
-Our implementation processes each sequence in `decode_batch` sequentially per step (Python has no GPU parallelism here), but we count statistics correctly — one "target call" per batch step, not per sequence.
+Our implementation processes each sequence in `decode_batch` sequentially per step (Python has no GPU parallelism here), but we count statistics correctly: one "target call" per batch step, and one "sequence step" per active sequence per step. The speedup divides by sequence steps. Dividing by target calls would credit batching to speculation: 4 sequences at about 4 tokens each would look like a 16x "speedup".
 
 **The speedup formula:**
 
-The expected number of tokens accepted from K draft proposals at acceptance rate `alpha`:
+Let `alpha` be the probability that a draft token is accepted, given that the one before it was. The number of accepted drafts N is a truncated geometric variable: `P(N >= i) = alpha^i` for `i <= K`. Every step also emits exactly one more token: the corrected resample at the first rejection, or the bonus token when all K drafts pass. So:
 
 ```
-E[accepted] = sum(alpha^i for i in range(K))
-            = (1 - alpha^K) / (1 - alpha)   [geometric series]
+E[tokens per target call] = 1 + alpha + alpha^2 + ... + alpha^K
+                          = (1 - alpha^(K+1)) / (1 - alpha)   [geometric series]
 ```
 
 At `alpha=0.82`, `K=5`:
 ```
-1 + 0.82 + 0.6724 + 0.5514 + 0.4521 = 3.496
+1 + 0.82 + 0.6724 + 0.5514 + 0.4521 + 0.3707 = 3.867
 ```
 
-Plus 1 bonus token = 4.496 tokens per target call on average. Standard decoding gives 1 token per target call. Speedup = 4.496... but in practice the integer floor of accepted tokens and the resampling overhead bring it to approximately 3.2x in simulations.
+Standard decoding gives 1 token per target call, so at this acceptance rate speculative decoding needs 3.87x fewer target calls. This is the result from Leviathan et al. (2023).
 
-`SpeedupStats.speedup_vs_standard = tokens_generated / target_calls`
+`SpeedupStats.speedup_vs_standard = tokens_generated / sequence_steps`
 
-This is the real-world measurement, not the theoretical formula. Run `decode_batch` over many prompts and compare `speedup_vs_standard` against `expected_speedup(acceptance_rate, K)` — they should be close.
+This is the measurement, not the formula. Run `decode_batch` over many prompts and compare it against `expected_speedup(alpha, K)`. Over 5,000 steps with this lab's mock draft, measured tokens per call was 4.64, and the closed form at the observed per-token acceptance (0.895) gives 4.63.
+
+One trap: `SpeedupStats.acceptance_rate` is accepted drafts divided by proposed drafts. That is not `alpha`. It equals `(tokens_per_call - 1) / K`, which is 0.57 at alpha=0.82. Use `implied_alpha(tokens_per_call, K)` to go from a measurement back to alpha.
 
 **`target_calls` counts steps, not tokens:**
 
-This is a common confusion. If you generate 30 tokens with speedup=3.0, `target_calls` should be approximately 10, not 30. Each `speculative_step` call is exactly 1 target call. The `tokens_generated / target_calls` ratio is what shows the speedup.
+This is a common confusion. If one sequence generates 30 tokens with speedup=3.0, `target_calls` should be approximately 10, not 30. Each `speculative_step` call is exactly 1 target call. The `tokens_generated / target_calls` ratio is what shows the speedup.
 
 **Breakeven analysis:**
 
@@ -270,17 +272,17 @@ Speculative decoding only helps if the draft model is fast enough. If the draft 
 Net speedup = tokens_per_target_call / (1 + K * d)
 ```
 
-At `d=0.10` (draft 10x faster) and `K=5` with `alpha=0.82`:
+At `d=0.10` (draft 10x cheaper) and `K=5` with `alpha=0.82`:
 ```
-Net speedup = 3.49 / (1 + 5*0.10) = 3.49 / 1.5 = 2.33x
-```
-
-Still profitable. But at `d=0.30` (draft only 3x faster):
-```
-Net speedup = 3.49 / (1 + 5*0.30) = 3.49 / 2.5 = 1.40x
+Net speedup = 3.87 / (1 + 5*0.10) = 3.87 / 1.5 = 2.58x
 ```
 
-Barely worth it. This is why draft model selection matters enormously in production.
+Still profitable. But at `d=0.30` (draft only about 3x cheaper):
+```
+Net speedup = 3.87 / (1 + 5*0.30) = 3.87 / 2.5 = 1.55x
+```
+
+Still a gain on paper, but small enough that a second model's memory and serving complexity may not pay for it. This is why draft model selection matters enormously in production. `expected_net_speedup(alpha, K, d)` computes this.
 
 </LabStage>
 
@@ -345,7 +347,7 @@ In practice, self-speculative requires the model to be trained with an auxiliary
 
 `mean_accepted` is the average. But `p95_accepted` tells you what happens on easy inputs (in-domain, high-certainty tokens), while `p50_accepted` tells you the median. If `p95_accepted = 4.8` and `mean_accepted = 2.1`, you have high variance — the acceptance rate fluctuates significantly across different input types. This is the signal to implement adaptive K.
 
-`target_calls_per_1k_tokens = 1000 / (mean_accepted + 1)` is the headline infrastructure metric: how many target model calls do you need per 1000 output tokens? At `mean_accepted=3.2`, you need `1000 / 4.2 = 238` calls instead of 1000 — a 4.2x reduction in inference infrastructure cost.
+`target_calls_per_1k_tokens = 1000 / (mean_accepted + 1)` is the headline infrastructure metric: how many target model calls do you need per 1000 output tokens? At `mean_accepted=3.2`, you need `1000 / 4.2 = 238` calls instead of 1000: 4.2x fewer target-model calls. The draft model's cost comes on top, so the infrastructure saving is smaller.
 
 </LabStage>
 
@@ -390,6 +392,8 @@ tests/test_speculative.py::TestV0Basic::test_accepted_tokens_in_valid_range PASS
 tests/test_speculative.py::TestV1Batched::test_batched_generates_one_output_per_prompt PASSED
 tests/test_speculative.py::TestV1Batched::test_speedup_greater_than_one PASSED
 tests/test_speculative.py::TestV1Batched::test_target_calls_equals_steps_not_tokens PASSED
+tests/test_speculative.py::TestV1Batched::test_expected_speedup_closed_form PASSED
+tests/test_speculative.py::TestV1Batched::test_simulated_tokens_per_call_matches_closed_form PASSED
 tests/test_speculative.py::TestV1Batched::test_acceptance_rate_computation_correct PASSED
 tests/test_speculative.py::TestV2Tree::test_tree_draft_generates_multiple_paths PASSED
 tests/test_speculative.py::TestV2Tree::test_self_speculator_early_exit_produces_valid_logits PASSED
@@ -397,36 +401,33 @@ tests/test_speculative.py::TestV2Tree::test_tree_verification_accepts_at_least_o
 
 ===== 100 speculative steps =====
 
-Acceptance rate: 0.813
-Speedup vs std:  3.12x
+Acceptance rate: 0.772
+Speedup vs std:  4.86x
 Target calls:    100
-Tokens generated:412`}
+Tokens generated:486`}
 />
 
 ## Benchmarks
 
 <Benchmark
-  hardware="M2 MacBook Pro, 16GB RAM, CPU-only simulation"
+  hardware="Apple M1 Ultra, 64 GB RAM, Python 3.13.7, torch 2.14.1 (CPU) — mock models"
   rows={[
-    { metric: "Acceptance rate (similar draft/target models)", value: "0.82", unit: "tokens/draft token", note: "estimated — high-quality draft model, same domain" },
-    { metric: "Speedup vs standard decoding (acceptance=0.82, K=5)", value: "3.2", unit: "x", note: "estimated — geometric series: sum(0.82^i, i=0..4)" },
-    { metric: "Target model calls per 100 tokens", value: "31", unit: "calls", note: "estimated — 100 tokens / 3.2 speedup" },
-    { metric: "Draft model overhead (K=5 tokens)", value: "12", unit: "% of target call time", note: "estimated — draft 10x faster than target" },
+    { metric: "Expected tokens per target call (per-token acceptance 0.82, K=5)", value: "3.87", unit: "tokens", note: "calculated — (1 - 0.82^6) / (1 - 0.82)" },
+    { metric: "Net speedup with a draft at 10% of target cost (acceptance 0.82, K=5)", value: "2.58", unit: "x", note: "calculated — 3.87 / (1 + 5 x 0.10)" },
+    { metric: "Target model calls per 100 tokens (acceptance 0.82, K=5)", value: "26", unit: "calls", note: "calculated — 100 / 3.87" },
+    { metric: "Tokens per target call, mock draft (epsilon=0.18), 5,000 steps", value: "4.64", unit: "tokens", note: "simulated — observed per-token acceptance 0.895; closed form gives 4.63" },
   ]}
 />
 
-These numbers come from the geometric series formula and the mock model simulations. In a production deployment (e.g., GPT-2 124M as draft, GPT-2 1.5B as target on an A100):
-- Acceptance rate drops to 0.65-0.75 on out-of-domain text, rising to 0.85-0.90 on in-domain
-- Speedup varies from 1.8x (low acceptance) to 3.8x (high acceptance) depending on input
-- The draft model overhead is typically 8-15% of the target's forward pass time at small K
+Rows marked calculated come from the closed form. The simulated row comes from the mock models in `src/models.py`, not a real draft/target pair, so it confirms the math rather than predicting production speed. We haven't measured a real pair. Published wall-clock results depend heavily on the models and hardware: Leviathan et al. (2023) report 2-3x on T5-XXL, and Chen et al. (2023) report 2-2.5x on Chinchilla 70B.
 
-Run `python -c "from src.v1_batched import expected_speedup; [print(f'alpha={a:.2f}: {expected_speedup(a,5):.2f}x') for a in [0.6, 0.7, 0.8, 0.82, 0.9]]"` to see the theoretical speedup at different acceptance rates.
+Run `python -c "from src.v1_batched import expected_speedup; [print(f'alpha={a:.2f}: {expected_speedup(a,5):.2f}x') for a in [0.6, 0.7, 0.8, 0.82, 0.9]]"` to see expected tokens per target call at different acceptance rates.
 
 ## Stress tests
 
-**Acceptance rate vs K**: run 1000 speculative steps with K=1, 3, 5, 8, 10 and measure `speedup_vs_standard` at each K. You should see speedup increase with K (more draft tokens amortize the target call), then plateau as `alpha^K` becomes negligible. At `alpha=0.82`, the optimal K is around 7-9 for draft models 10x faster than target.
+**Acceptance rate vs K**: run 1000 speculative steps with K=1, 3, 5, 8, 10 and measure `speedup_vs_standard` at each K. You should see tokens per call increase with K (more draft tokens amortize the target call), then plateau as `alpha^K` becomes negligible. Net speedup peaks earlier because every extra draft token costs draft time: at `alpha=0.82` with a draft at 10% of target cost, `optimal_K(0.82, 0.10)` returns 6 (2.61x net), and any K from 5 to 8 is within 2% of that.
 
-**Acceptance rate distribution**: log `n_accepted` for each step over 1000 steps. Plot the distribution — it should be roughly geometric with parameter `alpha`. Most steps accept all K tokens (probability `alpha^K = 0.82^5 = 0.37` at alpha=0.82). Some steps accept 0 draft tokens (probability `1-alpha = 0.18` for the first rejection). The distribution tells you the tail behavior.
+**Acceptance rate distribution**: log `n_accepted` for each step over 1000 steps. Plot the distribution — it should be a truncated geometric with parameter `alpha`. Accepting all K drafts is the single most likely outcome (probability `alpha^K = 0.82^5 = 0.37` at alpha=0.82). Some steps accept 0 draft tokens (probability `1-alpha = 0.18` for the first rejection). The distribution tells you the tail behavior.
 
 **Tree vs linear comparison**: run 500 steps with linear draft (width=1, depth=5) and tree draft (width=2, depth=3) at the same target model. Compare `mean_accepted_per_step`. The tree should outperform linear at the same total draft token budget because it explores more paths. The difference narrows as acceptance rate increases.
 
@@ -487,18 +488,18 @@ The response includes `speedupVsStandard` and `acceptanceRate` — metrics that 
 The geometric series formula translates directly to Java:
 
 ```java
-double alpha = 0.82;  // acceptance rate
+double alpha = 0.82;  // per-token acceptance probability
 int K = 5;            // speculation width
-double geoSum = 0.0;
-for (int i = 0; i < K; i++) {
-    geoSum += Math.pow(alpha, i);
+double tokensPerCall = 0.0;
+for (int i = 0; i <= K; i++) {
+    tokensPerCall += Math.pow(alpha, i);
 }
-// geoSum = 1 + 0.82 + 0.6724 + 0.5514 + 0.4521 = 3.496
-// Plus 1 bonus token: 4.496 tokens per target call
-// Speedup vs standard (1 token per call): ~3.2x after practical corrections
+// tokensPerCall = 1 + 0.82 + 0.6724 + 0.5514 + 0.4521 + 0.3707 = 3.867
+// = (1 - alpha^(K+1)) / (1 - alpha): accepted drafts + 1 corrected/bonus token
+// Net of a draft at 10% of target cost: 3.867 / (1 + 5 * 0.10) = 2.58x
 ```
 
-This is a useful back-of-envelope calculation for sizing inference infrastructure. If your target model costs 50ms per call and you achieve 3.2x speedup, effective latency per token drops from 50ms to 15ms — the difference between real-time and batch-feeling generation.
+This is a useful back-of-envelope calculation for sizing inference infrastructure. If your target model costs 50ms per call and the draft adds 10% per draft token, each step costs 75ms and yields about 3.87 tokens, so effective latency per token drops from 50ms to about 19ms.
 
 ### Part C — Spring AI ChatClient: transparency
 
@@ -546,28 +547,29 @@ Expected output:
 --- Part 1: SpeculativeClient (direct HTTP) ---
   Prompt tokens:      [10, 20, 30, 40, 50]
   Tokens generated:   40
-  Target calls:       13
-  Acceptance rate:    0.812
-  Speedup vs std:     3.08x
+  Target calls:       9
+  Acceptance rate:    0.800
+  Speedup vs std:     5.00x
 
   Aggregate stats (since server start):
-    Total tokens generated:   40
-    Total target calls:       13
-    Acceptance rate:          0.812
-    Speedup vs standard:      3.08x
-    Target calls per 1k tok:  277.8
+    Total tokens generated:   45
+    Total target calls:       9
+    Acceptance rate:          0.800
+    Speedup vs standard:      5.00x
+    Target calls per 1k tok:  200.0
 
 --- Part 2: Speedup math (geometric series) ---
   alpha=0.82, K=5
-  Geometric series: sum(alpha^i, i=0..4)
+  Geometric series: sum(alpha^i, i=0..5)
     i=0: 0.8200^0 = 1.0000  (cumsum = 1.0000)
     i=1: 0.8200^1 = 0.8200  (cumsum = 1.8200)
     i=2: 0.8200^2 = 0.6724  (cumsum = 2.4924)
     i=3: 0.8200^3 = 0.5514  (cumsum = 3.0438)
-    i=4: 0.8200^4 = 0.4521  (cumsum = 3.4960)
-  Expected accepted draft tokens: 3.496
-  Plus 1 bonus token:             4.496 total per target call
-  Speedup vs standard decoding:  ~3.5x
+    i=4: 0.8200^4 = 0.4521  (cumsum = 3.4959)
+    i=5: 0.8200^5 = 0.3707  (cumsum = 3.8666)
+  Expected accepted draft tokens: 2.867
+  Tokens per target call:         3.867 (accepted drafts + 1 corrected/bonus token)
+  Target-call reduction vs standard decoding: ~3.9x
 
 Done.
 ```
@@ -576,7 +578,7 @@ Done.
 
 ## What surprised me
 
-<WhatSurprisedMe insight="The geometric series math surprised me with its elegance. With acceptance rate alpha=0.82 and K=5 draft tokens, the expected tokens accepted per target call is sum(alpha^i for i=0..4) = 1 + 0.82 + 0.672 + 0.551 + 0.452 = 3.49 — plus 1 bonus token = 4.49 tokens per target call, a 3.2x speedup after rounding. The algorithm is provably sample-quality-preserving — the output distribution is identical to greedy target-only decoding. This means the speedup is entirely free: you get 3.2x more tokens per second with zero quality degradation, at the cost of running a smaller draft model that uses about 12% of the target model's compute." />
+<WhatSurprisedMe insight="The geometric series math surprised me with its elegance, and with how easy it is to get off by one. With per-token acceptance alpha=0.82 and K=5 draft tokens, each target call emits on average 1 + 0.82 + 0.672 + 0.551 + 0.452 + 0.371 = 3.87 tokens: the accepted drafts plus one corrected or bonus token. An earlier version of this lab summed only to alpha^4 and then added the bonus token separately, which double counts. Running the mock models settled it: over 5,000 steps the measured 4.64 tokens per call matched the closed form at the observed acceptance (4.63) to within 0.1%. The algorithm is provably distribution-preserving: the output distribution is identical to sampling from the target model alone, so the gain costs no quality. It is not free in compute, though. With a draft at 10% of the target cost, K=5 nets about 2.6x, and the draft model needs its own memory." />
 
 ## Where to go deeper
 

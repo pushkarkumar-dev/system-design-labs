@@ -17,25 +17,26 @@
 #   (with space) are always separate pre-tokens, so they can get different
 #   BPE subword representations.
 #
-# The GPT-2 regex:
-#   's|'t|'re|'ve|'m|'ll|'d|\w+|\d+|\S
+# The GPT-2 regex (the one OpenAI's encoder.py ships):
+#   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
 #
 #   Breaking it down:
-#     's      — possessives ("cat's" -> ["cat", "'s"])
-#     't      — negations  ("don't" -> ["don", "'t"])
-#     're     — contractions ("we're" -> ["we", "'re"])
-#     've     — contractions ("I've" -> ["I", "'ve"])
-#     'm      — contractions ("I'm" -> ["I", "'m"])
-#     'll     — contractions ("they'll" -> ["they", "'ll"])
-#     'd      — past tense  ("he'd" -> ["he", "'d"])
-#     \w+     — one or more word characters (including digits)
-#     \d+     — one or more digits (handles numbers before \w+ would catch them)
-#     \S      — any single non-whitespace character (punctuation, symbols)
+#     's 't 're 've 'm 'll 'd   — English contractions ("don't" -> ["don", "'t"])
+#      ?\p{L}+                  — a run of letters, with at most one leading space
+#      ?\p{N}+                  — a run of digits, with at most one leading space
+#      ?[^\s\p{L}\p{N}]+        — a run of punctuation/symbols, optional leading space
+#     \s+(?!\S)                 — whitespace NOT followed by a non-space, i.e.
+#                                 all but the last space of a run before a word
+#                                 (that last space attaches to the word), or
+#                                 trailing whitespace at the end of the text
+#     \s+                       — any remaining whitespace
 #
-#   Spaces are NOT matched — they're consumed as the leading character of the
-#   next \w+ match. This is why " world" is a single pre-token and why BPE
-#   never merges across a space boundary.
-#
+#   Every character of the input is covered by some alternative, so the
+#   pre-tokens concatenate back to the original text. That is what makes
+#   decode(encode(text)) == text. An earlier version of this lab used
+#   `\w+|\d+|\S`, which matches no whitespace at all: findall() silently
+#   dropped every space, and "hello world" decoded as "helloworld".
+
 # Portability:
 #   v2 saves vocab and merge rules as JSON, so any language can load and use
 #   the tokenizer. The Java integration (DJL tokenizers) reads HuggingFace's
@@ -51,10 +52,9 @@ from collections import Counter
 
 
 # GPT-2's pre-tokenization pattern.
-# `regex` (not `re`) is required for the \w and \S to work correctly on
-# Unicode text. The `re` module's \w matches Unicode letters/digits too, but
-# the `regex` module's patterns behave the same as the original GPT-2 tokenizer.
-GPT2_SPLIT_PATTERN = r"""'s|'t|'re|'ve|'m|'ll|'d|\w+|\d+|\S"""
+# `regex` (not `re`) is required: the built-in `re` module doesn't support
+# the Unicode property classes \p{L} (letters) and \p{N} (numbers).
+GPT2_SPLIT_PATTERN = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 
 TokenPair = Tuple[int, int]

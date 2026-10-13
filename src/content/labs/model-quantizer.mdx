@@ -24,7 +24,7 @@ stages:
     title: "INT4 Grouped Quantization + GGUF Format"
     learningGoals:
       - "Group quantization: one scale per 32 weights reduces error 8x vs per-tensor"
-      - "Pack two INT4 values per byte — 8x compression vs float32"
+      - "Pack two INT4 values per byte — 8x smaller weights, 6.4x overall once fp32 scales are stored"
     approxLoc: 480
     branchOrTag: "model-quantizer-v1"
   - id: v2
@@ -35,31 +35,31 @@ stages:
     approxLoc: 760
     branchOrTag: "model-quantizer-v2"
 benchmarks:
-  - metric: "INT8 model size (GPT-2 124M)"
-    value: "122"
+  - metric: "INT8 model size (GPT-2, 124.4M params)"
+    value: "124"
     unit: "MB"
-    measuredOn: "M2 MacBook Pro, 16GB RAM"
-    note: "4x compression — 1 byte per param + scale factors"
-  - metric: "INT4 grouped model size (group=32)"
-    value: "61"
+    measuredOn: "calculated"
+    note: "4x compression — 1 byte per param + one scale per tensor (fp32 is 498 MB)"
+  - metric: "INT4 size with one fp32 scale per 32 weights (this lab's v1)"
+    value: "78"
     unit: "MB"
-    measuredOn: "M2 MacBook Pro, 16GB RAM"
-    note: "8x compression — 0.5 byte per param + 1 scale per 32 params"
-  - metric: "Perplexity delta (INT8 vs fp32)"
-    value: "+0.4"
-    unit: "pp"
-    measuredOn: "estimated, GPT-2 on wikitext-2"
-    note: "Nearly imperceptible quality loss"
-  - metric: "Perplexity delta (Q4_K_M vs fp32)"
-    value: "+1.1"
-    unit: "pp"
-    measuredOn: "estimated, GPT-2 on wikitext-2"
-    note: "Group quantization reduces error vs Q4_0 (+3.8 pp)"
-  - metric: "Quantization speed (GPT-2, CPU)"
-    value: "2.1"
+    measuredOn: "calculated"
+    note: "6.4x — 0.5 byte per param + 4 bytes per 32 params; fp16 scales, as GGUF uses, give 70 MB (7.1x)"
+  - metric: "INT4 weight error, one scale per 32 weights (GPT-2, 48 matrices)"
+    value: "10.5"
+    unit: "%"
+    measuredOn: "Apple M1 Ultra, 64 GB RAM, Python 3.13.7, numpy (CPU), 2026-10-11"
+    note: "mean ||error|| / ||w||; scripts/gpt2_weight_error.py"
+  - metric: "INT4 weight error, one scale per tensor (GPT-2, 48 matrices)"
+    value: "74.3"
+    unit: "%"
+    measuredOn: "Apple M1 Ultra, 64 GB RAM, Python 3.13.7, numpy (CPU), 2026-10-11"
+    note: "7.1x worse than per-group; outliers set the scale"
+  - metric: "Quantize all GPT-2 weights (INT4, g=32)"
+    value: "0.36"
     unit: "seconds"
-    measuredOn: "M2 MacBook Pro, 16GB RAM"
-    note: "estimated — numpy operations on all weight tensors"
+    measuredOn: "Apple M1 Ultra, 64 GB RAM, Python 3.13.7, numpy (CPU), 2026-10-11"
+    note: "best of 3; INT8 takes 0.19 s"
 whatTheToyMisses:
   - thing: "GPTQ quantization (post-training)"
     why: "GPTQ minimizes per-layer quantization error using Hessian information from calibration data. It produces 4-bit models with much lower perplexity than our naive rounding — at the cost of calibration dataset selection and hours of compute."
@@ -87,7 +87,7 @@ javaIntegration:
   springModule: null
 publishedAt: "2026-05-08"
 updatedAt: "2026-05-08"
-summary: "Build a model quantizer from INT8 symmetric to INT4 grouped quantization with GGUF format to perplexity-based quality measurement — understanding how 8x compression trades only 1.1pp perplexity."
+summary: "Build a model quantizer from INT8 symmetric to INT4 grouped quantization with GGUF format to perplexity-based quality measurement — understanding where the bytes go (4-bit weights plus per-group scales) and why one scale per tensor wrecks 4-bit weights."
 ---
 
 ## Why this lab exists
@@ -96,7 +96,7 @@ Every quantized model you download from HuggingFace — `llama-3-8b-Q4_K_M.gguf`
 
 You've run models with llama.cpp or Ollama. You know INT4 models are smaller. You've read that quantization causes "slight quality degradation." But until you've implemented `pack_int4()` yourself, until you've measured that a single scale per tensor inflates error for every element near zero, until you've seen a group size of 32 reduce the max quantization error by 8x compared to a group size of 1024 — you don't *know* quantization.
 
-This lab builds a model quantizer in three stages: from symmetric INT8 in 180 lines to grouped INT4 with a GGUF-lite binary format in 480 lines to perplexity-based quality measurement with mixed precision in 760 lines. Each stage fixes one measured problem from the previous one. By the end, you will understand exactly what Q4_K_M means and why it achieves 8x compression with only 1.1pp perplexity delta.
+This lab builds a model quantizer in three stages: from symmetric INT8 in 180 lines to grouped INT4 with a GGUF-lite binary format in 480 lines to perplexity-based quality measurement with mixed precision in 760 lines. Each stage fixes one measured problem from the previous one. By the end, you will understand what the "4 bits" in Q4 actually costs once scales are stored, why per-group scales matter so much at 4 bits, and how to measure the quality cost with perplexity.
 
 ## What we're building
 
@@ -162,7 +162,7 @@ Per-group scale (INT4, group_size=32):
     "Implement quantize_symmetric_int8(tensor) -> (quantized, scale)",
     "Implement dequantize_symmetric_int8(quantized, scale) -> float32",
     "Implement quantize_model_int8(model_weights) -> QuantizedModel",
-    "Write 5 tests: roundtrip error < 0.5%, scale factor correct, INT8 range enforced, model dict preserved, size ratio = 4.0x",
+    "Write 5 tests: round-trip error within half a quantization step, scale factor correct, INT8 range enforced, model dict preserved, size ratio = 4.0x",
   ]}
   loc={180}
 >
@@ -186,7 +186,9 @@ def dequantize_symmetric_int8(quantized: np.ndarray, scale: float) -> np.ndarray
 
 **The outlier problem**: if a tensor has one weight at 3.0 and all others near 0.01, the scale is set by the outlier: `scale = 3.0 / 127 = 0.0236`. Every other weight quantizes to 0 or 1 level — catastrophic error for them. This is why per-tensor INT8 works for most layers but fails for layers with heavy-tailed weight distributions (embeddings, certain MLP layers). v1 fixes this with group quantization.
 
-**Perplexity proxy**: `perplexity_change()` computes the KL divergence between original and quantized logit distributions as a proxy for perplexity change. For INT8, the KL divergence is typically less than 0.001 nats — the quantized model produces nearly identical next-token distributions.
+**Perplexity proxy**: `perplexity_change()` computes the KL divergence between original and quantized logit distributions as a proxy for perplexity change. For INT8 it should be very small, but measure it on your own model's logits before relying on it.
+
+**Which error metric?** The v0 and v1 demos print the mean of per-element relative errors, `mean(|w - w_hat| / |w|)`. That number looks alarming (about 5% for INT8 on the demo's random weights) because weights near zero round to zero and count as ~100% error. Rounding itself is tightly bounded: no value moves more than half a step, `scale / 2 = max|w| / 254`, which is what the round-trip test checks. For comparing schemes, the norm-relative error `||w - w_hat|| / ||w||` is more useful, and it's what `scripts/gpt2_weight_error.py` reports.
 
 </LabStage>
 
@@ -238,7 +240,7 @@ def quantize_q4_grouped(tensor, group_size=32):
     return pack_int4(quantized.ravel()), scales
 ```
 
-**Why 8x, not 4x?** INT4 packs two values per byte: 0.5 bytes per weight. But we also store scales: one float32 (4 bytes) per 32 weights = 4/32 = 0.125 bytes per weight overhead. Total: 0.625 bytes per weight, vs 4.0 bytes for fp32. Effective ratio: 4.0 / 0.625 = 6.4x. GGUF's documentation rounds this to "8x" because the dominant cost is the packed weights; scale storage is 12.5% overhead.
+**Why 6.4x, not 8x?** INT4 packs two values per byte: 0.5 bytes per weight, which is where the "8x" you often see comes from. But we also store scales: one float32 (4 bytes) per 32 weights = 4/32 = 0.125 bytes per weight. Total: 0.625 bytes per weight, vs 4.0 bytes for fp32, so 4.0 / 0.625 = 6.4x. GGUF stores its scales as fp16, which costs 2/32 = 0.0625 bytes per weight: 4.5 bits per weight, 7.1x. The scales are the price of accuracy, and the next stage shows how large that accuracy gain is.
 
 **GGUF-lite binary format**:
 
@@ -282,19 +284,21 @@ Perplexity is the exponential of the average negative log-probability the model 
 perplexity = exp( mean( -log P(token_i | token_0 .. token_{i-1}) ) )
 ```
 
-A model that perfectly predicts every token would have perplexity 1.0 (impossible in practice). GPT-2 on wikitext-2 scores roughly 29.0. A quantized model that scores 30.1 has a perplexity delta of +1.1pp — the quantized model is slightly worse at predicting text.
+A model that perfectly predicts every token would have perplexity 1.0 (impossible in practice). The GPT-2 paper reports 29.41 for the 124M model on WikiText-2. A quantized model that scores 30.4 would be 1.0 point worse at predicting the same text.
 
-**The comparison table** for GPT-2 on wikitext-2:
+**An illustrative comparison table.** The sizes are exact arithmetic for GPT-2's 124.4M parameters. The perplexity column is **hard-coded** in `simulate_perplexity_from_scheme()` to show the usual ordering; this lab does not measure it. Treat it as a picture of the shape of the trade-off, not as data:
 
 | Scheme  | Bits | Size MB | Ratio | Perplexity | Delta pp |
 |---------|------|---------|-------|-----------|---------|
-| fp32    | 32.0 |    488  |  1.0x |     29.0  |    +0.0 |
-| int8    |  8.0 |    122  |  4.0x |     29.4  |    +0.4 |
-| q4_k_m  |  4.5 |     69  |  7.1x |     30.1  |    +1.1 |
-| q4_0    |  4.5 |     69  |  7.1x |     32.8  |    +3.8 |
-| q2_k    |  2.5 |     41  | 12.0x |     37.0  |    +8.0 |
+| fp32    | 32.0 |    498  |  1.0x |     29.0  |    +0.0 |
+| int8    |  8.0 |    124  |  4.0x |     29.4  |    +0.4 |
+| q4_k_m  |  4.5 |     70  |  7.1x |     30.1  |    +1.1 |
+| q4_0    |  4.0 |     62  |  8.0x |     32.8  |    +3.8 |
+| q2_k    |  2.5 |     39  | 12.8x |     37.0  |    +8.0 |
 
-The key observation: Q4_K_M and Q4_0 use the same storage format (4.5 bits/weight) but Q4_K_M uses group_size=32 while Q4_0 uses per-tensor scaling. The 2.7pp quality improvement is entirely from group quantization — no storage cost.
+In this table `q4_0` means per-tensor INT4 and `q4_k_m` means INT4 with one fp16 scale per 32 weights. The trade-off it illustrates is real: per-group scales cost 0.5 bits per weight, and in exchange each scale only has to cover the range of 32 neighbouring weights instead of the whole tensor. The size of that gain is something we did measure, in weight space: on GPT-2's 48 attention and MLP matrices, INT4 with one scale per tensor has 74.3% norm-relative error, against 10.5% with one scale per 32 weights.
+
+The names are borrowed loosely from llama.cpp, whose formats differ: its real Q4_0 is also block-wise (32 weights per fp16 scale), and Q4_K_M uses 256-weight super-blocks with 6-bit sub-block scales and mins, keeping some tensors at 6 bits.
 
 **Mixed precision** assigns different quantization schemes to different layers:
 
@@ -306,7 +310,7 @@ config = MixedPrecisionConfig.q4_k_m_style(layer_names)
 # MLP weights -> Q4_grouped (same)
 ```
 
-This is exactly what GGUF's Q4_K_M does. The "K" in Q4_K_M refers to "K-quants" — llama.cpp's term for the mixed-precision variant where attention Q projections use group_size=64 and everything else uses group_size=32.
+This is a simplified version of the idea behind GGUF's Q4_K_M, not its actual recipe. The "K" refers to llama.cpp's k-quants: block formats with 256-weight super-blocks whose sub-block scales are themselves quantized. The "M" (medium) mix keeps some attention-value and FFN down-projection tensors at 6 bits (Q6_K) and uses Q4_K for the rest.
 
 </LabStage>
 
@@ -349,58 +353,62 @@ This is exactly what GGUF's Q4_K_M does. The "K" in Q4_K_M refers to "K-quants" 
       cmd: "curl -s http://localhost:8000/compare | python -m json.tool",
     },
   ]}
-  expectedOutput={`=== v0 -- Symmetric INT8 quantization ===
-  Quantization time: 4.2 ms
-  layer.0.weight: relative error = 0.142%
-  layer.0.bias:   relative error = 0.198%
-  layer.1.weight: relative error = 0.137%
+  expectedOutput={`=== v0 — Symmetric INT8 quantization ===
+  Quantization time: 9.3 ms
+  layer.0.weight: relative error = 4.769%
+  layer.0.bias: relative error = 3.121%
+  layer.1.weight: relative error = 5.003%
   Compression ratio: 4.0x (expected ~4.0x)
 
 === v1 -- INT4 grouped quantization ===
   Compression ratio: 6.4x (expected ~6-8x)
   GGUF round-trip OK: 2 tensors loaded
   Group size: 32
-  attention.weight: mean relative error = 1.84%
-  mlp.weight:       mean relative error = 1.79%
+  layer.0.weight: mean relative error = 25.82%
+  layer.1.weight: mean relative error = 25.79%
 
 === v2 -- Perplexity-based quality comparison ===
 
 === Quantization Report: GPT-2 (124M params) ===
-fp32 baseline: 29.00 pp, 488 MB
-Scheme       Bits   Size (MB)   Ratio   Perplexity   Delta pp
-fp32         32.0       488.0    1.0x        29.00      +0.00
-int8          8.0       122.0    4.0x        29.40      +0.40
-q4_k_m        4.5        68.7    7.1x        30.10      +1.10
-q4_0          4.5        68.7    7.1x        32.80      +3.80
-q2_k          2.5        40.7   12.0x        37.00      +8.00`}
+fp32 baseline: 29.00 pp, 498 MB
+------------------------------------------------------------
+Scheme        Bits  Size (MB)   Ratio   Perplexity  Delta pp
+------------------------------------------------------------
+fp32          32.0      497.8    1.0x        29.00    +0.00
+int8           8.0      124.5    4.0x        29.40    +0.40
+q4_k_m         4.5       70.0    7.1x        30.10    +1.10
+q4_0           4.0       62.2    8.0x        32.80    +3.80
+q2_k           2.5       38.9   12.8x        37.00    +8.00
+------------------------------------------------------------
+Perplexity values are illustrative (hard-coded), not measured.`}
 />
 
 ## Benchmarks
 
 <Benchmark
-  hardware="M2 MacBook Pro, 16GB RAM"
+  hardware="Apple M1 Ultra, 64 GB RAM, Python 3.13.7, numpy (CPU), 2026-10-11"
   rows={[
-    { metric: "INT8 model size (GPT-2 124M)",    value: "122",  unit: "MB",      note: "4x compression — 1 byte per param" },
-    { metric: "INT4 grouped model size (g=32)",   value: "61",   unit: "MB",      note: "8x compression — 0.5 byte per param + scale overhead" },
-    { metric: "Perplexity delta (INT8 vs fp32)",  value: "+0.4", unit: "pp",      note: "estimated, GPT-2 on wikitext-2 — nearly imperceptible" },
-    { metric: "Perplexity delta (Q4_K_M vs fp32)", value: "+1.1", unit: "pp",     note: "estimated — group quantization vs Q4_0 (+3.8 pp)" },
-    { metric: "Quantization speed (GPT-2, CPU)",  value: "2.1",  unit: "seconds", note: "estimated — numpy on all weight tensors" },
+    { metric: "INT8 model size (GPT-2, 124.4M params)", value: "124", unit: "MB", note: "calculated — 4x, 1 byte per param" },
+    { metric: "INT4 size, one fp32 scale per 32 weights (v1)", value: "78", unit: "MB", note: "calculated — 6.4x; fp16 scales give 70 MB (7.1x)" },
+    { metric: "INT4 weight error, one scale per 32 weights", value: "10.5", unit: "%", note: "measured — mean ||error|| / ||w|| over GPT-2's 48 matrices" },
+    { metric: "INT4 weight error, one scale per tensor", value: "74.3", unit: "%", note: "measured — same matrices; 7.1x worse" },
+    { metric: "Quantize all GPT-2 weights (INT4, g=32)", value: "0.36", unit: "seconds", note: "measured — best of 3; INT8 takes 0.19 s" },
   ]}
 />
 
-Numbers marked "estimated" are based on published llama.cpp benchmarks for GPT-2 on wikitext-2. The compression ratios are exact arithmetic from the bit widths. Run `python src/v0_int8.py` and `python src/v1_int4.py` to see the actual quantization times and error rates on your hardware.
+Sizes are exact arithmetic from the storage format. The error and timing rows come from running `scripts/gpt2_weight_error.py` and the lab's quantizers on GPT-2's real weights (it needs `pip install torch transformers`). We have not measured perplexity: the perplexity values in the v2 table are illustrative and hard-coded. Measuring them means dequantizing GPT-2's weights for each scheme and running `compute_perplexity()` on WikiText-2.
 
 ## Stress tests
 
 **Outlier injection**: create a weight tensor where one element is 1000x larger than the rest. Measure the relative error on non-outlier elements under per-tensor INT8 vs group quantization with group_size=32. You'll observe the per-tensor error spikes to 30-50% for elements near zero; group quantization caps the damage to the 32 weights in the outlier's group.
 
-**Group size sensitivity**: quantize the same tensor with group_size values of 8, 16, 32, 64, 128, 256. Measure the mean relative error and the compression ratio for each. You'll see error decreasing as group_size shrinks, but compression ratio also decreasing (more scales to store). The "sweet spot" that GGUF chose is group_size=32 for MLP layers and group_size=64 for attention Q projections.
+**Group size sensitivity**: quantize the same tensor with group_size values of 8, 16, 32, 64, 128, 256. Measure the mean relative error and the compression ratio for each. You'll see error decreasing as group_size shrinks, but compression ratio also decreasing (more scales to store). Find where the error curve flattens for your tensors. For reference, GGUF's k-quants use 32-weight blocks inside 256-weight super-blocks.
 
 **GGUF file size verification**: quantize a synthetic 1024x1024 float32 matrix. Verify that the GGUF-lite file size equals: 16 (header) + len(metadata_json) + padding + per-tensor overhead + 512KB (packed INT4 data) + 128 * 4 bytes (scales for 32768 / 32 = 1024 groups... wait, 1024*1024/32 = 32768 groups, each 4 bytes = 128KB). Total: ~640KB vs 4MB original = 6.25x compression.
 
 **Pack/unpack round-trip**: generate 10,000 random INT4 values in [-8, 7], pack them, unpack them, and verify byte-for-byte equality. Then inject a single out-of-range value (8 or -9) and verify the pack function raises a ValueError.
 
-**Perplexity convergence**: for a model with uniformly random logits over a vocab of size V, the theoretical perplexity equals V. Generate random logits for vocab_size=1000 and verify `compute_perplexity()` returns a value close to 1000 (within 10%). This validates that the log-sum-exp implementation is numerically correct.
+**Perplexity convergence**: if every logit is equal, the model assigns 1/V to every token and perplexity is exactly V. Pass all-zero logits for vocab_size=1000 and verify `compute_perplexity()` returns 1000. With random N(0,1) logits instead, expect about V x e^0.5 on average, because the log-sum-exp gains about 0.5 nats. This validates that the log-sum-exp implementation is numerically correct.
 
 ## What the toy misses
 
@@ -548,25 +556,28 @@ Python quantizer server: UP
   Compression:      6.4x
 
 --- Quantization Scheme Comparison (GPT-2 124M params) ---
-  fp32 baseline: 29.0 pp perplexity, 488 MB
-  Scheme         Bits  Size MB   Ratio   Perplexity  Delta pp
-  fp32           32.0     488.0    1.0x      29.00     +0.00
-  int8            8.0     122.0    4.0x      29.40     +0.40
-  q4_k_m          4.5      68.7    7.1x      30.10     +1.10
-  q4_0            4.5      68.7    7.1x      32.80     +3.80
-  q2_k            2.5      40.7   12.0x      37.00     +8.00
+  (sizes are exact; perplexity values are illustrative, not measured)
+  fp32 baseline: 29.0 pp perplexity, 498 MB
+  Scheme        Bits  Size MB   Ratio   Perplexity  Delta pp
+  ------------------------------------------------------------
+  fp32          32.0    497.8    1.0x        29.00     +0.00
+  int8           8.0    124.5    4.0x        29.40     +0.40
+  q4_k_m         4.5     70.0    7.1x        30.10     +1.10
+  q4_0           4.0     62.2    8.0x        32.80     +3.80
+  q2_k           2.5     38.9   12.8x        37.00     +8.00
 
 --- Quantization Memory Reference ---
   GPT-2 (124M params):
-    fp32:  496000000 bytes = 473 MB
-    INT8:  124000000 bytes = 118 MB (4.0x)
-    INT4:   62000000 bytes =  59 MB (8.0x)
+    fp32:  497759232 bytes = 498 MB
+    INT8:  124439808 bytes = 124 MB (4.0x)
+    INT4:  62219904 bytes = 62 MB (8.0x)
+
   INT4 grouped (group_size=32) effective bytes/param: 0.625
   Effective compression vs fp32: 6.4x
 
   Llama 3 70B (70B params):
-    bfloat16: 130 GB
-    INT4:      33 GB  (fits on a single A100 80GB)
+    bfloat16: 140 GB
+    INT4:     35 GB  (weights fit on a single A100 80GB)
 
 Done.
 ```
@@ -575,7 +586,7 @@ Done.
 
 ## What surprised me
 
-<WhatSurprisedMe insight="The group size sensitivity surprised me. With a tensor-level scale (one scale per matrix), the max quantization error scales with the range of the entire tensor. With group_size=32 (one scale per 32 weights), the max error scales with the range of 32 consecutive weights — which is typically 8x smaller. That 8x error reduction translates to 1.1pp vs 3.8pp perplexity delta for Q4 quantization. GGUF's Q4_K_M uses group_size=32 for most layers but group_size=64 for attention projections — because empirically, Q projections have tighter weight distributions (fewer outliers) and benefit less from smaller groups." />
+<WhatSurprisedMe insight="How badly one scale per tensor fails at 4 bits is the surprise here. Running this lab's own quantizer over GPT-2's 48 attention and MLP weight matrices. With one scale per 32 weights, the reconstructed weights are off by 10.5% (norm-relative error). With one scale per tensor, the error is 74.3%, and on the last block's MLP output projection it reaches 96%: the 4-bit weights carry almost nothing. The reason is outliers. In that matrix the largest weight is 46 standard deviations from zero, so a per-tensor scale makes each of the 16 levels about 6.6 standard deviations wide, and nearly every weight rounds to zero. A scale per 32 weights only has to cover its own neighbourhood, so an outlier spoils 32 weights instead of 2.4 million. The price is storage: fp32 scales take this lab from the advertised 8x down to 6.4x, and fp16 scales (as in GGUF) to 7.1x." />
 
 ## Where to go deeper
 
@@ -588,5 +599,5 @@ Done.
 
 - **Previous in local-genai**: LLM Inference Engine (lab `llm-inference`) — the engine that loads and runs these quantized GGUF models
 - **Next in local-genai**: Speculative Decoding (lab `speculative-decoding`) — uses quantized draft models to accelerate the full-precision verifier
-- **System design question**: At what model size does INT4 quantization become the only viable option for single-GPU deployment? (Hint: an A100 80GB can hold a 40B fp16 model. Q4_K_M lets it hold an 80B model — with 1.1pp perplexity delta.)
+- **System design question**: At what model size does INT4 quantization become the only viable option for single-GPU deployment? (Hint: an A100 80GB holds the weights of a 40B fp16 model. At about 4.5 bits per weight it could hold about 140B — before any KV cache, and with a quality cost you have to measure.)
 - **System design question**: GPTQ takes hours of calibration data to quantize a 70B model. AWQ takes minutes. Which would you choose for a production deployment where you quantize once and serve millions of requests? What changes your answer?

@@ -74,7 +74,7 @@ public class EmbeddingDemoApplication implements CommandLineRunner {
             List<String> texts = List.of(
                 "The Write-Ahead Log ensures durability.",
                 "Embedding pipelines convert text to dense vectors.",
-                "Dynamic batching improves GPU throughput by 18x."
+                "Dynamic batching groups requests into one forward pass."
             );
 
             var response = ourClient.embed(texts);

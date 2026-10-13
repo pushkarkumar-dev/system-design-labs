@@ -154,7 +154,7 @@ class TestV1Batching:
         assert result is not None, "Long text should be retrievable from cache"
         np.testing.assert_allclose(result, embedding, atol=1e-5)
 
-    def test_batch_throughput_higher_than_single(self, v1_server):
+    def test_batch_throughput_higher_than_single(self, v0_server, v1_server):
         """
         Batch=32 throughput should be measurably higher than single-item throughput.
 
@@ -168,7 +168,7 @@ class TestV1Batching:
         # Single-item: 32 separate calls
         start = time.monotonic()
         for text in texts:
-            v1_server.v0.embed([text])  # bypass batching, call v0 directly
+            v0_server.embed([text])  # v0: no batching, one forward pass per text
         single_time = time.monotonic() - start
 
         # Batch=32: one call
@@ -232,7 +232,7 @@ class TestEmbeddingCache:
 # ---------------------------------------------------------------------------
 
 class TestModelRegistry:
-    """v2 tests: 4 tests covering dual-version load, drift, incompatibility, pinning."""
+    """v2 tests: 5 tests covering dual-version load, drift, incompatibility, neighbour overlap, pinning."""
 
     def test_two_versions_loaded_simultaneously(self, registry):
         """The registry should hold multiple versions simultaneously."""
@@ -263,20 +263,45 @@ class TestModelRegistry:
 
     def test_incompatible_versions_flagged(self, registry):
         """
-        is_compatible() should return False for incompatible threshold.
+        Two different models can never share an index, so is_compatible() is
+        False for them regardless of the threshold. Two aliases of the same
+        model are compatible.
 
-        We use the same model (so drift is ~0) but set threshold=0.9999 to force
-        incompatibility — simulating what would happen with very different models.
-        In real usage you'd load two different model families to see high drift.
+        To avoid downloading a second model in CI, the second alias reuses the
+        loaded weights but is labelled as a different model.
         """
+        import dataclasses
+
         registry.register_model("compat-a", "all-MiniLM-L6-v2")
         registry.register_model("compat-b", "all-MiniLM-L6-v2")
         drift_detector = EmbeddingDrift(registry)
         probe_texts = ["probe text one", "probe text two"]
-        # Normal threshold: same model should be compatible
         assert drift_detector.is_compatible("compat-a", "compat-b", probe_texts, threshold=0.9)
-        # Impossibly strict threshold: should flag as incompatible
-        assert not drift_detector.is_compatible("compat-a", "compat-b", probe_texts, threshold=0.9999999)
+
+        model, meta = registry._models["compat-b"]
+        registry._models["compat-other"] = (
+            model,
+            dataclasses.replace(meta, version="compat-other", name="all-MiniLM-L12-v2"),
+        )
+        assert not drift_detector.is_compatible("compat-a", "compat-other", probe_texts, threshold=0.0)
+
+    def test_neighbour_overlap_same_model_is_one(self, registry):
+        """Two aliases of the same model agree on every nearest neighbour."""
+        registry.register_model("overlap-a", "all-MiniLM-L6-v2")
+        registry.register_model("overlap-b", "all-MiniLM-L6-v2")
+        drift_detector = EmbeddingDrift(registry)
+        texts = [
+            "write-ahead logs make database writes durable",
+            "raft elects a leader by majority vote",
+            "consistent hashing limits key movement when nodes change",
+            "a bloom filter answers set membership with false positives",
+            "the kv cache stores past keys and values during decoding",
+            "lora adds low-rank adapters to frozen weights",
+            "token bucket rate limiting allows short bursts",
+            "hnsw builds a layered proximity graph for vector search",
+        ]
+        overlap = drift_detector.neighbour_overlap(texts, "overlap-a", "overlap-b", k=3)
+        assert overlap == pytest.approx(1.0)
 
     def test_pinned_version_respected(self):
         """PinningRegistry should route a pinned caller to their pinned version."""

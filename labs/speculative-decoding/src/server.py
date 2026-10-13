@@ -123,6 +123,7 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
         draft_tokens_proposed=_global_stats.draft_tokens_proposed + step_stats.draft_tokens_proposed,
         draft_tokens_accepted=_global_stats.draft_tokens_accepted + step_stats.draft_tokens_accepted,
         target_calls=_global_stats.target_calls + step_stats.target_calls,
+        sequence_steps=_global_stats.sequence_steps + step_stats.sequence_steps,
         total_time_sec=_global_stats.total_time_sec + step_stats.total_time_sec,
     )
 

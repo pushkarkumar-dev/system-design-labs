@@ -110,6 +110,10 @@ func (tp *TieredProxy) fetchAndCache(r *http.Request, key string) (*CacheEntry, 
 		}
 	}
 
+	// Same rule as the base proxy: never store a 5xx or a no-store response.
+	if !isCacheable(entry) {
+		return entry, nil
+	}
 	tp.stats.BytesCached.Add(int64(len(entry.Body)))
 	tp.insertL1(key, entry)
 	return entry, nil

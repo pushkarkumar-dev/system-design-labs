@@ -131,6 +131,10 @@ class TestV0FewShot:
         assert _extract_multiple_choice("A. Paris is the capital") == "A"
         # Lowercase should also work
         assert _extract_multiple_choice("b") == "B"
+        assert _extract_multiple_choice("The answer is (B)") == "B"
+        # Never invent a letter from an ordinary word ("is correct" is not "is C")
+        assert _extract_multiple_choice("Option A is correct") != "C"
+        assert _extract_multiple_choice("This is a hard one") == ""
 
     def test_accuracy_computed_correctly(self):
         """
@@ -273,6 +277,21 @@ class TestV1Logprob:
         assert suite_result.per_task["task-A-wins"] == 1.0
         assert suite_result.per_task["task-D-wins"] == 0.0
         assert abs(suite_result.macro_average - 0.5) < 1e-9
+
+    def test_logprob_evaluator_rejects_exact_match_tasks(self):
+        """
+        Log-likelihood scoring has no candidates to compare on an exact_match task.
+        It must refuse rather than report a score (an earlier fallback marked every
+        example correct, so any model scored 100%).
+        """
+        from src.tasks import TRIVIAQA_LITE
+        from src.v1_logprob import LogprobEvaluator
+
+        def hopeless(context: str, continuation: str) -> float:
+            return -1000.0
+
+        with pytest.raises(ValueError, match="exact_match"):
+            LogprobEvaluator(scoring_mode="raw").evaluate(hopeless, TRIVIAQA_LITE, n_shot=0)
 
 
 # ===========================================================================

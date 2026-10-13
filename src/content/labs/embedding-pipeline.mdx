@@ -23,7 +23,7 @@ stages:
   - id: v1
     title: "Dynamic Batching + LRU Cache"
     learningGoals:
-      - "Collect for 5ms or 32 texts — batch=32 gives 18x higher throughput"
+      - "Collect for 5ms or 32 texts — measured: batch=32 gives 6x the single-text throughput on CPU and 12x on an Apple GPU for short texts, 4-5x for chunk-sized ones"
       - "SHA-256 cache key handles long texts without memory issues"
     approxLoc: 460
     branchOrTag: "embedding-pipeline-v1"
@@ -31,43 +31,58 @@ stages:
     title: "Model Versioning + Drift Detection"
     learningGoals:
       - "Registry holds multiple versions simultaneously — zero-downtime upgrades"
-      - "Drift = avg cosine distance across versions; threshold=0.9 flags incompatible swaps"
+      - "Different models never share an index; neighbour overlap@k measures how much retrieval would change"
     approxLoc: 740
     branchOrTag: "embedding-pipeline-v2"
 benchmarks:
-  - metric: "Single-text embed throughput"
-    value: "100"
+  - metric: "encode(), 1 vs 32 short texts per call (CPU)"
+    value: "120 / 695"
     unit: "texts/sec"
-    measuredOn: "M2 MacBook Pro, CPU-only"
-    note: "estimated — no batching, one model.encode() per text"
-  - metric: "Batch=32 embed throughput"
-    value: "1,800"
+    measuredOn: "Apple M1 Ultra, 64 GB RAM, torch 2.14.1 (16 CPU threads), sentence-transformers 6.1.0, 2026-10-11"
+    note: "measured — 6.0x from batching; texts average 46 tokens; scripts/bench.py"
+  - metric: "encode(), 1 vs 32 short texts per call (MPS)"
+    value: "160 / 1,930"
     unit: "texts/sec"
-    measuredOn: "M2 MacBook Pro, CPU-only"
-    note: "estimated — 18x speedup from batching"
-  - metric: "Cache hit rate (typical RAG workload)"
-    value: "35"
+    measuredOn: "Apple M1 Ultra, Apple GPU via MPS, torch 2.14.1, sentence-transformers 6.1.0, 2026-10-11"
+    note: "measured — 12.0x from batching; MPS is sentence-transformers' default device on this Mac"
+  - metric: "encode(), 1 vs 32 chunk-length texts per call (CPU)"
+    value: "35 / 112"
+    unit: "texts/sec"
+    measuredOn: "Apple M1 Ultra, CPU, 2026-10-11"
+    note: "measured — 4.3x; 256-token texts leave less per-call overhead to amortize"
+  - metric: "v1 dynamic batching, 32 concurrent callers (CPU)"
+    value: "697"
+    unit: "texts/sec"
+    measuredOn: "Apple M1 Ultra, CPU, 2026-10-11"
+    note: "measured — queue formed batches of 32; p50 latency 45 ms. One caller: 62 texts/sec"
+  - metric: "LRU hit rate, Zipf s=1.0 over 100k texts, cache 10,000"
+    value: "72.2"
     unit: "%"
-    measuredOn: "M2 MacBook Pro, CPU-only"
-    note: "estimated — system prompt + repeated context hits cache"
-  - metric: "Drift (MiniLM-L6-v2 vs MiniLM-L12-v2)"
-    value: "0.08"
+    measuredOn: "Apple M1 Ultra, 2026-10-11 (synthetic request stream)"
+    note: "measured — uniform popularity: 9.8%; bulk ingestion with no repeats: 0%"
+  - metric: "Matched-pair cosine distance (MiniLM-L6-v2 vs MiniLM-L12-v2)"
+    value: "0.49"
     unit: "avg cosine distance"
-    measuredOn: "M2 MacBook Pro, CPU-only"
-    note: "estimated — same family, different depth; compatible"
+    measuredOn: "Apple M1 Ultra, 64 GB RAM, Python 3.13.7, sentence-transformers 6.1.0 (default device), 2026-10-11"
+    note: "measured — 434 probe texts; unrelated text pairs measure 0.92; scripts/compare_models.py"
+  - metric: "Neighbour overlap@10 (MiniLM-L6-v2 vs MiniLM-L12-v2)"
+    value: "0.65"
+    unit: "fraction"
+    measuredOn: "Apple M1 Ultra, 64 GB RAM, Python 3.13.7, sentence-transformers 6.1.0 (default device), 2026-10-11"
+    note: "measured — a third of each text's 10 nearest neighbours change between the models"
 whatTheToyMisses:
   - thing: "GPU acceleration"
-    why: "sentence-transformers supports CUDA automatically when PyTorch detects a GPU. A single A100 GPU runs all-MiniLM-L6-v2 at ~150,000 texts/sec (batch=512) — 80x faster than our CPU numbers."
+    why: "sentence-transformers picks CUDA or Apple's MPS automatically when PyTorch finds one (on the Mac we measured on it chose MPS without being asked). A datacenter GPU wants much larger batches than 32 to stay busy, so the batching window and max batch size need retuning per device."
   - thing: "Embedding quantization"
-    why: "Float32 embeddings use 4 bytes per dimension. INT8 quantization halves storage and speeds up ANN search, but introduces 0.5-2% recall degradation. Matryoshka representation learning trains models so you can truncate dimensions without significant quality loss."
+    why: "Float32 embeddings use 4 bytes per dimension. INT8 quantization cuts storage 4x (1,536 to 384 bytes per 384-dim vector) and speeds up ANN search at some cost in recall that you have to measure on your own queries. Matryoshka representation learning trains models so you can truncate dimensions with little quality loss."
   - thing: "Late chunking for long documents"
-    why: "Our server embeds up to 512 tokens per text (model max). Late chunking (JinaAI) embeds the full document first, then pools token embeddings per chunk — preserving cross-chunk context that naive chunking loses."
+    why: "all-MiniLM-L6-v2 reads at most 256 word pieces per text and silently drops the rest. Late chunking (JinaAI) embeds the full document with a long-context model first, then pools token embeddings per chunk — preserving cross-chunk context that naive chunking loses."
   - thing: "Streaming ingestion"
     why: "Embedding a 1M-document corpus sequentially takes hours. Production pipelines use parallel workers (Ray, Spark), with each worker embedding a shard. Coordination requires a distributed job queue and idempotent checkpointing."
   - thing: "Index synchronization"
-    why: "When embedding a new model version, all vectors in the ANN index must be re-embedded and re-indexed. For 100M vectors at 1,800 texts/sec (batch=32), that is 15+ hours of re-embedding. Blue-green index switching requires maintaining two indexes simultaneously."
+    why: "When embedding a new model version, all vectors in the ANN index must be re-embedded and re-indexed. Re-embedding time is corpus size / throughput: 100M chunk-length texts at the 110–180 texts/sec we measured for one M1 Ultra CPU process is 6–10 days, so real migrations shard the work across many GPUs. Blue-green index switching requires maintaining two indexes simultaneously."
   - thing: "Embedding model fine-tuning"
-    why: "General-purpose embeddings (MiniLM) underperform on domain-specific tasks. Fine-tuning with domain data using contrastive loss (positive/negative pairs) typically improves Recall@10 by 10-20pp on specialized retrieval tasks."
+    why: "General-purpose embeddings (MiniLM) can underperform on domain-specific tasks. Fine-tuning with domain data using contrastive loss (positive/negative pairs) can help on specialized retrieval tasks; how much is something to measure on your own labelled queries."
 realWorldReferences:
   - "Sentence-BERT paper (2019): https://arxiv.org/abs/1908.10084"
   - "Matryoshka Representation Learning: https://arxiv.org/abs/2205.13147"
@@ -82,14 +97,14 @@ javaIntegration:
   springModule: "spring-ai"
 publishedAt: "2026-05-08"
 updatedAt: "2026-05-08"
-summary: "Build an embedding pipeline from single-model serving to dynamic batching with LRU cache to model versioning with drift detection — making the 18x batching speedup and zero-downtime upgrade path concrete."
+summary: "Build an embedding pipeline from single-model serving to dynamic batching with LRU cache to model versioning with drift detection — measuring what batching really buys (6x on CPU, 12x on an Apple GPU for short texts) and making the zero-downtime upgrade path concrete."
 ---
 
 ## Why this lab exists
 
-Every RAG system, every semantic search, every recommendation engine begins with the same operation: convert text to a vector. That operation is embedding. Understanding embedding at the implementation level — not just calling `openai.embeddings.create()` — means understanding why batching gives 18x throughput, why L2 normalization matters for ANN indexes, and why swapping embedding models without re-indexing is a silent correctness bug.
+Every RAG system, every semantic search, every recommendation engine begins with the same operation: convert text to a vector. That operation is embedding. Understanding embedding at the implementation level — not just calling `openai.embeddings.create()` — means understanding why batching multiplies throughput (and by how much on your hardware), why L2 normalization matters for ANN indexes, and why swapping embedding models without re-indexing is a silent correctness bug.
 
-You've read that embeddings are dense representations. You've used them through an API. But until you've implemented the batching queue and timed the forward pass at batch=1 vs batch=32, until you've built the LRU cache and measured cache hit rates on real RAG workloads, until you've measured cosine drift between model versions and understood what it means for your vector index — you don't *know* it.
+You've read that embeddings are dense representations. You've used them through an API. But until you've implemented the batching queue and timed the forward pass at batch=1 vs batch=32, until you've built the LRU cache and seen its hit rate swing from 10% to 90% with nothing but the popularity of the requests, until you've measured cosine drift between model versions and understood what it means for your vector index — you don't *know* it.
 
 This lab builds an embedding pipeline from the ground up: a single-model HTTP server, then dynamic batching with an LRU cache, then model versioning with drift detection. Each stage addresses a concrete limitation of the previous one, measured in numbers.
 
@@ -102,7 +117,7 @@ A Python embedding pipeline implemented across three stages. Each stage is a tar
 - `BatchingQueue` + `EmbeddingWorker` (v1): dynamic batching — collect for 5ms or 32 texts, whichever fires first
 - `EmbeddingCache` (v1): SHA-256-keyed LRU cache with configurable max size
 - `ModelRegistry` (v2): hold multiple model versions simultaneously with alias routing
-- `EmbeddingDrift` (v2): measure cosine distance between versions to detect unsafe model swaps
+- `EmbeddingDrift` (v2): compare model versions — matched-pair cosine for same-model checks, neighbour overlap across models, and a gate on which versions can share an index
 - `PinningPolicy` (v2): pin callers to a version during gradual migrations
 
 **We explicitly skip:**
@@ -115,11 +130,11 @@ A Python embedding pipeline implemented across three stages. Each stage is a tar
 
 An embedding pipeline has three concerns that scale at different rates:
 
-**Throughput** — how many texts can you embed per second? The bottleneck is the transformer forward pass. A 22M-parameter model like `all-MiniLM-L6-v2` takes ~10ms for one forward pass on CPU regardless of batch size (up to the memory limit). Single-item encoding wastes 31/32 of each forward pass's capacity; batch=32 amortizes the cost across 32 texts.
+**Throughput** — how many texts can you embed per second? The bottleneck is the transformer forward pass, and a single-text call wastes most of it: fixed per-call overhead (tokenizer, Python, kernel launches) dominates when the matrices are tiny. On an M1 Ultra CPU, `all-MiniLM-L6-v2` takes 8.3 ms for one short text and 46 ms for 32 — the batch is 5.5x slower per call but carries 32x the texts, so throughput rises 6x. The longer the texts, the less there is to amortize: for 256-token chunks the gain is about 4x.
 
 **Freshness** — when do cached embeddings go stale? Embeddings are deterministic: the same text always produces the same vector from the same model. Cache invalidation is by model version, not by time. When you upgrade the model, all cached embeddings from the old model become stale.
 
-**Compatibility** — can you swap models without re-indexing? Two models from the same family (MiniLM-L6 vs MiniLM-L12) embed texts into similar vector spaces — their cosine distance on the same text is ~0.08 on average. Two models from different families might have cosine distance ~0.4. The vector index built against model-v1 is unusable against model-v2 if drift is high. Measuring drift before swapping is how you avoid this silent bug.
+**Compatibility** — can you swap models without re-indexing? No. Each model embeds into its own vector space, so query vectors from model-v2 can't be searched against an index built with model-v1. Even two models from the same family disagree a lot: on this lab's 434 probe texts, MiniLM-L6 and MiniLM-L12 embeddings of the same text have an average cosine distance of 0.49, and a third of each text's 10 nearest neighbours change between them. What you can measure is how much retrieval will change, which tells you how carefully to evaluate the new model before switching.
 
 ```
                 v0: Request → embed() → L2-normalize → return
@@ -127,7 +142,7 @@ An embedding pipeline has three concerns that scale at different rates:
   text(s) ──► SingleModelServer.embed()
                 │
                 ▼
-              model.encode(texts)   ← forward pass (~10ms, any batch 1-32)
+              model.encode(texts)   ← forward pass (CPU: 8 ms for 1 short text, 46 ms for 32)
                 │
                 ▼
               L2-normalize          ← cosine sim = dot product after this
@@ -158,7 +173,7 @@ An embedding pipeline has three concerns that scale at different rates:
                 ▼
               ModelRegistry.embed(texts, version="stable")
                               │
-                         (or "canary" if drift measured + approved)
+                         (or "canary" once its shadow index is built)
 ```
 
 ## Prerequisites
@@ -189,7 +204,7 @@ The key insight of v0 is L2 normalization. After normalization, every embedding 
 cosine_similarity(a, b) = (a · b) / (|a| * |b|) = a · b
 ```
 
-Because `|a| = |b| = 1` after normalization, the denominator disappears. This matters enormously for ANN indexes: FAISS's `IndexFlatIP` (inner product) gives exact cosine similarity for unit vectors. The HNSW index in Weaviate expects unit vectors and fails silently if they're not normalized (it computes inner products and reports wrong nearest neighbors).
+Because `|a| = |b| = 1` after normalization, the denominator disappears. This matters enormously for ANN indexes: FAISS's `IndexFlatIP` (inner product) gives exact cosine similarity for unit vectors. Any index configured for inner-product / dot-product distance has the same requirement and fails silently if vectors aren't normalized: it ranks by inner product, so longer vectors win and you get wrong nearest neighbours.
 
 The normalization itself is three lines:
 
@@ -213,7 +228,7 @@ The server exposes three endpoints:
 - `GET /health` — returns model name and loaded status
 - `GET /model-info` — returns name and dimension
 
-The v0 limitation is throughput: single-item requests call `model.encode()` once per text. The forward pass takes ~10ms on CPU whether you embed 1 text or 32 texts. At single-item: 100 texts/sec. With batch=32: 1,800 texts/sec. V1 fixes this.
+The v0 limitation is throughput: single-item requests call `model.encode()` once per text. Measured on the M1 Ultra CPU with short texts (~46 tokens), that's 120 texts/sec; the same code with 32 texts per call does 695 texts/sec. On the Apple GPU (MPS, which sentence-transformers picks by default on a Mac) it's 160 vs 1,930 texts/sec. V1 gets there without asking clients to batch.
 
 </LabStage>
 
@@ -277,7 +292,7 @@ def drain(self) -> list[_PendingRequest]:
 
 **SHA-256 cache key:**
 
-A production RAG system embeds document chunks of 512 tokens (~2,000 characters). Storing those as raw dict keys would use gigabytes of memory for the cache. SHA-256 produces a 32-byte key regardless of text length. Collision probability for 10M cached texts: approximately `10^-61` (birthday paradox on 2^256 outputs). Not a concern in practice.
+A production RAG system embeds document chunks of ~2,000 characters. As raw dict keys, 10,000 cached chunks would hold ~20 MB of key text next to ~15 MB of vectors (10,000 × 384 × 4 bytes); at a million entries that's ~2 GB of keys. A SHA-256 hex digest is 64 characters regardless of text length. Collision probability for 10M cached texts: about n²/2^257 ≈ `4 × 10^-64` (birthday bound on 2^256 outputs). Not a concern in practice.
 
 ```python
 @staticmethod
@@ -289,10 +304,19 @@ def _key(text: str) -> str:
 
 `collections.OrderedDict` maintains insertion order. Moving an accessed key to the end (`.move_to_end(key)`) and always evicting from the front (`popitem(last=False)`) implements LRU in O(1) per operation — no sorted data structure required.
 
-**Throughput comparison:**
-- Single-item: each text pays the full ~10ms forward pass → ~100 texts/sec
-- Batch=32: 32 texts share one ~10.5ms forward pass → ~1,800 texts/sec (18x speedup)
-- Cache hit: no forward pass → ~100,000 texts/sec (limited by hash + dict lookup)
+**Throughput comparison (measured, short texts, `scripts/bench.py`):**
+
+| | CPU (16 threads) | MPS (Apple GPU) |
+|---|---|---|
+| v0, 1 text per call | 120 texts/s (8.3 ms) | 160 texts/s (6.3 ms) |
+| v0, 32 texts per call | 695 texts/s (46 ms) | 1,930 texts/s (16.6 ms) |
+| v1, 32 concurrent callers, 1 text each | 697 texts/s, p50 45 ms | 1,579 texts/s, p50 19 ms |
+| v1, 1 caller | 62 texts/s, p50 16 ms | 56 texts/s, p50 17 ms |
+| v1, cache hit | ~300,000 texts/s (3.3 µs) | same (no model call) |
+
+With enough concurrent callers, the queue forms full batches of 32 and v1 matches explicit batching on CPU (82% of it on MPS). With a single caller there is nothing to batch, and v1 is *slower* than v0: every request waits out the 5 ms window plus a thread hand-off, 7.5 ms (CPU) to 11.7 ms (MPS) on top of the model call. Dynamic batching is a throughput tool for concurrent traffic, not a free win.
+
+For chunk-length texts (~256 tokens, the model's maximum) the gains shrink: CPU goes from 35 to 112 texts/s at batch 32 (4.3x) and peaks around batch 8; MPS from 112 to 648 texts/s (5.0x).
 
 </LabStage>
 
@@ -301,8 +325,9 @@ def _key(text: str) -> str:
   title="Model Versioning + Drift Detection"
   goals={[
     "Implement ModelRegistry: register_model(version, name), get_model(version), list_versions()",
-    "Implement EmbeddingDrift.measure_drift(texts, v_a, v_b) -> avg cosine distance",
-    "Implement EmbeddingDrift.is_compatible(v_a, v_b, probe_texts, threshold=0.9) -> bool",
+    "Implement EmbeddingDrift.measure_drift(texts, v_a, v_b) -> avg cosine distance (same-model check)",
+    "Implement EmbeddingDrift.neighbour_overlap(texts, v_a, v_b, k) -> fraction of shared nearest neighbours",
+    "Implement EmbeddingDrift.is_compatible(v_a, v_b, probe_texts, threshold=0.9) -> can both share one index?",
     "Implement PinningRegistry: pin(caller_id, version, until), resolve(caller_id, default)",
     "Wire into VersionedEmbeddingServer with caller_id -> version resolution",
   ]}
@@ -313,7 +338,7 @@ The failure mode v2 prevents: you upgrade the embedding model, embeddings look c
 
 **Why different models produce incompatible vectors:**
 
-Each sentence-transformer model is trained with a specific projection layer that maps the transformer's hidden states to the embedding space. Two models from the same family (MiniLM-L6 vs MiniLM-L12) share the same base architecture, so their projections are similar but not identical — cosine distance between same-text embeddings is ~0.08 on average. Two models from different families (MiniLM vs E5-large) have entirely different projections — cosine distance can be 0.3-0.5.
+Each model learns its own embedding space during training. Nothing forces coordinate 17 of one model to mean what coordinate 17 means in another, even when both output 384 dimensions. Models that share training lineage end up partly aligned: on our 434 probe texts, all-MiniLM-L6-v2 and all-MiniLM-L12-v2 embeddings of the *same* text have an average cosine distance of 0.49, against 0.92 for unrelated text pairs. That's well short of interchangeable. Models with different dimensions (MiniLM's 384 vs all-mpnet-base-v2's 768) can't be compared vector-to-vector at all.
 
 **Measuring drift:**
 
@@ -323,21 +348,40 @@ def measure_drift(self, texts, version_a, version_b) -> float:
     emb_b = self._registry.embed(texts, version=version_b)
     # Dot product of unit vectors = cosine similarity (N,)
     similarities = np.einsum("ij,ij->i", emb_a, emb_b)
-    distances = 1.0 - similarities
+    distances = np.clip(1.0 - similarities, 0.0, 2.0)  # clip float noise
     return float(np.mean(distances))
 ```
 
 `np.einsum("ij,ij->i", a, b)` is the row-wise dot product of two matrices — equivalent to `(a * b).sum(axis=1)` but more readable for this pattern. Since both matrices are L2-normalized, this gives cosine similarity per row.
 
-**The compatibility threshold:**
+Matched-pair drift answers "are these the same embeddings?" That's the right check when you redeploy the *same* model on a new runtime, precision or library version: it should be close to 0. Across different models it measures training lineage, not whether you can swap.
 
-`is_compatible(v_a, v_b, probe_texts, threshold=0.9)` returns True if average cosine similarity is at least 0.9 (equivalently, avg cosine distance at most 0.10). The threshold=0.9 was chosen empirically: at similarity above 0.9, the top-10 retrieved documents from a hybrid BM25+dense index change by less than 5% — acceptable degradation for a live migration.
+**Comparing different models: neighbour overlap**
+
+To compare two different models, compare rankings instead of vectors. For each probe text, find its k nearest neighbours among the other probe texts under each model, and count how many they share:
+
+```python
+def neighbour_overlap(self, texts, version_a, version_b, k=10) -> float:
+    def top_k(emb):
+        sims = emb @ emb.T
+        np.fill_diagonal(sims, -np.inf)   # a text is not its own neighbour
+        return np.argsort(-sims, axis=1)[:, :k]
+    nbrs_a = top_k(self._registry.embed(texts, version=version_a))
+    nbrs_b = top_k(self._registry.embed(texts, version=version_b))
+    return float(np.mean([len(set(a) & set(b)) / k for a, b in zip(nbrs_a, nbrs_b)]))
+```
+
+Each model is only ever compared with itself, so this works across spaces and even across dimensions. MiniLM-L6 vs L12 score 0.65 at k=10. Overlap tells you how much retrieval will change, not whether the new model is better: for that you still need labelled queries.
+
+**The compatibility gate:**
+
+`is_compatible(v_a, v_b, probe_texts, threshold=0.9)` answers one narrow question: can vectors from both versions live in the same index? For two different models (different names or dimensions) the answer is always False. For two versions of the same model, it requires average cosine similarity of at least `threshold` between same-text embeddings.
 
 **PinningPolicy:**
 
 During a gradual migration from "stable" (MiniLM-L6) to "next" (MiniLM-L12), you want:
 - New services: use "next" immediately (you chose them for a reason)
-- Existing services: keep "stable" for 7 days, allowing teams to test and re-index if needed
+- Existing services: keep "stable" for 7 days, while the new model's index is built and tested
 
 ```python
 policy = PinningRegistry()
@@ -353,8 +397,8 @@ After `pinned_until`, `resolve()` returns the default ("next"), so the pin expir
 **Zero-downtime upgrade path:**
 
 1. Load new model as "canary": `registry.register_model("canary", "all-MiniLM-L12-v2")`
-2. Measure drift: `drift.measure_drift(probe_corpus, "stable", "canary")` → 0.08
-3. Check compatibility: `drift.is_compatible(...)` → True
+2. Check whether it can share the index: `drift.is_compatible(...)` → False (different model)
+3. Measure how much retrieval will change: `drift.neighbour_overlap(probe_corpus, "stable", "canary")` → 0.65, then evaluate both on labelled queries
 4. Pin existing services to "stable" for 7 days
 5. Shadow-index: re-embed all documents with "canary" into a shadow index
 6. Promote: rename "canary" to "stable", atomically swap index pointer
@@ -400,57 +444,64 @@ After `pinned_until`, `resolve()` returns the default ("next"), so the pin expir
       label: "Check cache hit rate",
       cmd: "curl -s http://localhost:8000/cache/stats | python -m json.tool",
     },
+    {
+      label: "Measure batching, the queue and the cache on your machine (stop the server first; several minutes per device)",
+      cmd: "python scripts/bench.py --devices cpu",
+    },
   ]}
-  expectedOutput={`=== Embedding server health ===
+  expectedOutput={`=== GET /health ===
 {
   "v0": {"status": "ok", "model": "all-MiniLM-L6-v2", "loaded": true},
   "v1": {"status": "ok", "model": "all-MiniLM-L6-v2", "loaded": true,
          "cache": {"size": 0, "max_size": 10000, "hits": 0, "misses": 0, "hit_rate": 0.0}},
-  "v2": {"status": "ok", "versions": [...], "default_version": "stable", "active_pins": 0}
+  "v2": {"status": "ok",
+         "versions": [{"name": "all-MiniLM-L6-v2", "version": "stable", "dimension": 384,
+                       "loaded_at": "2026-10-12T02:49:18.751585+00:00"}],
+         "default_version": "stable", "active_pins": 0}
 }
 
-=== Single text embed (v0) ===
-{
-  "embeddings": [[0.034, -0.021, ...]],  // 384 floats
-  "model": "all-MiniLM-L6-v2",
-  "dimension": 384,
-  "count": 1
-}
+=== POST /embed/v0 (first 3 of 384 floats shown) ===
+{"embeddings": [[-0.034, 0.031, 0.007, ...]], "model": "all-MiniLM-L6-v2", "dimension": 384, "count": 1}
 
-=== Drift measurement (same model, two aliases) ===
-{
-  "version_a": "stable",
-  "version_b": "canary",
-  "avg_cosine_distance": 0.0,
-  "avg_cosine_similarity": 1.0,
-  "compatible": true,
-  "threshold": 0.9
-}`}
+=== POST /versions/canary, then POST /drift (same model under two aliases) ===
+{"version_a": "stable", "version_b": "canary", "avg_cosine_distance": 0.0,
+ "avg_cosine_similarity": 1.0, "compatible": true, "threshold": 0.9}
+
+=== GET /cache/stats (after the 4-text /embed/v1 call: 4 misses, now cached) ===
+{"size": 4, "max_size": 10000, "hits": 0, "misses": 4, "hit_rate": 0.0}`}
 />
 
 ## Benchmarks
 
 <Benchmark
-  hardware="M2 MacBook Pro, 16GB RAM, CPU-only"
+  hardware="Apple M1 Ultra, 64 GB RAM, macOS 27, Python 3.13.7, torch 2.14.1, sentence-transformers 6.1.0 — CPU (16 threads) and MPS rows labelled, 2026-10-11"
   rows={[
-    { metric: "Single-text embed throughput",              value: "100",   unit: "texts/sec",       note: "estimated — no batching, one model.encode() per text" },
-    { metric: "Batch=32 embed throughput",                 value: "1,800", unit: "texts/sec",       note: "estimated — 18x speedup from batching" },
-    { metric: "Cache hit rate (typical RAG workload)",     value: "35",    unit: "%",               note: "estimated — system prompt + repeated context hits cache" },
-    { metric: "Drift (MiniLM-L6-v2 vs MiniLM-L12-v2)",   value: "0.08",  unit: "avg cosine dist", note: "estimated — same family, different depth; compatible" },
+    { metric: "encode(), 1 short text per call (CPU / MPS)",        value: "120 / 160",     unit: "texts/sec",   note: "measured — 8.3 / 6.3 ms per call; texts average 46 tokens" },
+    { metric: "encode(), 32 short texts per call (CPU / MPS)",      value: "695 / 1,930",   unit: "texts/sec",   note: "measured — 6.0x / 12.0x the single-text rate" },
+    { metric: "encode(), 1 vs 32 chunk-length texts (CPU)",         value: "35 / 112",      unit: "texts/sec",   note: "measured — 4.3x; texts truncated to 256 tokens" },
+    { metric: "encode(), 1 vs 32 chunk-length texts (MPS)",         value: "112 / 648",     unit: "texts/sec",   note: "measured — 5.0x" },
+    { metric: "v1 queue, 32 concurrent callers (CPU / MPS)",        value: "697 / 1,579",   unit: "texts/sec",   note: "measured — full batches of 32; p50 latency 45 / 19 ms" },
+    { metric: "v1 queue, 1 caller: latency added by the queue",     value: "7.5 / 11.7",    unit: "ms",          note: "measured — CPU / MPS; 5 ms window + thread hand-off" },
+    { metric: "Cache hit through BatchedEmbeddingServer.embed()",   value: "300,000",       unit: "texts/sec",   note: "measured — 3.3 µs; SHA-256 + OrderedDict lookup is 1.1 µs of it" },
+    { metric: "LRU hit rate, Zipf s=1.0, 100k distinct texts, cache 10k", value: "72.2",   unit: "%",           note: "measured — synthetic stream of 200k requests; uniform: 9.8%" },
+    { metric: "Matched-pair cosine distance (MiniLM-L6 vs L12)",    value: "0.49",          unit: "avg cosine dist", note: "measured — 434 probe texts; unrelated pairs 0.92" },
+    { metric: "Neighbour overlap@10 (MiniLM-L6 vs L12)",            value: "0.65",          unit: "fraction",    note: "measured — scripts/compare_models.py" },
   ]}
 />
 
-The 18x batching speedup is the headline result. The model's forward pass time is nearly constant from batch=1 to batch=32: ~10ms for 1 text, ~10.5ms for 32 texts. Batching amortizes the fixed cost of loading 22M parameters into the compute units across 32 texts simultaneously.
+Every throughput row is the median of 7 rounds in which the alternatives being compared were interleaved, after a warm-up (`scripts/bench.py`; raw numbers in `bench-runs/mac/2026-10-11/`). Other workloads were running on the machine at the same time. Treat absolute CPU numbers as rough: an earlier, non-interleaved run of the script saw the same single-text measurement differ by 2x, and the chunk-length CPU rows here varied up to 3x between rounds. Ratios measured within one round are steadier (CPU short-text batching gain: 5.4x–6.5x across rounds).
 
-The 35% cache hit rate is typical for RAG workloads where the system prompt, user instructions, and repeated context chunks are embedded on every request. A system prompt of 200 tokens gets embedded with every conversation turn — 100% hit rate for that text after the first call.
+Batching helps because a single-text call is mostly fixed overhead, not because the forward pass is free. The per-call time does grow with the batch: on CPU, 8.3 ms for one short text and 46 ms for 32. It grows more slowly than the batch, so throughput rises, until the hardware is busy: CPU throughput flattens past batch 32 for short texts and past batch 8 for 256-token texts; MPS flattens past 64. The size of the win depends on hardware and text length: 12x on the Apple GPU for short texts, 4–5x for chunk-sized texts. Measure on your own hardware and your own text lengths before you quote a multiplier.
+
+There is no single "typical" cache hit rate. An LRU cache's hit rate is set by how often texts repeat, which is a property of your traffic, not of the cache. On 200,000-request streams over 100,000 distinct texts, `EmbeddingCache` hits 9.8% when every text is equally popular, 46% with mildly skewed popularity (Zipf s=0.8) and 72% with Zipf s=1.0, all at the default 10,000 entries. A bulk ingestion job that embeds each chunk once gets 0%. Log your own request stream and replay it against the cache before sizing it.
 
 ## Stress tests
 
-**Batch accumulation under load**: send 1,000 concurrent single-text requests using `asyncio.gather()`. The batching queue should naturally form batches of 32 as requests arrive faster than the 5ms window. Expected: all 1,000 requests complete in under 1,000ms (vs ~10,000ms for single-item). The queue depth should never exceed 32 sustained.
+**Batch accumulation under load**: in-process, the queue does what it promises. With 32 or 64 threads each calling `BatchedEmbeddingServer.embed()` with one text, every batch was full (32 texts) and throughput matched explicit batching on CPU (697 texts/s). Over HTTP it's a different story. `scripts/bench.py --server` sends 1,000 single-text requests through 100 connections (`asyncio.gather()` with httpx) to the FastAPI server on its default device (MPS): `/embed/v1` finished in 10.9 s (91 requests/s, p50 5.3 s), `/embed/v0` in 13.8 s (72 requests/s), and one `/embed/v0` request failed with a connection reset. The model isn't the bottleneck there: `GET /model-info`, which does no model work at all, peaked at 600 requests/s under the same load, and a single sequential `/embed/v1` request takes 19 ms against 7 ms for `/embed/v0` because it waits out the batching window. We didn't profile the server further; FastAPI runs these sync handlers in a thread pool, and every request pays for JSON-encoding 384 floats. The practical lesson: if clients can send 32 texts in one request, that beats any server-side batching of one-text requests.
 
 **Cache eviction correctness**: fill the cache to max_size (10,000 entries), then add 1,000 new entries. The 1,000 oldest entries should be evicted. Access pattern: check that the 1,000 most recently accessed entries are all cache hits, and that an entry accessed only at the beginning of the fill is a miss.
 
-**Drift with mismatched dimensions**: register a model with a different output dimension (e.g. `all-mpnet-base-v2` has 768-dim vs MiniLM's 384-dim). `measure_drift()` should raise immediately when trying to compute `np.einsum("ij,ij->i", emb_a, emb_b)` on mismatched shapes — a fast failure rather than silently wrong results.
+**Drift with mismatched dimensions**: register a model with a different output dimension (e.g. `all-mpnet-base-v2` has 768-dim vs MiniLM's 384-dim). `measure_drift()` should raise immediately when trying to compute `np.einsum("ij,ij->i", emb_a, emb_b)` on mismatched shapes — a fast failure rather than silently wrong results. `neighbour_overlap()` still works, because it never compares vectors across models; run `python scripts/compare_models.py all-MiniLM-L6-v2 all-mpnet-base-v2` to see it.
 
 **Pin expiry race condition**: create a pin that expires in 100ms. Send requests at 50ms intervals. The first two requests should get the pinned version; requests after 100ms should get the default. Verify with the `GET /pin` endpoint's `active` field.
 
@@ -460,12 +511,12 @@ The 35% cache hit rate is typical for RAG workloads where the system prompt, use
 
 <WhatTheToyMisses
   items={[
-    { thing: "GPU acceleration",             why: "sentence-transformers supports CUDA automatically when PyTorch detects a GPU. A single A100 GPU runs all-MiniLM-L6-v2 at ~150,000 texts/sec (batch=512) — 80x faster than our CPU numbers. The batch size optimum shifts from 32 (CPU) to 512+ (GPU) because GPU memory bandwidth is the bottleneck, not the forward pass latency." },
-    { thing: "Embedding quantization",       why: "Float32 embeddings use 4 bytes per dimension. INT8 quantization halves storage and speeds up ANN search, but introduces 0.5-2% recall degradation. Matryoshka representation learning trains models so you can truncate dimensions (384 → 256 → 128) without significant quality loss — useful for tiered storage." },
-    { thing: "Late chunking for long documents", why: "Our server embeds up to 512 tokens per text (model max). Late chunking (JinaAI) embeds the full document first, then pools token embeddings per chunk — preserving cross-chunk context that naive chunking loses. Particularly impactful for documents where the answer requires context from multiple sections." },
-    { thing: "Streaming ingestion",          why: "Embedding a 1M-document corpus sequentially takes hours. Production pipelines use parallel workers (Ray, Spark), with each worker embedding a shard. Coordination requires a distributed job queue and idempotent checkpointing — so you can resume after worker failure without re-embedding already-processed shards." },
-    { thing: "Index synchronization",        why: "When upgrading the embedding model, all vectors in the ANN index must be re-embedded and re-indexed. For 100M vectors at 1,800 texts/sec (batch=32), that is 15+ hours of re-embedding. Blue-green index switching requires maintaining two indexes simultaneously — doubling memory cost during the migration window." },
-    { thing: "Embedding model fine-tuning",  why: "General-purpose embeddings (MiniLM) underperform on domain-specific tasks. Fine-tuning with domain data using contrastive loss (positive/negative pairs) typically improves Recall@10 by 10-20pp on specialized retrieval tasks. The contrastive loss requires mining hard negatives — documents that are lexically similar but semantically different." },
+    { thing: "GPU acceleration",             why: "sentence-transformers picks CUDA or Apple's MPS automatically when PyTorch finds one; on the Mac we measured on, it chose MPS without being asked, so 'the default' already means different hardware on different machines. A datacenter GPU needs much larger batches than 32 to stay busy, so max_batch_size and the wait window have to be retuned per device, and GPU memory, not the 5 ms window, becomes the limit on batch size." },
+    { thing: "Embedding quantization",       why: "Float32 embeddings use 4 bytes per dimension. INT8 quantization cuts storage 4x (1,536 to 384 bytes per 384-dim vector) and speeds up ANN search, at a recall cost you have to measure on your own queries. Matryoshka representation learning trains models so you can truncate dimensions (384 → 256 → 128) with little quality loss — useful for tiered storage." },
+    { thing: "Late chunking for long documents", why: "all-MiniLM-L6-v2 reads at most 256 word pieces per text and silently drops the rest; every chunk-length text in our benchmark (~1,200 characters, ~270 tokens) was truncated. Late chunking (JinaAI) embeds the full document with a long-context model first, then pools token embeddings per chunk — preserving cross-chunk context that naive chunking loses." },
+    { thing: "Streaming ingestion",          why: "At the 110–180 chunk-length texts/sec we measured for one CPU process, a 1M-chunk corpus takes 1.5–2.5 hours to embed. Production pipelines use parallel workers (Ray, Spark), with each worker embedding a shard. Coordination requires a distributed job queue and idempotent checkpointing — so you can resume after worker failure without re-embedding already-processed shards." },
+    { thing: "Index synchronization",        why: "When upgrading the embedding model, all vectors in the ANN index must be re-embedded and re-indexed. Re-embedding time is corpus size divided by throughput: 100M chunk-length texts at 110–180 texts/sec is 6–10 days for one process, so real migrations shard the work across many GPUs. Blue-green index switching requires maintaining two indexes simultaneously — doubling memory cost during the migration window." },
+    { thing: "Embedding model fine-tuning",  why: "General-purpose embeddings (MiniLM) can underperform on domain-specific tasks. Fine-tuning with domain data using contrastive loss (positive/negative pairs) can help on specialized retrieval; measure it on your own labelled queries. The contrastive loss requires mining hard negatives — documents that are lexically similar but semantically different." },
   ]}
 />
 
@@ -578,7 +629,7 @@ cd labs/embedding-pipeline/java-integration
 mvn spring-boot:run
 ```
 
-Expected output:
+Expected output. The Java side wasn't run on the machine that measured this page (no JDK there). The cosine similarities are what the Python server's embeddings give for the demo's texts; the Spring AI part depends on whether an OpenAI key is configured.
 
 ```
 === Embedding Pipeline Spring Integration Demo ===
@@ -586,7 +637,7 @@ Expected output:
 --- Backend 1: Our Python server (all-MiniLM-L6-v2, 384-dim) ---
 Health: HealthStatus[v0={status=ok, ...}, v1=..., v2=...]
 Embedded 3 texts | model: all-MiniLM-L6-v2 | dim: 384
-  Cosine sim (text 0, text 1): 0.4231
+  Cosine sim (text 0, text 1): 0.1036
   Cosine sim (text 0, text 0): 1.0000
 
 --- Backend 2: Spring AI EmbeddingClient ---
@@ -602,7 +653,7 @@ Done. Both clients produce float[] embeddings — downstream code is identical.
 
 ## What surprised me
 
-<WhatSurprisedMe insight="The batching speedup surprised me with its magnitude. Embedding 1 text at a time: 100 texts/sec. Embedding in batches of 32: 1,800 texts/sec — an 18x speedup. The model's forward pass time is nearly fixed regardless of batch size (up to the memory limit): it takes ~10ms to embed 1 text and ~10.5ms to embed 32 texts. The 99% of time is spent on GPU/CPU matrix operations that are parallelized across the batch for free. The only cost of batching is the 5ms wait. For a 100ms P99 latency budget, that 5ms wait buys 18x throughput — an obvious trade." />
+<WhatSurprisedMe insight="This page used to quote an 18x batching speedup that was never measured. Measured with the same model and the same code, batch=32 gave 6.0x the single-text throughput on the M1 Ultra's CPU (120 to 695 texts/sec) and 12.0x on its GPU via MPS (160 to 1,930), for short texts of about 46 tokens. For chunk-sized texts of 256 tokens it was 4.3x on CPU and 5.0x on MPS, and CPU throughput stopped improving past batch 8. The forward pass is not nearly free at batch 32; the per-call time grew from 8.3 ms to 46 ms on CPU. Batching wins because a single short text leaves most of the hardware idle, so the gain shrinks as texts get longer or the hardware gets busier. The second surprise was the HTTP layer: 1,000 one-text requests got 91 requests/sec out of the batching endpoint, far below what the queue manages in-process, while an endpoint that does no work at all managed only 600. Measure the whole path, and ask clients to send batches." />
 
 ## Where to go deeper
 
@@ -618,4 +669,4 @@ Done. Both clients produce float[] embeddings — downstream code is identical.
 - **Previous in AI**: RAG System (lab rag) — uses an embedding pipeline exactly like this one for chunk retrieval; this lab explains what happens inside the `embed_texts()` call
 - **Next in AI**: Vector Index (lab vector-index) — build the ANN index that stores and queries the vectors this pipeline produces
 - **System design companion**: If your embedding model produces 384-dim vectors and your ANN index is built on them, how do you upgrade to a 768-dim model without downtime? (Hint: blue-green indexes — build the new index in the background, atomically swap the query pointer when ready)
-- **System design companion**: At what query volume does the 5ms batching window become too expensive? (Hint: if P99 latency SLO is 10ms, a 5ms batch window consumes half the budget — reduce to 1ms or use dedicated embedding hardware)
+- **System design companion**: At what query volume does the 5ms batching window become too expensive? (Hint: below the rate that fills batches, the window is pure cost. We measured a lone caller paying 7.5–11.7 ms extra per request, not 5 ms, because of the thread hand-off; against a 10 ms P99 budget that's the whole budget. Size the window from measured arrival rates, or let clients batch.)

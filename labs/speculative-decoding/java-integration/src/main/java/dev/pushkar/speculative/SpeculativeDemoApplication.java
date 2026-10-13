@@ -15,9 +15,9 @@ import java.util.List;
  * <ol>
  *   <li><b>Transparency</b>: the caller cannot tell whether speculative decoding
  *       is active. The API is identical; only throughput differs.
- *   <li><b>Speedup math</b>: with acceptance_rate=0.82 and K=5, the expected
- *       speedup is sum(0.82^i, i=0..4) = 3.49 accepted draft tokens + 1 bonus =
- *       ~3.2x more tokens per target forward pass.
+ *   <li><b>Speedup math</b>: with per-token acceptance 0.82 and K=5, each target
+ *       forward pass emits on average (1 - 0.82^6) / (1 - 0.82) = ~3.87 tokens
+ *       (accepted drafts plus one corrected or bonus token).
  * </ol>
  *
  * <p>The Spring AI integration shows how {@code ChatClient} abstracts over any
@@ -86,17 +86,19 @@ public class SpeculativeDemoApplication {
             int K = 5;
             double geoSum = 0.0;
             System.out.printf("  alpha=%.2f, K=%d%n", alpha, K);
-            System.out.printf("  Geometric series: sum(alpha^i, i=0..%d-1)%n", K);
-            for (int i = 0; i < K; i++) {
+            // E[tokens per target call] = sum(alpha^i, i=0..K) = (1 - alpha^(K+1)) / (1 - alpha).
+            // The i=0 term is the corrected or bonus token every step emits.
+            System.out.printf("  Geometric series: sum(alpha^i, i=0..%d)%n", K);
+            for (int i = 0; i <= K; i++) {
                 double term = Math.pow(alpha, i);
                 geoSum += term;
                 System.out.printf("    i=%d: %.4f^%d = %.4f  (cumsum = %.4f)%n",
                         i, alpha, i, term, geoSum);
             }
-            System.out.printf("  Expected accepted draft tokens: %.3f%n", geoSum);
-            System.out.printf("  Plus 1 bonus token:             %.3f total per target call%n",
-                    geoSum + 1);
-            System.out.printf("  Speedup vs standard decoding:  ~%.1fx%n%n", geoSum);
+            System.out.printf("  Expected accepted draft tokens: %.3f%n", geoSum - 1);
+            System.out.printf("  Tokens per target call:         %.3f (accepted drafts + 1 corrected/bonus token)%n",
+                    geoSum);
+            System.out.printf("  Target-call reduction vs standard decoding: ~%.1fx%n%n", geoSum);
 
             // ------------------------------------------------------------------
             // Part 3: Transparency — same API, faster serving
@@ -125,11 +127,12 @@ public class SpeculativeDemoApplication {
             System.out.printf("  (Assuming draft costs %.0f%% of target time — 10x faster draft)%n%n",
                     10.0);
             for (double a : new double[]{0.50, 0.60, 0.70, 0.80, 0.82, 0.90}) {
-                double geo = (1.0 - Math.pow(a, K)) / (1.0 - a);
+                // Expected tokens per target call: accepted drafts + 1 corrected/bonus token
+                double tokensPerCall = (1.0 - Math.pow(a, K + 1)) / (1.0 - a);
                 double overhead = 1.0 + K * 0.10; // draft overhead
-                double netGain = geo / overhead;
-                System.out.printf("  alpha=%.2f: accepted=%.2f, overhead=%.2f, net speedup=%.2f%s%n",
-                        a, geo, overhead, netGain, netGain > 1.5 ? " <<< profitable" : "");
+                double netGain = tokensPerCall / overhead;
+                System.out.printf("  alpha=%.2f: tokens/call=%.2f, overhead=%.2f, net speedup=%.2f%s%n",
+                        a, tokensPerCall, overhead, netGain, netGain > 1.5 ? " <<< profitable" : "");
             }
             System.out.println();
             System.out.println("Done.");

@@ -4,9 +4,9 @@
 #
 #   1. BatchingQueue + EmbeddingWorker:
 #      Collect requests for up to max_wait_ms or until max_batch_size,
-#      then call model.encode(batch) once. This exploits the fact that
-#      model.encode() time is nearly constant from batch=1 to batch=32:
-#      ~10ms for 1 text, ~10.5ms for 32 texts → 18x throughput increase.
+#      then call model.encode(batch) once. Per-call time grows much more slowly
+#      than the batch: on an M1 Ultra CPU, 8.3 ms for 1 short text vs 46 ms for 32
+#      (6x the throughput); on MPS, 6.3 ms vs 16.6 ms (12x).
 #
 #      The worker runs in a daemon thread (not async) because sentence-transformers
 #      releases the GIL during the forward pass, so true parallelism is possible
@@ -17,9 +17,9 @@
 #      SHA-256 as key prevents memory issues with long texts (a 10,000-word
 #      document would be a 60KB dict key; its 32-byte hash is not).
 #
-# Measured improvement (see bench-results.json):
-#   Single-item: 100 texts/sec   (1 encode() call per text, ~10ms each)
-#   Batch=32:  1,800 texts/sec   (18x speedup from amortizing the forward pass)
+# Measured (scripts/bench.py, bench-results.json), 32 concurrent callers, one short
+# text each: 697 texts/sec on CPU, 1,579 on MPS, in full batches of 32. One caller:
+# 62 texts/sec -- the 5 ms window plus thread hand-off adds 7.5-11.7 ms per call.
 
 from __future__ import annotations
 

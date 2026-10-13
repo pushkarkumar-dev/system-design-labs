@@ -213,12 +213,21 @@ func (p *EdgeProxy) fetchFromOrigin(r *http.Request, key string) (*CacheEntry, e
 		entry.StaleIfErrorUntil = now.Add(ttl + directives.SIE)
 	}
 
-	// Don't cache if the origin said no-store.
-	if !directives.NoStore && resp.StatusCode < 500 {
+	// Don't cache if the origin said no-store, or on a 5xx (origin failure).
+	if isCacheable(entry) {
 		p.cache.Set(key, entry)
 	}
 
 	return entry, nil
+}
+
+// isCacheable reports whether an origin response may be stored: not a 5xx and
+// not marked no-store.
+func isCacheable(entry *CacheEntry) bool {
+	if entry.StatusCode >= 500 {
+		return false
+	}
+	return !ParseCacheControl(entry.Headers.Get("Cache-Control"), "").NoStore
 }
 
 // serveFromCache writes a cached response to the client.

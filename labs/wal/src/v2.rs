@@ -32,8 +32,11 @@ pub struct Wal {
 
 impl Wal {
     pub fn open(path: &Path) -> io::Result<(Self, Vec<LogRecord>)> {
+        // Same on-disk format as v1, so reuse its recovery. It also truncates
+        // any torn tail, so the first append after a crash starts right after
+        // the last valid record instead of after the garbage.
         let recovered = if path.exists() {
-            crate::v1::Wal::open(path).map(|(_, r)| r)?
+            crate::v1::recover_and_truncate(path)?
         } else {
             Vec::new()
         };
@@ -93,4 +96,40 @@ fn checksum(data: &[u8]) -> u32 {
     let mut h = Hasher::new();
     h.update(data);
     h.finalize()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    /// Regression: records committed after a torn tail must survive the next
+    /// recovery (the torn bytes are truncated on open).
+    #[test]
+    fn commit_after_torn_tail_is_recovered() {
+        let f = NamedTempFile::new().unwrap();
+        {
+            let (mut wal, _) = Wal::open(f.path()).unwrap();
+            wal.append(b"one").unwrap();
+            wal.append(b"two").unwrap();
+            wal.commit().unwrap();
+        }
+
+        // Torn tail: a partial header.
+        {
+            let mut file = OpenOptions::new().append(true).open(f.path()).unwrap();
+            file.write_all(&[MAGIC, 0x01, 0x02, 0x03]).unwrap();
+        }
+
+        {
+            let (mut wal, recovered) = Wal::open(f.path()).unwrap();
+            assert_eq!(recovered.len(), 2);
+            assert_eq!(wal.append(b"three").unwrap(), 2);
+            wal.commit().unwrap();
+        }
+
+        let (_, recovered) = Wal::open(f.path()).unwrap();
+        assert_eq!(recovered.len(), 3);
+        assert_eq!(recovered[2].decode_data(), b"three");
+    }
 }

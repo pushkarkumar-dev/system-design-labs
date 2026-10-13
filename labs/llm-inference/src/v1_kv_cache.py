@@ -6,9 +6,10 @@
 #
 # KV cache for GPT-2 at seq_len=1024:
 #   2 (K and V) * 12 (layers) * 12 (heads) * 64 (d_head) * 1024 (seq) * 4 (float32)
-#   = 75,497,472 bytes ~ 72 MB
+#   = 75,497,472 bytes ~ 75.5 MB (72 MiB)
 #
-# This is exact (not an estimate). See the WhatSurprisedMe section.
+# This is exact (not an estimate). Models with grouped-query attention cache
+# fewer KV heads than query heads; see kv_cache_size_formula(). See the WhatSurprisedMe section.
 #
 # Speedup: 3-5x for long sequences. Each new token only runs attention over
 # one query position (the new token) against all cached K/V rows.
@@ -86,7 +87,7 @@ class KVCache:
 
         For GPT-2 with seq_len tokens:
           2 * 12 * 12 * 64 * seq_len * 4 = 73,728 * seq_len bytes
-          At seq_len=1024: 75,497,472 bytes = ~72 MB
+          At seq_len=1024: 75,497,472 bytes = ~75.5 MB (72 MiB)
         """
         total = 0
         for k, v in self.cache.values():
@@ -303,20 +304,32 @@ def kv_cache_size_formula(
     d_head: int = 64,
     seq_len: int = 1024,
     bytes_per_element: int = 4,     # float32
+    n_kv_heads: Optional[int] = None,
 ) -> int:
     """
     Analytical formula for KV cache memory.
 
-    For GPT-2 at seq_len=1024:
-      2 * 12 * 12 * 64 * 1024 * 4 = 75,497,472 bytes = ~72 MB
+      2 (K+V) * n_layers * n_kv_heads * d_head * seq_len * bytes_per_element
 
-    For a 70B-parameter Llama 3 model at seq_len=1024 in bfloat16:
-      2 * 80 * 64 * 128 * 1024 * 2 = 4,294,967,296 bytes = 4 GB
+    n_kv_heads is the number of key/value heads that are actually cached. For
+    multi-head attention (GPT-2) it equals n_heads, which is the default.
+    Grouped-query attention (GQA) shares each KV head across several query
+    heads, so the cache only holds n_kv_heads.
 
-    A single A100 with 80 GB HBM can serve at most ~20 such requests
-    in KV cache (before paged attention solves the fragmentation problem).
+    For GPT-2 at seq_len=1024 (12 KV heads, float32):
+      2 * 12 * 12 * 64 * 1024 * 4 = 75,497,472 bytes = ~75.5 MB (72 MiB)
+
+    For Llama 3 70B at seq_len=1024 in bfloat16 (80 layers, 64 query heads,
+    8 KV heads under GQA, d_head=128):
+      2 * 80 * 8 * 128 * 1024 * 2 = 335,544,320 bytes = 320 MiB
+    Plugging in all 64 heads gives 2.5 GiB, 8x too high.
+
+    At that size the weights are the bigger constraint: 70B params * 2 bytes
+    = 140 GB, so the model needs at least two 80 GB GPUs before a single
+    token is cached.
     """
-    return 2 * n_layers * n_heads * d_head * seq_len * bytes_per_element
+    kv_heads = n_heads if n_kv_heads is None else n_kv_heads
+    return 2 * n_layers * kv_heads * d_head * seq_len * bytes_per_element
 
 
 def load_model(model_name: str = "gpt2") -> tuple:
@@ -342,4 +355,4 @@ if __name__ == "__main__":
 
     # Show the analytical formula
     cache_at_1024 = kv_cache_size_formula(seq_len=1024)
-    print(f"\nKV cache formula (GPT-2, seq=1024): {cache_at_1024:,} bytes = {cache_at_1024/1024/1024:.1f} MB")
+    print(f"\nKV cache formula (GPT-2, seq=1024): {cache_at_1024:,} bytes = {cache_at_1024/1024/1024:.1f} MiB")

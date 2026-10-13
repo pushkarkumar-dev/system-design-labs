@@ -1,5 +1,6 @@
 package dev.pushkar.rag;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.MediaType;
 import org.springframework.web.client.RestClient;
@@ -68,12 +69,15 @@ public class RagClient {
     }
 
     // ── Request / response record types ──────────────────────────────────────
+    // The Python server uses snake_case JSON; @JsonProperty maps it to Java names.
 
     record IngestRequest(List<String> docs) {}
 
-    public record IngestResponse(int chunksAdded, int totalChunks, String version) {}
+    public record IngestResponse(@JsonProperty("chunks_added") int chunksAdded,
+                                 @JsonProperty("total_chunks") int totalChunks,
+                                 String version) {}
 
-    record QueryRequest(String question, int topK) {}
+    record QueryRequest(String question, @JsonProperty("top_k") int topK) {}
 
     /**
      * Answer + source chunks from the RAG pipeline.
@@ -81,7 +85,7 @@ public class RagClient {
      */
     public record RagResult(String answer, List<String> sources, String version) {}
 
-    public record HealthStatus(String status, int totalChunks, String version) {
+    public record HealthStatus(String status, @JsonProperty("total_chunks") int totalChunks, String version) {
         public boolean isHealthy() { return "ok".equals(status); }
     }
 
